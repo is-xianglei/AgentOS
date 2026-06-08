@@ -4,6 +4,12 @@ from anthropic.types.tool_param import InputSchemaTyped
 from dotenv import load_dotenv
 from pathlib import Path
 import os
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"  # 时间 + 级别 + 内容
+)
 
 root_dir = Path(__file__).resolve().parent
 
@@ -13,6 +19,16 @@ client = Anthropic(
     base_url=os.getenv("ANTHROPIC_BASE_URL"),
     api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
+
+class ToolUse:
+    def __init__(self, tid: str = "", name: str = "", description: str = "", input_schema: dict = ""):
+        self.tid = tid
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+
+    def __str__(self):
+        return str(self.__dict__)
 
 def _build_tool(name: str, description: str, required: list[str], properties: dict[str, object]) -> ToolParam:
     return ToolParam(
@@ -51,17 +67,20 @@ def loop():
         tools=tools
     )
 
+
+    tool_uses: list[ToolUse] = []
+    tool_use = ToolUse()
     for event in messages:
         if event.type == "content_block_start":
             block = event.content_block
             if block.type == "thinking":
-                print("thinking:", end="", flush=True)
+                print("\nthinking:", end="", flush=True)
             if block.type == "text":
                 print("\nAi:", end="", flush=True)
             if block.type == "tool_use":
-                tool_id = block.id
-                tool_name = block.name
-                print("\nAi_Tool:", end="", flush=True)
+                tool_use.tid = block.id
+                tool_use.name = block.name
+                print("\nAi_Tool: ", end="", flush=True)
         if event.type == "content_block_delta":
             delta = event.delta
             if delta.type == "thinking_delta":
@@ -70,8 +89,13 @@ def loop():
                 print(delta.text, end="", flush=True)
             if delta.type == "input_json_delta":
                 print(delta.partial_json, end="", flush=True)
+                tool_use.input_schema = delta.partial_json
         if event.type == "content_block_stop":
+            tool_uses.append(tool_use)
+            tool_use = ToolUse()
             print()
+
+    print([tool_use.__str__() for tool_use in tool_uses])
 
 if __name__ == '__main__':
     loop()
