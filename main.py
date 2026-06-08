@@ -1,15 +1,12 @@
+import json
+
 from anthropic import Anthropic
 from anthropic.types import MessageParam, ToolParam
 from anthropic.types.tool_param import InputSchemaTyped
+from model import ToolUse
 from dotenv import load_dotenv
 from pathlib import Path
 import os
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"  # 时间 + 级别 + 内容
-)
 
 root_dir = Path(__file__).resolve().parent
 
@@ -20,15 +17,6 @@ client = Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
 
-class ToolUse:
-    def __init__(self, tid: str = "", name: str = "", description: str = "", input_schema: dict = ""):
-        self.tid = tid
-        self.name = name
-        self.description = description
-        self.input_schema = input_schema
-
-    def __str__(self):
-        return str(self.__dict__)
 
 def _build_tool(name: str, description: str, required: list[str], properties: dict[str, object]) -> ToolParam:
     return ToolParam(
@@ -69,7 +57,7 @@ def loop():
 
 
     tool_uses: list[ToolUse] = []
-    tool_use = ToolUse()
+    tool_use = None
     for event in messages:
         if event.type == "content_block_start":
             block = event.content_block
@@ -78,8 +66,7 @@ def loop():
             if block.type == "text":
                 print("\nAi:", end="", flush=True)
             if block.type == "tool_use":
-                tool_use.tid = block.id
-                tool_use.name = block.name
+                tool_use = ToolUse(tid=block.id, name=block.name, input_schema=None)
                 print("\nAi_Tool: ", end="", flush=True)
         if event.type == "content_block_delta":
             delta = event.delta
@@ -89,13 +76,18 @@ def loop():
                 print(delta.text, end="", flush=True)
             if delta.type == "input_json_delta":
                 print(delta.partial_json, end="", flush=True)
-                tool_use.input_schema = delta.partial_json
+                tool_use.input_schema = json.loads(delta.partial_json)
         if event.type == "content_block_stop":
-            tool_uses.append(tool_use)
-            tool_use = ToolUse()
+            if tool_use:
+                tool_uses.append(tool_use)
+                tool_use = None
             print()
 
-    print([tool_use.__str__() for tool_use in tool_uses])
+    for tool_use in tool_uses:
+        print("tool invoke:", tool_use)
+        handler = tool_handlers.get(tool_use.name)
+        tool_result = handler(**tool_use.input_schema)
+        print("tool_result:", tool_result)
 
 if __name__ == '__main__':
     loop()
