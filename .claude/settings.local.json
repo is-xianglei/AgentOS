@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python *)",
-      "Bash(uv run *)"
+      "Bash(uv run *)",
+      "Bash(git ls-tree *)",
+      "Bash(git fsck *)"
     ]
   }
 }

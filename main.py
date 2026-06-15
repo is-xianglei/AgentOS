@@ -1,93 +1,85 @@
-import json
+from anthropic.types import MessageParam, ToolResultBlockParam
+from llm_client import client, LLM_MODEL
+from tools import tools, tool_handlers
 
-from anthropic import Anthropic
-from anthropic.types import MessageParam, ToolParam
-from anthropic.types.tool_param import InputSchemaTyped
-from model import ToolUse
-from dotenv import load_dotenv
-from pathlib import Path
-import os
-
-root_dir = Path(__file__).resolve().parent
-
-load_dotenv(root_dir / ".env")
-
-client = Anthropic(
-    base_url=os.getenv("ANTHROPIC_BASE_URL"),
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-)
-
-
-def _build_tool(name: str, description: str, required: list[str], properties: dict[str, object]) -> ToolParam:
-    return ToolParam(
-        name=name,
-        description=description,
-        input_schema=InputSchemaTyped(
-            type="object",
-            required=required,
-            properties=properties
-        )
-    )
-
-
-def bash(command: str) -> str:
-    return f"bash -c '{command}'"
-
-tools = [
-    _build_tool(name="bash", description="Run a shell command.", required=["command"], properties={"command": {"type": "string"}}),
-    _build_tool(name="weather", description="Get weather forecast.", required=["command"], properties={"command": {"type": "string"}}),
-]
-
-tool_handlers = {
-    "bash": bash
-}
-
+event_type: list[str] = ["message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta", "content_block_stop"]
 
 def loop():
-    messages = client.messages.create(
-        max_tokens=1024,
-        model=os.getenv("ANTHROPIC_MODEL"),
-        stream=True,
-        system="你是一个乐于助人的助手.",
-        messages=[
-            MessageParam(content="你好!先介绍一下自己，然后帮我在当前工作目录创建一个test.txt文件,然后在使用工具帮我查询天气预报", role="user")
-        ],
-        tools=tools
-    )
+
+    messages_history: list[MessageParam] = [
+        MessageParam(role="user",content="派发两个子代理帮我翻译：你好世界！\n 一个翻译为英文，一个翻译为日文。")
+    ]
+
+    while True:
+        with client.messages.stream(
+                max_tokens=1024,
+                model=LLM_MODEL,
+                system="你是一个乐于助人的助手.",
+                messages=messages_history,
+                tools=tools
+        ) as stream:
+            for block in stream:
+                if block.type in event_type:
+                    yield f"data: {block.model_dump_json(warnings=False)}\n\n"
+
+            final_message = stream.get_final_message()
+
+            # 回传LLM消息
+            messages_history.append(MessageParam(role="assistant", content=final_message.content))
+
+            # 判断是否调用工具
+            if final_message.stop_reason != 'tool_use':
+                break
+
+            # 解析并调用工具
+            tool_results: list[ToolResultBlockParam] = []
+            for item in final_message.content:
+                if item.type != 'tool_use':
+                    continue
+                tool_name: str = item.name
+                tool_input: dict = item.input
+                handler = tool_handlers[tool_name]
+                tool_result = ToolResultBlockParam(
+                    type='tool_result',
+                    tool_use_id=item.id,
+                    content=handler.run_with_dict(tool_input)
+                )
+                tool_results.append(tool_result)
+
+            # 回传工具调用结果
+            messages_history.append(MessageParam(role="user", content=tool_results))
 
 
-    tool_uses: list[ToolUse] = []
-    tool_use = None
-    for event in messages:
-        if event.type == "content_block_start":
-            block = event.content_block
-            if block.type == "thinking":
-                print("\nthinking:", end="", flush=True)
-            if block.type == "text":
-                print("\nAi:", end="", flush=True)
-            if block.type == "tool_use":
-                tool_use = ToolUse(tid=block.id, name=block.name, input_schema=None)
-                print("\nAi_Tool: ", end="", flush=True)
-        if event.type == "content_block_delta":
-            delta = event.delta
-            if delta.type == "thinking_delta":
-                print(delta.thinking, end="", flush=True)
-            if delta.type == "text_delta":
-                print(delta.text, end="", flush=True)
-            if delta.type == "input_json_delta":
-                print(delta.partial_json, end="", flush=True)
-                tool_use.input_schema = json.loads(delta.partial_json)
-        if event.type == "content_block_stop":
-            if tool_use:
-                tool_uses.append(tool_use)
-                tool_use = None
-            print()
-
-    for tool_use in tool_uses:
-        print("tool invoke:", tool_use)
-        handler = tool_handlers.get(tool_use.name)
-        tool_result = handler(**tool_use.input_schema)
-        print("tool_result:", tool_result)
 
 if __name__ == '__main__':
-    loop()
+    gen = loop()
+    for event in gen:
+        print(event)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# app = FastAPI()
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_methods=["GET"],
+#     allow_headers=["*"],
+# )
+#
+# @app.get("/stream")
+# def agent(prompt: str):
+#     return StreamingResponse(
+#         loop(),
+#         media_type="text/event-stream; charset=utf-8",
+#         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+#     )
