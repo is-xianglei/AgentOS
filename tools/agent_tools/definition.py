@@ -1,5 +1,7 @@
+import doctest
 from enum import Enum
 
+from anthropic.types import ToolParam
 from pydantic import BaseModel, Field
 
 # 四种内置SubAgent类型
@@ -17,6 +19,12 @@ class AgentDefinition(BaseModel):
     agent_type: AgentType = AgentType.GENERAL_PURPOSE
 
     def resolve_agent_tools(self):
+        from tools.registry import tools
+        allowed_tools = set((tool['name'] for tool in tools)) if self.allowed_tools == '*' else self.allowed_tools
+        allowed_tools -= set(self.disallowed_tools)
+        return allowed_tools # 应该返回 [ToolParam]
 
-        pass
+if __name__ == '__main__':
+    from tools.registry import tools
 
+    print(AgentDefinition(prompt='1').resolve_agent_tools())
