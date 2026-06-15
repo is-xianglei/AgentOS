@@ -1,4 +1,3 @@
-import doctest
 from enum import Enum
 
 from anthropic.types import ToolParam
@@ -18,13 +17,12 @@ class AgentDefinition(BaseModel):
     disallowed_tools: tuple[str, ...] = ("Agent",)
     agent_type: AgentType = AgentType.GENERAL_PURPOSE
 
-    def resolve_agent_tools(self):
+    # 过滤出SubAgent都允许调用哪些工具
+    def resolve_agent_tools(self) -> list[ToolParam]:
         from tools.registry import tools
-        allowed_tools = set((tool['name'] for tool in tools)) if self.allowed_tools == '*' else self.allowed_tools
-        allowed_tools -= set(self.disallowed_tools)
-        return allowed_tools # 应该返回 [ToolParam]
+        if self.allowed_tools == '*':
+            allowed = {t['name'] for t in tools} - set(self.disallowed_tools)
+        else:
+            allowed = set(self.allowed_tools) - set(self.disallowed_tools)
+        return [t for t in tools if t['name'] in allowed]
 
-if __name__ == '__main__':
-    from tools.registry import tools
-
-    print(AgentDefinition(prompt='1').resolve_agent_tools())
