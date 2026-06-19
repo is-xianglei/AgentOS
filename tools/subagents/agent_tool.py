@@ -1,4 +1,4 @@
-from tools.agent_tools.definition import AgentDefinition, AgentType
+from tools.subagents.definition import AgentDefinition, AgentType
 from tools.base import BaseTool
 
 
@@ -20,7 +20,7 @@ class AgentDefinitionTool(BaseTool):
     def run(self, input_object: AgentDefinition) -> str:
         # 通用SubAgent
         if input_object.agent_type == AgentType.GENERAL_PURPOSE:
-            from tools.agent_tools.general_purpose_agent import GeneralPurposeAgent
+            from tools.subagents.general_purpose_agent import GeneralPurposeAgent
             sub_agent = GeneralPurposeAgent(**input_object.model_dump())
             return sub_agent.run(input_object.prompt)
         return 'unknown agent type.'

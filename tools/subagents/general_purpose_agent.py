@@ -1,5 +1,5 @@
 from anthropic.types import MessageParam, ToolResultBlockParam
-from tools.agent_tools.definition import AgentDefinition
+from tools.subagents.definition import AgentDefinition
 from llm_client import client, LLM_MODEL
 from tools import tool_handlers
 

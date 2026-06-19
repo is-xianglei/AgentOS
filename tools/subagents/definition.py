@@ -19,7 +19,7 @@ class AgentDefinition(BaseModel):
 
     # 过滤出SubAgent都允许调用哪些工具
     def resolve_agent_tools(self) -> list[ToolParam]:
-        from tools.registry import tools
+        from tools.tool_registry import tools
         if self.allowed_tools == '*':
             allowed = {t['name'] for t in tools} - set(self.disallowed_tools)
         else:

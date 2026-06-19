@@ -58,3 +58,6 @@ logs/
 .coverage
 htmlcov/
 .tox/
+
+
+tasks/

@@ -198,7 +198,7 @@ class TodoStatus(str, Enum):
     COMPLETED = "completed"
 
 class TodoItem(BaseModel):
-    tid: str = Field(description="Todo item id")
+    id: str = Field(description="Todo item id")
     text: str = Field(description="Todo item text")
     status: TodoStatus = Field(description="Todo item status the available values include: [pending, in_progress, completed]")
 
@@ -234,7 +234,7 @@ class TodoTool(BaseTool):
             if in_progress_count > 1:
                 raise ValueError('一次只能有一个待办事项正在进行中.')
 
-            item.tid = index + 1 if item.tid else item.tid
+            item.id = index + 1 if item.id else item.id
 
         self.items = todo.items
         return self.render()
@@ -249,7 +249,7 @@ class TodoTool(BaseTool):
         completed_count: int = 0
         for item in items:
             marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item.status.value]
-            lines.append(f'{marker} #{item.tid} : {item.text}')
+            lines.append(f'{marker} #{item.id} : {item.text}')
             if item.status == TodoStatus.COMPLETED:
                 completed_count += 1
         lines.append(f'\n{completed_count} / {len(items)} completed')

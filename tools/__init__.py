@@ -1,3 +1,4 @@
-from tools.agent_tools.agent_tool import AgentDefinitionTool
+from tools.skill_registry import SkillRegistry
+from tools.subagents.agent_tool import AgentDefinitionTool
 
-from tools.registry import tools, tool_handlers
+from tools.tool_registry import tools, tool_handlers
