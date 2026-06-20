@@ -8,7 +8,7 @@ event_type: list[str] = ["message_start", "message_delta", "message_stop", "cont
 def loop():
 
     messages_history: list[MessageParam] = [
-        MessageParam(role="user",content="Use TaskTool tools to track work. \n 至少拆分为三个Task去执行 \n 帮我创建一个txt文件，并查询上海的天气写入进去.")
+        MessageParam(role="user",content="创建一个Team，只要有 3 个成员参与任务。帮我创建一个txt文件，并查询上海的天气写入进去.")
     ]
 
     while True:
@@ -23,7 +23,7 @@ def loop():
         with client.messages.stream(
                 max_tokens=1024,
                 model=LLM_MODEL,
-                system="你是一个乐于助人的助手.",
+                system="Spawn teammates and communicate via mailbox.",
                 messages=messages_history,
                 tools=tools
         ) as stream:
