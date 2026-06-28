@@ -4,7 +4,23 @@
       "Bash(python *)",
       "Bash(uv run *)",
       "Bash(git ls-tree *)",
-      "Bash(git fsck *)"
+      "Bash(git fsck *)",
+      "Bash(uv pip *)",
+      "Bash(uv add *)",
+      "Bash(nslookup db.txwodjldzeciwrwvejtb.supabase.co)",
+      "Bash(echo \"started, pid $!\")",
+      "Bash(curl -sN -m 60 -X POST http://127.0.0.1:8765/api/sessions/messages -H 'Content-Type: application/json' -d '{\"content\":\"请用一句话介绍你自己\"}')",
+      "Bash(kill 97988)",
+      "Bash(echo \"pid $!\")",
+      "Bash(curl -sN -m 90 -X POST http://127.0.0.1:8765/api/sessions/messages -H 'Content-Type: application/json' -d '{\"content\":\"请用中文简短介绍一下你自己，不要超过两句话\"}')",
+      "Bash(curl -sN -m 90 -X POST http://127.0.0.1:8765/api/sessions/messages -H 'Content-Type: application/json' -d '{\"content\":\"用一句话说你好\"}')",
+      "Bash(node --check web/app.js)",
+      "Bash(python3 *)",
+      "Bash(grep -nE \"^#{1,3} \" DESIGN.md)",
+      "Bash(git mv *)",
+      "WebSearch",
+      "WebFetch(domain:claude-code.mintlify.app)",
+      "WebFetch(domain:docs.anthropic.com)"
     ]
   }
 }
