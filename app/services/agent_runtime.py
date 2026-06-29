@@ -8,10 +8,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import config
 from app.core.event_bus import StreamBus
-from app.core.events import LEAD_ACTOR, Actor, RuntimeEvent, agent_actor
+from app.core.events import (
+    ORCHESTRATOR_ACTOR,
+    ErrorInfo,
+    RuntimeEvent,
+    StreamEvent,
+    ToolInfo,
+    teammate_actor,
+)
 from app.core.prompts import compose_system_prompt
 from app.llm.client import LLMClient
-from app.llm.types import ToolResultMessage, chunk_type, extract_tool_uses
+from app.llm.types import (
+    AnthropicStreamTranslator,
+    ToolResultMessage,
+    extract_tool_uses,
+)
 from app.services.compact_service import CompactService
 from app.services.session_service import SessionService
 from app.services.tool_service import ToolService
@@ -53,64 +64,61 @@ class AgentRuntime:
     async def _produce(self, session_id: int | None, user_content: str) -> None:
         """后台生产者:跑完整流程,所有事件 emit 到 bus,最终 close。"""
         try:
-            created = session_id is None
             session = await self.session_service.prepare_for_message(session_id, user_content)
             session_id = session.id
             await self.session_service.add_message(session_id, "user", user_content)
             await self.db.commit()
 
-            event = RuntimeEvent(type='session_ready', data={
-                "session_id": session.id,
-                "title": session.title,
-                "status": session.status,
-                "created": created,
-            })
-            # 会话已就绪
-            await self.bus.emit(event)
-
-            # 消息开始推送
-            await self.bus.emit(RuntimeEvent(type='message_start', data={"session_id": session_id}))
+            # 会话级控制事件:前端据此拿 session 元信息建立 UI。
+            await self.bus.emit(
+                RuntimeEvent(
+                    type="session_ready",
+                    data={
+                        "session_id": session.id,
+                        "title": session.title,
+                        "status": session.status,
+                    },
+                )
+            )
 
             try:
                 # 开始 LLM Loop
                 await self._run_llm_loop(session_id, session)
-                # B1: lead 主循环结束后,请求内单步唤醒本会话所有 working 队友各推进一次。
+                # 主循环结束后,请求内单步唤醒本会话所有 working 队友各推进一次。
                 await self._wake_team_members(session_id)
                 # 一次对话完成,标记会话为空闲中
                 await self.session_service.mark_finished(session, "idle")
-
-                await self.bus.emit(RuntimeEvent(type='message_stop', data={"session_id": session_id}))
-
             except Exception as exc:
+                print('session error:',str(exc))
                 await self.session_service.mark_finished(session, "failed")
-                await self.bus.emit(RuntimeEvent(type='session_error', data={"message": str(exc)}))
         finally:
             await self.bus.close()
 
     async def _run_llm_loop(self, session_id: int, session) -> None:
-        """运行 ReAct 循环并处理模型工具调用,事件 emit 到 bus。"""
+        """运行 ReAct 循环并处理模型工具调用,事件以协议形式 emit 到 bus。"""
+        actor = ORCHESTRATOR_ACTOR
+        # 翻译器跨本回合多次 LLM 调用共用:block index 持续递增、tool_use 入参累积。
+        translator = AnthropicStreamTranslator(actor, session_id)
+
+        # 回合开始(开场事件,带完整 actor)。
+        await self.bus.emit(StreamEvent.turn_start(actor, session_id))
+
+        stop_reason: str | None = None
         for _ in range(config.MAX_TOOL_ITERATIONS):
-            # 加载对话上下文
             context = await self.session_service.load_context(session_id)
-            # 压缩上下文
             context = await self.compact_service.maybe_compact(session_id, context)
-
-            final_content: list[dict[str, Any]] | None = None
-
-            # 系统提示词 + 会话提示词
             system_prompt: str = compose_system_prompt(session.system_prompt)
-
-            # 所有工具列表
             tools: list[ToolParam] = self.tool_registry.to_anthropic_tools()
 
-            chunks = self.llm.stream(context, system_prompt, tools=tools)
-
-            async for chunk in chunks:
-                if chunk_type(chunk) == "message_final":
+            final_content: list[dict[str, Any]] | None = None
+            async for chunk in self.llm.stream(context, system_prompt, tools=tools):
+                if chunk.get("type") == "message_final":
                     final_content = chunk.get("content")
-                    continue
-                await self.bus.emit(add_runtime_metadata(chunk, session_id=session_id, actor=LEAD_ACTOR))
+                # 原始 chunk 交给翻译器产出协议事件
+                for event in translator.translate(chunk):
+                    await self.bus.emit(event)
 
+            stop_reason = translator.stop_reason
             tool_uses = extract_tool_uses(final_content)
 
             assistant_message = await self.session_service.add_message(
@@ -120,45 +128,54 @@ class AgentRuntime:
             )
 
             if not tool_uses:
-                return
+                break
 
             for tool_use in tool_uses:
-                # 工具名称
-                tool_name = tool_use.name
-                # 工具参数
-                input_args = tool_use.input
-                # 推送工具开始执行的状态
-                await self.bus.emit(RuntimeEvent(type='tool_start', data={"tool_name": tool_name, "input_args": input_args}))
-                # 执行工具,获取工具执行结果
                 output = await self.tool_service.run(
                     session_id,
-                    tool_name,
-                    input_args,
+                    tool_use.name,
+                    tool_use.input,
                     message_id=assistant_message.id,
                     bus=self.bus,
                 )
-                # 将工具执行结果添加上对话上下文
+                # 工具结果事件(用发起方 actor;tool.id 关联此前的 tool_use)。
+                await self.bus.emit(
+                    StreamEvent.tool_result(
+                        actor,
+                        session_id,
+                        ToolInfo(
+                            id=tool_use.id,
+                            name=tool_use.name,
+                            output=output,
+                            is_error=False,
+                        ),
+                    )
+                )
                 await self.session_service.add_message(
                     session_id,
                     "tool",
                     ToolResultMessage(
                         tool_use_id=tool_use.id,
-                        tool_name=tool_name,
-                        input_args=input_args,
+                        tool_name=tool_use.name,
+                        input_args=tool_use.input,
                         output=output,
                     ).to_content_dict(),
                 )
-                # 推送工具执行结束的状态
-                await self.bus.emit(RuntimeEvent(type='tool_done', data={"tool_name": tool_name, "output": output}))
-
             await self.db.flush()
+        else:
+            # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
+            await self._finalize_without_tools(session_id, translator)
+            stop_reason = translator.stop_reason or "max_iterations"
 
-        # 达到轮数上限:不再报错,强制禁用工具最后调用一次 LLM,
-        # 让模型基于已有的工具结果给出最终答复(优雅降级)。
-        await self._finalize_without_tools(session_id)
+        # 回合结束
+        await self.bus.emit(
+            StreamEvent.turn_end(actor, session_id, stop_reason, translator.last_usage)
+        )
 
-    async def _finalize_without_tools(self, session_id: int) -> None:
-        """禁用工具再调一次 LLM,产出最终答复并落库。"""
+    async def _finalize_without_tools(
+        self, session_id: int, translator: AnthropicStreamTranslator
+    ) -> None:
+        """禁用工具再调一次 LLM,产出最终答复并落库。沿用同一翻译器维持事件连续。"""
         context = await self.session_service.load_context(session_id)
         context = await self.compact_service.maybe_compact(session_id, context)
         final_content: list[dict[str, Any]] | None = None
@@ -166,16 +183,10 @@ class AgentRuntime:
         async for chunk in self.llm.stream(
             context, compose_system_prompt(session_prompt=None), tools=[]
         ):
-            if chunk_type(chunk) == "message_final":
+            if chunk.get("type") == "message_final":
                 final_content = chunk.get("content")
-                continue
-            await self.bus.emit(
-                add_runtime_metadata(
-                    chunk,
-                    session_id=session_id,
-                    actor=LEAD_ACTOR,
-                )
-            )
+            for event in translator.translate(chunk):
+                await self.bus.emit(event)
 
         await self.session_service.add_message(
             session_id,
@@ -210,13 +221,15 @@ class AgentRuntime:
             except Exception as exc:
                 # 单个队友失败隔离:发 error 事件后继续唤醒其余成员。
                 await self.bus.emit(
-                    RuntimeEvent(
-                        type="subagent_run_error",
-                        data={
-                            "member": member.name,
-                            "error": str(exc),
-                            "actor": agent_actor(member.name).to_dict(),
-                        },
+                    StreamEvent.error_event(
+                        teammate_actor(member.name, run_id=f"wake-{member.id}"),
+                        session_id,
+                        ErrorInfo(
+                            code="TEAMMATE_WAKE_FAILED",
+                            message=str(exc),
+                            retriable=True,
+                            fatal=False,
+                        ),
                     )
                 )
 
@@ -224,18 +237,6 @@ class AgentRuntime:
 def format_sse(event: dict[str, Any]) -> str:
     """把事件字典序列化为 SSE 数据帧。"""
     return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
-
-
-def add_runtime_metadata(
-    chunk: dict[str, Any],
-    *,
-    session_id: int,
-    actor: Actor,
-) -> dict[str, Any]:
-    """给透传的模型原始 chunk 附加运行时上下文(session_id + actor)。"""
-    chunk["session_id"] = session_id
-    chunk["actor"] = actor.to_dict()
-    return chunk
 
 
 

@@ -1,6 +1,14 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.events import (
+    Actor,
+    BlockType,
+    StreamEvent,
+    ToolInfo,
+    Usage,
+)
+
 LLMRawChunk = dict[str, Any]
 
 
@@ -86,4 +94,144 @@ def text_from_content(content: list[dict[str, Any]] | None) -> str:
         for block in (content or [])
         if isinstance(block, dict) and block.get("type") == "text"
     )
+
+
+
+_BLOCK_TYPE_MAP = {
+    "text": BlockType.TEXT,
+    "thinking": BlockType.THINKING,
+    "tool_use": BlockType.TOOL_USE,
+}
+
+
+@dataclass
+class _OpenBlock:
+    """翻译过程中正在累积的内容块状态。"""
+
+    index: int
+    block_type: BlockType
+    tool_id: str = ""
+    tool_name: str = ""
+    json_buffer: str = ""
+
+
+class AnthropicStreamTranslator:
+    """把 Anthropic 原始流翻译成协议 StreamEvent 序列。
+
+    有状态:跨一个 turn 内多次 LLM 调用沿用同一个翻译器,block index 持续递增,
+    tool_use 的 input JSON 在 content_block_stop 时累积完整后一次性产出(不逐字发)。
+    turn_start / turn_end / tool_result 由调用方(runner)负责,翻译器只管中间内容。
+    """
+
+    def __init__(self, actor: Actor, session_id: int):
+        self._actor = actor
+        self._session_id = session_id
+        self._open: dict[int, _OpenBlock] = {}
+        self._last_usage: Usage | None = None
+        self._stop_reason: str | None = None
+
+    @property
+    def last_usage(self) -> Usage | None:
+        """最近一次 message_final 解析到的用量(供 turn_end 使用)。"""
+        return self._last_usage
+
+    @property
+    def stop_reason(self) -> str | None:
+        """最近一次 message_final 的停止原因(供 turn_end 使用)。"""
+        return self._stop_reason
+
+
+    def translate(self, chunk: LLMRawChunk) -> list[StreamEvent]:
+        """翻译单个原始 chunk 为零或多个协议事件。"""
+        ctype = chunk.get("type")
+        if ctype == "content_block_start":
+            return self._on_block_start(chunk)
+        if ctype == "content_block_delta":
+            return self._on_block_delta(chunk)
+        if ctype == "content_block_stop":
+            return self._on_block_stop(chunk)
+        if ctype == "message_final":
+            self._on_message_final(chunk)
+        # ping / message_start / message_delta / signature 等噪声不产出协议事件。
+        return []
+
+    def _on_block_start(self, chunk: LLMRawChunk) -> list[StreamEvent]:
+        index = int(chunk.get("index", 0))
+        cb = chunk.get("content_block") or {}
+        raw_type = cb.get("type", "text")
+        block_type = _BLOCK_TYPE_MAP.get(raw_type, BlockType.TEXT)
+        self._open[index] = _OpenBlock(
+            index=index,
+            block_type=block_type,
+            tool_id=cb.get("id", "") or "",
+            tool_name=cb.get("name", "") or "",
+        )
+        return [
+            StreamEvent.block_start(self._actor, self._session_id, index, block_type)
+        ]
+
+    def _on_block_delta(self, chunk: LLMRawChunk) -> list[StreamEvent]:
+        index = int(chunk.get("index", 0))
+        delta = chunk.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            return [
+                StreamEvent.text_delta(
+                    self._actor, self._session_id, index, delta.get("text", "")
+                )
+            ]
+        if dtype == "thinking_delta":
+            return [
+                StreamEvent.thinking_delta(
+                    self._actor, self._session_id, index, delta.get("thinking", "")
+                )
+            ]
+        if dtype == "input_json_delta":
+            # 累积 tool_use 的入参 JSON,等 block_stop 一次性产出。
+            block = self._open.get(index)
+            if block is not None:
+                block.json_buffer += delta.get("partial_json", "")
+            return []
+        # signature_delta 等:噪声,不产出。
+        return []
+
+
+    def _on_block_stop(self, chunk: LLMRawChunk) -> list[StreamEvent]:
+        import json as _json
+
+        index = int(chunk.get("index", 0))
+        block = self._open.pop(index, None)
+        if block is None:
+            return [StreamEvent.block_stop(self._actor, self._session_id, index)]
+        if block.block_type is BlockType.TOOL_USE:
+            # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件(不发 block_stop)。
+            try:
+                tool_input = _json.loads(block.json_buffer) if block.json_buffer else {}
+            except _json.JSONDecodeError:
+                tool_input = {}
+            tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
+            return [
+                StreamEvent.tool_use(self._actor, self._session_id, index, tool)
+            ]
+        return [StreamEvent.block_stop(self._actor, self._session_id, index)]
+
+    def _on_message_final(self, chunk: LLMRawChunk) -> None:
+        """记录 usage / stop_reason,供 runner 构造 turn_end。"""
+        self._stop_reason = chunk.get("stop_reason")
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            self._last_usage = Usage(
+                input_tokens=int(usage.get("input_tokens", 0) or 0),
+                output_tokens=int(usage.get("output_tokens", 0) or 0),
+                cache_creation_input_tokens=int(
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_input_tokens=int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                ),
+            )
+
+
+
+
 

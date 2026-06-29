@@ -4,14 +4,26 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.event_bus import StreamBus
-from app.core.events import RuntimeEvent
+from app.core.events import (
+    Actor,
+    ErrorInfo,
+    StreamEvent,
+    TeamRef,
+    subagent_actor,
+    teammate_actor,
+)
 from app.core.team_task_isolation import (
     new_team_task_instance_id,
     reset_team_task_instance_id,
     set_team_task_instance_id,
 )
 from app.llm.client import LLMClient
-from app.llm.types import chunk_text, chunk_type, extract_tool_uses, text_from_content
+from app.llm.types import (
+    AnthropicStreamTranslator,
+    ToolInfo,
+    extract_tool_uses,
+    text_from_content,
+)
 from app.repositories.subagent_run_repo import SubAgentRunRepository
 from app.services.team_service import TeamService
 from app.services.tool_service import ToolService
@@ -45,47 +57,80 @@ class SubAgentRunner:
         token = set_team_task_instance_id(new_team_task_instance_id())
         try:
             run = await self.run_repo.create(session_id, member_name, prompt)
-            await self._emit(
-                "subagent_run_created",
-                {"run_id": run.id, "member": member_name, "prompt": prompt},
-            )
+            # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt。
+            actor = subagent_actor(member_name, run_id=f"run-{run.id}", task=prompt)
+            translator = AnthropicStreamTranslator(actor, session_id)
+            await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:
-                await self._emit(
-                    "subagent_run_started", {"run_id": run.id, "member": member_name}
-                )
                 report = await self._run_react_loop(
-                    session_id, member_name, prompt, run.id, spec, tool_registry, tool_service
+                    session_id, actor, translator, prompt, spec, tool_registry, tool_service
                 )
                 await self.run_repo.succeed(run, report)
                 await self.db.commit()
-                await self._emit(
-                    "subagent_run_done",
-                    {"run_id": run.id, "member": member_name, "report": report},
+                await self._emit_event(
+                    StreamEvent.turn_end(
+                        actor, session_id, translator.stop_reason, translator.last_usage
+                    )
                 )
                 return report
             except Exception as exc:
                 await self.run_repo.fail(run, str(exc))
                 await self.db.commit()
-                await self._emit(
-                    "subagent_run_error",
-                    {"run_id": run.id, "member": member_name, "error": str(exc)},
+                await self._emit_event(
+                    StreamEvent.error_event(
+                        actor,
+                        session_id,
+                        ErrorInfo(code="SUBAGENT_RUN_FAILED", message=str(exc), fatal=True),
+                    )
                 )
                 raise
         finally:
             reset_team_task_instance_id(token)
 
-    async def _emit(self, event_type: str, data: dict[str, Any]) -> None:
-        """向事件总线发送子代理事件(若总线存在)。"""
+    async def _emit_event(self, event: StreamEvent) -> None:
+        """向事件总线发送协议事件(若总线存在)。"""
         if self.bus is None:
             return
-        await self.bus.emit(RuntimeEvent(type=event_type, data=data))
+        await self.bus.emit(event)
+
+    async def _stream_and_translate(
+        self,
+        messages: list[dict[str, Any]],
+        system_prompt: str,
+        tool_registry: ToolRegistry,
+        translator: AnthropicStreamTranslator,
+    ) -> list[dict[str, Any]] | None:
+        """跑一次 LLM 流:原始 chunk 经翻译器产出协议事件并 emit,返回 final_content。"""
+        final_content: list[dict[str, Any]] | None = None
+        async for chunk in self.llm.stream(
+            messages, system_prompt, tools=tool_registry.to_anthropic_tools()
+        ):
+            if chunk.get("type") == "message_final":
+                final_content = chunk.get("content")
+            for event in translator.translate(chunk):
+                await self._emit_event(event)
+        return final_content
+
+    async def _emit_tool_result(
+        self, actor: Actor, session_id: int, tool_use, output: str
+    ) -> None:
+        """发协议 tool_result 事件(actor 为该产出者自身)。"""
+        await self._emit_event(
+            StreamEvent.tool_result(
+                actor,
+                session_id,
+                ToolInfo(
+                    id=tool_use.id, name=tool_use.name, output=output, is_error=False
+                ),
+            )
+        )
 
     async def _run_react_loop(
         self,
         session_id: int,
-        member_name: str,
+        actor: Actor,
+        translator: AnthropicStreamTranslator,
         prompt: str,
-        run_id: int,
         spec: SubAgentSpec,
         tool_registry: ToolRegistry,
         tool_service: ToolService,
@@ -93,25 +138,10 @@ class SubAgentRunner:
         """执行子代理 ReAct 循环并返回报告。系统提示与工具集均取自 spec。"""
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         for _ in range(6):
-            final_content: list[dict[str, Any]] | None = None
-
-            async for chunk in self.llm.stream(
-                messages,
-                spec.system_prompt,
-                tools=tool_registry.to_anthropic_tools(),
-            ):
-                if chunk_type(chunk) == "message_final":
-                    final_content = chunk.get("content")
-                    continue
-                text = chunk_text(chunk)
-                if text:
-                    await self._emit(
-                        "subagent_run_delta",
-                        {"run_id": run_id, "member": member_name, "text": text},
-                    )
-
+            final_content = await self._stream_and_translate(
+                messages, spec.system_prompt, tool_registry, translator
+            )
             tool_uses = extract_tool_uses(final_content)
-
             messages.append({"role": "assistant", "content": final_content or ""})
 
             if not tool_uses:
@@ -119,10 +149,9 @@ class SubAgentRunner:
 
             for tool_use in tool_uses:
                 output = await tool_service.run(
-                    session_id,
-                    tool_use.name,
-                    tool_use.input,
+                    session_id, tool_use.name, tool_use.input
                 )
+                await self._emit_tool_result(actor, session_id, tool_use, output)
                 messages.append(
                     {
                         "role": "user",
@@ -136,6 +165,8 @@ class SubAgentRunner:
                     }
                 )
             await self.db.flush()
+        return text_from_content(None)
+
 
         raise RuntimeError("子代理工具调用轮次过多，已停止执行")
 
@@ -158,7 +189,13 @@ class SubAgentRunner:
         tool_service = ToolService(self.db, tool_registry)
 
         # 为本次推进设置独立隔离 id(收件箱消费按该 id 隔离;任务认领不隔离)。
-        token = set_team_task_instance_id(new_team_task_instance_id())
+        instance_id = new_team_task_instance_id()
+        token = set_team_task_instance_id(instance_id)
+        # teammate 的 actor:role=teammate,唯一键 name,run_id=本次推进隔离 id,
+        # task=初始任务,team 携带 team_id(若已归属团队)。
+        team_ref = TeamRef(id=member.team_id) if member.team_id is not None else None
+        actor = teammate_actor(name, run_id=instance_id, task=member.prompt, team=team_ref)
+        translator = AnthropicStreamTranslator(actor, session_id)
         try:
             # 1) 从 member.history 反序列化历史;为空则用初始 prompt 起一条 user 消息。
             messages = self._load_history(member)
@@ -179,13 +216,10 @@ class SubAgentRunner:
             # teammate 人格头:在 spec.system_prompt 之上拼接 name/role/team 身份。
             system_prompt = self._teammate_system_prompt(spec, session_id, name, role)
 
-            await self._emit(
-                "subagent_run_started",
-                {"member": name, "role": role, "session_id": session_id},
-            )
+            await self._emit_event(StreamEvent.turn_start(actor, session_id))
             # 4) ReAct 循环(轮内允许认领本会话 task)。
             report = await self._run_teammate_loop(
-                session_id, name, role, messages, spec, system_prompt, tool_registry, tool_service
+                session_id, actor, translator, messages, system_prompt, tool_registry, tool_service
             )
 
             # 5) 写回历史 + 据剩余待办决定 idle / working。
@@ -194,16 +228,20 @@ class SubAgentRunner:
             )
             await self._settle_member_status(session_id, name, member, team_service)
             await self.db.commit()
-            await self._emit(
-                "subagent_run_done",
-                {"member": name, "role": role, "report": report},
+            await self._emit_event(
+                StreamEvent.turn_end(
+                    actor, session_id, translator.stop_reason, translator.last_usage
+                )
             )
             return report
         except Exception as exc:
             await self.db.rollback()
-            await self._emit(
-                "subagent_run_error",
-                {"member": name, "role": role, "error": str(exc)},
+            await self._emit_event(
+                StreamEvent.error_event(
+                    actor,
+                    session_id,
+                    ErrorInfo(code="TEAMMATE_RUN_FAILED", message=str(exc), fatal=True),
+                )
             )
             raise
         finally:
@@ -267,35 +305,22 @@ class SubAgentRunner:
     async def _run_teammate_loop(
         self,
         session_id: int,
-        name: str,
-        role: str,
+        actor: Actor,
+        translator: AnthropicStreamTranslator,
         messages: list[dict[str, Any]],
-        spec: SubAgentSpec,
         system_prompt: str,
         tool_registry: ToolRegistry,
         tool_service: ToolService,
     ) -> str:
         """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环。"""
+        name = actor.name
         for _ in range(TEAMMATE_MAX_ROUNDS):
             # 轮首尝试认领可处理任务(只按 session_id,不加实例隔离)。
             await self._try_claim_tasks(session_id, name, messages)
 
-            final_content: list[dict[str, Any]] | None = None
-            async for chunk in self.llm.stream(
-                messages,
-                system_prompt,
-                tools=tool_registry.to_anthropic_tools(),
-            ):
-                if chunk_type(chunk) == "message_final":
-                    final_content = chunk.get("content")
-                    continue
-                text = chunk_text(chunk)
-                if text:
-                    await self._emit(
-                        "subagent_run_delta",
-                        {"member": name, "role": role, "text": text},
-                    )
-
+            final_content = await self._stream_and_translate(
+                messages, system_prompt, tool_registry, translator
+            )
             tool_uses = extract_tool_uses(final_content)
             # final_content 已是 model_dump(mode="json") 产物(JSON 原生),可直接落库。
             messages.append({"role": "assistant", "content": final_content or ""})
@@ -305,6 +330,7 @@ class SubAgentRunner:
 
             for tool_use in tool_uses:
                 output = await tool_service.run(session_id, tool_use.name, tool_use.input)
+                await self._emit_tool_result(actor, session_id, tool_use, output)
                 messages.append(
                     {
                         "role": "user",
