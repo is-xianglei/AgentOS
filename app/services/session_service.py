@@ -109,18 +109,15 @@ class SessionService:
                 context.append({"role": message.role, "content": message.content})
             elif message.role == "tool":
                 tool_result = ToolResultMessage.from_content_dict(message.content)
-                context.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_result.tool_use_id,
-                                "content": tool_result.output,
-                            }
-                        ],
-                    }
-                )
+                block = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_result.tool_use_id,
+                    "content": tool_result.output,
+                }
+                if context and context[-1].get("role") == "user" and isinstance(context[-1].get("content"), list) and context[-1]["content"] and context[-1]["content"][0].get("type") == "tool_result":
+                    context[-1]["content"].append(block)
+                else:
+                    context.append({"role": "user", "content": [block]})
         return context
 
     def _summarize_title(self, content: str) -> str:
