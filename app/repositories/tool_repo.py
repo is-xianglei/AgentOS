@@ -44,3 +44,28 @@ class ToolRepository:
         await self.db.flush()
         await self.db.refresh(record)
         return record
+
+    async def mark_awaiting(self, record: ToolCallRecord) -> ToolCallRecord:
+        """把工具调用置为待审批(不执行,入参已存,等待用户裁决)。"""
+        record.status = "awaiting_approval"
+        await self.db.flush()
+        await self.db.refresh(record)
+        return record
+
+    async def resolve_awaiting(
+        self, record: ToolCallRecord, decision: str
+    ) -> ToolCallRecord:
+        """裁决一条待审批记录。
+
+        decision=deny 时直接终态为 rejected;allow_once/always_allow 时回到 running,
+        由后续真正执行走 succeed/fail。
+        """
+        if decision == "deny":
+            record.status = "rejected"
+            record.finished_at = datetime.now(timezone.utc)
+        else:
+            record.status = "running"
+        await self.db.flush()
+        await self.db.refresh(record)
+        return record
+

@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from fastapi import Request
@@ -67,13 +68,14 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
 
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    safe_errors = json.loads(json.dumps(exc.errors(), default=str))
     return JSONResponse(
         status_code=422,
         content=error_payload(
             request,
             "VALIDATION_ERROR",
             "参数校验失败",
-            {"errors": exc.errors()},
+            {"errors": safe_errors},
         ),
     )
 

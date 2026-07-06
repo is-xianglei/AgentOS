@@ -72,6 +72,7 @@
 | 内容 | `block_stop` | `block.index` |
 | 工具 | `tool_use` | `tool.id/name/input`(input 一次性给全,不逐字流) |
 | 工具 | `tool_result` | `tool.id/name/output/is_error` |
+| 工具 | `permission_request` | `permission.request_id/tool_id/tool_name/tool_input/behavior/reason` |
 | 控制 | `error` | `error.code/message/retriable/fatal` |
 
 > `turn_end.usage` 含四个字段:`input_tokens` / `output_tokens` /
@@ -81,6 +82,94 @@
 > 约定:`tool_use.input` 累积完整后一次性给出,不透传 Anthropic 的 `input_json_delta`;
 > 传输层噪声(`ping`、`signature_delta`、仅更新 usage 的中间 `message_delta`)在后端消化,
 > 不进本协议;全量 `snapshot` 仅后端落库 / 对账用,不发前端。
+
+### `permission_request` —— 工具执行前的审批请求(Human-in-the-Loop)
+
+当某个 actor 想调用一个需要审批的工具(如 `Bash`,由权限规则判定为 `ask`)时,后端**不执行该工具**,
+而是发一个 `permission_request` 事件,随后**正常结束(close)本次 SSE 流**(前端触发 `onDone`,这不是错误)。
+会话状态置为 `awaiting_approval`,待批信息落库,等待用户裁决。
+
+```jsonc
+{"type":"permission_request","sequence":9,"session_id":42,
+ "actor":{"role":"orchestrator","name":"orchestrator"},
+ "permission":{
+   "request_id":"appr-3f9c1a2b",       // 稳定关联键,应答时回传对账
+   "tool_id":"toolu_01EX",             // 对应此前 tool_use 的 id
+   "tool_name":"Bash",
+   "tool_input":{"command":"rm -rf build/"},
+   "behavior":"ask",
+   "reason":"危险工具默认需审批"          // 可选,供前端展示
+ }}
+```
+
+**应答走独立 REST 端点,不回写 SSE 流**(前端流严格单向):
+
+```
+POST /api/sessions/{session_id}/approvals
+{ "request_id":"appr-3f9c1a2b",
+  "decision":"allow_once" | "always_allow" | "deny",
+  "updated_input": {...},              // 可选,批准时修改入参
+  "always_scope":"session" | "global"  // 仅 always_allow 时用,默认 session
+}
+```
+
+该端点返回一条**新的 SSE 流**(与 `POST /sessions/messages` 同构),从挂起点恢复执行:
+`allow_once`/`always_allow` → 执行该工具并流式产出后续事件;`always_allow` 额外落一条权限规则;
+`deny` → 该工具以"用户拒绝"作为结果喂回模型。前端用 `request_id`(或 `tool_id`)把"待批准"态与后续
+的 `tool_result` 关联起来。
+
+> 前端消费:收到 `permission_request` 时,在对应 actor 面板渲染批准/拒绝交互(带 `tool_name`/`tool_input`);
+> 用户裁决后调 `/approvals` 端点并接续新流。注意 reducer 的事件 switch 需为该 type 补 case,否则事件到达但无 UI。
+
+---
+
+## 三·补、会话级控制事件(`RuntimeEvent`,不带 actor)
+
+除上面 9 种 actor 事件外,另有一类**会话级控制事件**:它们描述整个会话的状态,不属于任何
+actor 的产出,因此**不带 `actor` 字段**,信封只有 `type` / `sequence` / `data`。与 `StreamEvent`
+共用同一个 bus 和 `sequence` 序号。
+
+| type | 何时发 | `data` 字段 |
+| --- | --- | --- |
+| `session_ready` | 每次消息处理开头 | `session_id`、`title`、`status` |
+| `task_snapshot` | 任务变更后 & 会话开头 | `session_id`、`tasks[]`、`reason` |
+
+### `task_snapshot` —— 任务看板全量快照
+
+采用**全量快照**语义(对标 AG-UI 的 `STATE_SNAPSHOT`):每次任务有变更,后端拉取该 session
+下**全部任务**推一帧,前端**整体替换**本地任务树,不做增量 merge。任务列表短、是 DB 强一致
+数据,全量传输成本可忽略,换来前端零 diff 逻辑与断线自愈。
+
+触发点:
+- `reason: "baseline"` —— 会话开头(`session_ready` 之后)发一帧,建立看板基线 / 重连重建;
+- `reason: "created"` —— `TaskCreate` 工具创建任务后;
+- `reason: "updated"` —— `TaskUpdate` 工具改字段/状态后(含完成任务时级联解锁下游,新的
+  `blocked_by` 已在快照中反映)。
+
+`tasks[]` 每项字段:`id` / `subject` / `description` / `status`(`pending`/`in_progress`/
+`completed`)/ `owner` / `blocked_by`(`int[]`,阻塞它的任务 id)/ `created_at` / `updated_at`。
+
+```json
+{
+  "type": "task_snapshot",
+  "sequence": 42,
+  "data": {
+    "session_id": 1,
+    "reason": "updated",
+    "tasks": [
+      {"id": 1, "subject": "读配置",  "status": "completed",   "owner": "agent", "blocked_by": []},
+      {"id": 2, "subject": "生成代码", "status": "in_progress", "owner": "coder", "blocked_by": []},
+      {"id": 3, "subject": "跑测试",  "status": "pending",     "owner": "agent", "blocked_by": [2]}
+    ]
+  }
+}
+```
+
+前端消费:`status == in_progress` 高亮为"正在进行";`blocked_by` 非空且上游未完成的置灰;
+`blocked_by` 即依赖边,可据此画 DAG;多 teammate 并行时按 `owner` 区分谁在跑哪个。
+
+> 提交时机:emit 读取的是当前事务内数据(可能尚未 commit),与主循环回合末尾落库一致;
+> 若该回合后续异常回滚,前端会先看到一个乐观快照,由下次操作或下轮 `baseline` 帧自愈。
 
 ---
 

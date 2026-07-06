@@ -50,7 +50,7 @@ class TaskCreateTool(BaseTool):
     input_model = TaskCreateInput
 
     async def run(self, args: TaskCreateInput, ctx: ToolContext) -> str:
-        service = TaskService(ctx.db)
+        service = TaskService(ctx.db, bus=ctx.bus)
         task = await service.create(
             session_id=ctx.session_id,
             subject=args.subject,
@@ -122,7 +122,7 @@ class TaskUpdateTool(BaseTool):
     input_model = TaskUpdateInput
 
     async def run(self, args: TaskUpdateInput, ctx: ToolContext) -> str:
-        service = TaskService(ctx.db)
+        service = TaskService(ctx.db, bus=ctx.bus)
         task = await service.update(
             session_id=ctx.session_id,
             task_id=args.id,

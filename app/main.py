@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core import config
+from app.core.builtin_hooks import register_builtin_hooks
 from app.core.errors import AppError, app_error_handler, unhandled_error_handler, validation_error_handler
 from app.core.logging import request_context_middleware, setup_logging
 from app.db.base import Base
@@ -23,6 +24,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     setup_logging()
+    register_builtin_hooks()
     app = FastAPI(title="AgentOS API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,

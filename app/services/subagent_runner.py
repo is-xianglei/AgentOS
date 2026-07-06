@@ -149,7 +149,7 @@ class SubAgentRunner:
 
             for tool_use in tool_uses:
                 output = await tool_service.run(
-                    session_id, tool_use.name, tool_use.input
+                    session_id, tool_use.name, tool_use.input, actor=actor
                 )
                 await self._emit_tool_result(actor, session_id, tool_use, output)
                 messages.append(
@@ -329,7 +329,9 @@ class SubAgentRunner:
                 return text_from_content(final_content)
 
             for tool_use in tool_uses:
-                output = await tool_service.run(session_id, tool_use.name, tool_use.input)
+                output = await tool_service.run(
+                    session_id, tool_use.name, tool_use.input, actor=actor
+                )
                 await self._emit_tool_result(actor, session_id, tool_use, output)
                 messages.append(
                     {

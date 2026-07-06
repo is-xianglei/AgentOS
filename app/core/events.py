@@ -37,6 +37,7 @@ class EventType(str, Enum):
     TEXT_DELTA = "text_delta"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
+    PERMISSION_REQUEST = "permission_request"
     ERROR = "error"
 
 
@@ -149,6 +150,35 @@ class ToolInfo:
 
 
 @dataclass(frozen=True)
+class PermissionInfo:
+    """工具执行前的审批请求信息(permission_request 事件携带)。
+
+    agent 想调用某工具、权限判定为 ask 时产出。前端据此渲染批准/拒绝交互,
+    应答通过独立 REST 端点(POST /sessions/{id}/approvals)回传,不回写 SSE 流。
+    request_id 是稳定关联键,应答时用它对账;tool_id 对应此前 tool_use 的 id。
+    """
+
+    request_id: str
+    tool_id: str
+    tool_name: str
+    tool_input: dict[str, Any] = field(default_factory=dict)
+    behavior: str = "ask"
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "request_id": self.request_id,
+            "tool_id": self.tool_id,
+            "tool_name": self.tool_name,
+            "tool_input": self.tool_input,
+            "behavior": self.behavior,
+        }
+        if self.reason is not None:
+            data["reason"] = self.reason
+        return data
+
+
+@dataclass(frozen=True)
 class Usage:
     """token 用量(turn_end 携带)。
 
@@ -201,6 +231,7 @@ class StreamEvent:
     session_id: int
     block: BlockInfo | None = None
     tool: ToolInfo | None = None
+    permission: PermissionInfo | None = None
     usage: Usage | None = None
     error: ErrorInfo | None = None
     text: str | None = None
@@ -293,6 +324,19 @@ class StreamEvent:
             type=EventType.TOOL_RESULT, actor=actor, session_id=session_id, tool=tool
         )
 
+    # ---- 工厂方法:权限审批 ----
+
+    @classmethod
+    def permission_request(
+        cls, actor: Actor, session_id: int, permission: PermissionInfo
+    ) -> "StreamEvent":
+        return cls(
+            type=EventType.PERMISSION_REQUEST,
+            actor=actor,
+            session_id=session_id,
+            permission=permission,
+        )
+
     # ---- 工厂方法:错误 ----
 
     @classmethod
@@ -309,7 +353,7 @@ class StreamEvent:
         data: dict[str, Any] = {
             "type": self.type.value,
             "session_id": self.session_id,
-            "actor": actor_dict,
+            "actor": actor_dict
         }
         if self.sequence is not None:
             data["sequence"] = self.sequence
@@ -317,6 +361,8 @@ class StreamEvent:
             data["block"] = self.block.to_dict()
         if self.tool is not None:
             data["tool"] = self.tool.to_dict()
+        if self.permission is not None:
+            data["permission"] = self.permission.to_dict()
         if self.usage is not None:
             data["usage"] = self.usage.to_dict()
         if self.error is not None:
@@ -339,6 +385,21 @@ class RuntimeEvent:
     type: str
     data: dict[str, Any] = field(default_factory=dict)
     sequence: int | None = None
+
+    @classmethod
+    def task_snapshot(
+        cls, session_id: int, tasks: list[dict[str, Any]], reason: str | None = None
+    ) -> "RuntimeEvent":
+        """会话级任务全量快照:前端收到后整体替换本地任务树(不做增量 merge)。
+
+        tasks 为该 session 下全量任务的序列化列表(含 id/subject/status/owner/
+        blocked_by 等),reason 仅作前端调试/动画提示(baseline/created/updated)。
+        任务是 session 级状态、不属于任何 actor 的产出,故走 RuntimeEvent 而非 StreamEvent。
+        """
+        data: dict[str, Any] = {"session_id": session_id, "tasks": tasks}
+        if reason is not None:
+            data["reason"] = reason
+        return cls(type="task_snapshot", data=data)
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"type": self.type, "data": self.data}

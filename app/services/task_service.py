@@ -1,19 +1,40 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError, ValidationAppError
+from app.core.event_bus import StreamBus
+from app.core.events import RuntimeEvent
+from app.models.task import TaskRecord
 from app.repositories.task_repo import TaskRepository
+from app.schemas.task import TaskResponse
 from app.services.session_service import SessionService
 
 VALID_TASK_STATUSES = {"pending", "in_progress", "completed"}
 
 
 class TaskService:
-    def __init__(self, db: AsyncSession):
-        """初始化任务服务依赖。"""
+    def __init__(self, db: AsyncSession, bus: StreamBus | None = None):
+        """初始化任务服务依赖。
+
+        bus 缺省为 None:REST 只读端点与 TaskGet/TaskList 不需要推送,不传即可。
+        经 TaskCreate/TaskUpdate 工具调用时由 ctx.bus 注入,变更后 emit 全量快照。
+        """
         self.repo = TaskRepository(db)
         self.session_service = SessionService(db)
+        self.bus = bus
 
-    async def list_by_session(self, session_id: int):
+    async def emit_snapshot(self, session_id: int, reason: str | None = None) -> None:
+        """拉当前 session 全量任务,emit 一帧 task_snapshot。bus 缺省则静默跳过。
+
+        读取的是当前事务内的数据(可能未 commit),与主循环回合末尾的落库一致;
+        若该回合后续异常回滚,前端会先看到一个乐观快照,由下次操作或首帧 baseline 自愈。
+        """
+        if self.bus is None:
+            return
+        tasks: list[TaskRecord] = await self.repo.list_by_session(session_id)
+        payload = [TaskResponse.model_validate(t).model_dump(mode="json") for t in tasks]
+        await self.bus.emit(RuntimeEvent.task_snapshot(session_id, payload, reason))
+
+    async def list_by_session(self, session_id: int) -> list[TaskRecord]:
         """查询指定会话下的任务列表。"""
         await self.session_service.get_required(session_id)
         return await self.repo.list_by_session(session_id)
@@ -25,18 +46,19 @@ class TaskService:
         description: str = "",
         owner: str = "agent",
         blocked_by: list[int] | None = None,
-    ):
+    ) -> TaskRecord:
         """创建任务。"""
         await self.session_service.get_required(session_id)
         self._validate_status("pending")
-        normalized_blocked_by = await self._validate_blocked_by(session_id, blocked_by or [])
-        task = await self.repo.create(
+        normalized_blocked_by: list[int] = await self._validate_blocked_by(session_id, blocked_by or [])
+        task: TaskRecord = await self.repo.create(
             session_id=session_id,
             subject=subject,
             description=description,
             owner=owner,
             blocked_by=normalized_blocked_by,
         )
+        await self.emit_snapshot(session_id, "created")
         return task
 
     async def update(
@@ -50,10 +72,10 @@ class TaskService:
         blocked_by: list[int] | None = None,
         add_blocked_by: list[int] | None = None,
         remove_blocked_by: list[int] | None = None,
-    ):
+    ) -> TaskRecord:
         """更新任务字段。"""
         await self.session_service.get_required(session_id)
-        task = await self.repo.get(session_id, task_id)
+        task: TaskRecord = await self.repo.get(session_id, task_id)
         if task is None:
             raise NotFoundError("TASK_NOT_FOUND", "任务不存在")
         if status is not None:
@@ -70,7 +92,7 @@ class TaskService:
                 normalized_blocked_by,
                 current_task_id=task_id,
             )
-        updated = await self.repo.update(
+        updated: TaskRecord = await self.repo.update(
             task,
             subject=subject,
             description=description,
@@ -80,6 +102,8 @@ class TaskService:
         )
         if status == "completed":
             await self.repo.remove_blocker_from_others(session_id, task_id)
+        # 级联解锁后再拉快照:被摘除 blocker 的下游任务的新 blocked_by 天然进快照。
+        await self.emit_snapshot(session_id, "updated")
         return updated
 
     def _validate_status(self, status: str) -> None:

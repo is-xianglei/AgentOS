@@ -22,7 +22,7 @@ class LLMClient:
         client = AsyncAnthropic(base_url=self.base_url, api_key=self.api_key)
 
         async with client.messages.stream(
-            max_tokens=1000000,
+            max_tokens=131072,
             model=self.model,
             system=system_prompt or "",
             messages=messages,

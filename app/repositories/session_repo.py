@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.session import SessionMessage, SessionRecord, SessionSnapshot
@@ -36,6 +36,20 @@ class SessionRepository:
 
     async def get(self, session_id: int) -> SessionRecord | None:
         return await self.db.get(SessionRecord, session_id)
+
+    async def delete(self, session: SessionRecord) -> None:
+        """删除单个会话;messages/snapshots/tasks 由外键 ON DELETE CASCADE 级联清理。"""
+        await self.db.delete(session)
+        await self.db.flush()
+
+    async def delete_by_ids(self, ids: list[int]) -> int:
+        """按 id 批量物理删除会话,返回实际删除行数。级联同上。"""
+        if not ids:
+            return 0
+        stmt = delete(SessionRecord).where(SessionRecord.id.in_(ids))
+        result = await self.db.execute(stmt)
+        await self.db.flush()
+        return result.rowcount or 0
 
     async def get_for_update(self, session_id: int) -> SessionRecord | None:
         stmt = select(SessionRecord).where(SessionRecord.id == session_id).with_for_update()

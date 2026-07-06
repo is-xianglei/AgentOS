@@ -1,3 +1,4 @@
+from app.models.permission import PermissionRuleRecord
 from app.models.session import SessionMessage, SessionRecord, SessionSnapshot
 from app.models.task import TaskRecord
 from app.models.team import (
@@ -18,4 +19,5 @@ __all__ = [
     "TeamMemberRecord",
     "TeamMessageRecord",
     "SubAgentRunRecord",
+    "PermissionRuleRecord",
 ]

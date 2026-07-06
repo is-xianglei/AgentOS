@@ -20,7 +20,9 @@
       "Bash(git mv *)",
       "WebSearch",
       "WebFetch(domain:claude-code.mintlify.app)",
-      "WebFetch(domain:docs.anthropic.com)"
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/alembic upgrade *)"
     ]
   }
 }
