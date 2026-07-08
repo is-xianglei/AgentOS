@@ -2,8 +2,11 @@ from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import NotFoundError
 from app.models.permission import PermissionRuleRecord
 from app.repositories.permission_repo import PermissionRepository
+
+Scope = Literal["global", "session"]
 
 Behavior = Literal["allow", "ask", "deny"]
 
@@ -57,6 +60,43 @@ class PermissionService:
             behavior="allow",
             source="always_allow",
         )
+
+    async def list_rules(
+        self,
+        scope: str | None = None,
+        session_id: int | None = None,
+    ) -> list[PermissionRuleRecord]:
+        """按可选 scope / session_id 过滤列出规则(REST 只读,不涉及事务)。"""
+        return await self.repo.list(scope=scope, session_id=session_id)
+
+    async def upsert_rule(
+        self,
+        scope: Scope,
+        session_id: int | None,
+        tool_name: str,
+        behavior: Behavior,
+        matcher: dict[str, Any] | None = None,
+    ) -> PermissionRuleRecord:
+        """用户手动新增或更新一条规则,并提交事务。"""
+        target_session = session_id if scope == "session" else None
+        rule: PermissionRuleRecord = await self.repo.upsert(
+            scope=scope,
+            session_id=target_session,
+            tool_name=tool_name,
+            behavior=behavior,
+            source="user",
+            matcher=matcher,
+        )
+        await self.db.commit()
+        return rule
+
+    async def delete_rule(self, rule_id: int) -> int:
+        """删除一条规则并提交事务;规则不存在时抛 NotFoundError。"""
+        deleted: int = await self.repo.delete(rule_id)
+        if deleted == 0:
+            raise NotFoundError("PERMISSION_RULE_NOT_FOUND", "权限规则不存在")
+        await self.db.commit()
+        return deleted
 
     def _coerce(self, behavior: str, tool_name: str) -> Behavior:
         """把落库的 behavior 收敛到合法取值;非法值退回默认策略。"""

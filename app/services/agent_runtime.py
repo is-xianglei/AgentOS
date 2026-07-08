@@ -216,9 +216,13 @@ class AgentRuntime:
 
         stop_reason: str | None = None
         for _ in range(config.MAX_TOOL_ITERATIONS):
+            # 加载会话上下文
             context = await self.session_service.load_context(session_id)
+            # 三层上下文压缩
             context = await self.compact_service.maybe_compact(session_id, context)
+            # 构造提示词
             system_prompt: str = compose_system_prompt(session.system_prompt)
+            # 取出可用的工具
             tools: list[ToolParam] = self.tool_registry.to_anthropic_tools()
 
             final_content: list[dict[str, Any]] | None = None
