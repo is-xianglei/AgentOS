@@ -133,3 +133,35 @@ def test_post_tool_use_observes_output():
         get_hook_registry().clear()
 
     assert seen == {"output": "TOOL_OUTPUT", "tool": "Bash"}
+
+
+class _FailingTool:
+    """替身工具:执行即抛异常。"""
+
+    async def run_with_dict(self, data, ctx):
+        raise RuntimeError("工具炸了")
+
+
+def test_post_tool_use_fires_on_failure():
+    get_hook_registry().clear()
+    svc = _make_service(_FailingTool())
+    seen = {}
+
+    async def observe(ctx):
+        seen["output"] = ctx.tool_output
+        seen["is_error"] = ctx.is_error
+        return None
+
+    get_hook_registry().register(HookEvent.POST_TOOL_USE, observe)
+    try:
+        try:
+            asyncio.run(svc.run(1, "Bash", {"cmd": "ls"}))
+            raised = False
+        except RuntimeError:
+            raised = True
+    finally:
+        get_hook_registry().clear()
+
+    assert raised  # 异常仍原样上抛,hook 不吞错
+    assert seen == {"output": "工具炸了", "is_error": True}
+    assert svc.tool_repo.last.status == "failed"

@@ -78,6 +78,18 @@ class ToolService:
         except Exception as exc:
             await self.tool_repo.fail(record, str(exc))
             await self.db.flush()
+            # 让"工具失败告警" hook 能观测到;触发后原样上抛。
+            await hooks.trigger(
+                HookContext(
+                    event=HookEvent.POST_TOOL_USE,
+                    session_id=session_id,
+                    actor=actor,
+                    tool_name=tool_name,
+                    tool_input=input_args,
+                    tool_output=str(exc),
+                    is_error=True,
+                )
+            )
             raise
         await self.tool_repo.succeed(record, output)
         await self.db.flush()

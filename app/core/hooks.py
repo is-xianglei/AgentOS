@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -95,11 +96,7 @@ class HookRegistry:
         """
         outcomes: list[HookOutcome] = []
         for callback in self._hooks[ctx.event]:
-            try:
-                result = await callback(ctx)
-            except Exception:  # noqa: BLE001 单个 hook 失败隔离,不中断主流程
-                traceback.print_exc()
-                continue
+            result = await asyncio.wait_for(callback(ctx), timeout=60)
             if result is not None:
                 outcomes.append(result)
         return outcomes

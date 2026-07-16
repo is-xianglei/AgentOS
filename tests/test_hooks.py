@@ -7,6 +7,7 @@ ToolService/AgentRuntime 的实际挂点由端到端验证覆盖,此处只测注
 
 import asyncio
 
+from app.core import hooks as hooks_module
 from app.core.events import ORCHESTRATOR_ACTOR
 from app.core.hooks import (
     HookContext,
@@ -53,6 +54,25 @@ def test_exception_in_hook_is_isolated():
     reg.register(HookEvent.USER_PROMPT_SUBMIT, good)
 
     # boom 抛异常被隔离,good 仍执行并进结果。
+    outcomes = asyncio.run(reg.trigger(_ctx(HookEvent.USER_PROMPT_SUBMIT)))
+    assert [o.additional_context for o in outcomes] == ["ok"]
+
+
+def test_timeout_in_hook_is_isolated(monkeypatch):
+    monkeypatch.setattr(hooks_module, "HOOK_TIMEOUT_SECONDS", 0.05)
+    reg = HookRegistry()
+
+    async def slow(ctx):
+        await asyncio.sleep(1)
+        return HookOutcome(additional_context="不应出现")
+
+    async def fast(ctx):
+        return HookOutcome(additional_context="ok")
+
+    reg.register(HookEvent.USER_PROMPT_SUBMIT, slow)
+    reg.register(HookEvent.USER_PROMPT_SUBMIT, fast)
+
+    # slow 超时被跳过(视为放行、无操作),fast 仍执行并进结果。
     outcomes = asyncio.run(reg.trigger(_ctx(HookEvent.USER_PROMPT_SUBMIT)))
     assert [o.additional_context for o in outcomes] == ["ok"]
 
