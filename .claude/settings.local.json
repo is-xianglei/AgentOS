@@ -22,7 +22,21 @@
       "WebFetch(domain:claude-code.mintlify.app)",
       "WebFetch(domain:docs.anthropic.com)",
       "Bash(.venv/bin/python *)",
-      "Bash(.venv/bin/alembic upgrade *)"
+      "Bash(.venv/bin/alembic upgrade *)",
+      "Read(//private/tmp/**)",
+      "WebFetch(domain:www.majiabin.com)",
+      "Bash(gh auth *)",
+      "Bash(gh search *)",
+      "Bash(gh api *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.claude.com)",
+      "WebFetch(domain:www.anthropic.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:hexdocs.pm)",
+      "WebFetch(domain:skywork.ai)",
+      "WebFetch(domain:conjure.hexdocs.pm)",
+      "WebFetch(domain:help.aliyun.com)",
+      "Bash(grep -nE '^#{2,3} ' docs/skill-prd.md)"
     ]
   }
 }

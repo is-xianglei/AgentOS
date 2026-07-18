@@ -4,7 +4,7 @@ AgentOS 是一个面向 Agent 会话运行的后端基座。第一阶段聚焦�
 
 ## 当前范围
 
-- 已实现 FastAPI 应用入口：`app.main:app`
+- 已实现 FastAPI 应用入口：`main:app`
 - 已实现 Session、Message、Snapshot、ToolCall、Task、Team 数据模型
 - 已实现统一响应和统一错误格式
 - 已实现示例工具 `echo`
@@ -13,10 +13,10 @@ AgentOS 是一个面向 Agent 会话运行的后端基座。第一阶段聚焦�
 ## 启动
 
 ```bash
-uv run uvicorn app.main:app --reload
+uv run uvicorn main:app --reload
 ```
 
-默认会读取 `.env` 中的 `DATABASE_URL`，且必须是 PostgreSQL 连接地址。正式建表请使用 Alembic：
+默认会读取 `.env` 中的 `AGENTOS_DATABASE_URL`，且必须是 PostgreSQL 连接地址。正式建表请使用 Alembic：
 
 ```bash
 uv run alembic upgrade head
