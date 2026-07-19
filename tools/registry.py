@@ -6,8 +6,12 @@ from tools.builtin import (
     AgentTool,
     BashTool,
     EchoTool,
+    EditTool,
+    GlobTool,
+    GrepTool,
     ListMessagesTool,
     ReadInboxTool,
+    ReadTool,
     SendMessageTool,
     SkillResourceTool,
     SkillRunTool,
@@ -20,15 +24,13 @@ from tools.builtin import (
     TeamListTool,
     TeamSpawnTool,
     WeatherTool,
+    WriteTool,
 )
 
 
 class ToolRegistry:
     def __init__(self, tools: list[BaseTool]):
         self._tools = {tool.name: tool for tool in tools}
-
-    def list(self) -> list[ToolParam]:
-        return [tool.to_param() for tool in self._tools.values()]
 
     def to_anthropic_tools(self) -> list[ToolParam]:
         return [tool.to_param() for tool in self._tools.values()]
@@ -60,6 +62,14 @@ def build_tool_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             EchoTool(),
+            # 文件工具
+            ReadTool(),
+            WriteTool(),
+            EditTool(),
+            GlobTool(),
+            GrepTool(),
+            # Shell 工具
+            BashTool(),
             # 任务工具
             TaskCreateTool(),
             TaskGetTool(),
@@ -74,7 +84,6 @@ def build_tool_registry() -> ToolRegistry:
             ListMessagesTool(),
             AgentTool(),
             WeatherTool(),
-            BashTool(),
             # Skill 工具组:发现走系统提示注入(catalog),加载/读资源/执行走这三个工具。
             SkillTool(),
             SkillResourceTool(),

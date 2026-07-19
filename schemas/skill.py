@@ -29,11 +29,6 @@ class SkillResponse(BaseModel):
 
 
 class SkillDetailResponse(SkillResponse):
-    """详情视图:在精简视图上附 frontmatter + 资源清单 + 正文。
-
-    resources / body 非 DB 字段,由 service 组装后传入。
-    """
-
     frontmatter: dict[str, Any] = Field(description="解析后的完整 frontmatter 快照")
     resources: list[SkillResourceItem] = Field(
         default_factory=list, description="资源清单(经 list_prefix 重建,详情含 SKILL.md)"

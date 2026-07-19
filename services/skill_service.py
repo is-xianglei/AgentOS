@@ -2,7 +2,6 @@ import hashlib
 import io
 import mimetypes
 import os
-import re
 import shutil
 import tempfile
 import zipfile
@@ -20,14 +19,11 @@ from models.skill import SkillRecord
 from repositories.skill_repo import SkillRepository
 from schemas.skill import SkillDetailResponse, SkillResourceItem, SkillValidateResult
 
-# 资源相对路径校验正则(PRD §6.2):字母/数字/点/下划线/连字符/斜杠,另禁 .. 段与绝对路径。
-_RESOURCE_PATH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
-
 
 @dataclass(frozen=True)
 class _ParsedBundle:
     """bundle 解析结果"""
-    top: str
+    root_prefix: str  # skill 根在 zip 内的前缀,如 "foo/" 或 ""(SKILL.md 在根级)
     name: str
     description: str
     frontmatter: dict[str, Any]
@@ -73,27 +69,32 @@ class SkillService:
 
         with zf:
             infos = zf.infolist()
-            names = [info.filename for info in infos]
 
-            # 2. 定位顶层目录:所有成员须共享唯一的顶层目录名。
-            top = self._resolve_top_dir(names)
+            # 2. 定位 SKILL.md 所在层级,以其目录作为 skill 根前缀。
+            #    宽松策略:不强制顶层目录结构,SKILL.md 在根级或任意单层目录内均可。
+            root_prefix = self._resolve_root_prefix(
+                [info.filename for info in infos if not info.filename.endswith("/")]
+            )
 
-            # 3. zip-slip 防护:拒绝绝对路径、.. 段、越出 top/ 的成员。
+            # 3. 收集 root_prefix 下的成员;穿越防护保留,root 外与 macOS 垃圾直接忽略。
             files: dict[str, bytes] = {}
             for info in infos:
                 member = info.filename
                 # 目录成员(以 / 结尾)跳过,不参与内容与存储。
                 if member.endswith("/"):
                     continue
-                self._guard_member(member, top)
-                rel = member[len(top) + 1 :]  # 去掉 "top/" 前缀
-                # 相对路径须过 §6.2 校验(zip-slip 之外再拦一层非法字符)。
+                if self._is_ignored_member(member):
+                    continue
+                norm = member.replace("\\", "/")
+                # root 前缀之外的成员忽略(不报错),使"多顶层目录"这类 bundle 也能用。
+                if root_prefix and not norm.startswith(root_prefix):
+                    continue
+                rel = norm[len(root_prefix):]
+                # 穿越防护:绝对路径 / .. 段仍拒绝。
                 self._validate_relative_path(rel)
                 files[rel] = zf.read(info)
 
-        # 4. 定位并解析 SKILL.md
-        if "SKILL.md" not in files:
-            raise AgentException.message(f"bundle 缺少 {top}/SKILL.md")
+        # 4. 解析 SKILL.md(定位阶段已保证其存在)。
         skill_md_text = files["SKILL.md"].decode("utf-8", errors="replace")
         parsed = parse_skill_md(skill_md_text)
         validate_frontmatter(parsed.frontmatter)
@@ -102,14 +103,8 @@ class SkillService:
         version = parsed.frontmatter.get("version")
         version = str(version) if version is not None else None
 
-        # 5. 一致性:顶层目录名须等于 frontmatter.name
-        if top != name:
-            raise AgentException.message(
-                f"bundle 顶层目录名 {top!r} 与 frontmatter.name {name!r} 不一致"
-            )
-
         return _ParsedBundle(
-            top=top,
+            root_prefix=root_prefix,
             name=name,
             description=description,
             frontmatter=parsed.frontmatter,
@@ -118,47 +113,50 @@ class SkillService:
         )
 
     @staticmethod
-    def _resolve_top_dir(names: list[str]) -> str:
-        """从 zip 成员名推断唯一顶层目录;无 / 多 / 根级文件均报 SKILL_BUNDLE_INVALID。"""
-        tops: set[str] = set()
-        for raw in names:
-            # 归一化:去掉可能的前导 ./,统一用 / 分隔。
-            norm = raw.replace("\\", "/").lstrip("./")
-            if not norm or norm == "/":
-                continue
-            head = norm.split("/", 1)[0]
-            # 根级直接是文件(无 / )→ 视为缺少顶层目录。
-            if "/" not in norm.rstrip("/"):
-                raise AgentException.message(
-                    f"bundle 内不允许根级文件 {raw!r};须有且只有一个顶层目录"
-                )
-            tops.add(head)
-        if len(tops) == 0:
-            raise AgentException.message("bundle 为空或无顶层目录")
-        if len(tops) > 1:
-            raise AgentException.message(
-                f"bundle 存在多个顶层目录: {sorted(tops)};须有且只有一个"
-            )
-        return next(iter(tops))
-
-    @staticmethod
-    def _guard_member(member: str, top: str) -> None:
-        """zip-slip 防护:拒绝绝对路径、.. 段、越出 top/ 前缀的成员。"""
+    def _is_ignored_member(member: str) -> bool:
+        """忽略打包工具产生的噪声:macOS 的 __MACOSX/ 与 .DS_Store、以 ._ 开头的 AppleDouble。"""
         norm = member.replace("\\", "/")
-        if norm.startswith("/"):
-            raise AgentException.message(f"bundle 成员为绝对路径,拒绝: {member!r}")
         parts = norm.split("/")
-        if ".." in parts:
-            raise AgentException.message(f"bundle 成员含 .. 段,拒绝: {member!r}")
-        if norm != top and not norm.startswith(top + "/"):
-            raise AgentException.message(f"bundle 成员越出顶层目录 {top!r}: {member!r}")
+        if "__MACOSX" in parts:
+            return True
+        base = parts[-1]
+        return base == ".DS_Store" or base.startswith("._")
+
+    @classmethod
+    def _resolve_root_prefix(cls, names: list[str]) -> str:
+        """定位 SKILL.md 所在层级,返回其目录前缀(含末尾 /,根级则为 "")。
+
+        宽松策略(PRD §5.3):不再强制"唯一顶层目录/禁根级文件/目录名==name"。
+        只要能找到 SKILL.md 即可;存在多个时取路径最浅(层级最少)的那个作为根。
+        找不到 → 报错。忽略 macOS 噪声成员后再判定。
+        """
+        candidates: list[str] = []
+        for raw in names:
+            if cls._is_ignored_member(raw):
+                continue
+            norm = raw.replace("\\", "/")
+            if norm.split("/")[-1] == "SKILL.md":
+                candidates.append(norm)
+        if not candidates:
+            raise AgentException.message("bundle 缺少 SKILL.md(根级或任一目录内均可)")
+        # 取层级最浅的 SKILL.md(斜杠最少),其所在目录即 skill 根。
+        chosen = min(candidates, key=lambda p: (p.count("/"), len(p)))
+        head, _, _ = chosen.rpartition("/")
+        return head + "/" if head else ""
 
     @staticmethod
     def _validate_relative_path(rel: str) -> None:
-        """校验相对 skill 根的资源路径(§6.2):正则 + 禁 .. 段。"""
-        if not rel or not _RESOURCE_PATH_RE.match(rel):
+        """校验相对 skill 根的资源路径:不再限制字符集,仅保留路径穿越防护。
+
+        安全兜底(不放宽):拒绝空路径、绝对路径与 .. 段,防 zip-slip / 对象存储 key 污染
+        导致的目录穿越。先把反斜杠归一化为 /,避免 Windows 风格 `..\\` 绕过 .. 检查。
+        """
+        if not rel:
             raise AgentException.message(f"非法的资源相对路径: {rel!r}")
-        if ".." in rel.split("/"):
+        norm = rel.replace("\\", "/")
+        if norm.startswith("/"):
+            raise AgentException.message(f"资源相对路径不允许绝对路径: {rel!r}")
+        if ".." in norm.split("/"):
             raise AgentException.message(f"资源相对路径含 .. 段: {rel!r}")
 
     @staticmethod
@@ -167,25 +165,26 @@ class SkillService:
         return hashlib.sha256(file_bytes).hexdigest()
 
     async def upload_bundle(self, file_bytes: bytes) -> SkillRecord:
-        """上传 / 覆盖更新一个 skill bundle(§13.1 九步,全部按序)。"""
-        bundle = self._parse_bundle(file_bytes)  # 第 1-5 步
-        skill_hash = self._skill_hash(file_bytes)  # 第 6 步:对 zip 包整体算哈希
+        """上传 / 覆盖更新一个 skill bundle"""
+        bundle = self._parse_bundle(file_bytes)
 
-        # 幂等短路:同名且 zip 哈希一致 → 直接返回现有记录,不重复写 MinIO、不改 DB。
+        skill_hash = self._skill_hash(file_bytes)
+
         existing = await self.repo.get_by_name(bundle.name)
+
         if existing is not None and existing.skill_hash == skill_hash:
             return existing
 
-        # 第 7 步:先写对象存储
         if hasattr(self.storage, "ensure_bucket"):
             await self.storage.ensure_bucket()
+
         prefix = f"{bundle.name}/"
-        await self.storage.delete_prefix(prefix)  # 清旧文件(覆盖更新去除已删资源)
+        await self.storage.delete_prefix(prefix)
+
         for rel, data in bundle.files.items():
             mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
             await self.storage.put(skill_object_key(bundle.name, rel), data, content_type=mime)
 
-        # 第 8 步:落库 + commit。
         record = await self.repo.upsert(
             name=bundle.name,
             description=bundle.description,
@@ -194,7 +193,6 @@ class SkillService:
             skill_hash=skill_hash,
         )
         await self.db.commit()
-        # 第 9 步:返回记录。
         return record
 
     async def validate(self, file_bytes: bytes) -> SkillValidateResult:

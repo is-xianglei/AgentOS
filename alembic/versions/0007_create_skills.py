@@ -21,8 +21,8 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "skills",
-        sa.Column("id", sa.Integer(), primary_key=True, comment="skillID"),
-        sa.Column("name", sa.String(length=64), nullable=False, comment="skill名称(kebab-case)"),
+        sa.Column("id", sa.Integer(), primary_key=True, comment="ID"),
+        sa.Column("name", sa.String(length=64), nullable=False, comment="skill名称"),
         sa.Column("description", sa.Text(), nullable=False, comment="skill描述"),
         sa.Column("frontmatter", postgresql.JSONB(), nullable=False, comment="解析后的完整frontmatter"),
         sa.Column("version", sa.String(length=32), nullable=True, comment="版本号"),
@@ -32,7 +32,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), comment="更新时间"),
         sa.Column("is_deleted", sa.Boolean(), server_default=sa.false(), nullable=False, comment="软删除标记"),
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True, comment="软删除时间"),
-        comment="web端上传的skill(正文与资源存对象存储,此表存索引与元数据)",
+        comment="skills",
     )
     op.create_index("ix_skills_name", "skills", ["name"], unique=True)
     op.create_index("ix_skills_is_deleted", "skills", ["is_deleted"])

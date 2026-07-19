@@ -12,10 +12,10 @@ Behavior = Literal["allow", "ask", "deny"]
 
 # 默认策略:未被任何规则命中时的兜底判定(参考 s03_permission 的"危险工具需审批"精神)。
 # 危险工具(可执行任意命令 / 有副作用)默认 ask;其余工具默认 allow。
-# 写文件类工具当前未内置,后续接入时在此登记。
 # SkillRun:进程内执行 skill 脚本,等同在主机跑任意代码(PRD §3.5 / §17),与 Bash 同级需审批。
-# Skill / SkillResource 为只读能力,默认放行(未知工具默认 allow),不纳入本集合。
-DANGEROUS_TOOLS: frozenset[str] = frozenset({"Bash", "SkillRun"})
+# Write/Edit:写入/修改文件有副作用,需审批。
+# Skill / SkillResource / Read / Glob / Grep 为只读能力,默认放行(未知工具默认 allow),不纳入本集合。
+DANGEROUS_TOOLS: frozenset[str] = frozenset({"Bash", "SkillRun", "Write", "Edit"})
 DEFAULT_ALLOW: Behavior = "allow"
 DEFAULT_ASK: Behavior = "ask"
 

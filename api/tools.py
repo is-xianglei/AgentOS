@@ -10,4 +10,4 @@ router = APIRouter()
 
 @router.get("", summary="查询可用工具", response_model=ApiResponse[list[ToolParam]])
 def list_tools(request: Request):
-    return ok(build_tool_registry().list(), request)
+    return ok(build_tool_registry().to_anthropic_tools(), request)

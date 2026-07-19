@@ -15,9 +15,6 @@ from core.errors import AgentException
 # 首行须为 ---,捕获两个 --- 之间的 YAML 与其后的正文。
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
-# name 格式:小写字母/数字/连字符,不以连字符开头结尾、不连续连字符。
-_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-
 
 @dataclass(frozen=True)
 class ParsedSkill:
@@ -57,13 +54,9 @@ def validate_frontmatter(fm: dict) -> None:
     name = fm.get("name")
     if not name or not isinstance(name, str) or not name.strip():
         raise AgentException.message("frontmatter 缺少必填字段 name 或其为空")
-    # name 格式
+    # name 长度(与 DB 列 String(64) 对齐;格式不再强制 kebab-case)
     if len(name) > 64:
         raise AgentException.message(f"name 长度超过 64 字符: {len(name)}")
-    if not _NAME_RE.match(name):
-        raise AgentException.message(
-            f"name 格式非法(须匹配 ^[a-z0-9]+(-[a-z0-9]+)*$): {name!r}"
-        )
     # description 存在
     description = fm.get("description")
     if (

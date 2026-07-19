@@ -1,6 +1,10 @@
 from tools.builtin.agent import AgentTool
 from tools.builtin.bash import BashTool
 from tools.builtin.echo import EchoTool
+from tools.builtin.edit import EditTool
+from tools.builtin.glob import GlobTool
+from tools.builtin.grep import GrepTool
+from tools.builtin.read import ReadTool
 from tools.builtin.skill import SkillResourceTool, SkillRunTool, SkillTool
 from tools.builtin.task import (
     TaskCreateTool,
@@ -17,11 +21,18 @@ from tools.builtin.team import (
     TeamSpawnTool,
 )
 from tools.builtin.weather import WeatherTool
+from tools.builtin.write import WriteTool
 
 __all__ = [
     "AgentTool",
     "BashTool",
     "EchoTool",
+    # 文件工具
+    "ReadTool",
+    "WriteTool",
+    "EditTool",
+    "GlobTool",
+    "GrepTool",
     # 任务工具(按操作拆分)
     "TaskCreateTool",
     "TaskGetTool",

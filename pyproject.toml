@@ -19,6 +19,7 @@ dependencies = [
     "redis>=5.2.0",
     "greenlet>=3.5.2",
     "pydantic-settings>=2.14.2",
+    "mcp[cli]>=1.28.1",
 ]
 
 [tool.pytest.ini_options]

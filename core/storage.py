@@ -154,7 +154,7 @@ _storage_instance: ObjectStorage | None = None
 
 
 def get_object_storage() -> ObjectStorage:
-    """返回进程内缓存的对象存储单例(本期恒为 MinIOStorage)。"""
+    """返回进程内缓存的对象存储单例"""
     global _storage_instance
     if _storage_instance is None:
         _storage_instance = MinIOStorage()

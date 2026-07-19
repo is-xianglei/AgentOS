@@ -1,8 +1,7 @@
 """内建 hook 实现与装配。
 
 这里写具体的 hook 回调,并通过 register_builtin_hooks 把它们挂到全局注册表。
-业务方新增 hook 在本文件追加回调 + 在 register_builtin_hooks 里追加一行 register 即可,
-无需改动引擎层(app.core.hooks)。
+业务方新增 hook 在本文件追加回调 + 在 register_builtin_hooks 里追加一行 register 即可
 """
 
 from __future__ import annotations
@@ -15,17 +14,21 @@ from hooks import (
     get_hook_registry,
 )
 
-# 单条工具输出超过该字符数视为"大输出",仅打日志提醒(不改写结果)。
-LARGE_OUTPUT_THRESHOLD = 20000
 
+async def user_prompt_submit(ctx: HookContext) -> HookOutcome | None:
+    print(f'用户提交了消息 - {ctx.user_content}...')
+    return None
 
-async def large_output_hook(ctx: HookContext) -> HookOutcome | None:
-    """PostToolUse:工具输出过大时打日志提醒"""
-    if ctx.tool_output and len(ctx.tool_output) > LARGE_OUTPUT_THRESHOLD:
-        print(
-            f"[hook] 大输出提醒: 工具 {ctx.tool_name} 产出 "
-            f"{len(ctx.tool_output)} 字符 (actor={ctx.actor.name})"
-        )
+async def pre_tool_use(ctx: HookContext) -> HookOutcome | None:
+    print(f'{ctx.tool_name} - 工具准备开始执行...')
+    return None
+
+async def post_tool_use(ctx: HookContext) -> HookOutcome | None:
+    print(f'{ctx.tool_name} - 工具已执行完成...')
+    return None
+
+async def stop(ctx: HookContext) -> HookOutcome | None:
+    print(f'{ctx.session_id} - 会话即将结束...')
     return None
 
 
@@ -35,4 +38,11 @@ def register_builtin_hooks(registry: HookRegistry | None = None) -> None:
     这里显式注册即"配置":业务方新增 hook 在此追加 register 调用即可。
     """
     registry = registry or get_hook_registry()
-    registry.register(HookEvent.POST_TOOL_USE, large_output_hook)
+    # 用户输入后
+    registry.register(HookEvent.USER_PROMPT_SUBMIT, user_prompt_submit)
+    # 工具执行前
+    registry.register(HookEvent.PRE_TOOL_USE, pre_tool_use)
+    # 工具执行后
+    registry.register(HookEvent.POST_TOOL_USE, post_tool_use)
+    # 对话结束时
+    registry.register(HookEvent.STOP, stop)
