@@ -20,18 +20,21 @@ class SessionService:
         model_name: str | None = None,
         system_prompt: str | None = None,
         metadata: dict[str, Any] | None = None,
+        user_id: int | None = None,
+        workspace_id: int | None = None,
     ) -> SessionRecord:
-        """创建会话并提交事务。"""
+        """创建会话。提交交给请求边界（get_db）统一处理。"""
         session: SessionRecord = await self.repo.create(
             title=title or "新会话",
             model_name=model_name,
             system_prompt=system_prompt,
             metadata=metadata or {},
+            user_id=user_id,
+            workspace_id=workspace_id,
         )
-        await self.db.commit()
         return session
 
-    async def create_from_first_message(self, content: str) -> SessionRecord:
+    async def create_from_first_message(self, content: str, user_id: int | None = None, workspace_id: int | None = None) -> SessionRecord:
         """根据首条用户消息创建会话。"""
         title = self._summarize_title(content)
         return await self.repo.create(
@@ -39,11 +42,49 @@ class SessionService:
             model_name=None,
             system_prompt=None,
             metadata={},
+            user_id=user_id,
+            workspace_id=workspace_id,
         )
 
     async def list(self) -> list[SessionRecord]:
         """查询全部会话列表。"""
         return await self.repo.list()
+
+    async def list_by_user(self, user_id: int) -> list[SessionRecord]:
+        """查询指定用户的会话列表。"""
+        return await self.repo.list_by_user(user_id)
+
+    async def check_access(self, session: SessionRecord, user_id: int) -> bool:
+        """检查用户是否有权访问某个会话。
+
+        访问规则：
+        1. 会话的创建者
+        2. 会话在 shared_with 列表中的用户
+        3. 会话可见性为 workspace 且用户是该工作区成员
+        4. 会话可见性为 public
+        5. 兼容旧数据：user_id 为 None 的会话允许所有人访问
+        """
+        # 兼容旧数据：user_id 为 None 的会话允许所有人访问
+        if session.user_id is None:
+            return True
+
+        # 检查是否是创建者
+        if session.user_id == user_id:
+            return True
+
+        # 检查是否在共享列表中
+        if user_id in session.shared_with:
+            return True
+
+        # 检查可见性
+        if session.visibility == "public":
+            return True
+
+        # TODO: 检查工作区成员关系（需要注入 workspace_service 或直接查询）
+        # if session.visibility == "workspace" and session.workspace_id:
+        #     return await self.workspace_service.is_member(session.workspace_id, user_id)
+
+        return False
 
     async def get_required(self, session_id: int) -> SessionRecord:
         """查询会话，不存在时抛出业务错误。"""
@@ -53,31 +94,27 @@ class SessionService:
         return session
 
     async def archive(self, session_id: int) -> SessionRecord:
-        """归档指定会话并提交事务。"""
+        """归档指定会话。提交交给请求边界统一处理。"""
         session: SessionRecord = await self.get_required(session_id)
         await self.repo.update_status(session, "archived")
-        await self.db.commit()
         return session
 
     async def rename(self, session_id: int, title: str) -> SessionRecord:
-        """重命名会话标题并提交事务。"""
+        """重命名会话标题。提交交给请求边界统一处理。"""
         session: SessionRecord = await self.get_required(session_id)
         session.title = title
         await self.db.flush()
         await self.db.refresh(session)
-        await self.db.commit()
         return session
 
     async def delete(self, session_id: int) -> None:
-        """软删除单个会话(级联标记消息/快照/任务等子表)并提交事务。"""
+        """软删除单个会话(级联标记消息/快照/任务等子表)。提交交给请求边界统一处理。"""
         session: SessionRecord = await self.get_required(session_id)
         await self.repo.delete(session)
-        await self.db.commit()
 
     async def delete_many(self, ids: list[int]) -> int:
-        """批量软删除会话,返回实际标记数量并提交事务。级联同上。"""
+        """批量软删除会话,返回实际标记数量。级联同上。提交交给请求边界统一处理。"""
         deleted: int = await self.repo.delete_by_ids(ids)
-        await self.db.commit()
         return deleted
 
     async def ensure_runnable(self, session_id: int) -> SessionRecord:
@@ -137,10 +174,10 @@ class SessionService:
         session.extra = extra
         await self.db.flush()
 
-    async def prepare_for_message(self, session_id: int | None, content: str) -> SessionRecord:
+    async def prepare_for_message(self, session_id: int | None, content: str, user_id: int | None = None, workspace_id: int | None = None) -> SessionRecord:
         """获取或创建本次消息所属会话，并标记为运行中。"""
         if session_id is None:
-            session: SessionRecord = await self.create_from_first_message(content)
+            session: SessionRecord = await self.create_from_first_message(content, user_id, workspace_id)
             await self.repo.update_status(session, "running")
             return session
         return await self.mark_running(session_id)

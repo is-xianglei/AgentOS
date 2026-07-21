@@ -40,6 +40,8 @@ class SessionRepository:
         model_name: str | None,
         system_prompt: str | None,
         metadata: dict[str, Any],
+        user_id: int | None = None,
+        workspace_id: int | None = None,
     ) -> SessionRecord:
         session = SessionRecord(
             title=title,
@@ -47,6 +49,8 @@ class SessionRepository:
             model_name=model_name,
             system_prompt=system_prompt,
             extra=metadata,
+            user_id=user_id,
+            workspace_id=workspace_id,
         )
         self.db.add(session)
         await self.db.flush()
@@ -55,6 +59,15 @@ class SessionRepository:
 
     async def list(self) -> list[SessionRecord]:
         stmt = select(SessionRecord).order_by(desc(SessionRecord.last_active_at), desc(SessionRecord.id))
+        return list(await self.db.scalars(stmt))
+
+    async def list_by_user(self, user_id: int) -> list[SessionRecord]:
+        """查询指定用户的会话列表。"""
+        stmt = (
+            select(SessionRecord)
+            .where(SessionRecord.user_id == user_id)
+            .order_by(desc(SessionRecord.last_active_at), desc(SessionRecord.id))
+        )
         return list(await self.db.scalars(stmt))
 
     async def get(self, session_id: int) -> SessionRecord | None:

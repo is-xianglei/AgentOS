@@ -34,6 +34,31 @@ class SessionRecord(Base):
         comment="最后活跃时间",
     )
 
+    # 用户与工作区关联（新增字段）
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="创建用户ID",
+    )
+    workspace_id: Mapped[int] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        index=True,
+        comment="所属工作区ID",
+    )
+
+    # 共享与权限（新增字段）
+    visibility: Mapped[str] = mapped_column(
+        String(32),
+        default="private",
+        index=True,
+        comment="可见性: private/team/workspace/public",
+    )
+    shared_with: Mapped[list[int]] = mapped_column(
+        MutableList.as_mutable(json_type()),
+        default=list,
+        comment="共享用户ID列表",
+    )
+
     messages: Mapped[list["SessionMessage"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
@@ -42,6 +67,10 @@ class SessionRecord(Base):
         back_populates="session",
         cascade="all, delete-orphan",
     )
+
+    # 关联关系（新增）
+    user: Mapped["UserRecord"] = relationship("UserRecord", foreign_keys=[user_id], back_populates="sessions")
+    workspace: Mapped["WorkspaceRecord"] = relationship("WorkspaceRecord", foreign_keys=[workspace_id], back_populates="sessions")
 
 
 class SessionMessage(Base):

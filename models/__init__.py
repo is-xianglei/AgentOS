@@ -9,6 +9,8 @@ from models.team import (
     TeamRecord,
 )
 from models.tool import ToolCallRecord
+from models.user import UserRecord
+from models.workspace import WorkspaceMemberRecord, WorkspaceRecord
 
 __all__ = [
     "SessionRecord",
@@ -22,4 +24,7 @@ __all__ = [
     "SubAgentRunRecord",
     "PermissionRuleRecord",
     "SkillRecord",
+    "UserRecord",
+    "WorkspaceRecord",
+    "WorkspaceMemberRecord",
 ]

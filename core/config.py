@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     skill_exec_timeout: int = 30  # 单次执行超时(秒)
     skill_exec_max_output: int = 65536  # stdout/stderr 各自字节上限
 
+    # --- JWT 认证 -----------------------
+    jwt_secret_key: str = "change-this-secret-key-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 15
+    jwt_refresh_token_expire_days: int = 7
+
     @classmethod
     def settings_customise_sources(
         cls,

@@ -44,9 +44,11 @@ from tools.subagents.registry import get_subagent_spec
 
 
 class AgentRuntime:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, user_id: int | None = None, workspace_id: int | None = None):
         """初始化 Agent 主运行时依赖。"""
         self.db = db
+        self.user_id = user_id
+        self.workspace_id = workspace_id
         self.session_service = SessionService(db)
         self.compact_service = CompactService(self.session_service.repo)
         self.permission_service = PermissionService(db)
@@ -78,7 +80,9 @@ class AgentRuntime:
         """后台生产者:跑完整流程,所有事件 emit 到 bus,最终 close。"""
         session: SessionRecord | None = None
         try:
-            session: SessionRecord = await self.session_service.prepare_for_message(session_id, user_content)
+            session: SessionRecord = await self.session_service.prepare_for_message(
+                session_id, user_content, self.user_id, self.workspace_id
+            )
             session_id = session.id
             # UserPromptSubmit:进 LLM 前触发,hook 可返回 additional_context 注入到用户输入之后。
             user_content = await self._apply_user_prompt_hooks(session_id, user_content)

@@ -89,15 +89,13 @@ class PermissionService:
             source="user",
             matcher=matcher,
         )
-        await self.db.commit()
         return rule
 
     async def delete_rule(self, rule_id: int) -> int:
-        """删除一条规则并提交事务;规则不存在时抛 AgentException。"""
+        """删除一条规则;规则不存在时抛 AgentException。提交交给请求边界统一处理。"""
         deleted: int = await self.repo.delete(rule_id)
         if deleted == 0:
             raise AgentException.message("权限规则不存在")
-        await self.db.commit()
         return deleted
 
     def _coerce(self, behavior: str, tool_name: str) -> Behavior:

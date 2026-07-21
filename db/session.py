@@ -52,9 +52,19 @@ def _filter_soft_deleted(state) -> None:
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """请求级事务边界:一次 HTTP 请求 = 一个事务。
+
+    service / repository 层只做 add / flush,绝不 commit;请求处理成功后由本依赖
+    统一 commit,任何异常则整体 rollback。这样跨 service 的多步写入(如注册时建
+    user + 建 workspace + 建 member)要么全部成功,要么全部回滚,不留孤儿数据。
+
+    注:流式 Agent 执行(agent_runtime / subagent_runner)在后台任务里自行按步
+    commit 做增量持久化,其 session 用完后此处的收尾 commit 已无未提交变更,是安全的空操作。
+    """
     async with AsyncSessionLocal() as db:
         try:
             yield db
+            await db.commit()
         except Exception:
             await db.rollback()
             raise

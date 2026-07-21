@@ -192,7 +192,7 @@ class SkillService:
             version=bundle.version,
             skill_hash=skill_hash,
         )
-        await self.db.commit()
+        # 提交交给请求边界（get_db）统一处理
         return record
 
     async def validate(self, file_bytes: bytes) -> SkillValidateResult:

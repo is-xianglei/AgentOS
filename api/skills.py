@@ -83,5 +83,5 @@ async def get_skill(name: str, request: Request, db: AsyncSession = Depends(get_
 async def delete_skill(name: str, request: Request, db: AsyncSession = Depends(get_db)):
     service = SkillService(db)
     deleted = await service.repo.soft_delete(name)
-    await db.commit()
+    # 提交交给请求边界（get_db）统一处理
     return ok({"deleted": deleted}, request)
