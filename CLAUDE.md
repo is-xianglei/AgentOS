@@ -14,6 +14,20 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pyte
 5. 只有流式 Agent 或后台运行时为了增量持久化才能分步 commit，并应注释生命周期原因。
 6. 所有数据库、LLM、事件流和工具 I/O 使用 async/await；异步流标注 AsyncIterator。
 7. 新增 ORM 后同步更新 models/__init__.py，并提供显式 Alembic upgrade/downgrade 迁移。
+8. feature 包之间只允许 Service 调 Service，不得跨域直接使用别的域的
+   Repository 或自行拼写别域表的 SQL；本域 Service 才能访问本域 Repository。
+9. 需要读写别域数据时，在数据所属域的 Service 上补公开方法，由该域负责
+   参数校验、业务规则和事务内的副作用；调用方只做转发，不重复实现规则。
+10. 判断归属看表的所有者：操作哪张表就归哪个域，不看谁先需要这个功能。
+    例如任务认领由 team 域触发，但 tasks 表属 task 域，方法就应放在 task 域。
+11. 跨域转发方法不要重复上游已做的校验（如会话存在性），避免同一次调用
+    重复查询；校验放在数据所属域的 Service，转发层保持空壳。
+12. 跨域调用产生的状态变更，其事件推送责任属数据所属域的 Service，
+    调用方按需透传 bus，不自行 emit 别域的事件。
+13. ORM 实体可以跨域导入（外键与 relationship 天然跨域），
+    但仅限类型引用和关系声明，不得据此绕过 Service 直接改别域数据。
+14. 确实需要跨域读模型对象时优先返回本域 Schema；
+    返回别域 ORM 实体仅限内部编排，不要直接透出到 API 响应。
 
 命名与类型：
 1. 文件、函数和变量使用 snake_case；类使用 PascalCase；常量使用 UPPER_SNAKE_CASE。
