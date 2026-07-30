@@ -2,14 +2,13 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
-from core.responses import ok
+from core.responses import ApiResponse, ok
 from permission.schemas import (
     PermissionRuleCreateRequest,
     PermissionRuleDeleteResult,
     PermissionRuleResponse,
 )
 from permission.service import PermissionService
-from schemas.common import ApiResponse
 
 router = APIRouter()
 

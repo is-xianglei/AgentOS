@@ -71,7 +71,7 @@ class AgentTool(BaseTool):
     ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
         from db.engine import AsyncSessionLocal
-        from services.subagent_runner import SubAgentRunner
+        from runtime.subagent import SubAgentRunner
 
         async with AsyncSessionLocal() as sub_db:
             return await SubAgentRunner(sub_db, bus=bus).run(

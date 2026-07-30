@@ -33,7 +33,7 @@ from llm.types import (
 )
 from models.tool import ToolCallRecord
 from permission.service import DANGEROUS_TOOLS, PermissionService
-from services.compact_service import CompactService
+from runtime.compact import CompactService
 from memory.job_service import MemoryJobRunner, MemoryJobService
 from memory.recall_service import MemoryRecallService
 from skill.service import SkillService
@@ -823,7 +823,7 @@ class AgentRuntime:
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
         from db.engine import AsyncSessionLocal
-        from services.subagent_runner import SubAgentRunner
+        from runtime.subagent import SubAgentRunner
         from team.service import TeamService
 
         members = await TeamService(self.db).list_members(session_id)

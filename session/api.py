@@ -6,10 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
-from core.responses import ok
-from user.models import UserRecord
-from schemas.common import ApiResponse
-from services.agent_runtime import AgentRuntime, format_sse
+from core.responses import ApiResponse, ok
+from runtime.agent import AgentRuntime, format_sse
 from session.schemas import (
     SessionApprovalRequest,
     SessionBatchDeleteRequest,
@@ -20,6 +18,7 @@ from session.schemas import (
     SessionSendMessageRequest,
 )
 from session.service import SessionService
+from user.models import UserRecord
 
 router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]

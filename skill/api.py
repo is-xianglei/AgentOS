@@ -3,8 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
 from core.errors import AgentException
-from core.responses import ok
-from schemas.common import ApiResponse
+from core.responses import ApiResponse, ok
 from skill.schemas import SkillDetailResponse, SkillResponse, SkillValidateResult
 from skill.service import SkillService
 

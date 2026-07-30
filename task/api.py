@@ -2,8 +2,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
-from core.responses import ok
-from schemas.common import ApiResponse
+from core.responses import ApiResponse, ok
 from task.schemas import TaskResponse
 from task.service import TaskService
 

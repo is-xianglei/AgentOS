@@ -2,9 +2,8 @@ from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_db
-from core.responses import ok
+from core.responses import ApiResponse, ok
 from user.models import UserRecord
-from schemas.common import ApiResponse
 from user.schemas import (
     UserChangePasswordRequest,
     UserCreateRequest,

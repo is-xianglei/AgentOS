@@ -4,9 +4,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 
 from api.deps import DatabaseSession, get_current_active_user, get_current_workspace_id
-from core.responses import ok
+from core.responses import ApiResponse, ok
 from user.models import UserRecord
-from schemas.common import ApiResponse
 from memory.schemas import (
     MemoryCreateRequest,
     MemoryDeleteRequest,

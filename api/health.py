@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Request
 
-from core.responses import ok
-from schemas.common import ApiResponse, HealthData
+from core.responses import ApiResponse, HealthData, ok
 
 router = APIRouter()
 
