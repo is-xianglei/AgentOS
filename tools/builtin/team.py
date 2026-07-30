@@ -14,8 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from schemas.team import TeamMemberResponse, TeamMessageResponse, TeamResponse
-from services.team_service import TeamService
+from team.schemas import TeamMemberResponse, TeamMessageResponse, TeamResponse
+from team.service import TeamService
 from tools.base import BaseTool, ToolContext
 
 

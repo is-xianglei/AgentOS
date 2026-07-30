@@ -4,8 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_db
 from core.responses import ok
 from schemas.common import ApiResponse
-from schemas.team import SubAgentRunResponse, TeamMemberResponse, TeamMessageResponse
-from services.team_service import TeamService
+from team.schemas import SubAgentRunResponse, TeamMemberResponse, TeamMessageResponse
+from team.service import TeamService
 
 router = APIRouter()
 

@@ -1,21 +1,22 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from services.team_task_isolation import (
+from session.service import SessionService
+from task.models import TaskRecord
+from task.repository import TaskRepository
+from team.isolation import (
     current_team_task_instance_id,
     outgoing_team_task_consumer_instance_id,
     team_task_debug_isolation_enabled,
 )
-from task.models import TaskRecord
-from models.team import (
+from team.models import (
     SubAgentRunRecord,
     TeamMemberRecord,
     TeamMessageRecord,
     TeamRecord,
 )
-from repositories.subagent_run_repo import SubAgentRunRepository
-from repositories.team_repo import TeamRepository
-from session.service import SessionService
+from team.repository import TeamRepository
+from team.subagent_run_repository import SubAgentRunRepository
 
 
 class TeamService:
@@ -23,6 +24,8 @@ class TeamService:
         """初始化团队服务依赖。"""
         self.repo = TeamRepository(db)
         self.run_repo = SubAgentRunRepository(db)
+        # 任务认领操作 task 域的表,经其 repository 访问而非在 team repo 里自行拼 SQL。
+        self.task_repo = TaskRepository(db)
         self.session_service = SessionService(db)
 
     async def list_members(self, session_id: int) -> list[TeamMemberRecord]:
@@ -214,17 +217,17 @@ class TeamService:
             delivered += 1
         return delivered
 
-    # ----- 任务认领(委托 repo,多实例安全) -----
+    # ----- 任务认领(委托 task 域 repo,多实例安全) -----
 
     async def list_claimable_tasks(self, session_id: int) -> list[TaskRecord]:
-        """查本会话可认领任务,委托 repo。"""
+        """查本会话可认领任务,委托 task 域 repo。"""
         await self.session_service.get_required(session_id)
-        return await self.repo.list_claimable_tasks(session_id)
+        return await self.task_repo.list_claimable_tasks(session_id)
 
     async def claim_task(self, session_id: int, task_id: int, owner: str) -> tuple[bool, str]:
-        """以条件 UPDATE 认领任务,委托 repo,返回 (是否成功, 原因)。"""
+        """以条件 UPDATE 认领任务,委托 task 域 repo,返回 (是否成功, 原因)。"""
         await self.session_service.get_required(session_id)
-        return await self.repo.claim_task(session_id, task_id, owner)
+        return await self.task_repo.claim_task(session_id, task_id, owner)
 
     def _validate_member_input(self, name: str, role: str) -> None:
         """校验团队成员名称和角色。"""

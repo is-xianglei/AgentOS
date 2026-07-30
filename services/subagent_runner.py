@@ -22,9 +22,9 @@ from llm.types import (
     text_from_content,
 )
 from repositories.memory_recall_repo import MemoryRecallRepository
-from repositories.subagent_run_repo import SubAgentRunRepository
-from services.team_service import TeamService
-from services.team_task_isolation import (
+from team.subagent_run_repository import SubAgentRunRepository
+from team.service import TeamService
+from team.isolation import (
     new_team_task_instance_id,
     reset_team_task_instance_id,
     set_team_task_instance_id,

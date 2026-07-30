@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.memory import TurnMemoryContextRecord
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from task.models import TaskRecord
-from models.team import (
+from team.models import (
     SubAgentRunRecord,
     TeamMemberRecord,
     TeamMessageRecord,

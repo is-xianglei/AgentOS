@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.team import SubAgentRunRecord
+from team.models import SubAgentRunRecord
 
 
 class SubAgentRunRepository:

@@ -824,7 +824,7 @@ class AgentRuntime:
         """
         from db.engine import AsyncSessionLocal
         from services.subagent_runner import SubAgentRunner
-        from services.team_service import TeamService
+        from team.service import TeamService
 
         members = await TeamService(self.db).list_members(session_id)
         working = [m for m in members if m.status == "working"]
