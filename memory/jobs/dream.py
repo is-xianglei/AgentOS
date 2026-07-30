@@ -16,7 +16,7 @@ from core.config import settings
 from core.errors import AgentException
 from llm.client import LLMClient
 from memory.models import MemoryItemRecord, MemoryRevisionRecord, MemorySpaceRecord
-from memory.job_repository import MemoryJobRepository
+from memory.jobs.repository import MemoryJobRepository
 from memory.repository import MemoryDreamEntry, MemoryRepository
 from memory.service import MEMORY_BODY_MAX_BYTES
 

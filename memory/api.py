@@ -33,7 +33,7 @@ from memory.schemas import (
     MemoryType,
     MemoryUpdateRequest,
 )
-from memory.dream_service import MemoryDreamService
+from memory.jobs.dream import MemoryDreamService
 from memory.service import (
     MemoryDetail,
     MemoryExportResult,

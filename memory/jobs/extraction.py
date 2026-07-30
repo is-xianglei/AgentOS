@@ -15,7 +15,7 @@ from core.config import settings
 from llm.client import LLMClient
 from memory.models import MemoryItemRecord
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
-from memory.job_repository import MemoryJobRepository
+from memory.jobs.repository import MemoryJobRepository
 from memory.repository import MemoryCatalogEntry, MemoryRepository
 from session.repository import SessionRepository
 from memory.service import MEMORY_BODY_MAX_BYTES, MEMORY_CATALOG_MAX_ITEMS

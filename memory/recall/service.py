@@ -13,7 +13,7 @@ from core.config import settings
 from llm.client import LLMClient
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from session.models import SessionTurnRecord
-from memory.recall_repository import (
+from memory.recall.repository import (
     MemoryLexicalCandidate,
     MemoryRecallRepository,
 )

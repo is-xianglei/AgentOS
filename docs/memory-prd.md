@@ -767,10 +767,10 @@ HookContext 增加 `principal/turn_id/actor`。所有 Hook 必须：
 Worker 使用独立进程启动：
 
 ```bash
-uv run python -m memory.worker
+uv run python -m memory.jobs.worker
 ```
 
-`memory.worker` 必须处理 SIGTERM：停止 Claim 新 Job，给当前 Job 最多 30 秒完成；未完成时保留或
+`memory.jobs.worker` 必须处理 SIGTERM：停止 Claim 新 Job，给当前 Job 最多 30 秒完成；未完成时保留或
 主动缩短 Lease，使其他 Worker 能恢复。Worker 不暴露业务 API，仅暴露独立的 metrics/health 端口。
 
 ---

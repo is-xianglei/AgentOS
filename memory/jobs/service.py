@@ -14,16 +14,16 @@ from db.engine import AsyncSessionLocal
 from llm.client import LLMClient
 from memory.models import MemoryJobRecord
 from session.models import SessionRecord, SessionTurnRecord
-from memory.job_repository import MemoryJobRepository
+from memory.jobs.repository import MemoryJobRepository
 from memory.repository import MemoryRepository
-from memory.dream_service import (
+from memory.jobs.dream import (
     DreamApplyResult,
     MemoryDreamFailure,
     MemoryDreamResult,
     MemoryDreamService,
     PreparedDream,
 )
-from memory.extraction_service import (
+from memory.jobs.extraction import (
     MemoryApplyResult,
     MemoryExtractionFailure,
     MemoryExtractionResult,
