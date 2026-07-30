@@ -6,7 +6,7 @@ from services.team_task_isolation import (
     outgoing_team_task_consumer_instance_id,
     team_task_debug_isolation_enabled,
 )
-from models.task import TaskRecord
+from task.models import TaskRecord
 from models.team import (
     SubAgentRunRecord,
     TeamMemberRecord,

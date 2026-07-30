@@ -3,7 +3,6 @@ from fastapi import APIRouter
 from api import (
     health,
     memories,
-    tasks,
     teams,
     tools,
 )
@@ -11,6 +10,7 @@ from auth import api as auth_api
 from permission import api as permission_api
 from session import api as session_api
 from skill import api as skill_api
+from task import api as task_api
 from user import api as user_api
 from workspace import api as workspace_api
 
@@ -20,7 +20,7 @@ api_router.include_router(auth_api.router, prefix="/auth", tags=["auth"])
 api_router.include_router(memories.router, prefix="/memories", tags=["memories"])
 api_router.include_router(session_api.router, prefix="/sessions", tags=["sessions"])
 api_router.include_router(tools.router, prefix="/tools", tags=["tools"])
-api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
+api_router.include_router(task_api.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(teams.router, prefix="/teams", tags=["teams"])
 api_router.include_router(permission_api.router, prefix="/permissions", tags=["permissions"])
 api_router.include_router(skill_api.router, prefix="/skills", tags=["skills"])

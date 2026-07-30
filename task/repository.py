@@ -1,7 +1,7 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.task import TaskRecord
+from task.models import TaskRecord
 
 
 class TaskRepository:

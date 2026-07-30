@@ -3,9 +3,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import RuntimeEvent
-from models.task import TaskRecord
-from repositories.task_repo import TaskRepository
-from schemas.task import TaskResponse
+from task.models import TaskRecord
+from task.repository import TaskRepository
+from task.schemas import TaskResponse
 from session.service import SessionService
 
 VALID_TASK_STATUSES = {"pending", "in_progress", "completed"}

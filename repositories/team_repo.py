@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.task import TaskRecord
+from task.models import TaskRecord
 from models.team import TeamMemberRecord, TeamMessageRecord, TeamRecord
 
 

@@ -13,6 +13,7 @@ from session.models import (  # noqa: F401
     SessionTurnRecord,
 )
 from skill.models import SkillRecord  # noqa: F401
+from task.models import TaskRecord  # noqa: F401
 from user.models import UserRecord  # noqa: F401
 from workspace.models import WorkspaceMemberRecord, WorkspaceRecord  # noqa: F401
 
@@ -24,7 +25,6 @@ from models import (  # noqa: F401
     MemorySourceRecord,
     MemorySpaceRecord,
     SubAgentRunRecord,
-    TaskRecord,
     TeamMemberRecord,
     TeamMessageRecord,
     TeamRecord,

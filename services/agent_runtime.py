@@ -37,7 +37,7 @@ from services.compact_service import CompactService
 from services.memory_job_service import MemoryJobRunner, MemoryJobService
 from services.memory_recall_service import MemoryRecallService
 from skill.service import SkillService
-from services.task_service import TaskService
+from task.service import TaskService
 from services.tool_service import ToolService
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from session.service import SessionService

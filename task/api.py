@@ -4,8 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_db
 from core.responses import ok
 from schemas.common import ApiResponse
-from schemas.task import TaskResponse
-from services.task_service import TaskService
+from task.schemas import TaskResponse
+from task.service import TaskService
 
 router = APIRouter()
 

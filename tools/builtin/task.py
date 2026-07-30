@@ -3,8 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from schemas.task import TaskResponse
-from services.task_service import TaskService
+from task.schemas import TaskResponse
+from task.service import TaskService
 from tools.base import BaseTool, ToolContext
 
 
