@@ -34,8 +34,8 @@ from llm.types import (
 from models.tool import ToolCallRecord
 from permission.service import DANGEROUS_TOOLS, PermissionService
 from services.compact_service import CompactService
-from services.memory_job_service import MemoryJobRunner, MemoryJobService
-from services.memory_recall_service import MemoryRecallService
+from memory.job_service import MemoryJobRunner, MemoryJobService
+from memory.recall_service import MemoryRecallService
 from skill.service import SkillService
 from task.service import TaskService
 from services.tool_service import ToolService

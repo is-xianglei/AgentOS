@@ -13,12 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from llm.client import LLMClient
-from models.memory import MemoryItemRecord
+from memory.models import MemoryItemRecord
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
-from repositories.memory_job_repo import MemoryJobRepository
-from repositories.memory_repo import MemoryCatalogEntry, MemoryRepository
+from memory.job_repository import MemoryJobRepository
+from memory.repository import MemoryCatalogEntry, MemoryRepository
 from session.repository import SessionRepository
-from services.memory_service import MEMORY_BODY_MAX_BYTES, MEMORY_CATALOG_MAX_ITEMS
+from memory.service import MEMORY_BODY_MAX_BYTES, MEMORY_CATALOG_MAX_ITEMS
 
 _MEMORY_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
 # 英文凭据模式与中文敏感表述并列维护；中文模式匹配“密码是/为/：值”这类口语化泄露。

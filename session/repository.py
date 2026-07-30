@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.memory import TurnMemoryContextRecord
+from memory.models import TurnMemoryContextRecord
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from task.models import TaskRecord
 from team.models import (

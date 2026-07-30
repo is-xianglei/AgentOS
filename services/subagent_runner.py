@@ -21,7 +21,7 @@ from llm.types import (
     extract_tool_uses,
     text_from_content,
 )
-from repositories.memory_recall_repo import MemoryRecallRepository
+from memory.recall_repository import MemoryRecallRepository
 from team.subagent_run_repository import SubAgentRunRepository
 from team.service import TeamService
 from team.isolation import (

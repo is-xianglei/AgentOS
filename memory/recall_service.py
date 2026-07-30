@@ -11,15 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from llm.client import LLMClient
-from models.memory import MemoryRevisionRecord, TurnMemoryContextRecord
+from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from session.models import SessionTurnRecord
-from repositories.memory_recall_repo import (
+from memory.recall_repository import (
     MemoryLexicalCandidate,
     MemoryRecallRepository,
 )
-from repositories.memory_repo import MemoryCatalogEntry, MemoryRepository
-from services.memory_rollout_service import MemoryRolloutService
-from services.memory_service import MemoryService
+from memory.repository import MemoryCatalogEntry, MemoryRepository
+from memory.rollout_service import MemoryRolloutService
+from memory.service import MemoryService
 
 logger = logging.getLogger(__name__)
 

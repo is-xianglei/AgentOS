@@ -15,10 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from llm.client import LLMClient
-from models.memory import MemoryItemRecord, MemoryRevisionRecord, MemorySpaceRecord
-from repositories.memory_job_repo import MemoryJobRepository
-from repositories.memory_repo import MemoryDreamEntry, MemoryRepository
-from services.memory_service import MEMORY_BODY_MAX_BYTES
+from memory.models import MemoryItemRecord, MemoryRevisionRecord, MemorySpaceRecord
+from memory.job_repository import MemoryJobRepository
+from memory.repository import MemoryDreamEntry, MemoryRepository
+from memory.service import MEMORY_BODY_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 

@@ -4,14 +4,14 @@ from uuid import UUID
 from sqlalchemy import func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.memory import (
+from memory.models import (
     MemoryItemRecord,
     MemoryRevisionRecord,
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
 from session.models import SessionMessage, SessionTurnRecord
-from repositories.memory_repo import MemoryCatalogEntry
+from memory.repository import MemoryCatalogEntry
 
 
 @dataclass(frozen=True)

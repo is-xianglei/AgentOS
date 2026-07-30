@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from db.engine import AsyncSessionLocal
-from repositories.memory_repo import MemoryPhysicalDeleteCounts, MemoryRepository
+from memory.repository import MemoryPhysicalDeleteCounts, MemoryRepository
 
 _ARCHIVED_ITEM_DAYS_KEY = "archived_item_retention_days"
 _TERMINAL_JOB_DAYS_KEY = "terminal_job_retention_days"

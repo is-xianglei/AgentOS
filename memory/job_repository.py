@@ -8,7 +8,7 @@ from sqlalchemy import ColumnElement, and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.memory import MemoryJobRecord, MemorySpaceRecord
+from memory.models import MemoryJobRecord, MemorySpaceRecord
 
 
 class MemoryJobRepository:

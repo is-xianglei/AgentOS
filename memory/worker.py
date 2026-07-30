@@ -5,8 +5,8 @@ import time
 
 from core.config import settings
 from db.engine import AsyncSessionLocal
-from services.memory_job_service import MemoryJobRunner
-from services.memory_retention_service import MemoryRetentionRunner
+from memory.job_service import MemoryJobRunner
+from memory.retention_service import MemoryRetentionRunner
 
 logger = logging.getLogger(__name__)
 

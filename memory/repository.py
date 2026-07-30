@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from models.memory import (
+from memory.models import (
     MemoryItemRecord,
     MemoryJobRecord,
     MemoryRevisionRecord,

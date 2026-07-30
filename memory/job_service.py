@@ -12,25 +12,25 @@ from core.config import settings
 from core.errors import AgentException
 from db.engine import AsyncSessionLocal
 from llm.client import LLMClient
-from models.memory import MemoryJobRecord
+from memory.models import MemoryJobRecord
 from session.models import SessionRecord, SessionTurnRecord
-from repositories.memory_job_repo import MemoryJobRepository
-from repositories.memory_repo import MemoryRepository
-from services.memory_dream_service import (
+from memory.job_repository import MemoryJobRepository
+from memory.repository import MemoryRepository
+from memory.dream_service import (
     DreamApplyResult,
     MemoryDreamFailure,
     MemoryDreamResult,
     MemoryDreamService,
     PreparedDream,
 )
-from services.memory_extraction_service import (
+from memory.extraction_service import (
     MemoryApplyResult,
     MemoryExtractionFailure,
     MemoryExtractionResult,
     MemoryExtractionService,
     PreparedMemoryExtraction,
 )
-from services.memory_rollout_service import MemoryRolloutService
+from memory.rollout_service import MemoryRolloutService
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ from api.deps import DatabaseSession, get_current_active_user, get_current_works
 from core.responses import ok
 from user.models import UserRecord
 from schemas.common import ApiResponse
-from schemas.memory import (
+from memory.schemas import (
     MemoryCreateRequest,
     MemoryDeleteRequest,
     MemoryDeleteResponse,
@@ -34,8 +34,8 @@ from schemas.memory import (
     MemoryType,
     MemoryUpdateRequest,
 )
-from services.memory_dream_service import MemoryDreamService
-from services.memory_service import (
+from memory.dream_service import MemoryDreamService
+from memory.service import (
     MemoryDetail,
     MemoryExportResult,
     MemoryExportRunner,
