@@ -8,7 +8,7 @@ from core.errors import AgentException
 from llm.types import ToolResultMessage
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from session.repository import SessionRepository
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 
 class SessionService:

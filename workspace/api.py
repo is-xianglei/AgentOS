@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_db
 from core.responses import ok
 from schemas.common import ApiResponse
-from schemas.workspace import (
+from workspace.schemas import (
     WorkspaceCreateRequest,
     WorkspaceMemberDetailResponse,
     WorkspaceMemberInviteRequest,
@@ -12,7 +12,7 @@ from schemas.workspace import (
     WorkspaceResponse,
     WorkspaceUpdateRequest,
 )
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 router = APIRouter()
 

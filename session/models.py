@@ -23,7 +23,7 @@ from db.base import Base, json_type
 
 if TYPE_CHECKING:
     from models.user import UserRecord
-    from models.workspace import WorkspaceRecord
+    from workspace.models import WorkspaceRecord
 
 
 class SessionRecord(Base):

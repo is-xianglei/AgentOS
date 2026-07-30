@@ -10,7 +10,7 @@ from core.errors import AgentException
 from db.engine import get_db
 from models.user import UserRecord
 from services.auth_service import AuthService
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 security = HTTPBearer(auto_error=False)
 SecurityCredentials = Annotated[HTTPAuthorizationCredentials | None, Depends(security)]

@@ -9,10 +9,10 @@ from api import (
     teams,
     tools,
     users,
-    workspaces,
 )
 from permission import api as permission_api
 from session import api as session_api
+from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(health.router, tags=["health"])
@@ -25,4 +25,4 @@ api_router.include_router(teams.router, prefix="/teams", tags=["teams"])
 api_router.include_router(permission_api.router, prefix="/permissions", tags=["permissions"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
-api_router.include_router(workspaces.router, prefix="/workspaces", tags=["workspaces"])
+api_router.include_router(workspace_api.router, prefix="/workspaces", tags=["workspaces"])

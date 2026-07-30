@@ -7,9 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from models import WorkspaceRecord
 from models.user import UserRecord
 from repositories.user_repo import UserRepository
+from workspace.models import WorkspaceRecord
 
 
 class AuthService:
@@ -55,7 +55,7 @@ class AuthService:
         # 若工作区创建失败则 user 一并回滚,避免孤儿用户。
 
         # 自动创建个人工作区
-        from services.workspace_service import WorkspaceService
+        from workspace.service import WorkspaceService
         workspace_service = WorkspaceService(self.db)
         workspace: WorkspaceRecord = await workspace_service.create_workspace(
             creator_user_id=user.id,
@@ -98,7 +98,7 @@ class AuthService:
         user.last_login_at = datetime.utcnow()
 
         # 获取用户的第一个工作区（优先个人工作区）
-        from services.workspace_service import WorkspaceService
+        from workspace.service import WorkspaceService
         workspace_service = WorkspaceService(self.db)
         user_workspaces = await workspace_service.list_user_workspaces(user.id)
 

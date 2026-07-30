@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from db.base import Base, json_type
 
 if TYPE_CHECKING:
-    from models.workspace import WorkspaceMemberRecord
+    from workspace.models import WorkspaceMemberRecord
     from session.models import SessionRecord
 
 

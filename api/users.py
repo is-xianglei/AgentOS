@@ -11,9 +11,9 @@ from schemas.user import (
     UserResponse,
     UserUpdateRequest,
 )
-from schemas.workspace import WorkspaceResponse
+from workspace.schemas import WorkspaceResponse
 from services.user_service import UserService
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 router = APIRouter()
 

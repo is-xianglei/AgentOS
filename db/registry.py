@@ -12,6 +12,7 @@ from session.models import (  # noqa: F401
     SessionSnapshot,
     SessionTurnRecord,
 )
+from workspace.models import WorkspaceMemberRecord, WorkspaceRecord  # noqa: F401
 
 # 仍位于 models/ 的实体（随域迁移逐步移出）
 from models import (  # noqa: F401
@@ -29,6 +30,4 @@ from models import (  # noqa: F401
     ToolCallRecord,
     TurnMemoryContextRecord,
     UserRecord,
-    WorkspaceMemberRecord,
-    WorkspaceRecord,
 )

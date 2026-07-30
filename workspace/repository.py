@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from models.user import UserRecord
-from models.workspace import WorkspaceMemberRecord, WorkspaceRecord
+from workspace.models import WorkspaceMemberRecord, WorkspaceRecord
 
 
 class WorkspaceRepository:

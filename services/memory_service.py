@@ -26,7 +26,7 @@ from repositories.memory_repo import (
     MemoryPhysicalDeleteCounts,
     MemoryRepository,
 )
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 MEMORY_BODY_MAX_BYTES = 16 * 1024
 MEMORY_CATALOG_MAX_BYTES = 25 * 1024

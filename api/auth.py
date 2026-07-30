@@ -14,7 +14,7 @@ from schemas.auth import (
     UserInfo,
 )
 from services.auth_service import AuthService
-from services.workspace_service import WorkspaceService
+from workspace.service import WorkspaceService
 
 router = APIRouter()
 
