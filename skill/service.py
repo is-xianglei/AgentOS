@@ -12,9 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import SKILL_EXEC_INTERPRETERS, settings
 from core.errors import AgentException
-from core.skill_executor import ExecResult, Executor, get_executor
-from skill.parser import parse_skill_md, validate_frontmatter
+from core.executor import ExecResult, Executor, get_executor
 from core.storage import ObjectStorage, get_object_storage, skill_object_key
+from skill.parser import parse_skill_md, validate_frontmatter
 from skill.models import SkillRecord
 from skill.repository import SkillRepository
 from skill.schemas import SkillDetailResponse, SkillResourceItem, SkillValidateResult

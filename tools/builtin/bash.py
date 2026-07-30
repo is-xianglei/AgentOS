@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from core.config import settings
 from core.errors import AgentException
-from core.skill_executor import get_executor
+from core.executor import get_executor
 from tools.base import BaseTool, ToolContext
 
 
@@ -28,7 +28,7 @@ class BashTool(BaseTool):
             if not workdir.is_dir():
                 raise AgentException.message(f"工作目录不是目录: {workdir}")
 
-            # 使用 bash -c 执行命令,与 skill_executor 保持一致的最小环境变量
+            # 使用 bash -c 执行命令,与 core/executor.py 保持一致的最小环境变量
             executor = get_executor()
             env = {
                 "PATH": os.environ.get("PATH", ""),

@@ -1,5 +1,5 @@
 """技能域：SKILL.md 解析校验、技能元数据与资源读取、脚本执行入口。
 
-进程沙箱执行器仍在 core/skill_executor.py：它同时被 Bash 工具复用，
+进程沙箱执行器在 core/executor.py：它同时被 Bash 工具复用，
 属跨域基础设施，不随本域迁入。
 """
