@@ -1,7 +1,16 @@
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, false, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def json_type() -> JSONB:
+    """JSON 列类型的统一入口，便于后续按方言切换实现。
+
+    历史上各 models 模块各自定义了同名函数，新代码统一从此处导入。
+    """
+    return JSONB()
 
 
 class Base(DeclarativeBase):

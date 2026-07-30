@@ -3,8 +3,7 @@ from typing import Any
 from sqlalchemy import ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from db.base import Base
-from models.session import json_type
+from db.base import Base, json_type
 
 
 class PermissionRuleRecord(Base):

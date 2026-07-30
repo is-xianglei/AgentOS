@@ -3,13 +3,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db
 from core.responses import ok
-from schemas.common import ApiResponse
-from schemas.permission import (
+from permission.schemas import (
     PermissionRuleCreateRequest,
     PermissionRuleDeleteResult,
     PermissionRuleResponse,
 )
-from services.permission_service import PermissionService
+from permission.service import PermissionService
+from schemas.common import ApiResponse
 
 router = APIRouter()
 

@@ -1,0 +1,33 @@
+"""ORM 模型注册入口：导入所有实体，确保 Base.metadata 与映射关系完整。
+
+Alembic autogenerate 与字符串式 relationship() 都依赖此处的副作用导入。
+遗漏任一模块会导致自动迁移误判为删表，因此新增实体必须同步登记到这里。
+"""
+
+# 按 feature 包组织的实体
+import permission.models  # noqa: F401
+
+# 仍位于 models/ 的实体（随域迁移逐步移出）
+from models import (  # noqa: F401
+    MemoryItemRecord,
+    MemoryJobRecord,
+    MemoryRevisionRecord,
+    MemorySourceRecord,
+    MemorySpaceRecord,
+    SessionMessage,
+    SessionRecord,
+    SessionSnapshot,
+    SessionTurnRecord,
+    SkillRecord,
+    SubAgentRunRecord,
+    TaskRecord,
+    TeamMemberRecord,
+    TeamMessageRecord,
+    TeamRecord,
+    ToolCallRecord,
+    TurnMemoryContextRecord,
+    UserRecord,
+    WorkspaceMemberRecord,
+    WorkspaceRecord,
+)
+from permission.models import PermissionRuleRecord  # noqa: F401

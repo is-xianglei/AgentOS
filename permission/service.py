@@ -3,8 +3,8 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from models.permission import PermissionRuleRecord
-from repositories.permission_repo import PermissionRepository
+from permission.models import PermissionRuleRecord
+from permission.repository import PermissionRepository
 
 Scope = Literal["global", "session"]
 

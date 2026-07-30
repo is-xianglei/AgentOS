@@ -33,10 +33,10 @@ from llm.types import (
 )
 from models import SessionMessage, SessionRecord, SessionTurnRecord
 from models.tool import ToolCallRecord
+from permission.service import DANGEROUS_TOOLS, PermissionService
 from services.compact_service import CompactService
 from services.memory_job_service import MemoryJobRunner, MemoryJobService
 from services.memory_recall_service import MemoryRecallService
-from services.permission_service import DANGEROUS_TOOLS, PermissionService
 from services.session_service import SessionService
 from services.skill_service import SkillService
 from services.task_service import TaskService

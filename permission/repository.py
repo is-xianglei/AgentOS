@@ -4,7 +4,7 @@ from typing import Any
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.permission import PermissionRuleRecord
+from permission.models import PermissionRuleRecord
 
 
 class PermissionRepository:

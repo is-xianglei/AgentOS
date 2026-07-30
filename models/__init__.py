@@ -1,3 +1,5 @@
+"""仍按分层组织的 ORM 实体聚合；已迁移到 feature 包的实体见 db/registry.py。"""
+
 from models.memory import (
     MemoryItemRecord,
     MemoryJobRecord,
@@ -6,7 +8,6 @@ from models.memory import (
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from models.permission import PermissionRuleRecord
 from models.session import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from models.skill import SkillRecord
 from models.task import TaskRecord
@@ -26,7 +27,6 @@ __all__ = [
     "MemoryRevisionRecord",
     "MemorySourceRecord",
     "MemorySpaceRecord",
-    "PermissionRuleRecord",
     "SessionMessage",
     "SessionRecord",
     "SessionSnapshot",

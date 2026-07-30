@@ -5,7 +5,7 @@ from sqlalchemy import create_engine, pool
 
 from core.config import settings
 from db.base import Base
-import models  # noqa: F401
+import db.registry  # noqa: F401  汇总所有实体，autogenerate 依赖其副作用导入
 
 config = context.config
 

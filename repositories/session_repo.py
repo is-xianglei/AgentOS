@@ -6,7 +6,6 @@ from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.memory import TurnMemoryContextRecord
-from models.permission import PermissionRuleRecord
 from models.session import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from models.task import TaskRecord
 from models.team import (
@@ -16,6 +15,7 @@ from models.team import (
     TeamRecord,
 )
 from models.tool import ToolCallRecord
+from permission.models import PermissionRuleRecord
 
 # 会话软删除时需一并标记的子表(均以 session_id 关联)。
 # 物理删除靠外键 ON DELETE CASCADE 清理,软删除只改标记,故须在此显式登记。
