@@ -3,8 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_db
 from core.errors import AgentException
-from models.user import UserRecord
-from schemas.auth import (
+from user.models import UserRecord
+from auth.schemas import (
     AuthResponse,
     LoginRequest,
     RefreshTokenRequest,
@@ -13,7 +13,7 @@ from schemas.auth import (
     TokenResponse,
     UserInfo,
 )
-from services.auth_service import AuthService
+from auth.service import AuthService
 from workspace.service import WorkspaceService
 
 router = APIRouter()

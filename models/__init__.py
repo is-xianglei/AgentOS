@@ -17,7 +17,6 @@ from models.team import (
     TeamRecord,
 )
 from models.tool import ToolCallRecord
-from models.user import UserRecord
 
 __all__ = [
     "MemoryItemRecord",
@@ -33,5 +32,4 @@ __all__ = [
     "TeamRecord",
     "ToolCallRecord",
     "TurnMemoryContextRecord",
-    "UserRecord",
 ]

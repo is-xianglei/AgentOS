@@ -3,16 +3,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_db
 from core.responses import ok
-from models.user import UserRecord
+from user.models import UserRecord
 from schemas.common import ApiResponse
-from schemas.user import (
+from user.schemas import (
     UserChangePasswordRequest,
     UserCreateRequest,
     UserResponse,
     UserUpdateRequest,
 )
 from workspace.schemas import WorkspaceResponse
-from services.user_service import UserService
+from user.service import UserService
 from workspace.service import WorkspaceService
 
 router = APIRouter()

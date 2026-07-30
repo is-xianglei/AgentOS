@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
 from workspace.models import WorkspaceMemberRecord, WorkspaceRecord
-from repositories.user_repo import UserRepository
+from user.repository import UserRepository
 from workspace.repository import WorkspaceMemberRepository, WorkspaceRepository
 
 

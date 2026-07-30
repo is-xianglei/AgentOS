@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from db.engine import get_db
-from models.user import UserRecord
-from services.auth_service import AuthService
+from user.models import UserRecord
+from auth.service import AuthService
 from workspace.service import WorkspaceService
 
 security = HTTPBearer(auto_error=False)

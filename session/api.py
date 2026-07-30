@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ok
-from models.user import UserRecord
+from user.models import UserRecord
 from schemas.common import ApiResponse
 from services.agent_runtime import AgentRuntime, format_sse
 from session.schemas import (

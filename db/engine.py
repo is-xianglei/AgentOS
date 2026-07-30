@@ -7,6 +7,12 @@ from sqlalchemy.orm import Session, with_loader_criteria
 from core.config import settings
 from db.base import Base
 
+# 实体分散到各 feature 包后，导入单个模型不再连带注册其余实体，
+# 而跨包的字符串式 relationship（如 UserRecord.sessions 指向 SessionRecord）
+# 要求映射配置时全部实体在册，否则首次查询即报 InvalidRequestError。
+# 在此副作用导入 registry，保证“能拿到 session 就一定已注册全部映射”。
+import db.registry  # noqa: F401,E402
+
 DATABASE_URL = settings.database_url
 
 # Supabase pooler(事务模式)不支持服务端 prepared statements,

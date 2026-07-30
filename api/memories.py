@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from api.deps import DatabaseSession, get_current_active_user, get_current_workspace_id
 from core.responses import ok
-from models.user import UserRecord
+from user.models import UserRecord
 from schemas.common import ApiResponse
 from schemas.memory import (
     MemoryCreateRequest,

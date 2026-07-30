@@ -2,8 +2,8 @@ import hashlib
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from models.user import UserRecord
-from repositories.user_repo import UserRepository
+from user.models import UserRecord
+from user.repository import UserRepository
 
 
 class UserService:
