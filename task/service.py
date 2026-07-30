@@ -106,6 +106,23 @@ class TaskService:
         await self.emit_snapshot(session_id, "updated")
         return updated
 
+    # ----- 任务认领(多实例安全) -----
+    # 供 team 域子代理认领任务;跨域调用一律经本 service,不暴露 repository。
+
+    async def list_claimable_tasks(self, session_id: int) -> list[TaskRecord]:
+        """查本会话可认领的任务: 待处理、无负责人、无阻塞。"""
+        await self.session_service.get_required(session_id)
+        return await self.repo.list_claimable_tasks(session_id)
+
+    async def claim_task(self, session_id: int, task_id: int, owner: str) -> tuple[bool, str]:
+        """以条件 UPDATE 认领任务,返回 (是否成功, 原因)。
+
+        并发下多个子代理可能同时抢同一条,失败方拿到 (False, "unavailable"),
+        由调用方跳过即可,不视为错误。
+        """
+        await self.session_service.get_required(session_id)
+        return await self.repo.claim_task(session_id, task_id, owner)
+
     def _validate_status(self, status: str) -> None:
         """校验任务状态是否合法。"""
         if status not in VALID_TASK_STATUSES:

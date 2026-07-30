@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from session.service import SessionService
 from task.models import TaskRecord
-from task.repository import TaskRepository
+from task.service import TaskService
 from team.isolation import (
     current_team_task_instance_id,
     outgoing_team_task_consumer_instance_id,
@@ -24,8 +24,8 @@ class TeamService:
         """初始化团队服务依赖。"""
         self.repo = TeamRepository(db)
         self.run_repo = SubAgentRunRepository(db)
-        # 任务认领操作 task 域的表,经其 repository 访问而非在 team repo 里自行拼 SQL。
-        self.task_repo = TaskRepository(db)
+        # 任务认领属 task 域,跨域调用经其 service,不直接持有 repository。
+        self.task_service = TaskService(db)
         self.session_service = SessionService(db)
 
     async def list_members(self, session_id: int) -> list[TeamMemberRecord]:
@@ -217,17 +217,16 @@ class TeamService:
             delivered += 1
         return delivered
 
-    # ----- 任务认领(委托 task 域 repo,多实例安全) -----
+    # ----- 任务认领(委托 task 域 service,多实例安全) -----
+    # 会话存在性校验由 TaskService 负责,此处不重复校验以免同一次认领查两遍。
 
     async def list_claimable_tasks(self, session_id: int) -> list[TaskRecord]:
-        """查本会话可认领任务,委托 task 域 repo。"""
-        await self.session_service.get_required(session_id)
-        return await self.task_repo.list_claimable_tasks(session_id)
+        """查本会话可认领任务,委托 task 域 service。"""
+        return await self.task_service.list_claimable_tasks(session_id)
 
     async def claim_task(self, session_id: int, task_id: int, owner: str) -> tuple[bool, str]:
-        """以条件 UPDATE 认领任务,委托 task 域 repo,返回 (是否成功, 原因)。"""
-        await self.session_service.get_required(session_id)
-        return await self.task_repo.claim_task(session_id, task_id, owner)
+        """以条件 UPDATE 认领任务,委托 task 域 service,返回 (是否成功, 原因)。"""
+        return await self.task_service.claim_task(session_id, task_id, owner)
 
     def _validate_member_input(self, name: str, role: str) -> None:
         """校验团队成员名称和角色。"""
