@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from llm.client import LLMClient
 from models.memory import MemoryRevisionRecord, TurnMemoryContextRecord
-from models.session import SessionTurnRecord
+from session.models import SessionTurnRecord
 from repositories.memory_recall_repo import (
     MemoryLexicalCandidate,
     MemoryRecallRepository,

@@ -6,7 +6,7 @@ from core.events import RuntimeEvent
 from models.task import TaskRecord
 from repositories.task_repo import TaskRepository
 from schemas.task import TaskResponse
-from services.session_service import SessionService
+from session.service import SessionService
 
 VALID_TASK_STATUSES = {"pending", "in_progress", "completed"}
 

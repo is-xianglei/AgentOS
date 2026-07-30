@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import settings
 from core.errors import AgentException
-from db.session import AsyncSessionLocal
+from db.engine import AsyncSessionLocal
 from llm.client import LLMClient
 from models.memory import MemoryJobRecord
-from models.session import SessionRecord, SessionTurnRecord
+from session.models import SessionRecord, SessionTurnRecord
 from repositories.memory_job_repo import MemoryJobRepository
 from repositories.memory_repo import MemoryRepository
 from services.memory_dream_service import (

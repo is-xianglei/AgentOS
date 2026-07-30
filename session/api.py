@@ -9,7 +9,8 @@ from core.errors import AgentException
 from core.responses import ok
 from models.user import UserRecord
 from schemas.common import ApiResponse
-from schemas.session import (
+from services.agent_runtime import AgentRuntime, format_sse
+from session.schemas import (
     SessionApprovalRequest,
     SessionBatchDeleteRequest,
     SessionDeleteResult,
@@ -18,8 +19,7 @@ from schemas.session import (
     SessionResponse,
     SessionSendMessageRequest,
 )
-from services.agent_runtime import AgentRuntime, format_sse
-from services.session_service import SessionService
+from session.service import SessionService
 
 router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]

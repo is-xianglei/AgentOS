@@ -17,7 +17,7 @@ from models.memory import (
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from models.session import SessionTurnRecord
+from session.models import SessionTurnRecord
 
 
 @dataclass(frozen=True)

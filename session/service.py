@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
 from llm.types import ToolResultMessage
-from models.session import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
-from repositories.session_repo import SessionRepository
+from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
+from session.repository import SessionRepository
 from services.workspace_service import WorkspaceService
 
 

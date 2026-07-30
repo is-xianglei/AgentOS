@@ -31,16 +31,16 @@ from llm.types import (
     ToolUse,
     extract_tool_uses,
 )
-from models import SessionMessage, SessionRecord, SessionTurnRecord
 from models.tool import ToolCallRecord
 from permission.service import DANGEROUS_TOOLS, PermissionService
 from services.compact_service import CompactService
 from services.memory_job_service import MemoryJobRunner, MemoryJobService
 from services.memory_recall_service import MemoryRecallService
-from services.session_service import SessionService
 from services.skill_service import SkillService
 from services.task_service import TaskService
 from services.tool_service import ToolService
+from session.models import SessionMessage, SessionRecord, SessionTurnRecord
+from session.service import SessionService
 from tools.registry import build_tool_registry
 from tools.subagents.definition import AgentType
 from tools.subagents.registry import get_subagent_spec
@@ -822,7 +822,7 @@ class AgentRuntime:
         每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
-        from db.session import AsyncSessionLocal
+        from db.engine import AsyncSessionLocal
         from services.subagent_runner import SubAgentRunner
         from services.team_service import TeamService
 

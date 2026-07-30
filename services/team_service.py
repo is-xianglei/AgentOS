@@ -15,7 +15,7 @@ from models.team import (
 )
 from repositories.subagent_run_repo import SubAgentRunRepository
 from repositories.team_repo import TeamRepository
-from services.session_service import SessionService
+from session.service import SessionService
 
 
 class TeamService:

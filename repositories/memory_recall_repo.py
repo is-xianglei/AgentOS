@@ -10,7 +10,7 @@ from models.memory import (
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from models.session import SessionMessage, SessionTurnRecord
+from session.models import SessionMessage, SessionTurnRecord
 from repositories.memory_repo import MemoryCatalogEntry
 
 

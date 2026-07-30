@@ -2,19 +2,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import String, DateTime, Boolean
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from db.base import Base
+from db.base import Base, json_type
 
 if TYPE_CHECKING:
     from models.workspace import WorkspaceMemberRecord
-    from models.session import SessionRecord
-
-
-def json_type():
-    return JSONB()
+    from session.models import SessionRecord
 
 
 class UserRecord(Base):

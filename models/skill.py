@@ -4,7 +4,7 @@ from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
-from models.session import json_type
+from db.base import json_type
 
 
 class SkillRecord(Base):

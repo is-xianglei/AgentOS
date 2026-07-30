@@ -4,7 +4,7 @@ import signal
 import time
 
 from core.config import settings
-from db.session import AsyncSessionLocal
+from db.engine import AsyncSessionLocal
 from services.memory_job_service import MemoryJobRunner
 from services.memory_retention_service import MemoryRetentionRunner
 

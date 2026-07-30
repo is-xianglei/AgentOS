@@ -4,7 +4,6 @@ from api import (
     auth,
     health,
     memories,
-    sessions,
     skills,
     tasks,
     teams,
@@ -13,12 +12,13 @@ from api import (
     workspaces,
 )
 from permission import api as permission_api
+from session import api as session_api
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(memories.router, prefix="/memories", tags=["memories"])
-api_router.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
+api_router.include_router(session_api.router, prefix="/sessions", tags=["sessions"])
 api_router.include_router(tools.router, prefix="/tools", tags=["tools"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(teams.router, prefix="/teams", tags=["teams"])

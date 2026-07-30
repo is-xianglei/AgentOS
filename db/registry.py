@@ -5,7 +5,13 @@ Alembic autogenerate 与字符串式 relationship() 都依赖此处的副作用�
 """
 
 # 按 feature 包组织的实体
-import permission.models  # noqa: F401
+from permission.models import PermissionRuleRecord  # noqa: F401
+from session.models import (  # noqa: F401
+    SessionMessage,
+    SessionRecord,
+    SessionSnapshot,
+    SessionTurnRecord,
+)
 
 # 仍位于 models/ 的实体（随域迁移逐步移出）
 from models import (  # noqa: F401
@@ -14,10 +20,6 @@ from models import (  # noqa: F401
     MemoryRevisionRecord,
     MemorySourceRecord,
     MemorySpaceRecord,
-    SessionMessage,
-    SessionRecord,
-    SessionSnapshot,
-    SessionTurnRecord,
     SkillRecord,
     SubAgentRunRecord,
     TaskRecord,
@@ -30,4 +32,3 @@ from models import (  # noqa: F401
     WorkspaceMemberRecord,
     WorkspaceRecord,
 )
-from permission.models import PermissionRuleRecord  # noqa: F401

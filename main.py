@@ -15,7 +15,7 @@ from core.errors import (
 )
 from core.logging import request_context_middleware, setup_logging
 from db.base import Base
-from db.session import engine
+from db.engine import engine
 from hooks.builtin import register_builtin_hooks
 
 

@@ -6,7 +6,7 @@ from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.memory import TurnMemoryContextRecord
-from models.session import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
+from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from models.task import TaskRecord
 from models.team import (
     SubAgentRunRecord,

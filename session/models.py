@@ -15,20 +15,15 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from db.base import Base
+from db.base import Base, json_type
 
 if TYPE_CHECKING:
     from models.user import UserRecord
     from models.workspace import WorkspaceRecord
-
-
-def json_type():
-    return JSONB()
 
 
 class SessionRecord(Base):

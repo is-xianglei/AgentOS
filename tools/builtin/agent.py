@@ -70,7 +70,7 @@ class AgentTool(BaseTool):
         workspace_id: int | None,
     ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
-        from db.session import AsyncSessionLocal
+        from db.engine import AsyncSessionLocal
         from services.subagent_runner import SubAgentRunner
 
         async with AsyncSessionLocal() as sub_db:

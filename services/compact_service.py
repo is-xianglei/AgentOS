@@ -5,7 +5,7 @@ from anthropic.types import MessageParam
 
 from llm.client import LLMClient
 from llm.types import chunk_type, text_from_content
-from repositories.session_repo import SessionRepository
+from session.repository import SessionRepository
 
 # 压缩 L1 的保留参考资料工具白名单:这类工具的输出一旦被替换,模型只能重读文件,反而更费 token.
 _PRESERVE_TOOL_NAMES: frozenset[str] = frozenset({"read_file"})

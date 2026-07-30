@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from db.session import get_db
+from db.engine import get_db
 from models.user import UserRecord
 from services.auth_service import AuthService
 from services.workspace_service import WorkspaceService
