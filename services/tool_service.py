@@ -1,4 +1,5 @@
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +28,9 @@ class ToolService:
         bus: StreamBus | None = None,
         record: ToolCallRecord | None = None,
         actor: Actor | None = None,
+        turn_id: UUID | None = None,
+        user_id: int | None = None,
+        workspace_id: int | None = None,
     ) -> str:
         """执行工具并记录调用状态。
 
@@ -47,6 +51,7 @@ class ToolService:
                 event=HookEvent.PRE_TOOL_USE,
                 session_id=session_id,
                 actor=actor,
+                turn_id=turn_id,
                 tool_name=tool_name,
                 tool_input=input_args,
             )
@@ -73,7 +78,15 @@ class ToolService:
 
         try:
             tool = self.registry.get(tool_name)
-            ctx = ToolContext(session_id=session_id, db=self.db, bus=bus)
+            ctx = ToolContext(
+                session_id=session_id,
+                db=self.db,
+                bus=bus,
+                turn_id=turn_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            # 开始执行工具
             output = await tool.run_with_dict(input_args, ctx)
         except Exception as exc:
             await self.tool_repo.fail(record, str(exc))
@@ -84,6 +97,7 @@ class ToolService:
                     event=HookEvent.POST_TOOL_USE,
                     session_id=session_id,
                     actor=actor,
+                    turn_id=turn_id,
                     tool_name=tool_name,
                     tool_input=input_args,
                     tool_output=str(exc),
@@ -100,6 +114,7 @@ class ToolService:
                 event=HookEvent.POST_TOOL_USE,
                 session_id=session_id,
                 actor=actor,
+                turn_id=turn_id,
                 tool_name=tool_name,
                 tool_input=input_args,
                 tool_output=output,

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -11,7 +12,6 @@ _ENV_FILE = _PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
-
     model_config = SettingsConfigDict(
         env_prefix="AGENTOS_",
         env_file=_ENV_FILE,
@@ -50,6 +50,47 @@ class Settings(BaseSettings):
     skill_exec_enabled: bool = True
     skill_exec_timeout: int = 30  # 单次执行超时(秒)
     skill_exec_max_output: int = 65536  # stdout/stderr 各自字节上限
+
+    # --- 长期 Memory -----------------------
+    memory_selector_model: str | None = None
+    memory_selector_timeout_seconds: float = 5.0
+    memory_selector_query_max_chars: int = 12_000
+    memory_recall_max_items: int = 5
+    memory_recall_item_max_bytes: int = 4 * 1024
+    memory_recall_item_max_lines: int = 200
+    memory_session_max_bytes: int = 60 * 1024
+    memory_extraction_enabled: bool = True
+    memory_extraction_inline: bool = True
+    memory_extractor_model: str | None = None
+    memory_extractor_timeout_seconds: float = 20.0
+    memory_extractor_prompt_version: str = "v1"
+    memory_extractor_max_messages: int = 10
+    memory_extractor_max_chars: int = 20_000
+    memory_extractor_max_items: int = 5
+    memory_job_max_attempts: int = 5
+    memory_job_lease_seconds: int = 300
+    memory_job_claim_batch_size: int = 10
+    memory_worker_poll_seconds: float = 1.0
+    memory_dream_enabled: bool = True
+    memory_dream_model: str | None = None
+    memory_dream_timeout_seconds: float = 60.0
+    memory_dream_prompt_version: str = "v1"
+    memory_dream_min_items: int = 10
+    memory_dream_min_sessions: int = 5
+    memory_dream_interval_seconds: int = 24 * 60 * 60
+    memory_dream_scan_interval_seconds: int = 60 * 60
+    memory_dream_lease_seconds: int = 60 * 60
+    memory_dream_max_input_chars: int = 120_000
+    memory_dream_max_operations: int = 100
+    memory_retention_enabled: bool = True
+    memory_archived_item_retention_days: int = Field(default=90, ge=0, le=36_500)
+    memory_terminal_job_retention_days: int = Field(default=30, ge=0, le=36_500)
+    memory_retention_batch_size: int = Field(default=100, ge=1, le=10_000)
+    memory_retention_interval_seconds: int = Field(default=60 * 60, ge=1)
+    memory_rollout_salt: str = "agentos-memory-v1"
+    memory_recall_rollout_percent: int = Field(default=0, ge=0, le=100)
+    memory_dream_rollout_percent: int = Field(default=0, ge=0, le=100)
+    memory_extraction_shadow_enabled: bool = True
 
     # --- JWT 认证 -----------------------
     jwt_secret_key: str = "change-this-secret-key-in-production"

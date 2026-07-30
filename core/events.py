@@ -387,6 +387,18 @@ class RuntimeEvent:
     sequence: int | None = None
 
     @classmethod
+    def session_ready(cls, session_id: int, title: str, status: str) -> "RuntimeEvent":
+        """会话就绪事件:前端据此拿 session 元信息建立 UI。
+
+        首轮流式运行与审批恢复复用同一份 payload,字段名收在此处避免调用点各写一遍。
+        参数取标量而非 ORM 对象,保持 core 层不依赖 models。
+        """
+        return cls(
+            type="session_ready",
+            data={"session_id": session_id, "title": title, "status": status},
+        )
+
+    @classmethod
     def task_snapshot(
         cls, session_id: int, tasks: list[dict[str, Any]], reason: str | None = None
     ) -> "RuntimeEvent":

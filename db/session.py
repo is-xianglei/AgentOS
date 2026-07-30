@@ -51,7 +51,7 @@ def _filter_soft_deleted(state) -> None:
     )
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db() -> AsyncGenerator[AsyncSession]:
     """请求级事务边界:一次 HTTP 请求 = 一个事务。
 
     service / repository 层只做 add / flush,绝不 commit;请求处理成功后由本依赖

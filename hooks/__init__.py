@@ -11,12 +11,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from uuid import UUID
 
 from core.events import Actor
+
+logger = logging.getLogger(__name__)
 
 
 class HookEvent(str, Enum):
@@ -46,6 +50,7 @@ class HookContext:
     event: HookEvent
     session_id: int
     actor: Actor
+    turn_id: UUID | None = None
     user_content: str | None = None
     tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
@@ -105,7 +110,25 @@ class HookRegistry:
         """
         outcomes: list[HookOutcome] = []
         for callback in self._hooks[ctx.event]:
-            result = await asyncio.wait_for(callback(ctx), timeout=60)
+            callback_name = getattr(callback, "__qualname__", repr(callback))
+            try:
+                result = await asyncio.wait_for(callback(ctx), timeout=60)
+            except TimeoutError:
+                logger.warning(
+                    "Hook 执行超时，已按 fail-open 放行：事件=%s，回调=%s",
+                    ctx.event.value,
+                    callback_name,
+                    extra={"session_id": ctx.session_id, "turn_id": str(ctx.turn_id or "")},
+                )
+                continue
+            except Exception:
+                logger.exception(
+                    "Hook 执行失败，已按 fail-open 放行：事件=%s，回调=%s",
+                    ctx.event.value,
+                    callback_name,
+                    extra={"session_id": ctx.session_id, "turn_id": str(ctx.turn_id or "")},
+                )
+                continue
             if result is not None:
                 outcomes.append(result)
         return outcomes
@@ -121,10 +144,10 @@ def get_hook_registry() -> HookRegistry:
 
 
 __all__ = [
-    "HookEvent",
-    "HookContext",
-    "HookOutcome",
     "HookCallback",
+    "HookContext",
+    "HookEvent",
+    "HookOutcome",
     "HookRegistry",
     "get_hook_registry",
 ]

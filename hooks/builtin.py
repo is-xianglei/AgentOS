@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from hooks import (
     HookContext,
     HookEvent,
@@ -14,21 +16,37 @@ from hooks import (
     get_hook_registry,
 )
 
+logger = logging.getLogger(__name__)
+
 
 async def user_prompt_submit(ctx: HookContext) -> HookOutcome | None:
-    print(f'用户提交了消息 - {ctx.user_content}...')
+    logger.debug("用户已提交消息", extra={"session_id": ctx.session_id})
     return None
+
 
 async def pre_tool_use(ctx: HookContext) -> HookOutcome | None:
-    print(f'{ctx.tool_name} - 工具准备开始执行...')
+    logger.debug(
+        "工具准备开始执行：%s",
+        ctx.tool_name,
+        extra={"session_id": ctx.session_id, "turn_id": str(ctx.turn_id or "")},
+    )
     return None
+
 
 async def post_tool_use(ctx: HookContext) -> HookOutcome | None:
-    print(f'{ctx.tool_name} - 工具已执行完成...')
+    logger.debug(
+        "工具已执行完成：%s",
+        ctx.tool_name,
+        extra={"session_id": ctx.session_id, "turn_id": str(ctx.turn_id or "")},
+    )
     return None
 
+
 async def stop(ctx: HookContext) -> HookOutcome | None:
-    print(f'{ctx.session_id} - 会话即将结束...')
+    logger.debug(
+        "交互轮次即将结束",
+        extra={"session_id": ctx.session_id, "turn_id": str(ctx.turn_id or "")},
+    )
     return None
 
 

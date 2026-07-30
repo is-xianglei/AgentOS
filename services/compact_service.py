@@ -33,6 +33,7 @@ class CompactService:
         self,
         session_id: int,
         messages: list[dict[str, Any]],
+        through_message_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """LLM 调用前的两级压缩入口。
 
@@ -46,7 +47,13 @@ class CompactService:
 
         compacted = await self._auto_compact(messages)
         summary = compacted[0]["content"] if compacted else ""
-        await self.session_repo.add_snapshot(session_id, compacted, summary)
+        if through_message_id is not None:
+            await self.session_repo.add_snapshot(
+                session_id,
+                compacted,
+                summary,
+                through_message_id=through_message_id,
+            )
         return compacted
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:

@@ -4,14 +4,19 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
+import models  # noqa: F401
 from api.router import api_router
 from core.config import settings
-from hooks.builtin import register_builtin_hooks
-from core.errors import AgentException, agent_error_handler, unhandled_error_handler, validation_error_handler
+from core.errors import (
+    AgentException,
+    agent_error_handler,
+    unhandled_error_handler,
+    validation_error_handler,
+)
 from core.logging import request_context_middleware, setup_logging
 from db.base import Base
 from db.session import engine
-import models  # noqa: F401
+from hooks.builtin import register_builtin_hooks
 
 
 @asynccontextmanager
@@ -37,7 +42,6 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
     app.include_router(api_router)
-
     return app
 
 

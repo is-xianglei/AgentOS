@@ -37,6 +37,7 @@ class ToolResultMessage:
     tool_name: str
     input_args: dict[str, Any]
     output: str
+    is_error: bool = False
 
     def to_content_dict(self) -> dict[str, Any]:
         """序列化为落库的 content dict。"""
@@ -45,19 +46,19 @@ class ToolResultMessage:
             "tool_name": self.tool_name,
             "input_args": self.input_args,
             "output": self.output,
+            "is_error": self.is_error,
         }
 
     @classmethod
-    def from_content_dict(cls, content: dict[str, Any]) -> "ToolResultMessage":
+    def from_content_dict(cls, content: dict[str, Any]) -> ToolResultMessage:
         """从落库的 content dict 还原。"""
         return cls(
             tool_use_id=content["tool_use_id"],
             tool_name=content.get("tool_name", ""),
             input_args=content.get("input_args") or {},
             output=content["output"],
+            is_error=bool(content.get("is_error", False)),
         )
-
-
 
 
 def chunk_type(chunk: LLMRawChunk) -> str | None:
@@ -70,9 +71,9 @@ def chunk_text(chunk: LLMRawChunk) -> str:
     """从原始 content_block_delta 中取出文本增量,非文本事件返回空串。"""
     delta = chunk.get("delta")
     if (
-            isinstance(delta, dict)
-            and delta.get("type") == "text_delta"
-            and isinstance(delta.get("text"), str)
+        isinstance(delta, dict)
+        and delta.get("type") == "text_delta"
+        and isinstance(delta.get("text"), str)
     ):
         return delta["text"]
     return ""
@@ -94,7 +95,6 @@ def text_from_content(content: list[dict[str, Any]] | None) -> str:
         for block in (content or [])
         if isinstance(block, dict) and block.get("type") == "text"
     )
-
 
 
 _BLOCK_TYPE_MAP = {
@@ -140,7 +140,6 @@ class AnthropicStreamTranslator:
         """最近一次 message_final 的停止原因(供 turn_end 使用)。"""
         return self._stop_reason
 
-
     def translate(self, chunk: LLMRawChunk) -> list[StreamEvent]:
         """翻译单个原始 chunk 为零或多个协议事件。"""
         ctype = chunk.get("type")
@@ -166,9 +165,7 @@ class AnthropicStreamTranslator:
             tool_id=cb.get("id", "") or "",
             tool_name=cb.get("name", "") or "",
         )
-        return [
-            StreamEvent.block_start(self._actor, self._session_id, index, block_type)
-        ]
+        return [StreamEvent.block_start(self._actor, self._session_id, index, block_type)]
 
     def _on_block_delta(self, chunk: LLMRawChunk) -> list[StreamEvent]:
         index = int(chunk.get("index", 0))
@@ -176,9 +173,7 @@ class AnthropicStreamTranslator:
         dtype = delta.get("type")
         if dtype == "text_delta":
             return [
-                StreamEvent.text_delta(
-                    self._actor, self._session_id, index, delta.get("text", "")
-                )
+                StreamEvent.text_delta(self._actor, self._session_id, index, delta.get("text", ""))
             ]
         if dtype == "thinking_delta":
             return [
@@ -195,7 +190,6 @@ class AnthropicStreamTranslator:
         # signature_delta 等:噪声,不产出。
         return []
 
-
     def _on_block_stop(self, chunk: LLMRawChunk) -> list[StreamEvent]:
         import json as _json
 
@@ -210,9 +204,7 @@ class AnthropicStreamTranslator:
             except _json.JSONDecodeError:
                 tool_input = {}
             tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
-            return [
-                StreamEvent.tool_use(self._actor, self._session_id, index, tool)
-            ]
+            return [StreamEvent.tool_use(self._actor, self._session_id, index, tool)]
         return [StreamEvent.block_stop(self._actor, self._session_id, index)]
 
     def _on_message_final(self, chunk: LLMRawChunk) -> None:
@@ -223,15 +215,6 @@ class AnthropicStreamTranslator:
             self._last_usage = Usage(
                 input_tokens=int(usage.get("input_tokens", 0) or 0),
                 output_tokens=int(usage.get("output_tokens", 0) or 0),
-                cache_creation_input_tokens=int(
-                    usage.get("cache_creation_input_tokens", 0) or 0
-                ),
-                cache_read_input_tokens=int(
-                    usage.get("cache_read_input_tokens", 0) or 0
-                ),
+                cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
+                cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
             )
-
-
-
-
-

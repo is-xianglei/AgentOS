@@ -7,19 +7,31 @@ from fastapi.responses import JSONResponse
 
 
 class AgentException(Exception):
-    """业务异常:状态码固定 500,携带可读消息与可选详情。"""
+    """业务异常，携带可读消息、可选详情和 HTTP 状态码。"""
 
     status_code = 500
 
-    def __init__(self, message: str, details: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+        status_code: int | None = None,
+    ):
         self.message = message
         self.details = details or {}
+        self.status_code = status_code or type(self).status_code
         super().__init__(message)
 
     @classmethod
-    def message(cls, message: str, details: dict[str, Any] | None = None) -> "AgentException":
+    def message(
+        cls,
+        message: str,
+        details: dict[str, Any] | None = None,
+        *,
+        status_code: int | None = None,
+    ) -> AgentException:
         """业务异常唯一入口。"""
-        return cls(message, details)
+        return cls(message, details, status_code)
 
 
 def error_payload(request: Request, message: str, details: dict[str, Any] | None = None):

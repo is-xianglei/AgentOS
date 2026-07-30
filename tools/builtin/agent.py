@@ -1,11 +1,13 @@
 import json
 from dataclasses import asdict, dataclass
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from core.event_bus import StreamBus
 from tools.base import BaseTool, ToolContext
-from tools.subagents.definition import AgentType
+from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import get_subagent_spec
 
 
@@ -32,9 +34,7 @@ class AgentToolInput(BaseModel):
         description=f"要启动的子代理类型,可选: {_AGENT_TYPES}",
     )
     prompt: str = Field(description="分派给子代理的完整任务描述")
-    description: str | None = Field(
-        default=None, description="3-5 个词的任务简述,便于展示与追踪"
-    )
+    description: str | None = Field(default=None, description="3-5 个词的任务简述,便于展示与追踪")
 
 
 class AgentTool(BaseTool):
@@ -48,15 +48,37 @@ class AgentTool(BaseTool):
 
     async def run(self, args: AgentToolInput, ctx: ToolContext) -> str:
         spec = get_subagent_spec(args.agent_type)
-        report = await self._dispatch(ctx.session_id, args.prompt, spec, ctx.bus)
-        return _dumps(
-            SubAgentRunReport(agent=args.agent_type.value, report=report)
+        report = await self._dispatch(
+            ctx.session_id,
+            args.prompt,
+            spec,
+            ctx.bus,
+            ctx.turn_id,
+            ctx.user_id,
+            ctx.workspace_id,
         )
+        return _dumps(SubAgentRunReport(agent=args.agent_type.value, report=report))
 
-    async def _dispatch(self, session_id: int, prompt: str, spec, bus) -> str:
+    async def _dispatch(
+        self,
+        session_id: int,
+        prompt: str,
+        spec: SubAgentSpec,
+        bus: StreamBus | None,
+        parent_turn_id: UUID | None,
+        user_id: int | None,
+        workspace_id: int | None,
+    ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
         from db.session import AsyncSessionLocal
         from services.subagent_runner import SubAgentRunner
 
         async with AsyncSessionLocal() as sub_db:
-            return await SubAgentRunner(sub_db, bus=bus).run(session_id, prompt, spec)
+            return await SubAgentRunner(sub_db, bus=bus).run(
+                session_id,
+                prompt,
+                spec,
+                parent_turn_id=parent_turn_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )

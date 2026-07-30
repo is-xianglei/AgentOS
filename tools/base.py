@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from anthropic.types import ToolParam
 from pydantic import BaseModel, ValidationError
@@ -14,6 +15,9 @@ class ToolContext:
     session_id: int
     db: AsyncSession
     bus: StreamBus | None = None
+    turn_id: UUID | None = None
+    user_id: int | None = None
+    workspace_id: int | None = None
 
 
 class BaseTool(ABC):

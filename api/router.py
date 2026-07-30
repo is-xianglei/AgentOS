@@ -1,10 +1,23 @@
 from fastapi import APIRouter
 
-from api import auth, health, permissions, sessions, skills, tasks, teams, tools, users, workspaces
+from api import (
+    auth,
+    health,
+    memories,
+    permissions,
+    sessions,
+    skills,
+    tasks,
+    teams,
+    tools,
+    users,
+    workspaces,
+)
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(memories.router, prefix="/memories", tags=["memories"])
 api_router.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
 api_router.include_router(tools.router, prefix="/tools", tags=["tools"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])

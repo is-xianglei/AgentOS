@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,7 +54,7 @@ class WorkspaceService:
         await self.member_repo.create(
             workspace_id=workspace.id,
             user_id=creator_user_id,
-            joined_at=datetime.utcnow(),
+            joined_at=datetime.now(UTC),
         )
 
         # 提交交给请求边界（get_db）统一处理，保证与调用方（如注册建 user）同事务原子提交
@@ -67,9 +67,7 @@ class WorkspaceService:
             raise AgentException.message("工作区不存在")
         return workspace
 
-    async def list_workspaces(
-        self, limit: int = 100, offset: int = 0
-    ) -> list[WorkspaceRecord]:
+    async def list_workspaces(self, limit: int = 100, offset: int = 0) -> list[WorkspaceRecord]:
         """获取工作区列表"""
         return await self.repo.list_all(limit=limit, offset=offset)
 
@@ -114,10 +112,28 @@ class WorkspaceService:
 
     async def is_member(self, workspace_id: int, user_id: int) -> bool:
         """检查用户是否是工作区成员"""
-        member = await self.member_repo.get_by_workspace_and_user(
-            workspace_id, user_id
-        )
+        member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
         return member is not None
+
+    async def is_active_member(self, workspace_id: int, user_id: int) -> bool:
+        """检查工作区可用且用户已经正式加入。"""
+        workspace = await self.repo.get_by_id(workspace_id)
+        if workspace is None or workspace.is_deleted or workspace.suspended:
+            return False
+        member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
+        return member is not None and member.joined_at is not None
+
+    async def require_active_member(self, workspace_id: int, user_id: int) -> WorkspaceRecord:
+        """校验可信工作区作用域，不满足时拒绝请求。"""
+        workspace = await self.repo.get_by_id(workspace_id)
+        if workspace is None or workspace.is_deleted:
+            raise AgentException.message("当前工作区不存在")
+        if workspace.suspended:
+            raise AgentException.message("当前工作区已被停用")
+        member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
+        if member is None or member.joined_at is None:
+            raise AgentException.message("当前用户不是该工作区的有效成员")
+        return workspace
 
     # ===== 成员管理 =====
 
@@ -126,7 +142,7 @@ class WorkspaceService:
     ) -> WorkspaceMemberRecord:
         """邀请成员加入工作区"""
         # 验证工作区存在
-        workspace = await self.get_workspace(workspace_id)
+        await self.get_workspace(workspace_id)
 
         # 验证邀请人是工作区成员
         if not await self.is_member(workspace_id, inviter_user_id):
@@ -152,16 +168,14 @@ class WorkspaceService:
             workspace_id=workspace_id,
             user_id=invited_user.id,
             invited_by=inviter_user_id,
-            invited_at=datetime.utcnow(),
+            invited_at=datetime.now(UTC),
             joined_at=None,  # 待接受邀请
         )
 
         # TODO: 发送邀请邮件
         return member
 
-    async def accept_invite(
-        self, workspace_id: int, user_id: int
-    ) -> WorkspaceMemberRecord:
+    async def accept_invite(self, workspace_id: int, user_id: int) -> WorkspaceMemberRecord:
         """接受工作区邀请"""
         member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
         if not member:
@@ -171,21 +185,17 @@ class WorkspaceService:
             raise AgentException.message("已经加入工作区")
 
         # 更新加入时间
-        member.joined_at = datetime.utcnow()
+        member.joined_at = datetime.now(UTC)
         await self.member_repo.update(member)
         return member
 
-    async def list_members(
-        self, workspace_id: int
-    ) -> list[tuple[WorkspaceMemberRecord, dict]]:
+    async def list_members(self, workspace_id: int) -> list[tuple[WorkspaceMemberRecord, dict]]:
         """获取工作区成员列表（包含用户信息）"""
         # 验证工作区存在
         await self.get_workspace(workspace_id)
 
         # 查询成员和用户信息
-        members_with_users = await self.member_repo.list_by_workspace_with_user(
-            workspace_id
-        )
+        members_with_users = await self.member_repo.list_by_workspace_with_user(workspace_id)
 
         # 转换为返回格式
         result = []
@@ -204,9 +214,7 @@ class WorkspaceService:
             )
         return result
 
-    async def remove_member(
-        self, workspace_id: int, user_id: int, operator_user_id: int
-    ) -> None:
+    async def remove_member(self, workspace_id: int, user_id: int, operator_user_id: int) -> None:
         """移除工作区成员"""
         # 验证工作区存在
         await self.get_workspace(workspace_id)
@@ -223,9 +231,7 @@ class WorkspaceService:
         # 软删除成员
         await self.member_repo.delete(member)
 
-    async def get_member(
-        self, workspace_id: int, user_id: int
-    ) -> WorkspaceMemberRecord:
+    async def get_member(self, workspace_id: int, user_id: int) -> WorkspaceMemberRecord:
         """获取成员信息"""
         member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
         if not member:

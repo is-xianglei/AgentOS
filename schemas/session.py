@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -55,6 +56,7 @@ class SessionResponse(BaseModel):
 class SessionMessageResponse(BaseModel):
     id: int = Field(description="消息ID")
     session_id: int = Field(description="所属会话ID")
+    turn_id: UUID | None = Field(default=None, description="所属交互轮次ID")
     role: Literal["user", "assistant", "tool"] | str = Field(description="消息角色")
     content: Any = Field(description="消息内容")
     token_estimate: int = Field(description="预估token数")
