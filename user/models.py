@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import String, DateTime, Boolean
+from sqlalchemy import Boolean, DateTime, Index, String
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,14 +14,19 @@ if TYPE_CHECKING:
 
 class UserRecord(Base):
     __tablename__ = "users"
-    __table_args__ = {"comment": "用户表"}
+    __table_args__ = (
+        # 第三方登录按 (auth_provider, provider_user_id) 定位用户，
+        # 索引由 0011_fix_users_table_schema 建立，此处补齐声明以免 autogenerate 误判删除。
+        Index("ix_users_auth_provider_provider_user_id", "auth_provider", "provider_user_id"),
+        {"comment": "用户表"},
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, comment="用户ID")
     email: Mapped[str] = mapped_column(
         String(255), unique=True, index=True, comment="邮箱(唯一登录标识)"
     )
     username: Mapped[str] = mapped_column(
-        String(64), unique=True, index=True, comment="用户名"
+        String(64), unique=True, index=True, comment="用户名(唯一)"
     )
     password: Mapped[str] = mapped_column(String(255), comment="密码哈希(MD5)")
     full_name: Mapped[str | None] = mapped_column(

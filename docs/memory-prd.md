@@ -340,18 +340,20 @@ class RequestPrincipal:
 所有 Session、Message、Task、Team、Tool 和 Memory Repository 方法必须接收 Principal/Scope，
 并在 SQL 层先过滤 `tenant_id`。按裸 ID 查询后再做 Python 判断不合格。
 
-### 9.3 PostgreSQL RLS
+### 9.3 PostgreSQL RLS（已评估后放弃，仅作决策记录）
 
-生产必须启用 RLS 作为第二道隔离：
-
-```sql
-ALTER TABLE memory_spaces ENABLE ROW LEVEL SECURITY;
-CREATE POLICY memory_spaces_tenant_policy ON memory_spaces
-USING (tenant_id = current_setting('app.tenant_id', true));
-```
-
-每个业务事务开始后执行 `SET LOCAL app.tenant_id = :tenant_id`。后台 Worker 从 Job 记录读取
-tenant_id 后设置相同事务变量。管理任务需要独立数据库角色，不能复用普通 API 角色绕过 RLS。
+> 本节原方案要求生产启用 RLS 作为第二道隔离，配合每个事务 `SET LOCAL app.tenant_id`。
+> 该方案已被放弃，当前实现只依赖应用层的用户与工作区隔离，见
+> `s09-memory-postgresql-plan.md` §「统一使用 AGENTOS_DATABASE_URL」。
+>
+> 放弃原因：策略表达式依赖 `current_setting('app.user_id')` 等自定义 GUC，
+> 而应用从未设置这些变量；一旦启用 `FORCE ROW LEVEL SECURITY`，
+> 判定恒为假会使全部 Memory 查询静默返回零行。此外该方案需要独立数据库角色
+> `agentos_memory_worker`，与「生产不创建 Memory 专用数据库用户」的部署约定冲突。
+>
+> 迁移 `0016_enable_memory_rls` 与 `0017_disable_memory_rls` 曾实现开启与关闭，
+> 二者互相抵消且从未在任何环境应用，已一并删除，链尾回到 `0015_add_memory_jobs`。
+> 若将来重新引入 RLS，需先落实事务级 GUC 注入与专用角色，再重建迁移。
 
 ---
 
@@ -1313,7 +1315,7 @@ Worker Trace 从 `memory_jobs` 继承原 Turn trace/link，而不是伪装成同
 
 - 两个租户使用相同 user_id 时完全隔离；
 - 伪造 Session ID 无法读取或引用其他租户消息；
-- RLS 与应用层过滤同时生效；
+- 应用层过滤在 SQL 层生效（RLS 已按 §9.3 放弃，不再作为第二道防线）；
 - 两个事务并发 update 同一 item，只有一个成功，另一个返回 409；
 - 相同幂等键重复提交只生成一个结果；
 - 删除后即使 Embedding 未清理也不能 Recall；
@@ -1438,7 +1440,7 @@ memory.session_search_enabled
 
 以下全部满足才可宣布 Memory v1 上线：
 
-- [ ] 所有 Session 和 Memory 查询强制 tenant/user Scope，RLS 已启用。
+- [ ] 所有 Session 和 Memory 查询强制 tenant/user Scope（RLS 已按 §9.3 放弃）。
 - [ ] 动态 Recall 不出现在用户原始消息、历史 API 和 Extractor 输入中。
 - [ ] Snapshot 使用 watermark，压缩后的新消息不会丢失。
 - [ ] 同一 Turn 的所有 LLM 调用和审批恢复复用同一个 Memory Context。
