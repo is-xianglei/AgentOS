@@ -4,7 +4,6 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
-import models  # noqa: F401
 from api.router import api_router
 from core.config import settings
 from core.errors import (

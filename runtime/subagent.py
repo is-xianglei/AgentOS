@@ -29,7 +29,7 @@ from team.isolation import (
     reset_team_task_instance_id,
     set_team_task_instance_id,
 )
-from services.tool_service import ToolService
+from tools.service import ToolService
 from tools.registry import ToolRegistry, build_tool_registry
 from tools.subagents.definition import SubAgentSpec
 

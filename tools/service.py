@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from hooks import HookContext, HookEvent, get_hook_registry
-from models.tool import ToolCallRecord
-from repositories.tool_repo import ToolRepository
+from tools.models import ToolCallRecord
+from tools.repository import ToolRepository
 from tools.base import ToolContext
 from tools.registry import ToolRegistry
 

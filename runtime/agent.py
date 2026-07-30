@@ -31,14 +31,14 @@ from llm.types import (
     ToolUse,
     extract_tool_uses,
 )
-from models.tool import ToolCallRecord
+from tools.models import ToolCallRecord
 from permission.service import DANGEROUS_TOOLS, PermissionService
 from runtime.compact import CompactService
 from memory.job_service import MemoryJobRunner, MemoryJobService
 from memory.recall_service import MemoryRecallService
 from skill.service import SkillService
 from task.service import TaskService
-from services.tool_service import ToolService
+from tools.service import ToolService
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from tools.registry import build_tool_registry

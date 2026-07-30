@@ -4,7 +4,6 @@ Alembic autogenerate 与字符串式 relationship() 都依赖此处的副作用�
 遗漏任一模块会导致自动迁移误判为删表，因此新增实体必须同步登记到这里。
 """
 
-# 按 feature 包组织的实体
 from memory.models import (  # noqa: F401
     MemoryItemRecord,
     MemoryJobRecord,
@@ -28,8 +27,6 @@ from team.models import (  # noqa: F401
     TeamMessageRecord,
     TeamRecord,
 )
+from tools.models import ToolCallRecord  # noqa: F401
 from user.models import UserRecord  # noqa: F401
 from workspace.models import WorkspaceMemberRecord, WorkspaceRecord  # noqa: F401
-
-# 仍位于 models/ 的实体（随域迁移逐步移出）
-from models import ToolCallRecord  # noqa: F401

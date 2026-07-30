@@ -14,7 +14,7 @@ from team.models import (
     TeamMessageRecord,
     TeamRecord,
 )
-from models.tool import ToolCallRecord
+from tools.models import ToolCallRecord
 from permission.models import PermissionRuleRecord
 
 # 会话软删除时需一并标记的子表(均以 session_id 关联)。

@@ -3,7 +3,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.tool import ToolCallRecord
+from tools.models import ToolCallRecord
 
 
 class ToolRepository:
