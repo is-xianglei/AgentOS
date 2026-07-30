@@ -485,8 +485,11 @@ class SubAgentRunner:
     async def _try_claim_tasks(
         self, session_id: int, name: str, messages: list[dict[str, Any]]
     ) -> None:
-        """认领本会话可处理任务,认领成功的作为 user 消息注入 messages。"""
-        team_service = TeamService(self.db)
+        """认领本会话可处理任务,认领成功的作为 user 消息注入 messages。
+
+        传入自身 bus:认领会把任务推进到 in_progress,需同步刷新前端任务列表。
+        """
+        team_service = TeamService(self.db, bus=self.bus)
         claimable = await team_service.list_claimable_tasks(session_id)
         for task in claimable:
             ok, _reason = await team_service.claim_task(session_id, task.id, name)

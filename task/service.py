@@ -119,9 +119,14 @@ class TaskService:
 
         并发下多个子代理可能同时抢同一条,失败方拿到 (False, "unavailable"),
         由调用方跳过即可,不视为错误。
+        认领成功会把状态推进到 in_progress,故与 update() 一致 emit 一帧快照;
+        失败不改数据,不推送。bus 缺省为 None 时 emit_snapshot 静默跳过。
         """
         await self.session_service.get_required(session_id)
-        return await self.repo.claim_task(session_id, task_id, owner)
+        claimed, reason = await self.repo.claim_task(session_id, task_id, owner)
+        if claimed:
+            await self.emit_snapshot(session_id, "claimed")
+        return claimed, reason
 
     def _validate_status(self, status: str) -> None:
         """校验任务状态是否合法。"""

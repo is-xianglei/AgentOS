@@ -1,6 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
+from core.event_bus import StreamBus
 from session.service import SessionService
 from task.models import TaskRecord
 from task.service import TaskService
@@ -20,12 +21,17 @@ from team.subagent_run_repository import SubAgentRunRepository
 
 
 class TeamService:
-    def __init__(self, db: AsyncSession):
-        """初始化团队服务依赖。"""
+    def __init__(self, db: AsyncSession, bus: StreamBus | None = None):
+        """初始化团队服务依赖。
+
+        bus 缺省为 None:REST 端点与只读团队操作不需要推送。
+        子代理认领任务会推进任务状态,由 subagent_runner 注入自身 bus,
+        使认领结果能同步到前端任务列表。
+        """
         self.repo = TeamRepository(db)
         self.run_repo = SubAgentRunRepository(db)
         # 任务认领属 task 域,跨域调用经其 service,不直接持有 repository。
-        self.task_service = TaskService(db)
+        self.task_service = TaskService(db, bus=bus)
         self.session_service = SessionService(db)
 
     async def list_members(self, session_id: int) -> list[TeamMemberRecord]:
