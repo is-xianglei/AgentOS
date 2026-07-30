@@ -6,14 +6,21 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pyte
 不要覆盖用户已有改动，不要自动执行 git push。
 
 架构与职责：
-1. 保持 API -> Service -> Repository -> ORM Model 的分层结构，Schema 与 ORM 分离。
+1. 保持 API -> Service -> Repository -> ORM Model 的分层依赖关系，Schema 与 ORM 分离。
+   分层是依赖约定，不是目录结构：代码按 feature 域组织，每个域一个顶层包，
+   内含 models.py、schemas.py、repository.py、service.py、api.py，
+   不要再新建 models/、services/、repositories/、schemas/ 这类按层划分的目录。
 2. API 层保持轻薄：负责路由、Depends 注入、认证/权限入口、Schema 转换和响应包装；
    业务校验与跨模块编排放在 Service，SQL 查询和持久化放在 Repository。
 3. Repository 持有 AsyncSession，写操作通常使用 add/flush/refresh，不得自行 commit。
 4. 普通 HTTP 请求由 get_db 统一管理事务：成功 commit，异常 rollback。
 5. 只有流式 Agent 或后台运行时为了增量持久化才能分步 commit，并应注释生命周期原因。
 6. 所有数据库、LLM、事件流和工具 I/O 使用 async/await；异步流标注 AsyncIterator。
-7. 新增 ORM 后同步更新 models/__init__.py，并提供显式 Alembic upgrade/downgrade 迁移。
+7. 新增 ORM 后必须登记到 db/registry.py，并提供显式 Alembic upgrade/downgrade 迁移。
+   实体分散在各 feature 包，仅靠导入单个模型不会连带注册其余实体；
+   registry 是唯一汇总入口，漏登记会导致 autogenerate 把缺失实体误判为删表，
+   跨包字符串式 relationship 也会解析失败。db/engine.py 已副作用导入 registry，
+   保证「能拿到 session 就一定已注册全部映射」。
 8. feature 包之间只允许 Service 调 Service，不得跨域直接使用别的域的
    Repository 或自行拼写别域表的 SQL；本域 Service 才能访问本域 Repository。
 9. 需要读写别域数据时，在数据所属域的 Service 上补公开方法，由该域负责
