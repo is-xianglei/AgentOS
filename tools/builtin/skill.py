@@ -11,7 +11,7 @@
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from services.skill_service import SkillService
+from skill.service import SkillService
 from tools.base import BaseTool, ToolContext
 
 # 文本类 mime:命中则把资源内容内联返回,否则只给描述(避免把二进制/base64 塞进上下文)。

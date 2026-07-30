@@ -4,7 +4,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.skill import SkillRecord
+from skill.models import SkillRecord
 
 
 class SkillRepository:

@@ -5,8 +5,8 @@ from api.deps import get_db
 from core.errors import AgentException
 from core.responses import ok
 from schemas.common import ApiResponse
-from schemas.skill import SkillDetailResponse, SkillResponse, SkillValidateResult
-from services.skill_service import SkillService
+from skill.schemas import SkillDetailResponse, SkillResponse, SkillValidateResult
+from skill.service import SkillService
 
 router = APIRouter()
 

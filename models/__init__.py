@@ -8,7 +8,6 @@ from models.memory import (
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from models.skill import SkillRecord
 from models.task import TaskRecord
 from models.team import (
     SubAgentRunRecord,
@@ -24,7 +23,6 @@ __all__ = [
     "MemoryRevisionRecord",
     "MemorySourceRecord",
     "MemorySpaceRecord",
-    "SkillRecord",
     "SubAgentRunRecord",
     "TaskRecord",
     "TeamMemberRecord",
