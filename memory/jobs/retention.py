@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from db.engine import AsyncSessionLocal
+from database.engine import AsyncSessionLocal
 from memory.repository import MemoryPhysicalDeleteCounts, MemoryRepository
 
 _ARCHIVED_ITEM_DAYS_KEY = "archived_item_retention_days"

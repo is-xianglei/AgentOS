@@ -10,6 +10,7 @@ from core.errors import AgentException
 from user.models import UserRecord
 from user.repository import UserRepository
 from workspace.models import WorkspaceRecord
+from workspace.service import WorkspaceService
 
 
 class AuthService:
@@ -232,20 +233,18 @@ class AuthService:
             raise AgentException.message("无效的 Refresh Token")
 
     async def switch_workspace(self, user_id: int, workspace_id: int) -> dict:
-        """切换工作区并生成新的 Token"""
+        """切换工作区并生成新的 Token。
+
+        Token 的 workspace_id 是后续请求的可信作用域来源，签发前必须确认成员身份，
+        否则任意登录用户都能凭任意 workspace_id 换到该工作区的访问权。
+        成员与工作区状态校验由数据所属的 workspace 域负责。
+        """
         # 验证用户存在
         user = await self.repo.get_by_id(user_id)
         if not user or user.is_deleted or user.suspended:
             raise AgentException.message("用户不存在或已被禁用")
 
-        # TODO: 验证用户是该工作区的成员
-        # 这里需要注入 workspace_service 或直接查询
-        # workspace_member = await workspace_service.get_member(workspace_id, user_id)
-        # if not workspace_member:
-        #     raise HTTPException(
-        #         status_code=status.HTTP_403_FORBIDDEN,
-        #         detail="Not a member of this workspace",
-        #     )
+        await WorkspaceService(self.db).require_active_member(workspace_id, user_id)
 
         # 生成包含 workspace_id 的新 Token
         tokens = self._generate_tokens_with_workspace(user, workspace_id)

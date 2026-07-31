@@ -13,8 +13,8 @@ from core.errors import (
     validation_error_handler,
 )
 from core.logging import request_context_middleware, setup_logging
-from db.base import Base
-from db.engine import engine
+from database.base import Base
+from database.engine import engine
 from hooks.builtin import register_builtin_hooks
 
 

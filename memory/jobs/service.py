@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.config import settings
 from core.errors import AgentException
-from db.engine import AsyncSessionLocal
+from database.engine import AsyncSessionLocal
 from llm.client import LLMClient
 from memory.models import MemoryJobRecord
 from session.models import SessionRecord, SessionTurnRecord

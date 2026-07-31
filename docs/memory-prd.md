@@ -743,7 +743,7 @@ HookContext 增加 `principal/turn_id/actor`。所有 Hook 必须：
 | `api/router.py` | 注册 `api.memory` 路由 |
 | `api/sessions.py` | 把 Principal 传入 SessionService/AgentRuntime；所有 Session API 校验所有权 |
 | `core/config.py` | 增加 Auth、Memory、Worker、Embedding 和 Feature Flag 配置 |
-| `db/session.py` | 每个事务执行 tenant `SET LOCAL`；为 Worker 提供 tenant-scoped session helper |
+| `database/engine.py` | 每个事务执行 tenant `SET LOCAL`；为 Worker 提供 tenant-scoped session helper |
 | `models/session.py` | 增加身份、turn_id、api_content、搜索字段和 Snapshot watermark |
 | `models/memory.py` | 定义本 PRD 的 Memory ORM 表 |
 | `models/__init__.py` | 导出新 ORM，确保 Alembic metadata 可见 |

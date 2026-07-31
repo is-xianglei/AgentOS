@@ -18,7 +18,7 @@ class SkillRepository:
         """按 name 取单条。include_deleted=True 时跳过全局软删读过滤,可读已软删记录。"""
         stmt = select(SkillRecord).where(SkillRecord.name == name)
         if include_deleted:
-            # 全局软删过滤(db/engine.py 的 do_orm_execute)默认会追加 is_deleted=false,
+            # 全局软删过滤(database/engine.py 的 do_orm_execute)默认会追加 is_deleted=false,
             # 复活/幂等判重需读到已软删行,故显式关闭本次过滤(仓库首次引入该用法)。
             stmt = stmt.execution_options(include_deleted=True)
         return (await self.db.scalars(stmt)).first()

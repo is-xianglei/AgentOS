@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from db.engine import AsyncSessionLocal
+from database.engine import AsyncSessionLocal
 from memory.models import (
     MemoryItemRecord,
     MemoryRevisionRecord,

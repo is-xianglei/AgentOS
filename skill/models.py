@@ -3,8 +3,8 @@ from typing import Any
 from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from db.base import Base
-from db.base import json_type
+from database.base import Base
+from database.base import json_type
 
 
 class SkillRecord(Base):

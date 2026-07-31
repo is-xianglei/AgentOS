@@ -4,8 +4,8 @@ from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.ext.mutable import MutableList
 from sqlalchemy.orm import Mapped, mapped_column
 
-from db.base import Base
-from db.base import json_type
+from database.base import Base
+from database.base import json_type
 
 
 class TaskRecord(Base):

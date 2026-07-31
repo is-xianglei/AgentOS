@@ -4,7 +4,7 @@ Revision ID: 0006_add_audit_fields
 Revises: 0005_permission_rules
 Create Date: 2026-07-17
 
-统一审计字段现由 db.base.Base 直接提供(列下发给所有子类)。本迁移把已有表
+统一审计字段现由 database.base.Base 直接提供(列下发给所有子类)。本迁移把已有表
 补齐到 Base 定义的四列:created_at / updated_at / is_deleted / deleted_at。
 """
 from alembic import op

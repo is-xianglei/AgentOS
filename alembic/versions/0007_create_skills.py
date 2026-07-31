@@ -5,7 +5,7 @@ Revises: 0006_add_audit_fields
 Create Date: 2026-07-18
 
 skill 的正文与资源文件存对象存储(MinIO),此表只存索引与管理元数据。
-审计四列(created_at/updated_at/is_deleted/deleted_at)由 db.base.Base 下发,
+审计四列(created_at/updated_at/is_deleted/deleted_at)由 database.base.Base 下发,
 但建表迁移中仍须逐列手写(项目手写迁移,不依赖 autogenerate)。
 """
 from alembic import op

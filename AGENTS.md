@@ -16,10 +16,10 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pyte
 4. 普通 HTTP 请求由 get_db 统一管理事务：成功 commit，异常 rollback。
 5. 只有流式 Agent 或后台运行时为了增量持久化才能分步 commit，并应注释生命周期原因。
 6. 所有数据库、LLM、事件流和工具 I/O 使用 async/await；异步流标注 AsyncIterator。
-7. 新增 ORM 后必须登记到 db/registry.py，并提供显式 Alembic upgrade/downgrade 迁移。
+7. 新增 ORM 后必须登记到 database/registry.py，并提供显式 Alembic upgrade/downgrade 迁移。
    实体分散在各 feature 包，仅靠导入单个模型不会连带注册其余实体；
    registry 是唯一汇总入口，漏登记会导致 autogenerate 把缺失实体误判为删表，
-   跨包字符串式 relationship 也会解析失败。db/engine.py 已副作用导入 registry，
+   跨包字符串式 relationship 也会解析失败。database/engine.py 已副作用导入 registry，
    保证「能拿到 session 就一定已注册全部映射」。
 8. feature 包之间只允许 Service 调 Service，不得跨域直接使用别的域的
    Repository 或自行拼写别域表的 SQL；本域 Service 才能访问本域 Repository。
@@ -128,3 +128,42 @@ API、错误与日志：
 5. 环境变量继续使用 `AGENTOS_` 前缀，并确保名称能正确映射到 `Settings` 中的字段。
 6. 修改配置后，应验证 `Settings` 能成功加载，并检查必填项、类型转换和默认值是否符合预期。
 7. `.env.example` 不得包含 `.env` 中的真实密码、Token、密钥、数据库连接串或 Redis 凭证。
+
+Anthropic SDK 使用规范：
+1. 新增或修改 Anthropic SDK 相关代码前，必须先查阅 Anthropic 官方文档：
+   https://platform.claude.com/docs/
+2. 优先搜索官方最佳实践、API Reference、教程和 Demo 示例，确认当前推荐的调用方式后再实现。
+3. 使用示例代码前，应核对项目实际安装的 Anthropic SDK 版本，确保类名、参数、
+   返回结构、流式事件和异常类型与当前版本兼容。
+4. 官方文档和项目现有实现不一致时，不要直接照搬示例；应结合项目依赖版本、
+   异步架构、工具系统、事件协议和事务边界进行适配。
+5. 优先使用官方提供的异步客户端、流式接口、类型定义和工具调用格式，
+   不要自行猜测 SDK 接口或手工模拟已有能力。
+6. 涉及流式响应、Tool Use、Prompt Caching、Token Usage、错误重试等能力时，
+   必须分别确认官方推荐用法和限制。
+7. 仅将 Anthropic 官方文档作为 SDK 用法的首要依据；第三方博客和旧示例只能辅助参考。
+8. 实现完成后，应针对正常响应、流式事件、工具调用、超时和 SDK 异常补充验证，
+   并如实说明参考的官方文档页面及验证结果。
+9. 不得在代码、日志、测试、文档或提交记录中暴露 Anthropic API Key。
+
+功能删除与代码清理：
+1. 删除某项功能时，必须完整删除与其关联的实现，不得遗留死代码、空类、空方法、
+   占位文件、无效分支、pass、TODO、临时兼容层或不可达逻辑。
+2. 删除前应搜索该功能的全部引用，确认其 API、Schema、Service、Repository、ORM、
+   工具、事件、Hook、Prompt、注册表、依赖注入和跨域调用关系。
+3. 同步清理相关路由注册、模块导出、配置项、`.env`、`.env.example`、Settings 字段、
+   常量、依赖包、测试夹具、Mock、示例代码和文档。
+4. 删除工具时，同步清理 BaseTool 实现、Input Schema、builtin 导出、
+   ToolRegistry 注册、权限配置及相关 Prompt 描述。
+5. 删除 ORM 实体时，同步清理 relationship、外键引用和 database/registry.py 登记，
+   并新增 Alembic 迁移删除对应数据库对象。
+6. 已经进入迁移历史的 Alembic 文件不得直接删除或篡改；数据库结构变更应通过新的
+   upgrade/downgrade 迁移完成。
+7. 如果删除功能导致某个模块、依赖、配置或抽象不再被使用，应一并移除，
+   不要为了“以后可能使用”保留无实际调用的骨架。
+8. 除非用户明确要求保留兼容性，否则不要留下 deprecated 接口、旧参数转发、
+   空响应或仅抛出“功能已删除”的占位实现。
+9. 清理完成后使用代码搜索确认旧名称、路由、配置键和注册项已无有效引用，
+   并运行相关测试及完整测试。
+10. 最终说明删除了哪些入口、实现、配置、数据结构、测试和文档；
+    对因迁移历史或外部兼容契约必须保留的内容，应明确说明原因。

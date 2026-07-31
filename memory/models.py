@@ -22,7 +22,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from db.base import Base
+from database.base import Base
 
 
 class MemorySpaceRecord(Base):

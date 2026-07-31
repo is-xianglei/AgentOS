@@ -1,11 +1,11 @@
 """Hook 系统引擎层。
 
 本模块只定义 hook 机制本身——事件点、载荷、返回值、注册表——不含任何
-具体业务 hook。内建实现在 ``app.core.hooks.builtin``,业务方新增 hook
+具体业务 hook。内建实现在 ``hooks.builtin``,业务方新增 hook
 也应放在 builtin(或另建子模块)后由 register_builtin_hooks 装配,
 而不要污染本文件。
 
-对外 import 路径保持不变:``from core.hooks import HookContext, ...``
+对外 import 路径:``from hooks import HookContext, ...``
 """
 
 from __future__ import annotations

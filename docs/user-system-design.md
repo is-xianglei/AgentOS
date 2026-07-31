@@ -1269,7 +1269,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.session import get_db
+from database.engine import get_db
 from services.auth_service import AuthService
 from models.user import User
 
@@ -1309,7 +1309,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user
-from db.session import get_db
+from database.engine import get_db
 from models.user import User
 from schemas.workspace import WorkspaceCreate, WorkspaceResponse
 from services.workspace_service import WorkspaceService

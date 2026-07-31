@@ -5,13 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import Session, with_loader_criteria
 
 from core.config import settings
-from db.base import Base
+from database.base import Base
 
 # 实体分散到各 feature 包后，导入单个模型不再连带注册其余实体，
 # 而跨包的字符串式 relationship（如 UserRecord.sessions 指向 SessionRecord）
 # 要求映射配置时全部实体在册，否则首次查询即报 InvalidRequestError。
 # 在此副作用导入 registry，保证“能拿到 session 就一定已注册全部映射”。
-import db.registry  # noqa: F401,E402
+import database.registry  # noqa: F401,E402
 
 DATABASE_URL = settings.database_url
 
@@ -67,10 +67,10 @@ async def get_db() -> AsyncGenerator[AsyncSession]:
     注:流式 Agent 执行(agent_runtime / subagent_runner)在后台任务里自行按步
     commit 做增量持久化,其 session 用完后此处的收尾 commit 已无未提交变更,是安全的空操作。
     """
-    async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as session:
         try:
-            yield db
-            await db.commit()
+            yield session
+            await session.commit()
         except Exception:
-            await db.rollback()
+            await session.rollback()
             raise

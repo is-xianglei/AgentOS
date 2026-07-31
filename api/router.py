@@ -1,6 +1,5 @@
 from fastapi import APIRouter
 
-from api import health
 from auth import api as auth_api
 from memory import api as memory_api
 from permission import api as permission_api
@@ -13,7 +12,6 @@ from user import api as user_api
 from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
-api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth_api.router, prefix="/auth", tags=["auth"])
 api_router.include_router(memory_api.router, prefix="/memories", tags=["memories"])
 api_router.include_router(session_api.router, prefix="/sessions", tags=["sessions"])

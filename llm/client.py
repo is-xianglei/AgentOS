@@ -4,7 +4,7 @@ from typing import Any
 from warnings import deprecated
 
 from anthropic import NOT_GIVEN, AsyncAnthropic
-from anthropic.types import ToolParam
+from anthropic.types import TextBlockParam, ToolParam
 from pydantic import BaseModel, ValidationError
 
 from core.config import settings
@@ -25,15 +25,21 @@ class LLMClient:
     async def stream(
         self,
         messages: list[dict],
-        system_prompt: str | None = None,
+        system_prompt: str | list[TextBlockParam] | None = None,
         tools: list[ToolParam] | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[LLMRawChunk]:
+        """流式调用。system_prompt 传 TextBlockParam 列表时可携带 cache 断点。
+
+        model 留空时回落主会话模型,供 SubAgent 按类型指定档位(如 Explore 走
+        速度优先档)。别名与云厂商区域前缀原样透传,不做改写,避免继承时丢前缀。
+        """
 
         client = AsyncAnthropic(base_url=self.base_url, api_key=self.api_key)
 
         async with client.messages.stream(
             max_tokens=131072,
-            model=self.model,
+            model=model or self.model,
             system=system_prompt or "",
             messages=messages,
             tools=tools or [],
@@ -50,6 +56,7 @@ class LLMClient:
             usage = None
             if hasattr(final, "usage") and final.usage is not None:
                 usage = final.usage.model_dump(mode="json", warnings=False)
+                self._log_cache_usage(usage)
             yield {
                 "type": "message_final",
                 "stop_reason": final.stop_reason,
@@ -59,6 +66,26 @@ class LLMClient:
                     for block in final.content
                 ],
             }
+
+    @staticmethod
+    def _log_cache_usage(usage: dict[str, Any]) -> None:
+        """记录 prompt cache 命中情况。
+
+        写入按 1.25 倍计费、读取按 0.1 倍，故 write 常态不为 0 说明前缀在被反复
+        击穿（多为易失内容排在了稳定内容之前）。低于模型最小可缓存长度时不报错，
+        只是两项都为 0。
+        """
+        write = usage.get("cache_creation_input_tokens") or 0
+        read = usage.get("cache_read_input_tokens") or 0
+        if not write and not read:
+            return
+        logger.info(
+            "prompt cache 使用情况: 写入=%d 读取=%d 未缓存=%d",
+            write,
+            read,
+            usage.get("input_tokens") or 0,
+            extra={"cache_write": write, "cache_read": read},
+        )
 
     @deprecated(
         "依赖服务端 structured outputs，第三方中转端点普遍不实现 output_config 且静默丢弃该字段，"

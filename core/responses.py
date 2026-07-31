@@ -23,10 +23,6 @@ class ApiResponse(BaseModel, Generic[T]):
     request_id: str | None = Field(default=None, description="请求ID")
 
 
-class HealthData(BaseModel):
-    status: str = Field(description="服务状态")
-
-
 def ok(data: Any, request: Request) -> dict[str, Any]:
     return {
         "data": data,

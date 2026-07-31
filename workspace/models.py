@@ -5,7 +5,7 @@ from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from db.base import Base, json_type
+from database.base import Base, json_type
 
 if TYPE_CHECKING:
     from user.models import UserRecord

@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID, uuid4
 
-from anthropic.types import ToolParam
+from anthropic.types import TextBlockParam, ToolParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
@@ -24,7 +24,7 @@ from core.events import (
 )
 from hooks import HookContext, HookEvent, get_hook_registry
 from llm.client import LLMClient
-from llm.prompts import compose_system_prompt
+from prompt import PromptContext, compose_lead_blocks
 from llm.types import (
     AnthropicStreamTranslator,
     ToolResultMessage,
@@ -294,10 +294,14 @@ class AgentRuntime:
         if memory_context is not None:
             await self.db.commit()
         rendered_memories = memory_context.rendered_memories if memory_context else None
-        system_prompt = compose_system_prompt(
-            session.system_prompt,
-            skills_catalog,
-            memory_context.rendered_catalog if memory_context else None,
+        # blocks 形式携带 cache 断点：tools + 稳定段跨 turn 复用，
+        # 完整 system 供本 turn 内多轮工具迭代复用。
+        system_prompt = compose_lead_blocks(
+            PromptContext.create(
+                skills_catalog=skills_catalog,
+                session_prompt=session.system_prompt,
+                memory_catalog=memory_context.rendered_catalog if memory_context else None,
+            )
         )
         tools: list[ToolParam] = self.tool_registry.to_anthropic_tools()
 
@@ -743,7 +747,7 @@ class AgentRuntime:
         translator: AnthropicStreamTranslator,
         additional_context: str | None,
         rendered_memories: str | None,
-        system_prompt: str,
+        system_prompt: str | list[TextBlockParam],
     ) -> SessionMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。沿用同一翻译器维持事件连续。"""
         history, current, through_message_id = await self.session_service.load_context_for_turn(
@@ -822,7 +826,7 @@ class AgentRuntime:
         每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
-        from db.engine import AsyncSessionLocal
+        from database.engine import AsyncSessionLocal
         from runtime.subagent import SubAgentRunner
         from team.service import TeamService
 
