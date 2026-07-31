@@ -1,9 +1,11 @@
 from anthropic.types import ToolParam
+from pydantic import ValidationError
 
 from core.errors import AgentException
 from tools.base import BaseTool
 from tools.builtin import (
     AgentTool,
+    AskUserQuestionTool,
     BashTool,
     EchoTool,
     EditTool,
@@ -41,6 +43,22 @@ class ToolRegistry:
             raise AgentException.message("工具不存在")
         return tool
 
+    def validate_input(self, name: str, data: dict) -> dict:
+        """按工具Schema校验并规范化输入，供执行和人工恢复共用。"""
+        tool = self.get(name)
+        try:
+            value = tool.input_model.model_validate(data)
+        except ValidationError as exc:
+            raise AgentException.message(
+                "工具参数校验失败",
+                {"tool_name": name, "errors": exc.errors(include_url=False)},
+            ) from exc
+        return value.model_dump(by_alias=True, exclude_none=True)
+
+    @property
+    def names(self) -> frozenset[str]:
+        return frozenset(self._tools)
+
     def without(self, *names: str) -> "ToolRegistry":
         excluded = set(names)
         return ToolRegistry([tool for name, tool in self._tools.items() if name not in excluded])
@@ -62,6 +80,8 @@ def build_tool_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             EchoTool(),
+            # 强制人工交互工具，仅主运行时处理，不进入普通 ToolService 执行路径。
+            AskUserQuestionTool(),
             # 文件工具
             ReadTool(),
             WriteTool(),

@@ -7,6 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from permission.models import PermissionRuleRecord
 
 
+def matcher_agent_type(matcher: dict[str, Any] | None) -> str | None:
+    """从 matcher 中取出 agent_type 维度;缺失或非字符串视为未限定。"""
+    if not matcher:
+        return None
+    value = matcher.get("agent_type")
+    return value if isinstance(value, str) and value else None
+
+
 class PermissionRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -26,10 +34,14 @@ class PermissionRepository:
     async def get(self, rule_id: int) -> PermissionRuleRecord | None:
         return await self.db.get(PermissionRuleRecord, rule_id)
 
-    async def find_match(
+    async def find_candidates(
         self, scope: str, session_id: int | None, tool_name: str
-    ) -> PermissionRuleRecord | None:
-        """查找作用域内针对某工具的规则(取最新一条)。"""
+    ) -> list[PermissionRuleRecord]:
+        """列出作用域内针对某工具的全部规则,按 id 倒序(最新优先)。
+
+        matcher 维度的取舍在 Python 侧完成:同一 (scope, session_id, tool_name) 下
+        规则数极少,换取不与 JSONB 查询方言耦合,单测无需真实 PostgreSQL。
+        """
         conditions = [
             PermissionRuleRecord.scope == scope,
             PermissionRuleRecord.tool_name == tool_name,
@@ -42,9 +54,43 @@ class PermissionRepository:
             select(PermissionRuleRecord)
             .where(and_(*conditions))
             .order_by(PermissionRuleRecord.id.desc())
-            .limit(1)
         )
-        return (await self.db.scalars(stmt)).first()
+        return list(await self.db.scalars(stmt))
+
+    async def find_match(
+        self,
+        scope: str,
+        session_id: int | None,
+        tool_name: str,
+        agent_type: str | None = None,
+    ) -> PermissionRuleRecord | None:
+        """按 agent_type 优先级取一条规则:定向规则 > 未限定 agent_type 的通用规则。
+
+        agent_type 为 None(主代理)时只认通用规则,不会误命中子代理的定向放行。
+        """
+        candidates = await self.find_candidates(scope, session_id, tool_name)
+        fallback: PermissionRuleRecord | None = None
+        for rule in candidates:
+            scoped = matcher_agent_type(rule.matcher)
+            if scoped is None:
+                fallback = fallback or rule
+            elif agent_type is not None and scoped == agent_type:
+                return rule
+        return fallback
+
+    async def find_exact(
+        self,
+        scope: str,
+        session_id: int | None,
+        tool_name: str,
+        agent_type: str | None = None,
+    ) -> PermissionRuleRecord | None:
+        """精确匹配同一 agent_type 维度的规则,供 upsert 判定是否为同一条。"""
+        candidates = await self.find_candidates(scope, session_id, tool_name)
+        for rule in candidates:
+            if matcher_agent_type(rule.matcher) == agent_type:
+                return rule
+        return None
 
     async def upsert(
         self,
@@ -55,8 +101,14 @@ class PermissionRepository:
         source: str = "user",
         matcher: dict[str, Any] | None = None,
     ) -> PermissionRuleRecord:
-        """新增或更新一条规则(同 scope/session_id/tool_name 视为同一条)。"""
-        existing = await self.find_match(scope, session_id, tool_name)
+        """新增或更新一条规则。
+
+        去重键为 (scope, session_id, tool_name, matcher.agent_type):
+        定向规则与通用规则互不覆盖,否则给 verification 放行 Bash 会顺带改掉主代理的规则。
+        """
+        existing = await self.find_exact(
+            scope, session_id, tool_name, matcher_agent_type(matcher)
+        )
         if existing is not None:
             existing.behavior = behavior
             existing.source = source

@@ -26,6 +26,20 @@ class Settings(BaseSettings):
     anthropic_model: str | None = None
     max_tool_iterations: int = 50  # 工具调用上限,防止模型在工具循环里无限调用
 
+    # --- SubAgent ------------------------------------------------------------
+    # 模型档位:留空表示继承主会话模型(anthropic_model)。
+    # 优先级为「调用方显式指定 > spec 声明 > 本项兜底 > 继承主会话」,
+    # 见 tools/subagents/definition.py 的 resolve_model()。default 按兜底处理,
+    # 否则一配上去会把 Explore 的速度档位一并顶掉,与"默认值"语义相反。
+    subagent_default_model: str | None = None  # 未声明模型的类型的兜底
+    subagent_fast_model: str | None = None  # Explore 用,速度优先档位
+    # ReAct 轮次上限,按类型分档。verification 须跑构建+测试+lint+对抗探测。
+    subagent_max_rounds: int = 6
+    subagent_plan_max_rounds: int = 12
+    subagent_verification_max_rounds: int = 24
+    # 每会话并发 SubAgent 上限,防止无限 spawn 导致连接与 token 失控。
+    subagent_max_concurrency: int = 3
+
     # --- 数据库 --------------------------------------------------------------
     database_url: str | None = None
 

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -8,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
+from tools.shell_policy import ShellAccess
 
 
 @dataclass
@@ -18,6 +20,10 @@ class ToolContext:
     turn_id: UUID | None = None
     user_id: int | None = None
     workspace_id: int | None = None
+    # shell 访问级别与可写临时目录:由 SubAgent 规格下发,Bash 工具据此自校验。
+    # 主代理路径不设置,等价于 FULL。
+    shell_access: ShellAccess = ShellAccess.FULL
+    shell_tmp_root: Path | None = None
 
 
 class BaseTool(ABC):

@@ -340,7 +340,9 @@ class AgentRuntime:
             if not tool_uses:
                 # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
                 # (作为一条 user 消息注入),否则正常结束本回合。
-                continuation = await self._apply_stop_hooks(session_id, turn.id, actor)
+                continuation = await self._apply_stop_hooks(
+                    session_id, turn.id, actor, context
+                )
                 if continuation is not None:
                     await self.session_service.add_message(
                         session_id,
@@ -802,14 +804,20 @@ class AgentRuntime:
         session_id: int,
         turn_id: UUID,
         actor: Actor,
+        messages: list[dict[str, Any]] | None = None,
     ) -> str | None:
-        """触发 Stop hook,返回首个非空 continuation(强制续跑),无则 None。"""
+        """触发 Stop hook,返回首个非空 continuation(强制续跑),无则 None。
+
+        messages 为本回合送进 LLM 的完整上下文:Stop hook 需要据此判断这一轮
+        实际做了什么(如改了哪些文件、是否已走过验收),不能只凭会话 ID 猜。
+        """
         outcomes = await get_hook_registry().trigger(
             HookContext(
                 event=HookEvent.STOP,
                 session_id=session_id,
                 actor=actor,
                 turn_id=turn_id,
+                messages=messages,
             )
         )
         return next((o.continuation for o in outcomes if o.continuation), None)

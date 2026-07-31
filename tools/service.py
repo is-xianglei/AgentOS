@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from tools.models import ToolCallRecord
 from tools.repository import ToolRepository
 from tools.base import ToolContext
 from tools.registry import ToolRegistry
+from tools.shell_policy import ShellAccess
 
 
 class ToolService:
@@ -31,6 +33,8 @@ class ToolService:
         turn_id: UUID | None = None,
         user_id: int | None = None,
         workspace_id: int | None = None,
+        shell_access: ShellAccess = ShellAccess.FULL,
+        shell_tmp_root: Path | None = None,
     ) -> str:
         """执行工具并记录调用状态。
 
@@ -85,6 +89,8 @@ class ToolService:
                 turn_id=turn_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                shell_access=shell_access,
+                shell_tmp_root=shell_tmp_root,
             )
             # 开始执行工具
             output = await tool.run_with_dict(input_args, ctx)

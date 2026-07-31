@@ -1,4 +1,5 @@
 from tools.builtin.agent import AgentTool
+from tools.builtin.ask_user_question import AskUserQuestionTool
 from tools.builtin.bash import BashTool
 from tools.builtin.echo import EchoTool
 from tools.builtin.edit import EditTool
@@ -25,6 +26,7 @@ from tools.builtin.write import WriteTool
 
 __all__ = [
     "AgentTool",
+    "AskUserQuestionTool",
     "BashTool",
     "EchoTool",
     # 文件工具

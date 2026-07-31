@@ -1,12 +1,15 @@
+import logging
 import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from core.config import settings
 from core.errors import AgentException
 from core.executor import get_executor
 from tools.base import BaseTool, ToolContext
+from tools.shell_policy import ShellAccess, check_shell_command
+
+logger = logging.getLogger(__name__)
 
 
 class BashInput(BaseModel):
@@ -20,9 +23,46 @@ class BashTool(BaseTool):
     description = "执行 shell 命令并返回输出。支持设置工作目录和超时时间。"
     input_model = BashInput
 
+    @staticmethod
+    def _resolve_workdir(cwd: str | None, ctx: ToolContext) -> Path:
+        """定出工作目录,受限档位下限制其范围。
+
+        命令白名单只看命令本身,不看在哪执行:`ls` 在任意目录都合规,
+        但把 cwd 指到项目外就等于给了越界的读取面。因此受限档位下要求 cwd
+        落在项目目录或该 spec 的临时目录内,拒绝时抛业务异常而非静默改路径。
+        """
+        if cwd is None:
+            return Path.cwd()
+        target = Path(cwd).expanduser().resolve(strict=False)
+        if ctx.shell_access is ShellAccess.FULL:
+            return target
+        roots = [Path.cwd().resolve(strict=False)]
+        if ctx.shell_tmp_root is not None:
+            roots.append(ctx.shell_tmp_root.resolve(strict=False))
+        if not any(target == root or root in target.parents for root in roots):
+            raise AgentException.message(f"受限模式下工作目录越界: {target}")
+        return target
+
     async def run(self, args: BashInput, ctx: ToolContext) -> str:
+        # 只读约束在命令进入 bash -c 之前强制,不依赖提示词自律。拒绝理由回灌给
+        # 模型而非抛异常,便于其改用允许的手段重试。
+        verdict = check_shell_command(
+            args.command,
+            ctx.shell_access,
+            tmp_root=ctx.shell_tmp_root,
+        )
+        if not verdict.allowed:
+            logger.warning(
+                "shell 命令被访问策略拒绝,会话 ID=%s 级别=%s 原因=%s",
+                ctx.session_id,
+                ctx.shell_access.value,
+                verdict.reason,
+                extra={"session_id": ctx.session_id, "shell_access": ctx.shell_access.value},
+            )
+            return f"error: {verdict.reason}"
+
         try:
-            workdir = Path(args.cwd).resolve() if args.cwd else Path.cwd()
+            workdir = self._resolve_workdir(args.cwd, ctx)
             if not workdir.exists():
                 raise AgentException.message(f"工作目录不存在: {workdir}")
             if not workdir.is_dir():
