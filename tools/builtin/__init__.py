@@ -5,6 +5,7 @@ from tools.builtin.echo import EchoTool
 from tools.builtin.edit import EditTool
 from tools.builtin.glob import GlobTool
 from tools.builtin.grep import GrepTool
+from tools.builtin.plan_mode import EnterPlanModeTool, ExitPlanModeTool, WritePlanTool
 from tools.builtin.read import ReadTool
 from tools.builtin.skill import SkillResourceTool, SkillRunTool, SkillTool
 from tools.builtin.task import (
@@ -35,6 +36,9 @@ __all__ = [
     "EditTool",
     "GlobTool",
     "GrepTool",
+    "EnterPlanModeTool",
+    "ExitPlanModeTool",
+    "WritePlanTool",
     # 任务工具(按操作拆分)
     "TaskCreateTool",
     "TaskGetTool",

@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from anthropic.types import TextBlockParam, ToolParam
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,36 +18,60 @@ from core.events import (
     ORCHESTRATOR_ACTOR,
     Actor,
     ErrorInfo,
-    PermissionInfo,
+    InteractionInfo,
     RuntimeEvent,
     StreamEvent,
     ToolInfo,
     teammate_actor,
 )
 from hooks import HookContext, HookEvent, get_hook_registry
+from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
+from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
+from interaction.service import InteractionService
 from llm.client import LLMClient
-from prompt import PromptContext, compose_lead_blocks
 from llm.types import (
     AnthropicStreamTranslator,
     ToolResultMessage,
     ToolUse,
     extract_tool_uses,
 )
-from tools.models import ToolCallRecord
-from permission.service import DANGEROUS_TOOLS, PermissionService
-from runtime.compact import CompactService
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
-from skill.service import SkillService
-from task.service import TaskService
-from tools.service import ToolService
+from permission.service import DANGEROUS_TOOLS, PermissionService
+from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
+from plan.service import PlanService
+from prompt import PromptContext, compose_lead_blocks
+from runtime.compact import CompactService
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from session.service import SessionService
-from tools.registry import build_tool_registry
+from skill.service import SkillService
+from task.service import TaskService
+from tools.models import ToolCallRecord
+from tools.registry import ToolRegistry, build_tool_registry
+from tools.service import ToolService
 from tools.subagents.definition import AgentType
 from tools.subagents.registry import get_subagent_spec
 
 logger = logging.getLogger(__name__)
+
+INTERACTION_TOOL_KINDS = {
+    "AskUserQuestion": "user_question",
+    "EnterPlanMode": "enter_plan_mode",
+    "ExitPlanMode": "exit_plan_mode",
+}
+PLAN_MODE_ALLOWED_TOOLS = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "Agent",
+        "Skill",
+        "SkillResource",
+        "AskUserQuestion",
+        "WritePlan",
+        "ExitPlanMode",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +80,19 @@ class TurnLoopResult:
 
     suspended: bool
     completed_message_id: int | None = None
+    interaction: SuspendedInteraction | None = None
+
+
+@dataclass(frozen=True)
+class SuspendedInteraction:
+    """提交挂起事务后需要发布给客户端的交互事件快照。"""
+
+    session_id: int
+    suspension_id: UUID
+    request_id: UUID
+    kind: str
+    request_payload: dict[str, Any]
+    schema_version: int
 
 
 class AgentRuntime:
@@ -67,6 +106,8 @@ class AgentRuntime:
         self.session_service = SessionService(db)
         self.compact_service = CompactService(self.session_service.repo)
         self.permission_service = PermissionService(db)
+        self.interaction_service = InteractionService(db)
+        self.plan_service = PlanService(db)
         self.memory_recall_service = MemoryRecallService(db)
         self.llm = LLMClient()
         self.tool_registry = build_tool_registry()
@@ -96,6 +137,7 @@ class AgentRuntime:
         """后台生产者:跑完整流程,所有事件 emit 到 bus,最终 close。"""
         session: SessionRecord | None = None
         turn: SessionTurnRecord | None = None
+        suspension_committed = False
         try:
             if self.user_id is None or self.workspace_id is None:
                 raise AgentException.message("缺少可信用户或工作区上下文")
@@ -136,9 +178,11 @@ class AgentRuntime:
                 additional_context,
             )
             if loop_result.suspended:
-                # 已因等待用户审批挂起:提交会话 awaiting_approval + 待批指针 + 已执行的
-                # tool 结果,不唤醒队友、不标记 idle,正常关闭本次 SSE(前端 onDone)。
+                # 暂停点、请求、Session/Turn 状态先提交，再向客户端发布交互事件。
                 await self.db.commit()
+                suspension_committed = True
+                if loop_result.interaction is not None:
+                    await self._emit_interaction(loop_result.interaction)
                 return
             memory_job_id = await self._complete_turn(
                 session,
@@ -149,28 +193,45 @@ class AgentRuntime:
             # 完成状态已提交，独立数据库会话中的队友才能读取到本轮最终回复。
             await self._wake_team_members(session_id, turn)
         except asyncio.CancelledError:
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "interrupted")
+            if suspension_committed:
+                await self.db.rollback()
+            else:
+                await self._mark_abnormal_end(
+                    session_id,
+                    turn.id if turn else None,
+                    "interrupted",
+                )
             raise
         except Exception:
             logger.exception(
                 "处理会话消息失败",
                 extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
             )
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
+            if suspension_committed:
+                await self.db.rollback()
+            else:
+                await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
         finally:
             await self.bus.close()
 
     async def resume(
         self,
         session_id: int,
-        request_id: str,
-        decision: str,
-        updated_input: dict[str, Any] | None = None,
-        always_scope: str = "session",
+        request_id: UUID,
+        kind: str,
+        response_payload: dict[str, Any],
+        *,
+        response_prepared: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
-        """从审批挂起点恢复执行,产出流式事件(与 run 同构)。"""
+        """持久化人工响应并从通用暂停点恢复执行。"""
         producer = asyncio.create_task(
-            self._produce_resume(session_id, request_id, decision, updated_input, always_scope)
+            self._produce_resume(
+                session_id,
+                request_id,
+                kind,
+                response_payload,
+                response_prepared=response_prepared,
+            )
         )
         try:
             async for event in self.bus.stream():
@@ -183,71 +244,228 @@ class AgentRuntime:
             except asyncio.CancelledError:
                 pass
 
+    async def prepare_interaction_response(
+        self,
+        session_id: int,
+        request_id: UUID,
+        kind: str,
+        response_payload: dict[str, Any],
+    ) -> None:
+        """校验并提交用户响应，使格式错误和冲突能在 SSE 建立前返回 HTTP 错误。"""
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+
+        session = await self.session_service.lock_required(session_id)
+        current = await self.interaction_service.get_request_required(
+            request_id,
+            session_id=session_id,
+        )
+        is_replay = current.status == "resolved"
+        if not is_replay and session.status != "awaiting_interaction":
+            raise AgentException.message("会话当前没有待处理的人工交互")
+
+        normalized = await self._normalize_interaction_response(
+            session_id,
+            request_id,
+            kind,
+            response_payload,
+        )
+        request, suspension = await self.interaction_service.resolve_request(
+            request_id,
+            normalized,
+            self.user_id,
+            session_id=session_id,
+            expected_kind=kind,
+        )
+        turn = await self.session_service.get_turn_required(suspension.turn_id)
+        if turn.session_id != session_id:
+            raise AgentException.message("人工交互对应的轮次不属于指定会话")
+        if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
+            raise AgentException.message("无权限恢复该交互轮次", status_code=403)
+        if not is_replay and turn.status != "awaiting_interaction":
+            raise AgentException.message("人工交互对应的轮次不可恢复")
+        if request.response_payload != normalized:
+            raise AgentException.message("人工交互响应持久化结果不一致")
+
+        # 流建立或客户端连接随后失败时，响应仍可从 resuming 暂停点重放。
+        await self.db.commit()
+
+    async def cancel_interaction(
+        self,
+        session_id: int,
+        suspension_id: UUID,
+    ) -> RuntimeSuspensionRecord:
+        """取消当前暂停点，并原子收尾关联的 Turn 与工具调用。"""
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+
+        session = await self.session_service.ensure_interaction_resumable(session_id)
+        suspension = await self.interaction_service.get_suspension_required(
+            suspension_id,
+            session_id=session_id,
+        )
+        turn = await self.session_service.get_turn_required(suspension.turn_id)
+        if turn.session_id != session_id:
+            raise AgentException.message("运行暂停点与交互轮次不匹配")
+        if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
+            raise AgentException.message("无权限取消该交互轮次", status_code=403)
+
+        suspension, requests = await self.interaction_service.cancel_suspension(
+            suspension_id,
+            self.user_id,
+            session_id=session_id,
+        )
+        await self._finish_cancelled_interaction(
+            session,
+            turn,
+            requests,
+            "用户取消了运行暂停点。",
+        )
+        return suspension
+
     async def _produce_resume(
         self,
         session_id: int,
-        request_id: str,
-        decision: str,
-        updated_input: dict[str, Any] | None,
-        always_scope: str,
+        request_id: UUID,
+        kind: str,
+        response_payload: dict[str, Any],
+        *,
+        response_prepared: bool = False,
     ) -> None:
-        """后台生产者:裁决当前待批项,补齐同 turn 待批,再续跑主循环。"""
+        """后台生产者：先可靠保存响应，再应用 continuation 并续跑主循环。"""
         session: SessionRecord | None = None
         turn: SessionTurnRecord | None = None
+        response_committed = response_prepared
+        continuation_applied = False
+        idempotent_replay = False
+        terminal_committed = False
         try:
-            session = await self.session_service.ensure_resumable(session_id)
-            pending = self.session_service.get_pending_approval(session)
-            if not pending or pending.get("request_id") != request_id:
-                raise AgentException.message("审批请求已失效或不匹配")
+            if not response_prepared:
+                await self.prepare_interaction_response(
+                    session_id,
+                    request_id,
+                    kind,
+                    response_payload,
+                )
+                response_committed = True
 
-            try:
-                turn_id = UUID(str(pending.get("turn_id")))
-            except (TypeError, ValueError) as exc:
-                raise AgentException.message("审批请求缺少有效的交互轮次") from exc
-            turn = await self.session_service.get_turn_required(turn_id)
-            if turn.session_id != session_id or turn.status != "awaiting_approval":
-                raise AgentException.message("审批请求对应的交互轮次不可恢复")
+            # 所有恢复者都按 Session -> Suspension 的顺序重新加锁。竞争者会在首个
+            # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
+            session = await self.session_service.lock_required(session_id)
+            request = await self.interaction_service.get_request_required(
+                request_id,
+                session_id=session_id,
+            )
+            suspension = await self.interaction_service.lock_suspension_required(
+                request.suspension_id,
+                session_id=session_id,
+            )
+            turn = await self.session_service.get_turn_required(suspension.turn_id)
+            if request.suspension_id != suspension.id or turn.session_id != session_id:
+                raise AgentException.message("人工交互与运行暂停点不匹配")
             if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
-                raise AgentException.message("无权限恢复该交互轮次")
+                raise AgentException.message("无权限恢复该交互轮次", status_code=403)
 
+            # 上一次恢复已经推进到同一 suspension 的下一项交互时，相同响应只需
+            # 重放当前待处理请求，不能再次执行已经完成的工具副作用。
+            if suspension.status == "pending":
+                if session.status != "awaiting_interaction":
+                    raise AgentException.message("人工交互暂停点与会话状态不一致")
+                idempotent_replay = True
+                await self.db.commit()
+                interaction = await self._get_pending_interaction(session_id)
+                await self._emit_interaction(interaction)
+                return
+
+            if suspension.status in {"resolved", "cancelled", "failed"}:
+                idempotent_replay = True
+                await self.db.commit()
+                await self.bus.emit(
+                    RuntimeEvent.session_ready(session.id, session.title, session.status)
+                )
+                await self.bus.emit(
+                    StreamEvent.turn_end(
+                        ORCHESTRATOR_ACTOR,
+                        session_id,
+                        f"interaction_{suspension.status}",
+                        None,
+                    )
+                )
+                return
+            if suspension.status != "resuming":
+                raise AgentException.message(
+                    "运行暂停点当前不可恢复",
+                    {"status": suspension.status},
+                )
+            if (
+                session.status != "awaiting_interaction"
+                or turn.status != "awaiting_interaction"
+            ):
+                raise AgentException.message("人工交互对应的会话或轮次不可恢复")
+
+            persisted_response = request.response_payload
+            if persisted_response is None:
+                raise AgentException.message("人工交互缺少已持久化的响应")
+
+            if request.kind == "user_question" and persisted_response["decision"] == "cancel":
+                suspension, requests = await self.interaction_service.cancel_suspension(
+                    suspension.id,
+                    self.user_id,
+                    session_id=session_id,
+                )
+                await self._finish_cancelled_interaction(
+                    session,
+                    turn,
+                    requests,
+                    "用户取消了问题交互。",
+                )
+                await self.db.commit()
+                continuation_applied = True
+                terminal_committed = True
+                await self.bus.emit(
+                    RuntimeEvent.session_ready(session.id, session.title, session.status)
+                )
+                await self.bus.emit(
+                    StreamEvent.turn_end(
+                        ORCHESTRATOR_ACTOR,
+                        session_id,
+                        "user_cancelled",
+                        None,
+                    )
+                )
+                return
+
+            interaction = await self._apply_interaction_and_continue(
+                session_id,
+                session,
+                turn,
+                request,
+                suspension,
+            )
+            if interaction is not None:
+                await self.db.commit()
+                await self._emit_interaction(interaction)
+                return
+
+            await self.interaction_service.mark_suspension_resolved(suspension.id)
             await self.session_service.repo.update_status(session, "running")
             await self.session_service.mark_turn_status(turn, "running")
             await self.db.commit()
-
+            continuation_applied = True
             await self.bus.emit(
                 RuntimeEvent.session_ready(session.id, session.title, session.status)
             )
 
-            actor = ORCHESTRATOR_ACTOR
-            suspended = await self._apply_decision_and_continue(
-                session_id,
-                session,
-                turn,
-                actor,
-                pending,
-                decision,
-                updated_input,
-                always_scope,
-            )
-            await self.db.flush()
-            if suspended:
-                # 同 turn 还有下一个待批项,已重新挂起:提交挂起状态后结束本次流。
-                await self.db.commit()
-                return
-
-            # 该 turn 待批全部裁决完:清指针,继续主循环跑完剩余回合。
-            await self.session_service.clear_pending_approval(session)
-            await self.db.commit()
-            # 续跑:此时上下文已含该 turn 全部 tool_result,_run_llm_loop 从下一次 LLM
-            # 调用开始(新 SSE 流,重新 emit turn_start 供前端开面板)。
             loop_result = await self._run_llm_loop(
                 session_id,
                 session,
                 turn,
-                pending.get("additional_context"),
+                suspension.continuation_payload.get("additional_context"),
             )
             if loop_result.suspended:
                 await self.db.commit()
+                if loop_result.interaction is not None:
+                    await self._emit_interaction(loop_result.interaction)
                 return
             memory_job_id = await self._complete_turn(
                 session,
@@ -257,14 +475,53 @@ class AgentRuntime:
             await self._run_inline_memory_job(memory_job_id)
             await self._wake_team_members(session_id, turn)
         except asyncio.CancelledError:
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "interrupted")
+            if terminal_committed or (response_committed and not continuation_applied):
+                await self.db.rollback()
+            else:
+                await self._mark_abnormal_end(
+                    session_id,
+                    turn.id if turn else None,
+                    "interrupted",
+                )
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "恢复审批交互轮次失败",
+                "恢复人工交互轮次失败",
                 extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
             )
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
+            if not response_committed:
+                # 请求格式、请求归属或并发状态错误都不能破坏仍可响应的原暂停点。
+                await self.db.rollback()
+                message = exc.message if isinstance(exc, AgentException) else "人工交互响应处理失败。"
+                await self.bus.emit(
+                    StreamEvent.error_event(
+                        ORCHESTRATOR_ACTOR,
+                        session_id,
+                        ErrorInfo(
+                            code="INTERACTION_RESPONSE_INVALID",
+                            message=message,
+                            retriable=True,
+                            fatal=True,
+                        ),
+                    )
+                )
+            elif terminal_committed or idempotent_replay or not continuation_applied:
+                # 保持 session=awaiting_interaction / suspension=resuming，允许相同响应重放。
+                await self.db.rollback()
+                await self.bus.emit(
+                    StreamEvent.error_event(
+                        ORCHESTRATOR_ACTOR,
+                        session_id,
+                        ErrorInfo(
+                            code="INTERACTION_RESUME_FAILED",
+                            message="人工交互响应已保存，但恢复执行失败，可重试该响应。",
+                            retriable=True,
+                            fatal=True,
+                        ),
+                    )
+                )
+            else:
+                await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
         finally:
             await self.bus.close()
 
@@ -296,14 +553,23 @@ class AgentRuntime:
         rendered_memories = memory_context.rendered_memories if memory_context else None
         # blocks 形式携带 cache 断点：tools + 稳定段跨 turn 复用，
         # 完整 system 供本 turn 内多轮工具迭代复用。
-        system_prompt = compose_lead_blocks(
+        system_prompt: list[TextBlockParam] = compose_lead_blocks(
             PromptContext.create(
                 skills_catalog=skills_catalog,
                 session_prompt=session.system_prompt,
                 memory_catalog=memory_context.rendered_catalog if memory_context else None,
             )
         )
-        tools: list[ToolParam] = self.tool_registry.to_anthropic_tools()
+        active_plan = await self.plan_service.get_active(session_id)
+        active_registry = self._registry_for_mode(active_plan is not None)
+        if active_plan is not None:
+            system_prompt.append(
+                {
+                    "type": "text",
+                    "text": render_plan_mode_instructions(active_plan.content),
+                }
+            )
+        tools: list[ToolParam] = active_registry.to_anthropic_tools()
 
         stop_reason: str | None = None
         for _ in range(settings.max_tool_iterations):
@@ -354,7 +620,7 @@ class AgentRuntime:
                     continue
                 break
 
-            suspended = await self._execute_tool_uses(
+            interaction = await self._execute_tool_uses(
                 session_id,
                 session,
                 turn,
@@ -365,9 +631,8 @@ class AgentRuntime:
                 additional_context=additional_context,
             )
             await self.db.flush()
-            if suspended:
-                # 命中 ask:待批指针已落库、permission_request 已发,提前返回挂起信号。
-                return TurnLoopResult(suspended=True)
+            if interaction is not None:
+                return TurnLoopResult(suspended=True, interaction=interaction)
         else:
             # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
             assistant_message = await self._finalize_without_tools(
@@ -459,7 +724,6 @@ class AgentRuntime:
             if session is None or turn is None or turn.status == "completed":
                 return
             await self.session_service.mark_turn_status(turn, turn_status)
-            await self.session_service.clear_pending_approval(session)
             await self.session_service.repo.update_status(session, "failed")
             await self.db.commit()
         except Exception:
@@ -476,30 +740,107 @@ class AgentRuntime:
         turn: SessionTurnRecord,
         actor: Actor,
         assistant_message_id: int,
-        tool_uses: list,
+        tool_uses: list[ToolUse],
         done_ids: list[str],
         additional_context: str | None,
-    ) -> bool:
-        """按序处理一个 assistant turn 的 tool_uses,逐个过权限判定。
-
-        - allow → 执行工具,emit tool_result,落 tool 消息,计入 done_ids;
-        - deny  → 不执行,落一条"用户拒绝"tool_result 消息(让模型自行反应);
-        - ask   → 不执行,写待批指针 + tool_calls 置 awaiting_approval +
-                  emit permission_request + 会话置 awaiting_approval,返回 True(挂起)。
-
-        done_ids 传入时已含本 turn 之前已完成的 tool_use_id(恢复场景),
-        用于挂起时精确记录"哪些已完成、哪些还在等"。
-        """
+        existing_suspension: RuntimeSuspensionRecord | None = None,
+    ) -> SuspendedInteraction | None:
+        """按原始顺序执行工具；需要人工输入时返回可发布的交互事件快照。"""
         for idx, tool_use in enumerate(tool_uses):
             if tool_use.id in done_ids:
                 continue
-            behavior = await self.permission_service.evaluate(
-                session_id, tool_use.name, tool_use.input
-            )
-            if behavior == "ask":
-                # 剩余未裁决的 tool_use(含当前这个)作为待批列表。
-                remaining = [tu for tu in tool_uses[idx:] if tu.id not in done_ids]
-                await self._suspend_for_approval(
+
+            active_plan = await self.plan_service.get_active(session_id)
+            if active_plan is not None and tool_use.name not in PLAN_MODE_ALLOWED_TOOLS:
+                await self._record_tool_response(
+                    session_id,
+                    turn.id,
+                    actor,
+                    tool_use,
+                    "Plan Mode仅允许只读探索、AskUserQuestion、WritePlan和ExitPlanMode。",
+                    is_error=True,
+                )
+                done_ids.append(tool_use.id)
+                continue
+
+            try:
+                normalized_input = self.tool_registry.validate_input(
+                    tool_use.name,
+                    tool_use.input,
+                )
+            except AgentException as exc:
+                details = (
+                    f"：{json.dumps(exc.details, ensure_ascii=False, default=str)}"
+                    if exc.details
+                    else ""
+                )
+                await self._record_tool_response(
+                    session_id,
+                    turn.id,
+                    actor,
+                    tool_use,
+                    f"{exc.message}{details}",
+                    is_error=True,
+                )
+                done_ids.append(tool_use.id)
+                continue
+            tool_use = replace(tool_use, input=normalized_input)
+            tool_uses[idx] = tool_use
+
+            if (
+                active_plan is not None
+                and tool_use.name == "Agent"
+                and tool_use.input.get("agent_type") not in {"Explore", "Plan"}
+            ):
+                await self._record_tool_response(
+                    session_id,
+                    turn.id,
+                    actor,
+                    tool_use,
+                    "Plan Mode只能派发Explore或Plan只读子代理。",
+                    is_error=True,
+                )
+                done_ids.append(tool_use.id)
+                continue
+
+            if tool_use.name in INTERACTION_TOOL_KINDS:
+                if tool_use.name == "EnterPlanMode" and active_plan is not None:
+                    await self._record_tool_response(
+                        session_id,
+                        turn.id,
+                        actor,
+                        tool_use,
+                        "当前会话已经处于Plan Mode。",
+                        is_error=True,
+                    )
+                    done_ids.append(tool_use.id)
+                    continue
+                if tool_use.name == "ExitPlanMode":
+                    if active_plan is None:
+                        await self._record_tool_response(
+                            session_id,
+                            turn.id,
+                            actor,
+                            tool_use,
+                            "当前会话未处于Plan Mode，不能调用ExitPlanMode。",
+                            is_error=True,
+                        )
+                        done_ids.append(tool_use.id)
+                        continue
+                    if not active_plan.content.strip():
+                        await self._record_tool_response(
+                            session_id,
+                            turn.id,
+                            actor,
+                            tool_use,
+                            "计划正文为空。请先使用WritePlan保存计划，再请求退出。",
+                            is_error=True,
+                        )
+                        done_ids.append(tool_use.id)
+                        continue
+
+                remaining = [item for item in tool_uses[idx:] if item.id not in done_ids]
+                return await self._suspend_for_interaction(
                     session_id,
                     session,
                     turn,
@@ -508,13 +849,38 @@ class AgentRuntime:
                     remaining,
                     done_ids,
                     additional_context,
+                    INTERACTION_TOOL_KINDS[tool_use.name],
+                    existing_suspension,
                 )
-                return True
+
+            behavior = await self.permission_service.evaluate(
+                session_id, tool_use.name, tool_use.input
+            )
+            if behavior == "ask":
+                remaining = [item for item in tool_uses[idx:] if item.id not in done_ids]
+                return await self._suspend_for_interaction(
+                    session_id,
+                    session,
+                    turn,
+                    actor,
+                    assistant_message_id,
+                    remaining,
+                    done_ids,
+                    additional_context,
+                    "tool_approval",
+                    existing_suspension,
+                )
             if behavior == "deny":
-                await self._record_denied(session_id, turn.id, actor, tool_use)
+                await self._record_tool_response(
+                    session_id,
+                    turn.id,
+                    actor,
+                    tool_use,
+                    "权限策略拒绝执行该工具调用。",
+                    is_error=True,
+                )
                 done_ids.append(tool_use.id)
                 continue
-            # allow:正常执行
             await self._execute_one(
                 session_id,
                 turn.id,
@@ -523,7 +889,7 @@ class AgentRuntime:
                 tool_use,
             )
             done_ids.append(tool_use.id)
-        return False
+        return None
 
     async def _execute_one(
         self,
@@ -577,15 +943,23 @@ class AgentRuntime:
         )
         return output
 
-    async def _record_denied(
+    async def _record_tool_response(
         self,
         session_id: int,
         turn_id: UUID,
         actor: Actor,
-        tool_use,
+        tool_use: ToolUse,
+        output: str,
+        *,
+        is_error: bool,
+        record: ToolCallRecord | None = None,
     ) -> None:
-        """把被用户拒绝的工具调用作为 tool_result 喂回模型(标记 is_error)。"""
-        message = "用户拒绝执行该工具调用。"
+        """持久化不经过真实工具执行的合成 tool_result。"""
+        if record is not None:
+            if is_error:
+                await self.tool_service.tool_repo.reject_awaiting(record, output)
+            else:
+                await self.tool_service.tool_repo.succeed(record, output)
         await self.bus.emit(
             StreamEvent.tool_result(
                 actor,
@@ -593,8 +967,8 @@ class AgentRuntime:
                 ToolInfo(
                     id=tool_use.id,
                     name=tool_use.name,
-                    output=message,
-                    is_error=True,
+                    output=output,
+                    is_error=is_error,
                 ),
             )
         )
@@ -605,34 +979,32 @@ class AgentRuntime:
                 tool_use_id=tool_use.id,
                 tool_name=tool_use.name,
                 input_args=tool_use.input,
-                output=message,
-                is_error=True,
+                output=output,
+                is_error=is_error,
             ).to_content_dict(),
             turn_id=turn_id,
         )
 
-    async def _suspend_for_approval(
+    async def _suspend_for_interaction(
         self,
         session_id: int,
         session: SessionRecord,
         turn: SessionTurnRecord,
         actor: Actor,
         assistant_message_id: int,
-        remaining: list,
+        remaining: list[ToolUse],
         done_ids: list[str],
         additional_context: str | None,
-    ) -> None:
-        """在 remaining[0] 处挂起:落待批指针、置 tool_calls awaiting、emit permission_request。"""
+        kind: str,
+        existing_suspension: RuntimeSuspensionRecord | None,
+    ) -> SuspendedInteraction:
+        """冻结 continuation 并创建一项业务交互请求。"""
         target = remaining[0]
-        request_id = f"appr-{uuid4().hex[:12]}"
-        # 为待批工具建一条 awaiting_approval 记录(入参已存,便于恢复时复用)。
         record = await self.tool_service.tool_repo.start(
             session_id, target.name, target.input, message_id=assistant_message_id
         )
-        await self.tool_service.tool_repo.mark_awaiting(record)
-        pending = {
-            "request_id": request_id,
-            "turn_id": str(turn.id),
+        await self.tool_service.tool_repo.mark_awaiting_interaction(record)
+        continuation = {
             "assistant_message_id": assistant_message_id,
             "actor": actor.to_dict_compact(),
             "pending": [
@@ -647,21 +1019,39 @@ class AgentRuntime:
             "done_tool_use_ids": list(done_ids),
             "additional_context": additional_context,
         }
-        await self.session_service.set_pending_approval(session, pending)
-        await self.session_service.mark_turn_status(turn, "awaiting_approval")
-        await self.bus.emit(
-            StreamEvent.permission_request(
-                actor,
+        request_payload = await self._build_interaction_payload(session_id, kind, target)
+        request_create = InteractionRequestCreate(
+            kind=kind,
+            request_payload=request_payload,
+            tool_call_id=record.id,
+            tool_use_id=target.id,
+        )
+
+        if existing_suspension is None:
+            suspension, request = await self.interaction_service.create_suspension_with_request(
                 session_id,
-                PermissionInfo(
-                    request_id=request_id,
-                    tool_id=target.id,
-                    tool_name=target.name,
-                    tool_input=target.input,
-                    behavior="ask",
-                    reason=self._ask_reason(target.name),
-                ),
+                turn.id,
+                continuation,
+                {"mode": "sequential"},
+                request_create,
             )
+        else:
+            suspension, request = (
+                await self.interaction_service.continue_suspension_with_request(
+                    existing_suspension.id,
+                    continuation,
+                    request_create,
+                )
+            )
+        await self.session_service.repo.update_status(session, "awaiting_interaction")
+        await self.session_service.mark_turn_status(turn, "awaiting_interaction")
+        return SuspendedInteraction(
+            session_id=session_id,
+            suspension_id=suspension.id,
+            request_id=request.id,
+            kind=request.kind,
+            request_payload=dict(request.request_payload),
+            schema_version=request.schema_version,
         )
 
     def _ask_reason(self, tool_name: str) -> str:
@@ -670,29 +1060,58 @@ class AgentRuntime:
             return "危险工具默认需审批"
         return "该工具已被配置为需审批"
 
-    async def _apply_decision_and_continue(
+    async def _build_interaction_payload(
+        self,
+        session_id: int,
+        kind: str,
+        target: ToolUse,
+    ) -> dict[str, Any]:
+        if kind == "tool_approval":
+            return {
+                "tool": {
+                    "id": target.id,
+                    "name": target.name,
+                    "input": target.input,
+                },
+                "reason": self._ask_reason(target.name),
+                "allowed_decisions": ["allow_once", "always_allow", "deny"],
+                "can_update_input": True,
+            }
+        if kind == "user_question":
+            return AskUserQuestionRequestPayload.model_validate(target.input).model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        if kind == "enter_plan_mode":
+            return {"message": "是否进入只读Plan Mode？"}
+        if kind == "exit_plan_mode":
+            plan = await self.plan_service.get_active_required(session_id)
+            return {
+                "plan_id": str(plan.id),
+                "plan": plan.content,
+                "plan_version": plan.version,
+                "allowedPrompts": target.input.get("allowedPrompts", []),
+            }
+        raise AgentException.message("不支持的人工交互类型")
+
+    async def _apply_interaction_and_continue(
         self,
         session_id: int,
         session: SessionRecord,
         turn: SessionTurnRecord,
-        actor: Actor,
-        pending: dict[str, Any],
-        decision: str,
-        updated_input: dict[str, Any] | None,
-        always_scope: str,
-    ) -> bool:
-        """裁决当前待批项(pending[0]),再补齐该 turn 剩余待批项。
-
-        返回 True 表示同 turn 还有下一个 ask、已重新挂起;False 表示该 turn 全部裁决完。
-        """
+        request: InteractionRequestRecord,
+        suspension: RuntimeSuspensionRecord,
+    ) -> SuspendedInteraction | None:
+        """应用已持久化的业务响应，并继续同一 assistant 工具序列。"""
+        pending = suspension.continuation_payload
         pending_items = pending.get("pending", [])
         if not pending_items:
-            return False
+            raise AgentException.message("运行暂停点缺少待处理工具")
         assistant_message_id = pending.get("assistant_message_id")
         if not isinstance(assistant_message_id, int):
-            raise AgentException.message("审批请求缺少关联的助手消息")
+            raise AgentException.message("运行暂停点缺少关联的助手消息")
         done_ids = list(pending.get("done_tool_use_ids", []))
-        # 从待批指针重建 tool_uses(保存了原始顺序);done 的会被 _execute_tool_uses 跳过。
         tool_uses = [
             ToolUse(id=it["tool_use_id"], name=it["tool_name"], input=it.get("input") or {})
             for it in pending_items
@@ -704,33 +1123,34 @@ class AgentRuntime:
         tool_call_id = target_item.get("tool_call_id")
         if tool_call_id is not None:
             record = await self.db.get(ToolCallRecord, tool_call_id)
+        if record is None or request.tool_call_id != record.id or request.tool_use_id != target.id:
+            raise AgentException.message("人工交互与工具调用记录不匹配")
+        response = request.response_payload
+        if response is None:
+            raise AgentException.message("人工交互缺少已持久化的响应")
 
-        if decision == "deny":
-            if record is not None:
-                await self.tool_service.tool_repo.resolve_awaiting(record, "deny")
-            await self._record_denied(session_id, turn.id, actor, target)
-            done_ids.append(target.id)
-        else:
-            # allow_once / always_allow
-            if decision == "always_allow":
-                await self.permission_service.add_always_allow(
-                    session_id, target.name, always_scope
-                )
-            # 批准时可修改入参
-            if updated_input is not None:
-                target = replace(target, input=updated_input)
-                tool_uses[0] = target
-            await self._execute_one(
+        actor = ORCHESTRATOR_ACTOR
+        if request.kind == "tool_approval":
+            await self._apply_tool_approval(
                 session_id,
-                turn.id,
+                turn,
                 actor,
                 assistant_message_id,
                 target,
-                record=record,
+                tool_uses,
+                record,
+                response,
             )
-            done_ids.append(target.id)
+        elif request.kind == "user_question":
+            await self._apply_user_question(turn, actor, target, record, request, response)
+        elif request.kind == "enter_plan_mode":
+            await self._apply_enter_plan_mode(turn, actor, target, record, response)
+        elif request.kind == "exit_plan_mode":
+            await self._apply_exit_plan_mode(turn, actor, target, record, request, response)
+        else:
+            raise AgentException.message("不支持的人工交互类型")
+        done_ids.append(target.id)
 
-        # 继续处理该 turn 剩余待批项(可能在下一个 ask 处再次挂起)。
         return await self._execute_tool_uses(
             session_id,
             session,
@@ -740,6 +1160,336 @@ class AgentRuntime:
             tool_uses,
             done_ids,
             additional_context=pending.get("additional_context"),
+            existing_suspension=suspension,
+        )
+
+    async def _apply_tool_approval(
+        self,
+        session_id: int,
+        turn: SessionTurnRecord,
+        actor: Actor,
+        assistant_message_id: int,
+        target: ToolUse,
+        tool_uses: list[ToolUse],
+        record: ToolCallRecord,
+        response: dict[str, Any],
+    ) -> None:
+        decision = response["decision"]
+        if decision == "deny":
+            message = response.get("message") or "用户拒绝执行该工具调用。"
+            await self._record_tool_response(
+                session_id,
+                turn.id,
+                actor,
+                target,
+                message,
+                is_error=True,
+                record=record,
+            )
+            return
+
+        updated_input = response.get("updated_input")
+        if updated_input is not None:
+            normalized = self.tool_registry.validate_input(target.name, updated_input)
+            target = replace(target, input=normalized)
+            tool_uses[0] = target
+        if decision == "always_allow":
+            await self.permission_service.add_always_allow(
+                session_id,
+                target.name,
+                response.get("always_scope", "session"),
+            )
+        await self._execute_one(
+            session_id,
+            turn.id,
+            actor,
+            assistant_message_id,
+            target,
+            record=record,
+        )
+
+    async def _apply_user_question(
+        self,
+        turn: SessionTurnRecord,
+        actor: Actor,
+        target: ToolUse,
+        record: ToolCallRecord,
+        request: InteractionRequestRecord,
+        response: dict[str, Any],
+    ) -> None:
+        decision = response["decision"]
+        answers = response.get("answers") or {}
+        if decision == "submit":
+            output = self._format_question_answers(
+                request.request_payload,
+                answers,
+                response.get("annotations") or {},
+            )
+            is_error = False
+        elif decision == "cancel":
+            raise AgentException.message("取消问题交互必须由运行时中止路径处理")
+        elif decision == "discuss":
+            output = self._format_question_discussion(
+                request.request_payload,
+                answers,
+                response.get("message"),
+            )
+            is_error = True
+        else:
+            active_plan = await self.plan_service.get_active(turn.session_id)
+            if active_plan is None:
+                output = "只有Plan Mode中的规划访谈可以使用finish_plan_interview。"
+            else:
+                output = self._format_finish_plan_interview(
+                    request.request_payload,
+                    answers,
+                    response.get("message"),
+                )
+            is_error = True
+        await self._record_tool_response(
+            turn.session_id,
+            turn.id,
+            actor,
+            target,
+            output,
+            is_error=is_error,
+            record=record,
+        )
+
+    async def _apply_enter_plan_mode(
+        self,
+        turn: SessionTurnRecord,
+        actor: Actor,
+        target: ToolUse,
+        record: ToolCallRecord,
+        response: dict[str, Any],
+    ) -> None:
+        if response["decision"] == "approve":
+            await self.plan_service.enter(turn.session_id, turn.id)
+            output = ENTER_PLAN_MODE_RESULT
+            is_error = False
+        else:
+            feedback = response.get("feedback")
+            output = "用户拒绝进入Plan Mode。"
+            if feedback:
+                output = f"{output}\n\n用户反馈：{feedback}"
+            is_error = True
+        await self._record_tool_response(
+            turn.session_id,
+            turn.id,
+            actor,
+            target,
+            output,
+            is_error=is_error,
+            record=record,
+        )
+
+    async def _apply_exit_plan_mode(
+        self,
+        turn: SessionTurnRecord,
+        actor: Actor,
+        target: ToolUse,
+        record: ToolCallRecord,
+        request: InteractionRequestRecord,
+        response: dict[str, Any],
+    ) -> None:
+        if self.user_id is None:
+            raise AgentException.message("退出Plan Mode缺少可信用户")
+        edited_plan = response.get("edited_plan")
+        feedback = response.get("feedback")
+        if response["decision"] == "approve":
+            allowed_prompts = request.request_payload.get("allowedPrompts") or []
+            plan = await self.plan_service.approve_exit(
+                turn.session_id,
+                turn.id,
+                self.user_id,
+                allowed_prompts,
+                feedback,
+                edited_plan,
+            )
+            output = f"用户已批准以下计划并退出Plan Mode：\n\n{plan.content}"
+            if feedback:
+                output = f"{output}\n\n用户反馈：{feedback}"
+            if allowed_prompts:
+                output = (
+                    f"{output}\n\nallowedPrompts仅作为计划声明保存，"
+                    "不会绕过现有工具权限规则。"
+                )
+            is_error = False
+        else:
+            plan = await self.plan_service.reject_exit(
+                turn.session_id,
+                feedback,
+                edited_plan,
+            )
+            output = "用户暂未批准计划，Plan Mode保持启用。"
+            if feedback:
+                output = f"{output}\n\n用户反馈：{feedback}"
+            output = f"{output}\n\n当前计划：\n{plan.content}"
+            is_error = True
+        await self._record_tool_response(
+            turn.session_id,
+            turn.id,
+            actor,
+            target,
+            output,
+            is_error=is_error,
+            record=record,
+        )
+
+    @staticmethod
+    def _format_question_answers(
+        request_payload: dict[str, Any],
+        answers: dict[str, str],
+        annotations: dict[str, dict[str, str]],
+    ) -> str:
+        parts: list[str] = []
+        for question in request_payload.get("questions", []):
+            question_text = question["question"]
+            answer = answers[question_text]
+            answer_parts = [f'"{question_text}"="{answer}"']
+            annotation = annotations.get(question_text) or {}
+            if annotation.get("preview"):
+                answer_parts.append(f"selected preview:\n{annotation['preview']}")
+            if annotation.get("notes"):
+                answer_parts.append(f"user notes: {annotation['notes']}")
+            parts.append(" ".join(answer_parts))
+        joined = ", ".join(parts)
+        return (
+            "User has answered your questions: "
+            f"{joined}. You can now continue with the user's answers in mind."
+        )
+
+    @staticmethod
+    def _format_question_discussion(
+        request_payload: dict[str, Any],
+        answers: dict[str, str],
+        message: str | None,
+    ) -> str:
+        lines = ["用户希望先讨论这些问题。请先询问用户想澄清什么，再按需重写问题。"]
+        for question in request_payload.get("questions", []):
+            text = question["question"]
+            lines.append(f'- "{text}": {answers.get(text, "（未回答）")}')
+        if message:
+            lines.append(f"用户补充：{message}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_finish_plan_interview(
+        request_payload: dict[str, Any],
+        answers: dict[str, str],
+        message: str | None,
+    ) -> str:
+        lines = ["用户表示规划访谈信息已经足够。停止继续澄清并完成计划。"]
+        for question in request_payload.get("questions", []):
+            text = question["question"]
+            lines.append(f'- "{text}": {answers.get(text, "（未回答）")}')
+        if message:
+            lines.append(f"用户补充：{message}")
+        return "\n".join(lines)
+
+    def _registry_for_mode(self, plan_mode: bool) -> ToolRegistry:
+        if plan_mode:
+            return self.tool_registry.only(*PLAN_MODE_ALLOWED_TOOLS)
+        return self.tool_registry.without("ExitPlanMode", "WritePlan")
+
+    async def _get_pending_interaction(self, session_id: int) -> SuspendedInteraction:
+        """读取已提交的唯一待处理请求，用于幂等重放 SSE 通知。"""
+        pending = await self.interaction_service.get_pending(session_id)
+        if pending is None:
+            raise AgentException.message("会话没有可重放的人工交互")
+        suspension, requests = pending
+        if suspension.status != "pending" or len(requests) != 1:
+            raise AgentException.message(
+                "运行暂停点的待处理请求数量无效",
+                {"status": suspension.status, "request_count": len(requests)},
+            )
+        request = requests[0]
+        return SuspendedInteraction(
+            session_id=session_id,
+            suspension_id=suspension.id,
+            request_id=request.id,
+            kind=request.kind,
+            request_payload=dict(request.request_payload),
+            schema_version=request.schema_version,
+        )
+
+    async def _finish_cancelled_interaction(
+        self,
+        session: SessionRecord,
+        turn: SessionTurnRecord,
+        requests: list[InteractionRequestRecord],
+        message: str,
+    ) -> None:
+        """将取消投影到工具调用、Turn 与 Session，避免留下半挂起状态。"""
+        for request in requests:
+            if request.tool_call_id is not None:
+                record = await self.tool_service.get_interaction_call_required(
+                    request.tool_call_id,
+                    session.id,
+                )
+                if record.status == "awaiting_interaction":
+                    if request.tool_use_id is None:
+                        raise AgentException.message("人工交互请求缺少工具调用ID")
+                    await self._record_tool_response(
+                        session.id,
+                        turn.id,
+                        ORCHESTRATOR_ACTOR,
+                        ToolUse(
+                            id=request.tool_use_id,
+                            name=record.tool_name,
+                            input=dict(record.input_args),
+                        ),
+                        message,
+                        is_error=True,
+                        record=record,
+                    )
+                elif record.status not in {"succeeded", "failed", "rejected"}:
+                    raise AgentException.message(
+                        "人工交互关联的工具调用状态无效",
+                        {"tool_call_id": record.id, "status": record.status},
+                    )
+        await self.session_service.mark_turn_status(turn, "interrupted")
+        await self.session_service.repo.update_status(session, "idle")
+
+    async def _normalize_interaction_response(
+        self,
+        session_id: int,
+        request_id: UUID,
+        kind: str,
+        response_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """在响应落库前完成依赖工具注册表的校验。"""
+        if kind != "tool_approval" or response_payload.get("updated_input") is None:
+            return response_payload
+        request = await self.interaction_service.get_request_required(
+            request_id,
+            session_id=session_id,
+        )
+        tool = request.request_payload.get("tool") or {}
+        tool_name = tool.get("name")
+        if not isinstance(tool_name, str):
+            raise AgentException.message("工具审批请求缺少有效工具名")
+        normalized = dict(response_payload)
+        normalized["updated_input"] = self.tool_registry.validate_input(
+            tool_name,
+            response_payload["updated_input"],
+        )
+        return normalized
+
+    async def _emit_interaction(self, interaction: SuspendedInteraction) -> None:
+        await self.bus.emit(
+            StreamEvent.interaction_request(
+                ORCHESTRATOR_ACTOR,
+                interaction.session_id,
+                InteractionInfo(
+                    request_id=str(interaction.request_id),
+                    suspension_id=str(interaction.suspension_id),
+                    kind=interaction.kind,
+                    schema_version=interaction.schema_version,
+                    request_payload=interaction.request_payload,
+                ),
+            )
         )
 
     async def _finalize_without_tools(

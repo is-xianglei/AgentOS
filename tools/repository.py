@@ -10,6 +10,9 @@ class ToolRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def get(self, tool_call_id: int) -> ToolCallRecord | None:
+        return await self.db.get(ToolCallRecord, tool_call_id)
+
     async def start(
         self,
         session_id: int,
@@ -45,27 +48,18 @@ class ToolRepository:
         await self.db.refresh(record)
         return record
 
-    async def mark_awaiting(self, record: ToolCallRecord) -> ToolCallRecord:
-        """把工具调用置为待审批(不执行,入参已存,等待用户裁决)。"""
-        record.status = "awaiting_approval"
+    async def mark_awaiting_interaction(self, record: ToolCallRecord) -> ToolCallRecord:
+        """把工具调用置为等待人工交互。"""
+        record.status = "awaiting_interaction"
         await self.db.flush()
         await self.db.refresh(record)
         return record
 
-    async def resolve_awaiting(
-        self, record: ToolCallRecord, decision: str
-    ) -> ToolCallRecord:
-        """裁决一条待审批记录。
-
-        decision=deny 时直接终态为 rejected;allow_once/always_allow 时回到 running,
-        由后续真正执行走 succeed/fail。
-        """
-        if decision == "deny":
-            record.status = "rejected"
-            record.finished_at = datetime.now(timezone.utc)
-        else:
-            record.status = "running"
+    async def reject_awaiting(self, record: ToolCallRecord, message: str) -> ToolCallRecord:
+        """把等待交互的工具调用标记为拒绝。"""
+        record.status = "rejected"
+        record.error_message = message
+        record.finished_at = datetime.now(timezone.utc)
         await self.db.flush()
         await self.db.refresh(record)
         return record
-

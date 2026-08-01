@@ -1,3 +1,5 @@
+from typing import Any
+
 from anthropic.types import ToolParam
 from pydantic import ValidationError
 
@@ -9,6 +11,8 @@ from tools.builtin import (
     BashTool,
     EchoTool,
     EditTool,
+    EnterPlanModeTool,
+    ExitPlanModeTool,
     GlobTool,
     GrepTool,
     ListMessagesTool,
@@ -26,6 +30,7 @@ from tools.builtin import (
     TeamListTool,
     TeamSpawnTool,
     WeatherTool,
+    WritePlanTool,
     WriteTool,
 )
 
@@ -43,7 +48,7 @@ class ToolRegistry:
             raise AgentException.message("工具不存在")
         return tool
 
-    def validate_input(self, name: str, data: dict) -> dict:
+    def validate_input(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
         """按工具Schema校验并规范化输入，供执行和人工恢复共用。"""
         tool = self.get(name)
         try:
@@ -82,6 +87,9 @@ def build_tool_registry() -> ToolRegistry:
             EchoTool(),
             # 强制人工交互工具，仅主运行时处理，不进入普通 ToolService 执行路径。
             AskUserQuestionTool(),
+            EnterPlanModeTool(),
+            ExitPlanModeTool(),
+            WritePlanTool(),
             # 文件工具
             ReadTool(),
             WriteTool(),

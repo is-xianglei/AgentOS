@@ -138,25 +138,23 @@ class SessionService:
 
     async def ensure_runnable(self, session_id: int) -> SessionRecord:
         """校验会话当前是否允许继续执行。"""
-        session: SessionRecord = await self.repo.get_for_update(session_id)
-        if session is None:
-            raise AgentException.message("会话不存在")
+        session = await self.lock_required(session_id)
         if session.status not in {"idle", "created", "failed"}:
             raise AgentException.message("会话当前不可执行")
         return session
 
-    async def ensure_resumable(self, session_id: int) -> SessionRecord:
-        """校验会话当前是否处于可从审批挂起点恢复的状态。
-
-        只允许 awaiting_approval 态被 /approvals 端点驱动;与 ensure_runnable 的
-        白名单隔离,避免普通 send_message 误入恢复流程,也避免 /approvals 驱动一个
-        并未挂起的会话。
-        """
-        session: SessionRecord = await self.repo.get_for_update(session_id)
+    async def lock_required(self, session_id: int) -> SessionRecord:
+        """锁定并刷新会话，供跨事务状态机按统一顺序获取行锁。"""
+        session = await self.repo.get_for_update(session_id)
         if session is None:
             raise AgentException.message("会话不存在")
-        if session.status != "awaiting_approval":
-            raise AgentException.message("会话当前没有待审批的请求")
+        return session
+
+    async def ensure_interaction_resumable(self, session_id: int) -> SessionRecord:
+        """锁定并校验等待人工交互的会话。"""
+        session = await self.lock_required(session_id)
+        if session.status != "awaiting_interaction":
+            raise AgentException.message("会话当前没有待处理的人工交互")
         return session
 
     async def mark_running(self, session_id: int) -> SessionRecord:
@@ -170,28 +168,6 @@ class SessionService:
         await self.repo.update_status(session, status)
         await self.db.commit()
         return session
-
-    async def set_pending_approval(self, session: SessionRecord, pending: dict[str, Any]) -> None:
-        """把会话置为待审批态并写入待批指针(session.extra.pending_approval)。
-
-        pending 结构见方案:request_id / assistant_message_id / actor / pending[] /
-        done_tool_use_ids。extra 是 MutableDict,直接改并 update_status 落库。
-        """
-        extra = dict(session.extra or {})
-        extra["pending_approval"] = pending
-        session.extra = extra
-        await self.repo.update_status(session, "awaiting_approval")
-
-    def get_pending_approval(self, session: SessionRecord) -> dict[str, Any] | None:
-        """读取当前待批指针(无则 None)。"""
-        return (session.extra or {}).get("pending_approval")
-
-    async def clear_pending_approval(self, session: SessionRecord) -> None:
-        """清除待批指针(恢复流程裁决完全部待批项后调用)。"""
-        extra = dict(session.extra or {})
-        extra.pop("pending_approval", None)
-        session.extra = extra
-        await self.db.flush()
 
     async def prepare_for_message(
         self,
@@ -349,11 +325,13 @@ class SessionService:
                 context.append({"role": message.role, "content": content})
             elif message.role == "tool":
                 tool_result = ToolResultMessage.from_content_dict(message.content)
-                block = {
+                block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": tool_result.tool_use_id,
                     "content": tool_result.output,
                 }
+                if tool_result.is_error:
+                    block["is_error"] = True
                 previous_content = context[-1].get("content") if context else None
                 if (
                     context

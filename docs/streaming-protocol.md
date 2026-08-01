@@ -57,7 +57,7 @@
 
 ---
 
-## 三、事件类型清单(9 种,所有 actor 通用)
+## 三、事件类型清单(10 种,所有 actor 通用)
 
 **核心:思考 / 回答 / 工具调用对所有 actor 是同一套 type,只是 actor 不同。**
 不存在 `subagent_thinking` 这类专属类型;前端用同一套渲染逻辑,按 actor 分面板。
@@ -72,7 +72,7 @@
 | 内容 | `block_stop` | `block.index` |
 | 工具 | `tool_use` | `tool.id/name/input`(input 一次性给全,不逐字流) |
 | 工具 | `tool_result` | `tool.id/name/output/is_error` |
-| 工具 | `permission_request` | `permission.request_id/tool_id/tool_name/tool_input/behavior/reason` |
+| 交互 | `interaction_request` | `interaction.request_id/suspension_id/kind/schema_version/request_payload` |
 | 控制 | `error` | `error.code/message/retriable/fatal` |
 
 > `turn_end.usage` 含四个字段:`input_tokens` / `output_tokens` /
@@ -83,49 +83,66 @@
 > 传输层噪声(`ping`、`signature_delta`、仅更新 usage 的中间 `message_delta`)在后端消化,
 > 不进本协议;全量 `snapshot` 仅后端落库 / 对账用,不发前端。
 
-### `permission_request` —— 工具执行前的审批请求(Human-in-the-Loop)
+### `interaction_request` —— 通用人工交互请求(Human-in-the-Loop)
 
-当某个 actor 想调用一个需要审批的工具(如 `Bash`,由权限规则判定为 `ask`)时,后端**不执行该工具**,
-而是发一个 `permission_request` 事件,随后**正常结束(close)本次 SSE 流**(前端触发 `onDone`,这不是错误)。
-会话状态置为 `awaiting_approval`,待批信息落库,等待用户裁决。
+当 orchestrator 遇到需要人工响应的工具审批、用户问题或 Plan Mode 进出请求时，后端暂不执行
+对应工具，而是先持久化 `runtime_suspensions` 与 `interaction_requests`，将 Session 和 Turn
+置为 `awaiting_interaction`。事务提交后发出 `interaction_request`，随后正常关闭本次 SSE 流；
+关闭表示运行已可靠挂起，不是错误。
 
 ```jsonc
-{"type":"permission_request","sequence":9,"session_id":42,
+{"type":"interaction_request","sequence":9,"session_id":42,
  "actor":{"role":"orchestrator","name":"orchestrator"},
- "permission":{
-   "request_id":"appr-3f9c1a2b",       // 稳定关联键,应答时回传对账
-   "tool_id":"toolu_01EX",             // 对应此前 tool_use 的 id
-   "tool_name":"Bash",
-   "tool_input":{"command":"rm -rf build/"},
-   "behavior":"ask",
-   "reason":"危险工具默认需审批"          // 可选,供前端展示
+ "interaction":{
+   "request_id":"dc760479-e4c6-4ca9-9e1e-eafc34f88893",
+   "suspension_id":"ef865764-ed8d-4325-98cf-cb64a94713a0",
+   "kind":"tool_approval",
+   "schema_version":1,
+   "request_payload":{
+     "tool":{"id":"toolu_01EX","name":"Bash","input":{"command":"rm -rf build/"}},
+     "reason":"危险工具默认需审批",
+     "allowed_decisions":["allow_once","always_allow","deny"],
+     "can_update_input":true
+   }
  }}
 ```
 
-**应答走独立 REST 端点,不回写 SSE 流**(前端流严格单向):
+`kind` 当前取值为 `tool_approval`、`user_question`、`enter_plan_mode` 或
+`exit_plan_mode`；`request_payload` 由对应类型定义。断线或页面重建时，通过以下端点读取当前
+暂停点和请求；没有待处理交互时，响应数据为 `null`：
 
 ```
-POST /api/sessions/{session_id}/approvals
-{ "request_id":"appr-3f9c1a2b",
-  "decision":"allow_once" | "always_allow" | "deny",
-  "updated_input": {...},              // 可选,批准时修改入参
-  "always_scope":"session" | "global"  // 仅 always_allow 时用,默认 session
+GET /api/interactions/sessions/{session_id}/pending
+```
+
+响应通过独立 REST 端点提交，不回写已关闭的旧 SSE 流：
+
+```jsonc
+POST /api/interactions/sessions/{session_id}/requests/{request_id}/resolve
+{
+  "kind":"tool_approval",
+  "response_payload":{
+    "decision":"allow_once",          // 或 always_allow / deny
+    "updated_input":null,
+    "always_scope":"session"
+  }
 }
 ```
 
-该端点返回一条**新的 SSE 流**(与 `POST /sessions/messages` 同构),从挂起点恢复执行:
-`allow_once`/`always_allow` → 执行该工具并流式产出后续事件;`always_allow` 额外落一条权限规则;
-`deny` → 该工具以"用户拒绝"作为结果喂回模型。前端用 `request_id`(或 `tool_id`)把"待批准"态与后续
-的 `tool_result` 关联起来。
+该端点返回一条新的 SSE 流，从持久化暂停点恢复执行。相同响应可安全重试；同一请求若已用不同
+响应处理，则在建立 SSE 前返回 HTTP `409`。若要终止整个暂停点，调用下列普通 JSON API；
+它会同步取消未处理请求和等待中的工具调用，将 Turn 标记为 `interrupted`，并让 Session 回到
+`idle`：
 
-> 前端消费:收到 `permission_request` 时,在对应 actor 面板渲染批准/拒绝交互(带 `tool_name`/`tool_input`);
-> 用户裁决后调 `/approvals` 端点并接续新流。注意 reducer 的事件 switch 需为该 type 补 case,否则事件到达但无 UI。
+```
+POST /api/interactions/sessions/{session_id}/suspensions/{suspension_id}/cancel
+```
 
 ---
 
 ## 三·补、会话级控制事件(`RuntimeEvent`,不带 actor)
 
-除上面 9 种 actor 事件外,另有一类**会话级控制事件**:它们描述整个会话的状态,不属于任何
+除上面 10 种 actor 事件外,另有一类**会话级控制事件**:它们描述整个会话的状态,不属于任何
 actor 的产出,因此**不带 `actor` 字段**,信封只有 `type` / `sequence` / `data`。与 `StreamEvent`
 共用同一个 bus 和 `sequence` 序号。
 
@@ -266,5 +283,3 @@ actor 的产出,因此**不带 `actor` 字段**,信封只有 `type` / `sequence`
 
 > 状态:协议已定稿。落地需改造 `SubAgentRunner`(`run` / `run_teammate`)的 emit 与
 > `app/llm/client.py` 的事件解析,使三类 actor 输出统一精细事件。
-
-

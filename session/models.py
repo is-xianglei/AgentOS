@@ -134,7 +134,7 @@ class SessionTurnRecord(Base):
             name="uq_session_turns_memory_context_id",
         ),
         CheckConstraint(
-            "status IN ('running', 'awaiting_approval', 'completed', 'failed', 'interrupted')",
+            "status IN ('running', 'awaiting_interaction', 'completed', 'failed', 'interrupted')",
             name="ck_session_turns_status",
         ),
         CheckConstraint(

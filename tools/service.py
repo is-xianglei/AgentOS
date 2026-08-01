@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
+from core.errors import AgentException
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from hooks import HookContext, HookEvent, get_hook_registry
 from tools.models import ToolCallRecord
@@ -20,6 +21,17 @@ class ToolService:
         self.db = db
         self.registry = registry
         self.tool_repo = ToolRepository(db)
+
+    async def get_interaction_call_required(
+        self,
+        tool_call_id: int,
+        session_id: int,
+    ) -> ToolCallRecord:
+        """按可信会话读取人工交互关联的工具调用。"""
+        record = await self.tool_repo.get(tool_call_id)
+        if record is None or record.session_id != session_id:
+            raise AgentException.message("人工交互关联的工具调用不存在")
+        return record
 
     async def run(
         self,

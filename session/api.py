@@ -9,7 +9,6 @@ from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from runtime.agent import AgentRuntime, format_sse
 from session.schemas import (
-    SessionApprovalRequest,
     SessionBatchDeleteRequest,
     SessionDeleteResult,
     SessionMessageResponse,
@@ -58,35 +57,6 @@ async def send_message(
 
     async def event_stream():
         async for event in runtime.run(payload.session_id, payload.content):
-            yield format_sse(event)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
-
-
-@router.post("/{session_id}/approvals", summary="审批工具调用并恢复执行")
-async def respond_approval(
-    session_id: int,
-    payload: SessionApprovalRequest,
-    db: DatabaseSession,
-    current_user: CurrentUser,
-    workspace_id: CurrentWorkspaceId,
-):
-    # 验证会话权限
-    service = SessionService(db)
-    session = await service.get_required(session_id)
-    if not await service.check_access(session, current_user.id, workspace_id):
-        raise AgentException.message("无权限访问该会话", status_code=403)
-
-    runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
-
-    async def event_stream():
-        async for event in runtime.resume(
-            session_id,
-            payload.request_id,
-            payload.decision,
-            payload.updated_input,
-            payload.always_scope,
-        ):
             yield format_sse(event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")

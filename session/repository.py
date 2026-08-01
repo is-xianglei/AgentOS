@@ -5,7 +5,9 @@ from uuid import UUID
 from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from memory.models import TurnMemoryContextRecord
+from plan.models import SessionPlanRecord
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from task.models import TaskRecord
 from team.models import (
@@ -30,6 +32,9 @@ _SESSION_CHILD_MODELS = (
     TeamMessageRecord,
     SubAgentRunRecord,
     PermissionRuleRecord,
+    RuntimeSuspensionRecord,
+    InteractionRequestRecord,
+    SessionPlanRecord,
 )
 
 
@@ -135,7 +140,12 @@ class SessionRepository:
         return result.rowcount or 0
 
     async def get_for_update(self, session_id: int) -> SessionRecord | None:
-        stmt = select(SessionRecord).where(SessionRecord.id == session_id).with_for_update()
+        stmt = (
+            select(SessionRecord)
+            .where(SessionRecord.id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         return (await self.db.scalars(stmt)).first()
 
     async def update_status(self, session: SessionRecord, status: str) -> SessionRecord:

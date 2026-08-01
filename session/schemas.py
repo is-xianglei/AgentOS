@@ -10,17 +10,6 @@ class SessionSendMessageRequest(BaseModel):
     content: str = Field(description="用户消息")
 
 
-class SessionApprovalRequest(BaseModel):
-    request_id: str = Field(description="待批准请求ID(permission_request 事件里的 request_id)")
-    decision: Literal["allow_once", "always_allow", "deny"] = Field(description="裁决结果")
-    updated_input: dict[str, Any] | None = Field(
-        default=None, description="批准时可选修改的工具入参"
-    )
-    always_scope: Literal["session", "global"] = Field(
-        default="session", description="decision=always_allow 时规则落库的作用域"
-    )
-
-
 class SessionRenameRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200, description="会话新标题")
 

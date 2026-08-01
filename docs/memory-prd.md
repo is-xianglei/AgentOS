@@ -140,7 +140,7 @@ Memory 分为四个逻辑层：
 
 - L0 在 Session 首次运行时生成不可变快照，整个 Session 复用完全相同的渲染文本。
 - L1 Recall 只能加入当前 Turn 的 API 消息副本，不能写入用户原始消息。
-- 同一 Turn 的所有 ReAct 迭代和审批恢复必须复用同一个 Recall 快照。
+- 同一 Turn 的所有 ReAct 迭代和人工交互恢复必须复用同一个 Recall 快照。
 - 本 Turn 新写入的 Memory 不改变本 Turn 已冻结的上下文；下一 Turn 或显式刷新后生效。
 
 ### 5.3 PostgreSQL 是事实真源
@@ -280,7 +280,7 @@ sequenceDiagram
 - 原始用户消息先落库，Recall 内容保存在独立运行时上下文中。
 - Recall 查询失败或超时返回空上下文，主对话继续。
 - 同一 Turn 后续工具迭代不重新 Recall。
-- 审批恢复读取原 `turn_id` 对应的 Memory Context，禁止重新计算。
+- 人工交互恢复读取原 `turn_id` 对应的 Memory Context，禁止重新计算。
 
 ### 8.2 自动抽取与写入
 
@@ -368,7 +368,7 @@ class RequestPrincipal:
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `memory_snapshot_id` | BigInteger nullable | 当前 Session 固定的 L0 快照 |
-| `active_turn_id` | UUID nullable | 当前运行/审批恢复对应 Turn |
+| `active_turn_id` | UUID nullable | 当前运行/人工交互恢复对应 Turn |
 
 所有直接持有 `session_id` 的子表同时增加 `tenant_id String(64) NOT NULL`，包括
 `session_messages/session_snapshots/tool_calls/tasks/teams/team_members/team_messages/`
@@ -406,14 +406,14 @@ Turn 必须成为持久实体，不能只存在于请求内变量：
 | `session_id` | Integer FK | 非空 |
 | `user_message_id` | BigInteger nullable | 原始用户消息 |
 | `final_assistant_message_id` | BigInteger nullable | 最终可见回复 |
-| `status` | String(24) | running/awaiting_approval/completed/failed/interrupted |
+| `status` | String(24) | running/awaiting_interaction/completed/failed/interrupted |
 | `memory_snapshot_id` | BigInteger nullable | 本 Turn 使用的 L0 快照 |
 | `turn_memory_context_id` | BigInteger nullable | 本 Turn 使用的 L1 Context |
 | `stop_reason` | String(64) nullable | LLM/运行时结束原因 |
 | `started_at/completed_at` | DateTime | 生命周期 |
 | `metadata` | JSONB | 模型、actor 和 trace 链接，不放正文 |
 
-只有 `completed` 且 `final_assistant_message_id` 非空的 Turn 可以触发自动抽取。审批恢复更新原 Turn，
+只有 `completed` 且 `final_assistant_message_id` 非空的 Turn 可以触发自动抽取。人工交互恢复更新原 Turn，
 不得创建新的 Turn 或重新计算 Memory Context。
 
 ### 10.3 `memory_spaces`
@@ -871,7 +871,7 @@ Provider 返回的 `<memory-context>`、`<system>` 等标签必须转义或删�
 满足以下条件才创建 `extract` Job：
 
 - 主 Agent Turn 成功完成并提交；
-- 没有处于审批挂起或中断状态；
+- 没有处于人工交互挂起或中断状态；
 - 从上次成功抽取水位后累计 ≥ 5 个用户 Turn；或 Session 空闲满 10 分钟；
 - 本 Turn 出现显式“记住”、用户纠正或偏好信号时立即触发；
 - 一次性 SubAgent 不直接触发全局抽取。
@@ -1159,7 +1159,7 @@ Anthropic/Extractor LLM           主 Agent 与抽取必需；抽取故障不影
 MinIO                             延续 Skill/附件用途，不是 Memory 必需依赖
 ```
 
-API Pod 不要求 Sticky Session 才能保证 Memory 正确性；审批恢复和后续 Turn 可落到其他 Pod。
+API Pod 不要求 Sticky Session 才能保证 Memory 正确性；人工交互恢复和后续 Turn 可落到其他 Pod。
 当前 SSE producer 仍与连接绑定的问题属于生产化 P0：在支持真正断线续跑前，Ingress SHOULD 保持
 长连接并配置合理 idle timeout，但 Memory Job 不得依赖 Sticky Session。
 
@@ -1337,7 +1337,7 @@ Worker Trace 从 `memory_jobs` 继承原 Turn trace/link，而不是伪装成同
 - Session A 保存偏好，Session B 能召回；
 - 当前 Turn 写入不改变当前 Turn 冻结快照，下一 Turn 生效；
 - 同一 Turn 多次工具迭代复用完全相同的 Memory Context；
-- 审批挂起后换 Pod 恢复，仍使用相同 turn_id 和 Memory Context；
+- 人工交互挂起后换 Pod 恢复，仍使用相同 turn_id 和 Memory Context；
 - SubAgent 不得直接污染 user scope；
 - L2 Compact 前后情景搜索仍能找到原始消息；
 - Recall/Embedding/Redis 超时均不阻塞主回复。
@@ -1443,7 +1443,7 @@ memory.session_search_enabled
 - [ ] 所有 Session 和 Memory 查询强制 tenant/user Scope（RLS 已按 §9.3 放弃）。
 - [ ] 动态 Recall 不出现在用户原始消息、历史 API 和 Extractor 输入中。
 - [ ] Snapshot 使用 watermark，压缩后的新消息不会丢失。
-- [ ] 同一 Turn 的所有 LLM 调用和审批恢复复用同一个 Memory Context。
+- [ ] 同一 Turn 的所有 LLM 调用和人工交互恢复复用同一个 Memory Context。
 - [ ] Memory CRUD、Tool 和自动抽取共用同一 CommandService。
 - [ ] 所有写入有版本、幂等键、来源和不可变审计事件。
 - [ ] 自动抽取由持久 Worker 执行，不依赖请求内 `asyncio.create_task`。

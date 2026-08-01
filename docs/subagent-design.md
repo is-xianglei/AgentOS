@@ -136,9 +136,9 @@ SkillRun SkillResource Task* Team* SendMessage ReadInbox ListMessages`。
 调用方是 orchestrator。`SubAgentRunner._run_react_loop`
 （`runtime/subagent.py:227`）直接调 `tool_service.run(...)`，不走那条路径。
 
-orchestrator 侧有完整链路：`PermissionService.evaluate()`
-（`runtime/agent.py:494`）、`DANGEROUS_TOOLS` 名单、命中 `ask` 时挂起会话并
-emit `permission_request`。子代理一条都没有。
+orchestrator 侧有完整链路：`PermissionService.evaluate()`、`DANGEROUS_TOOLS`
+名单，以及命中 `ask` 时创建 `tool_approval` 交互、持久化暂停点并 emit
+`interaction_request`。子代理不具备这条挂起与恢复链路。
 
 而 `DANGEROUS_TOOLS = frozenset({"Bash", "SkillRun", "Write", "Edit"})`
 （`permission/service.py:18`），默认 `ask`。
@@ -351,22 +351,19 @@ Critical: In this phase you should only use the ${EXPLORE_AGENT.agentType} subag
 ### 8.2 AskUserQuestion 独立，可先做
 
 `AskUserQuestion` **没有授予任何子代理**（AgentTool 的黑白名单中查不到），
-它是主代理工具。其实现位置在
-`src/components/permissions/AskUserQuestionPermissionRequest/`——
-**按 permission request 实现，复用审批的挂起/恢复通道**，不是独立机制。
-
-AgentOS 已有这条通道：`_suspend_for_approval`（`runtime/agent.py:612`）、
-`permission_request` 事件、待批指针与恢复路径（`runtime/agent.py:199-239`）。
-所以在 AgentOS 落地 `AskUserQuestion` 是「复用现成挂起通道 + 加一个工具」，
-成本低，且与阶段 0-5 完全解耦，做不做都不影响 SubAgent 工作。
+它是主代理工具。参考实现的界面位于
+`src/components/permissions/AskUserQuestionPermissionRequest/`，但 AgentOS 后端已经将
+人工输入统一为独立 `interaction` 域：`AskUserQuestion` 创建 `user_question` 请求，
+与工具审批、Plan Mode 进出共用持久化 suspension、`interaction_request` 事件和恢复入口，
+不再使用 Session metadata 中的待批指针。
 
 它也是 plan mode 的前置件——Phase 1 的 "asking them questions" 需要它。
 
 ### 8.3 Plan 子代理的语义差异仍然存在
 
-AgentOS 没有 `ExitPlanMode`，Plan 子代理产出的方案回到主代理后没有人类
-审批环节。解法不是推迟 Plan 子代理，而是接受它先作为「架构分析器」落地，
-等 plan mode 那层再补审批语义——Claude Code 就是这个分层。
+AgentOS 现已提供 `EnterPlanMode`、`WritePlan` 和 `ExitPlanMode`，Plan Mode 的进出也通过
+`interaction` 域等待用户响应。Plan 子代理仍只是「架构分析器」；只有 orchestrator 可以使用
+人工交互工具，子代理不会直接进入或退出会话级 Plan Mode。
 
 ### 8.4 综合次序
 
@@ -399,7 +396,6 @@ AgentOS 没有 `ExitPlanMode`，Plan 子代理产出的方案回到主代理后�
    故「Explore 能改文件」的路径是 Write / Edit，不是 Bash。
 4. `permission` 的 `matcher` 列是为 actor 维度预留的，
    故定向授权不需要迁移，成本远低于预估。
-5. plan mode 不是会话状态机，而是派发 Explore / Plan 子代理的编排层
-   （提示词注入 + 并行派发）。因此它是子代理的消费方，不能先于子代理实现。
-   先前把它当作 Plan 子代理的前置件是错的。
-
+5. Plan 子代理与 Plan Mode 是两层能力：前者只产出分析结果，后者是会话级、持久化的
+   运行模式，通过提示词、受限工具集和人工批准控制进入与退出。Plan Mode 可以派发
+   Explore / Plan 子代理，但子代理不能反向切换主会话模式。

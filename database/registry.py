@@ -4,6 +4,8 @@ Alembic autogenerate 与字符串式 relationship() 都依赖此处的副作用�
 遗漏任一模块会导致自动迁移误判为删表，因此新增实体必须同步登记到这里。
 """
 
+from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord  # noqa: F401
+
 from memory.models import (  # noqa: F401
     MemoryItemRecord,
     MemoryJobRecord,
@@ -13,6 +15,7 @@ from memory.models import (  # noqa: F401
     TurnMemoryContextRecord,
 )
 from permission.models import PermissionRuleRecord  # noqa: F401
+from plan.models import SessionPlanRecord  # noqa: F401
 from session.models import (  # noqa: F401
     SessionMessage,
     SessionRecord,

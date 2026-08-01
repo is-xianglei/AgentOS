@@ -92,7 +92,8 @@ snapshot.messages + session_messages WHERE id > snapshot.through_message_id
 
 ### 4.3 缺少持久 Turn
 
-当前只有 Session 状态，审批指针放在 `session.extra`，无法证明多次 ReAct、Stop continuation 和审批恢复属于同一个用户 Turn。
+旧实现只在 `session.extra` 保存工具审批指针，无法证明多次 ReAct、Stop continuation 和
+人工交互恢复属于同一个用户 Turn。
 
 必须新增 `session_turns`，并让同一 Turn 的所有模型调用复用完全相同的 Catalog 和相关记忆 Revision。
 
@@ -136,7 +137,7 @@ Memory Space = workspace_id + user_id
 | `id` | UUID PK | 稳定 Turn ID |
 | `session_id` | Integer FK | 所属 Session |
 | `user_id/workspace_id` | Integer FK | 可信作用域 |
-| `status` | String | running/awaiting_approval/completed/failed/interrupted |
+| `status` | String | running/awaiting_interaction/completed/failed/interrupted |
 | `started_message_id` | Integer | 启动本 Turn 的用户原始请求消息 |
 | `completed_message_id` | Integer nullable | 成功完成本 Turn 的最终 assistant 回复 |
 | `memory_context_id` | BigInteger nullable | 冻结的 Memory 上下文 |
@@ -145,7 +146,7 @@ Memory Space = workspace_id + user_id
 
 `session_messages` 增加 nullable `turn_id`。历史数据可以为空，新消息必须有 Turn。
 
-表中继承的 `created_at` 表示 Turn 记录创建时间，`started_at` 表示运行时真正开始处理的时间。`completed_at` 和 `completed_message_id` 只对 `status='completed'` 有值；`running/awaiting_approval/failed/interrupted` 状态下二者都必须为空。`started_message_id` 必须指向触发该 Turn 的原始 user 消息，`completed_message_id` 必须指向最终对用户可见的 assistant 消息。
+表中继承的 `created_at` 表示 Turn 记录创建时间，`started_at` 表示运行时真正开始处理的时间。`completed_at` 和 `completed_message_id` 只对 `status='completed'` 有值；`running/awaiting_interaction/failed/interrupted` 状态下二者都必须为空。`started_message_id` 必须指向触发该 Turn 的原始 user 消息，`completed_message_id` 必须指向最终对用户可见的 assistant 消息。
 
 `session_snapshots` 增加非空 `through_message_id`。迁移时旧 Snapshot 需要根据生成时点或消息范围回填；不能可靠回填的旧 Snapshot 应失效重建。
 
@@ -258,7 +259,9 @@ ORDER BY m.memory_key, m.id
 LIMIT 200;
 ```
 
-目录最多 200 行、25 KiB。生成后的精确文本保存到当前 Turn 的 `turn_memory_contexts.rendered_catalog`，因此工具循环和审批恢复不需要重新查询，也不需要维护全局 Catalog 历史表。
+目录最多 200 行、25 KiB。生成后的精确文本保存到当前 Turn 的
+`turn_memory_contexts.rendered_catalog`，因此工具循环和人工交互恢复不需要重新查询，
+也不需要维护全局 Catalog 历史表。
 
 目录按 `memory_key ASC, id ASC` 确定性渲染，禁止依赖数据库默认行序。若 active 数量达到 200，必须先触发 Dream 或拒绝普通自动新增，不能静默让部分 active Memory 从目录中消失。
 
@@ -270,7 +273,7 @@ selected_revision_ids, rendered_catalog, rendered_memories,
 selector_status, degraded_reason, byte_count, created_at
 ```
 
-该表保存本 Turn 发给模型的精确 Memory 字节。工具循环和审批恢复只能读取它，禁止重新选择。
+该表保存本 Turn 发给模型的精确 Memory 字节。工具循环和人工交互恢复只能读取它，禁止重新选择。
 
 ### 6.8 `memory_jobs`
 
@@ -297,7 +300,7 @@ v1 不建立独立执行记录表。`attempts` 保存累计尝试次数，`last_
 7. 加载“历史 Snapshot + 水位后的消息”，仅压缩以前的历史，保留当前 Turn 原始消息。
 8. 构造请求副本：SYSTEM 加稳定 Catalog；当前 user API 副本前加相关正文。
 9. 同一 Turn 的所有 ReAct 调用重复使用同一个 `turn_memory_contexts`。
-10. Stop continuation 继续使用原 Turn；审批挂起写 `awaiting_approval`，恢复仍使用原 Turn。
+10. Stop continuation 继续使用原 Turn；人工交互挂起写 `awaiting_interaction`，恢复仍使用原 Turn。
 11. 真正终轮时，最终 assistant 消息、`turn=completed` 和唯一 extract Job 一起提交。
 12. 严格 s09 模式下，API 用独立数据库会话尝试认领并执行该 extract Job，完成后再关闭 Turn SSE；执行失败或连接中断时由 Worker 根据 Lease 接管。
 13. Dream 只入队，不阻塞用户回复。
@@ -380,7 +383,7 @@ score = 3 * name_token_overlap
 
 - 中间 `tool_use` 回合；
 - Stop continuation 尚未结束；
-- `awaiting_approval`；
+- `awaiting_interaction`；
 - failed/interrupted；
 - 一次性子代理内部 Turn。
 
@@ -582,7 +585,8 @@ Alembic 新迁移必须接当前唯一 Head `0011_fix_users_table_schema`。
 5. 拆分 raw 用户消息和 API 临时上下文。
 6. 修复 Hook fail-open。
 
-退出条件：压缩后不丢消息；动态上下文不落原始消息；审批恢复复用原 Turn；跨用户/Workspace 访问被拒绝。
+退出条件：压缩后不丢消息；动态上下文不落原始消息；人工交互恢复复用原 Turn；
+跨用户/Workspace 访问被拒绝。
 
 ### Phase 1：Memory 存储和手动管理
 
@@ -598,7 +602,7 @@ Alembic 新迁移必须接当前唯一 Head `0011_fix_users_table_schema`。
 1. 实现 Catalog SYSTEM 注入。
 2. 实现 LLM side-query 和 PostgreSQL 词法降级。
 3. 实现 `turn_memory_contexts` 和临时正文注入。
-4. 固定同一 Turn 的选择结果，支持审批恢复。
+4. 固定同一 Turn 的选择结果，支持人工交互恢复。
 5. 加入 5 条、4 KiB/条和 60 KiB/Session 预算。
 
 退出条件：selector 失败不影响主回答；相关正文不进入消息历史；同一 Turn 多次工具调用的 Memory 字节完全一致。
@@ -662,7 +666,7 @@ Job 的模式不随运行时配置漂移。
 
 - Recall 正文不出现在 `session_messages.content`。
 - Extractor 输入不含 `turn_memory_contexts.rendered_memories`。
-- tool_use 中间态、Stop continuation 和 awaiting approval 不创建 extract Job。
+- tool_use 中间态、Stop continuation 和 `awaiting_interaction` 不创建 extract Job。
 - Resume 完成后只创建一个 Job。
 - 选择器最多返回 5 条，重复和越权 ID 被过滤。
 - 恶意 Memory 标签不能逃逸围栏或覆盖 SYSTEM。
@@ -704,7 +708,7 @@ Job 的模式不随运行时配置漂移。
 - 把所有 Memory 正文常驻 SYSTEM：破坏 s09 的索引加按需正文设计，Token 成本失控。
 - 只做 pgvector top-k：偏离 s09 的 LLM selector 行为，也缺少可靠降级。
 - 通过 UserPromptSubmit Hook 注入：会把 Memory 拼进原始用户消息并再次提取。
-- 每个 ReAct 迭代重新召回：同一 Turn 上下文漂移，审批恢复无法重放。
+- 每个 ReAct 迭代重新召回：同一 Turn 上下文漂移，人工交互恢复无法重放。
 - Stop Hook 中裸起后台协程：SSE 断开、进程重启或扩缩容会丢任务。
 - Dream 先删旧数据再写新数据：任何坏输出或中途异常都会造成不可恢复的数据损坏。
 

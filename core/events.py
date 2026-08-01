@@ -5,8 +5,7 @@
 sequence 由 StreamBus 在入队时注入,不在对象构造期填充。
 
 两类信封:
-1. StreamEvent —— 协议定义的 9 类事件(turn_start/turn_end/block_*/thinking_delta/
-   text_delta/tool_use/tool_result/error),带 actor。
+1. StreamEvent —— actor 产出的生命周期、内容、工具、交互和错误事件。
 2. RuntimeEvent —— 会话级控制事件(如 session_ready),不属于某个 actor 的产出,
    仅用于前端建立连接 / 拿 session 元信息。
 """
@@ -37,7 +36,7 @@ class EventType(str, Enum):
     TEXT_DELTA = "text_delta"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
-    PERMISSION_REQUEST = "permission_request"
+    INTERACTION_REQUEST = "interaction_request"
     ERROR = "error"
 
 
@@ -150,32 +149,23 @@ class ToolInfo:
 
 
 @dataclass(frozen=True)
-class PermissionInfo:
-    """工具执行前的审批请求信息(permission_request 事件携带)。
-
-    agent 想调用某工具、权限判定为 ask 时产出。前端据此渲染批准/拒绝交互,
-    应答通过独立 REST 端点(POST /sessions/{id}/approvals)回传,不回写 SSE 流。
-    request_id 是稳定关联键,应答时用它对账;tool_id 对应此前 tool_use 的 id。
-    """
+class InteractionInfo:
+    """需要客户端响应的通用人工交互请求。"""
 
     request_id: str
-    tool_id: str
-    tool_name: str
-    tool_input: dict[str, Any] = field(default_factory=dict)
-    behavior: str = "ask"
-    reason: str | None = None
+    suspension_id: str
+    kind: str
+    request_payload: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
+        return {
             "request_id": self.request_id,
-            "tool_id": self.tool_id,
-            "tool_name": self.tool_name,
-            "tool_input": self.tool_input,
-            "behavior": self.behavior,
+            "suspension_id": self.suspension_id,
+            "kind": self.kind,
+            "schema_version": self.schema_version,
+            "request_payload": self.request_payload,
         }
-        if self.reason is not None:
-            data["reason"] = self.reason
-        return data
 
 
 @dataclass(frozen=True)
@@ -220,7 +210,7 @@ class ErrorInfo:
 
 @dataclass
 class StreamEvent:
-    """协议事件(9 类的统一载体)。
+    """Actor 级流式协议事件的统一载体。
 
     type 决定携带哪些 payload 子对象;sequence 由 StreamBus 注入。
     用工厂方法构造,不直接填字段,保证各类型字段组合正确。
@@ -231,7 +221,7 @@ class StreamEvent:
     session_id: int
     block: BlockInfo | None = None
     tool: ToolInfo | None = None
-    permission: PermissionInfo | None = None
+    interaction: InteractionInfo | None = None
     usage: Usage | None = None
     error: ErrorInfo | None = None
     text: str | None = None
@@ -324,17 +314,18 @@ class StreamEvent:
             type=EventType.TOOL_RESULT, actor=actor, session_id=session_id, tool=tool
         )
 
-    # ---- 工厂方法:权限审批 ----
-
     @classmethod
-    def permission_request(
-        cls, actor: Actor, session_id: int, permission: PermissionInfo
+    def interaction_request(
+        cls,
+        actor: Actor,
+        session_id: int,
+        interaction: InteractionInfo,
     ) -> "StreamEvent":
         return cls(
-            type=EventType.PERMISSION_REQUEST,
+            type=EventType.INTERACTION_REQUEST,
             actor=actor,
             session_id=session_id,
-            permission=permission,
+            interaction=interaction,
         )
 
     # ---- 工厂方法:错误 ----
@@ -361,8 +352,8 @@ class StreamEvent:
             data["block"] = self.block.to_dict()
         if self.tool is not None:
             data["tool"] = self.tool.to_dict()
-        if self.permission is not None:
-            data["permission"] = self.permission.to_dict()
+        if self.interaction is not None:
+            data["interaction"] = self.interaction.to_dict()
         if self.usage is not None:
             data["usage"] = self.usage.to_dict()
         if self.error is not None:
@@ -418,7 +409,4 @@ class RuntimeEvent:
         if self.sequence is not None:
             result["sequence"] = self.sequence
         return result
-
-
-
 
