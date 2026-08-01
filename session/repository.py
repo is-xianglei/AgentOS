@@ -2,11 +2,12 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import desc, select, update
+from sqlalchemy import desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from memory.models import TurnMemoryContextRecord
+from permission.models import PermissionRuleRecord
 from plan.models import SessionPlanRecord
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from task.models import TaskRecord
@@ -17,7 +18,6 @@ from team.models import (
     TeamRecord,
 )
 from tools.models import ToolCallRecord
-from permission.models import PermissionRuleRecord
 
 # 会话软删除时需一并标记的子表(均以 session_id 关联)。
 # 物理删除靠外键 ON DELETE CASCADE 清理,软删除只改标记,故须在此显式登记。
@@ -96,8 +96,58 @@ class SessionRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_accessible(
+        self,
+        user_id: int,
+        workspace_id: int,
+        *,
+        department_scope_ids: list[int],
+        group_ids: list[int],
+    ) -> list[SessionRecord]:
+        """按调用方已解析的组织范围查询当前用户可读会话。"""
+        access_conditions = [
+            SessionRecord.user_id == user_id,
+            SessionRecord.visibility.in_(("workspace", "public")),
+            SessionRecord.shared_with.contains([user_id]),
+        ]
+        access_conditions.extend(
+            SessionRecord.shared_with_departments.contains([department_id])
+            for department_id in department_scope_ids
+        )
+        access_conditions.extend(
+            SessionRecord.shared_with_groups.contains([group_id]) for group_id in group_ids
+        )
+        stmt = (
+            select(SessionRecord)
+            .where(
+                SessionRecord.workspace_id == workspace_id,
+                SessionRecord.user_id.is_not(None),
+                or_(*access_conditions),
+            )
+            .order_by(desc(SessionRecord.last_active_at), desc(SessionRecord.id))
+        )
+        return list(await self.db.scalars(stmt))
+
     async def get(self, session_id: int) -> SessionRecord | None:
         return await self.db.get(SessionRecord, session_id)
+
+    async def update_sharing(
+        self,
+        session: SessionRecord,
+        *,
+        visibility: str,
+        user_ids: list[int],
+        department_ids: list[int],
+        group_ids: list[int],
+    ) -> SessionRecord:
+        """覆盖会话共享范围，提交由请求事务边界负责。"""
+        session.visibility = visibility
+        session.shared_with = user_ids
+        session.shared_with_departments = department_ids
+        session.shared_with_groups = group_ids
+        await self.db.flush()
+        await self.db.refresh(session)
+        return session
 
     async def delete(self, session: SessionRecord) -> None:
         """软删除单个会话:标记会话本身并级联标记其所有子表记录。"""

@@ -67,43 +67,166 @@ class SessionService:
         """查询当前工作区内的用户会话。"""
         return await self.repo.list_by_user_and_workspace(user_id, workspace_id)
 
+    async def list_accessible(
+        self,
+        user_id: int,
+        workspace_id: int,
+    ) -> list[SessionRecord]:
+        """查询当前工作区内由所有权、可见性或共享范围授予读取权的会话。"""
+        membership = await WorkspaceService(self.db).require_active_membership(
+            workspace_id,
+            user_id,
+        )
+
+        from department.service import DepartmentService
+        from group.service import GroupService
+
+        department_scope_ids = await DepartmentService(self.db).get_department_scope_ids(
+            workspace_id,
+            membership.department_id,
+        )
+        groups = await GroupService(self.db).list_groups_for_active_member(
+            workspace_id,
+            user_id,
+        )
+        return await self.repo.list_accessible(
+            user_id,
+            workspace_id,
+            department_scope_ids=department_scope_ids,
+            group_ids=[group.id for group in groups],
+        )
+
     async def check_access(
         self,
         session: SessionRecord,
         user_id: int,
         workspace_id: int,
     ) -> bool:
-        """检查用户是否有权访问某个会话。
+        """检查用户是否有权读取某个会话。
 
         访问规则：
         1. 会话的创建者
         2. 会话在 shared_with 列表中的用户
         3. 会话可见性为 workspace 且用户是该工作区成员
         4. 会话可见性为 public
+        5. 用户直属部门或任一有效祖先在部门共享范围内
+        6. 用户是任一有效共享群组的正式成员
         无可信用户或工作区归属的历史会话默认拒绝，避免跨租户自动认领。
         """
         if session.workspace_id != workspace_id or session.user_id is None:
             return False
 
-        # 检查是否是创建者
+        try:
+            membership = await WorkspaceService(self.db).require_active_membership(
+                workspace_id,
+                user_id,
+            )
+        except AgentException:
+            return False
+
         if session.user_id == user_id:
             return True
-
-        # 检查是否在共享列表中
         if user_id in session.shared_with:
             return True
-
-        # 检查可见性
         if session.visibility == "public":
             return True
 
-        if session.visibility == "workspace" and session.workspace_id:
-            return await WorkspaceService(self.db).is_active_member(
-                session.workspace_id,
+        if session.visibility == "workspace":
+            return True
+
+        if session.shared_with_departments:
+            from department.service import DepartmentService
+
+            if await DepartmentService(self.db).is_department_in_shared_departments(
+                workspace_id,
+                membership.department_id,
+                session.shared_with_departments,
+            ):
+                return True
+
+        if session.shared_with_groups:
+            from group.service import GroupService
+
+            if await GroupService(self.db).is_user_in_groups(
+                workspace_id,
                 user_id,
-            )
+                session.shared_with_groups,
+            ):
+                return True
 
         return False
+
+    async def check_write_access(
+        self,
+        session: SessionRecord,
+        user_id: int,
+        workspace_id: int,
+    ) -> bool:
+        """共享仅授予读取权；写入、删除和恢复运行只允许会话创建者。"""
+        if session.workspace_id != workspace_id or session.user_id != user_id:
+            return False
+        return await WorkspaceService(self.db).is_active_member(workspace_id, user_id)
+
+    async def require_read_access(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> SessionRecord:
+        """返回当前用户可读的会话，否则拒绝访问。"""
+        session = await self.get_required(session_id)
+        if not await self.check_access(session, user_id, workspace_id):
+            raise AgentException.message("无权限访问该会话", status_code=403)
+        return session
+
+    async def require_write_access(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> SessionRecord:
+        """返回当前用户拥有的会话，共享读取者不能修改。"""
+        session = await self.get_required(session_id)
+        if not await self.check_write_access(session, user_id, workspace_id):
+            raise AgentException.message("只有会话创建者可以执行该操作", status_code=403)
+        return session
+
+    async def share(
+        self,
+        session_id: int,
+        actor_user_id: int,
+        workspace_id: int,
+        *,
+        visibility: str,
+        user_ids: list[int],
+        department_ids: list[int],
+        group_ids: list[int],
+    ) -> SessionRecord:
+        """校验并覆盖会话共享范围，部门范围在读取时动态包含子部门。"""
+        session = await self.require_write_access(session_id, actor_user_id, workspace_id)
+        if visibility not in {"private", "workspace", "public"}:
+            raise AgentException.message("会话可见性无效")
+
+        users = [item for item in dict.fromkeys(user_ids) if item != actor_user_id]
+        departments = list(dict.fromkeys(department_ids))
+        groups = list(dict.fromkeys(group_ids))
+        await WorkspaceService(self.db).require_active_user_ids(workspace_id, users)
+
+        from department.service import DepartmentService
+        from group.service import GroupService
+
+        await DepartmentService(self.db).require_department_ids(
+            workspace_id,
+            departments,
+        )
+        await GroupService(self.db).require_active_group_ids(workspace_id, groups)
+        return await self.repo.update_sharing(
+            session,
+            visibility=visibility,
+            user_ids=users,
+            department_ids=departments,
+            group_ids=groups,
+        )
 
     async def get_required(self, session_id: int) -> SessionRecord:
         """查询会话，不存在时抛出业务错误。"""
@@ -112,28 +235,52 @@ class SessionService:
             raise AgentException.message("会话不存在")
         return session
 
-    async def archive(self, session_id: int) -> SessionRecord:
+    async def archive(
+        self,
+        session_id: int,
+        actor_user_id: int,
+        workspace_id: int,
+    ) -> SessionRecord:
         """归档指定会话。提交交给请求边界统一处理。"""
-        session: SessionRecord = await self.get_required(session_id)
+        session = await self.require_write_access(session_id, actor_user_id, workspace_id)
         await self.repo.update_status(session, "archived")
         return session
 
-    async def rename(self, session_id: int, title: str) -> SessionRecord:
+    async def rename(
+        self,
+        session_id: int,
+        title: str,
+        actor_user_id: int,
+        workspace_id: int,
+    ) -> SessionRecord:
         """重命名会话标题。提交交给请求边界统一处理。"""
-        session: SessionRecord = await self.get_required(session_id)
+        session = await self.require_write_access(session_id, actor_user_id, workspace_id)
         session.title = title
         await self.db.flush()
         await self.db.refresh(session)
         return session
 
-    async def delete(self, session_id: int) -> None:
+    async def delete(
+        self,
+        session_id: int,
+        actor_user_id: int,
+        workspace_id: int,
+    ) -> None:
         """软删除单个会话(级联标记消息/快照/任务等子表)。提交交给请求边界统一处理。"""
-        session: SessionRecord = await self.get_required(session_id)
+        session = await self.require_write_access(session_id, actor_user_id, workspace_id)
         await self.repo.delete(session)
 
-    async def delete_many(self, ids: list[int]) -> int:
+    async def delete_many(
+        self,
+        ids: list[int],
+        actor_user_id: int,
+        workspace_id: int,
+    ) -> int:
         """批量软删除会话,返回实际标记数量。级联同上。提交交给请求边界统一处理。"""
-        deleted: int = await self.repo.delete_by_ids(ids)
+        normalized_ids = list(dict.fromkeys(ids))
+        for session_id in normalized_ids:
+            await self.require_write_access(session_id, actor_user_id, workspace_id)
+        deleted: int = await self.repo.delete_by_ids(normalized_ids)
         return deleted
 
     async def ensure_runnable(self, session_id: int) -> SessionRecord:

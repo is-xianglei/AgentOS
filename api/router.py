@@ -1,10 +1,12 @@
 from fastapi import APIRouter
 
 from auth import api as auth_api
+from department import api as department_api
+from group import api as group_api
 from interaction import api as interaction_api
 from memory import api as memory_api
-from plan import api as plan_api
 from permission import api as permission_api
+from plan import api as plan_api
 from session import api as session_api
 from skill import api as skill_api
 from task import api as task_api
@@ -15,6 +17,12 @@ from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(auth_api.router, prefix="/auth", tags=["auth"])
+api_router.include_router(
+    department_api.router,
+    prefix="/workspaces",
+    tags=["departments"],
+)
+api_router.include_router(group_api.router, tags=["groups"])
 api_router.include_router(interaction_api.router, prefix="/interactions", tags=["interactions"])
 api_router.include_router(memory_api.router, prefix="/memories", tags=["memories"])
 api_router.include_router(plan_api.router, prefix="/plans", tags=["plans"])

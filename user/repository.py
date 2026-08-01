@@ -57,6 +57,13 @@ class UserRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_by_ids(self, user_ids: list[int]) -> list[UserRecord]:
+        """批量查询有效用户，供其他域通过 UserService 获取用户摘要。"""
+        if not user_ids:
+            return []
+        stmt = select(UserRecord).where(UserRecord.id.in_(user_ids)).order_by(UserRecord.id)
+        return list(await self.db.scalars(stmt))
+
     async def update(self, user: UserRecord) -> UserRecord:
         await self.db.flush()
         await self.db.refresh(user)

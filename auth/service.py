@@ -1,6 +1,5 @@
 import hashlib
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import UTC, datetime, timedelta
 
 import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +32,7 @@ class AuthService:
         email: str,
         username: str,
         password: str,
-        full_name: Optional[str] = None,
+        full_name: str | None = None,
     ) -> dict:
         """用户注册"""
         # 检查邮箱唯一性
@@ -57,13 +56,14 @@ class AuthService:
 
         # 自动创建个人工作区
         from workspace.service import WorkspaceService
+
         workspace_service = WorkspaceService(self.db)
         workspace: WorkspaceRecord = await workspace_service.create_workspace(
             creator_user_id=user.id,
             name=f"{username}_personal",
             slug=f"{username}-personal",
             display_name=f"{full_name or username}的个人空间",
-            workspace_type="personal"
+            workspace_type="personal",
         )
 
         # 生成包含 workspace_id 的 Token
@@ -96,17 +96,20 @@ class AuthService:
             raise AgentException.message("用户名或密码错误")
 
         # 更新登录时间（提交交给请求边界统一处理）
-        user.last_login_at = datetime.utcnow()
+        user.last_login_at = datetime.now(UTC)
 
         # 获取用户的第一个工作区（优先个人工作区）
         from workspace.service import WorkspaceService
+
         workspace_service = WorkspaceService(self.db)
         user_workspaces = await workspace_service.list_user_workspaces(user.id)
 
         workspace_id = None
         if user_workspaces:
             # 优先选择 personal 类型的工作区
-            personal_workspace = next((ws for ws in user_workspaces if ws.workspace_type == "personal"), None)
+            personal_workspace = next(
+                (ws for ws in user_workspaces if ws.workspace_type == "personal"), None
+            )
             workspace_id = personal_workspace.id if personal_workspace else user_workspaces[0].id
 
         # 生成包含 workspace_id 的 Token
@@ -131,9 +134,8 @@ class AuthService:
             "email": user.email,
             "username": user.username,
             "type": "access",
-            "exp": datetime.utcnow()
-            + timedelta(minutes=settings.jwt_access_token_expire_minutes),
-            "iat": datetime.utcnow(),
+            "exp": datetime.now(UTC) + timedelta(minutes=settings.jwt_access_token_expire_minutes),
+            "iat": datetime.now(UTC),
         }
 
         access_token = jwt.encode(
@@ -146,9 +148,8 @@ class AuthService:
         refresh_payload = {
             "sub": str(user.id),
             "type": "refresh",
-            "exp": datetime.utcnow()
-            + timedelta(days=settings.jwt_refresh_token_expire_days),
-            "iat": datetime.utcnow(),
+            "exp": datetime.now(UTC) + timedelta(days=settings.jwt_refresh_token_expire_days),
+            "iat": datetime.now(UTC),
         }
 
         refresh_token = jwt.encode(
@@ -205,22 +206,26 @@ class AuthService:
             if not user or user.is_deleted or user.suspended:
                 raise AgentException.message("用户不存在或已被禁用")
 
-            # 生成新的 Access Token
-            access_payload = {
-                "sub": str(user.id),
-                "email": user.email,
-                "username": user.username,
-                "type": "access",
-                "exp": datetime.utcnow()
-                + timedelta(minutes=settings.jwt_access_token_expire_minutes),
-                "iat": datetime.utcnow(),
-            }
-
-            access_token = jwt.encode(
-                access_payload,
-                settings.jwt_secret_key,
-                algorithm=settings.jwt_algorithm,
-            )
+            workspace_id = payload.get("workspace_id")
+            if type(workspace_id) is int:
+                await WorkspaceService(self.db).require_active_member(workspace_id, user.id)
+                access_token = self._generate_tokens_with_workspace(user, workspace_id)[
+                    "access_token"
+                ]
+            else:
+                # 兼容升级前签发的 refresh token：只从实时有效成员关系中选择工作区。
+                workspaces = await WorkspaceService(self.db).list_user_workspaces(user.id)
+                if workspaces:
+                    personal = next(
+                        (item for item in workspaces if item.workspace_type == "personal"),
+                        None,
+                    )
+                    selected = personal or workspaces[0]
+                    access_token = self._generate_tokens_with_workspace(user, selected.id)[
+                        "access_token"
+                    ]
+                else:
+                    access_token = self._generate_tokens(user)["access_token"]
 
             return {
                 "access_token": access_token,
@@ -263,9 +268,8 @@ class AuthService:
             "username": user.username,
             "workspace_id": workspace_id,
             "type": "access",
-            "exp": datetime.utcnow()
-            + timedelta(minutes=settings.jwt_access_token_expire_minutes),
-            "iat": datetime.utcnow(),
+            "exp": datetime.now(UTC) + timedelta(minutes=settings.jwt_access_token_expire_minutes),
+            "iat": datetime.now(UTC),
         }
 
         access_token = jwt.encode(
@@ -277,10 +281,10 @@ class AuthService:
         # Refresh Token
         refresh_payload = {
             "sub": str(user.id),
+            "workspace_id": workspace_id,
             "type": "refresh",
-            "exp": datetime.utcnow()
-            + timedelta(days=settings.jwt_refresh_token_expire_days),
-            "iat": datetime.utcnow(),
+            "exp": datetime.now(UTC) + timedelta(days=settings.jwt_refresh_token_expire_days),
+            "iat": datetime.now(UTC),
         }
 
         refresh_token = jwt.encode(
@@ -293,4 +297,3 @@ class AuthService:
             "access_token": access_token,
             "refresh_token": refresh_token,
         }
-

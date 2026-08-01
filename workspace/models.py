@@ -1,20 +1,24 @@
-from datetime import datetime
-from typing import TYPE_CHECKING
+from __future__ import annotations
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from datetime import datetime
+from typing import TYPE_CHECKING, ClassVar
+
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.base import Base, json_type
 
 if TYPE_CHECKING:
-    from user.models import UserRecord
+    from department.models import DepartmentRecord
+    from group.models import GroupRecord
     from session.models import SessionRecord
+    from user.models import UserRecord
 
 
 class WorkspaceRecord(Base):
     __tablename__ = "workspaces"
-    __table_args__ = {"comment": "工作区表（个人/团队/企业）"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "工作区表（个人/团队/企业）"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="工作区ID")
     name: Mapped[str] = mapped_column(
@@ -35,17 +39,11 @@ class WorkspaceRecord(Base):
         index=True,
         comment="类型: personal/team/enterprise",
     )
-    suspended: Mapped[bool] = mapped_column(
-        default=False, index=True, comment="是否被暂停使用"
-    )
+    suspended: Mapped[bool] = mapped_column(default=False, index=True, comment="是否被暂停使用")
 
     # 企业信息
-    industry: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="所属行业"
-    )
-    company_size: Mapped[str | None] = mapped_column(
-        String(32), nullable=True, comment="公司规模"
-    )
+    industry: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="所属行业")
+    company_size: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="公司规模")
     billing_email: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="账单邮箱"
     )
@@ -66,19 +64,31 @@ class WorkspaceRecord(Base):
     )
 
     # 关联关系
-    members: Mapped[list["WorkspaceMemberRecord"]] = relationship(
+    members: Mapped[list[WorkspaceMemberRecord]] = relationship(
         back_populates="workspace", cascade="all, delete-orphan"
     )
     sessions: Mapped[list[SessionRecord]] = relationship(
         "SessionRecord",
         foreign_keys="SessionRecord.workspace_id",
-        back_populates="workspace"
+        back_populates="workspace",
+    )
+    departments: Mapped[list[DepartmentRecord]] = relationship(
+        "DepartmentRecord",
+        back_populates="workspace",
+    )
+    groups: Mapped[list[GroupRecord]] = relationship(
+        "GroupRecord",
+        back_populates="workspace",
     )
 
 
 class WorkspaceMemberRecord(Base):
     __tablename__ = "workspace_members"
     __table_args__ = (
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member')",
+            name="ck_workspace_members_role",
+        ),
         Index("ix_workspace_members_workspace_user", "workspace_id", "user_id", unique=True),
         {"comment": "工作区成员关系表"},
     )
@@ -89,6 +99,23 @@ class WorkspaceMemberRecord(Base):
     )
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True, comment="用户ID"
+    )
+    role: Mapped[str] = mapped_column(
+        String(32),
+        default="member",
+        index=True,
+        comment="工作区角色: owner/admin/member",
+    )
+    department_id: Mapped[int | None] = mapped_column(
+        ForeignKey("departments.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="所属部门ID（一个成员只能属于一个部门）",
+    )
+    job_title: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="职位/岗位",
     )
 
     # 邀请与加入
@@ -103,6 +130,15 @@ class WorkspaceMemberRecord(Base):
     )
 
     # 关联关系
-    workspace: Mapped["WorkspaceRecord"] = relationship(back_populates="members")
-    user: Mapped["UserRecord"] = relationship("UserRecord", foreign_keys=[user_id], back_populates="workspace_memberships")
-    inviter: Mapped["UserRecord"] = relationship("UserRecord", foreign_keys=[invited_by])
+    workspace: Mapped[WorkspaceRecord] = relationship(back_populates="members")
+    user: Mapped[UserRecord] = relationship(
+        "UserRecord",
+        foreign_keys=[user_id],
+        back_populates="workspace_memberships",
+    )
+    inviter: Mapped[UserRecord | None] = relationship("UserRecord", foreign_keys=[invited_by])
+    department: Mapped[DepartmentRecord | None] = relationship(
+        "DepartmentRecord",
+        foreign_keys=[department_id],
+        back_populates="members",
+    )

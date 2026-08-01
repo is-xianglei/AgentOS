@@ -3,10 +3,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import RuntimeEvent
+from session.service import SessionService
 from task.models import TaskRecord
 from task.repository import TaskRepository
 from task.schemas import TaskResponse
-from session.service import SessionService
 
 VALID_TASK_STATUSES = {"pending", "in_progress", "completed"}
 
@@ -39,6 +39,16 @@ class TaskService:
         await self.session_service.get_required(session_id)
         return await self.repo.list_by_session(session_id)
 
+    async def list_by_session_for_user(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> list[TaskRecord]:
+        """按会话读取权限查询任务，供 HTTP API 使用。"""
+        await self.session_service.require_read_access(session_id, user_id, workspace_id)
+        return await self.repo.list_by_session(session_id)
+
     async def create(
         self,
         session_id: int,
@@ -50,7 +60,9 @@ class TaskService:
         """创建任务。"""
         await self.session_service.get_required(session_id)
         self._validate_status("pending")
-        normalized_blocked_by: list[int] = await self._validate_blocked_by(session_id, blocked_by or [])
+        normalized_blocked_by: list[int] = await self._validate_blocked_by(
+            session_id, blocked_by or []
+        )
         task: TaskRecord = await self.repo.create(
             session_id=session_id,
             subject=subject,

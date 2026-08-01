@@ -39,6 +39,16 @@ class TeamService:
         await self.session_service.get_required(session_id)
         return await self.repo.list_members(session_id)
 
+    async def list_members_for_user(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> list[TeamMemberRecord]:
+        """按会话读取权限查询团队成员，供 HTTP API 使用。"""
+        await self.session_service.require_read_access(session_id, user_id, workspace_id)
+        return await self.repo.list_members(session_id)
+
     async def create_member(self, session_id: int, name: str, role: str) -> TeamMemberRecord:
         """创建团队成员。"""
         await self.session_service.get_required(session_id)
@@ -58,7 +68,9 @@ class TeamService:
         member = await self.repo.create_member(session_id, name, role)
         return member
 
-    async def update_member_status(self, session_id: int, name: str, status: str) -> TeamMemberRecord:
+    async def update_member_status(
+        self, session_id: int, name: str, status: str
+    ) -> TeamMemberRecord:
         """更新团队成员状态。"""
         await self.session_service.get_required(session_id)
         if status not in {"idle", "running", "failed"}:
@@ -72,6 +84,16 @@ class TeamService:
     async def list_messages(self, session_id: int) -> list[TeamMessageRecord]:
         """查询指定会话的团队消息。"""
         await self.session_service.get_required(session_id)
+        return await self.repo.list_messages(session_id)
+
+    async def list_messages_for_user(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> list[TeamMessageRecord]:
+        """按会话读取权限查询团队消息，供 HTTP API 使用。"""
+        await self.session_service.require_read_access(session_id, user_id, workspace_id)
         return await self.repo.list_messages(session_id)
 
     async def send_message(
@@ -114,7 +136,9 @@ class TeamService:
         await self._ensure_recipient(session_id, recipient)
         if consumer_instance_id is None and team_task_debug_isolation_enabled():
             consumer_instance_id = current_team_task_instance_id()
-        messages: list[TeamMessageRecord] = await self.repo.unread_messages(session_id, recipient, consumer_instance_id)
+        messages: list[TeamMessageRecord] = await self.repo.unread_messages(
+            session_id, recipient, consumer_instance_id
+        )
         await self.repo.mark_read(messages)
         return messages
 
@@ -138,6 +162,16 @@ class TeamService:
     async def list_subagent_runs(self, session_id: int) -> list[SubAgentRunRecord]:
         """查询指定会话的子代理运行记录。"""
         await self.session_service.get_required(session_id)
+        return await self.run_repo.list_by_session(session_id)
+
+    async def list_subagent_runs_for_user(
+        self,
+        session_id: int,
+        user_id: int,
+        workspace_id: int,
+    ) -> list[SubAgentRunRecord]:
+        """按会话读取权限查询子代理运行记录，供 HTTP API 使用。"""
+        await self.session_service.require_read_access(session_id, user_id, workspace_id)
         return await self.run_repo.list_by_session(session_id)
 
     # ----- 团队(会话 1:1) -----
@@ -189,7 +223,9 @@ class TeamService:
         )
         return member
 
-    async def set_member_runtime_status(self, session_id: int, name: str, status: str) -> TeamMemberRecord:
+    async def set_member_runtime_status(
+        self, session_id: int, name: str, status: str
+    ) -> TeamMemberRecord:
         """更新 teammate 的 s11 运行状态(working/idle/shutdown)。
 
         独立于旧 update_member_status:旧方法服务于子代理运行记录语义

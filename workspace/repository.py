@@ -1,10 +1,9 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from user.models import UserRecord
 from workspace.models import WorkspaceMemberRecord, WorkspaceRecord
 
 
@@ -56,9 +55,7 @@ class WorkspaceRepository:
         stmt = select(WorkspaceRecord).where(WorkspaceRecord.slug == slug)
         return (await self.db.scalars(stmt)).first()
 
-    async def list_all(
-        self, limit: int = 100, offset: int = 0
-    ) -> list[WorkspaceRecord]:
+    async def list_all(self, limit: int = 100, offset: int = 0) -> list[WorkspaceRecord]:
         stmt = (
             select(WorkspaceRecord)
             .where(WorkspaceRecord.is_deleted.is_(False))
@@ -76,7 +73,7 @@ class WorkspaceRepository:
     async def delete(self, workspace: WorkspaceRecord) -> None:
         """软删除工作区"""
         workspace.is_deleted = True
-        workspace.deleted_at = datetime.utcnow()
+        workspace.deleted_at = datetime.now(UTC)
         await self.db.flush()
 
 
@@ -91,13 +88,37 @@ class WorkspaceMemberRepository:
         invited_by: int | None = None,
         invited_at: datetime | None = None,
         joined_at: datetime | None = None,
+        role: str = "member",
+        department_id: int | None = None,
+        job_title: str | None = None,
     ) -> WorkspaceMemberRecord:
+        existing = await self.get_by_workspace_and_user(
+            workspace_id,
+            user_id,
+            include_deleted=True,
+        )
+        if existing is not None:
+            existing.invited_by = invited_by
+            existing.invited_at = invited_at
+            existing.joined_at = joined_at
+            existing.role = role
+            existing.department_id = department_id
+            existing.job_title = job_title
+            existing.is_deleted = False
+            existing.deleted_at = None
+            await self.db.flush()
+            await self.db.refresh(existing)
+            return existing
+
         member = WorkspaceMemberRecord(
             workspace_id=workspace_id,
             user_id=user_id,
             invited_by=invited_by,
             invited_at=invited_at,
             joined_at=joined_at,
+            role=role,
+            department_id=department_id,
+            job_title=job_title,
         )
         self.db.add(member)
         await self.db.flush()
@@ -108,18 +129,21 @@ class WorkspaceMemberRepository:
         return await self.db.get(WorkspaceMemberRecord, member_id)
 
     async def get_by_workspace_and_user(
-        self, workspace_id: int, user_id: int
+        self,
+        workspace_id: int,
+        user_id: int,
+        *,
+        include_deleted: bool = False,
     ) -> WorkspaceMemberRecord | None:
         stmt = select(WorkspaceMemberRecord).where(
             WorkspaceMemberRecord.workspace_id == workspace_id,
             WorkspaceMemberRecord.user_id == user_id,
-            WorkspaceMemberRecord.is_deleted.is_(False),
         )
+        if include_deleted:
+            stmt = stmt.execution_options(include_deleted=True)
         return (await self.db.scalars(stmt)).first()
 
-    async def list_by_workspace(
-        self, workspace_id: int
-    ) -> list[WorkspaceMemberRecord]:
+    async def list_by_workspace(self, workspace_id: int) -> list[WorkspaceMemberRecord]:
         stmt = (
             select(WorkspaceMemberRecord)
             .where(
@@ -130,21 +154,39 @@ class WorkspaceMemberRepository:
         )
         return list(await self.db.scalars(stmt))
 
-    async def list_by_workspace_with_user(
-        self, workspace_id: int
-    ) -> list[tuple[WorkspaceMemberRecord, UserRecord]]:
-        """查询工作区成员列表，并关联用户信息"""
+    async def list_by_department_ids(
+        self,
+        workspace_id: int,
+        department_ids: list[int],
+    ) -> list[WorkspaceMemberRecord]:
+        """查询指定工作区内属于目标部门的有效成员。"""
+        if not department_ids:
+            return []
         stmt = (
-            select(WorkspaceMemberRecord, UserRecord)
-            .join(UserRecord, WorkspaceMemberRecord.user_id == UserRecord.id)
+            select(WorkspaceMemberRecord)
             .where(
                 WorkspaceMemberRecord.workspace_id == workspace_id,
-                WorkspaceMemberRecord.is_deleted.is_(False),
+                WorkspaceMemberRecord.department_id.in_(department_ids),
+                WorkspaceMemberRecord.joined_at.is_not(None),
             )
             .order_by(WorkspaceMemberRecord.id)
         )
-        result = await self.db.execute(stmt)
-        return list(result.all())
+        return list(await self.db.scalars(stmt))
+
+    async def list_by_user_ids(
+        self,
+        workspace_id: int,
+        user_ids: list[int],
+    ) -> list[WorkspaceMemberRecord]:
+        """批量查询工作区内已经正式加入的成员。"""
+        if not user_ids:
+            return []
+        stmt = select(WorkspaceMemberRecord).where(
+            WorkspaceMemberRecord.workspace_id == workspace_id,
+            WorkspaceMemberRecord.user_id.in_(user_ids),
+            WorkspaceMemberRecord.joined_at.is_not(None),
+        )
+        return list(await self.db.scalars(stmt))
 
     async def list_by_user(self, user_id: int) -> list[WorkspaceMemberRecord]:
         stmt = (
@@ -152,7 +194,7 @@ class WorkspaceMemberRepository:
             .options(joinedload(WorkspaceMemberRecord.workspace))
             .where(
                 WorkspaceMemberRecord.user_id == user_id,
-                WorkspaceMemberRecord.is_deleted.is_(False),
+                WorkspaceMemberRecord.joined_at.is_not(None),
             )
             .order_by(WorkspaceMemberRecord.id)
         )
@@ -166,5 +208,5 @@ class WorkspaceMemberRepository:
     async def delete(self, member: WorkspaceMemberRecord) -> None:
         """软删除成员"""
         member.is_deleted = True
-        member.deleted_at = datetime.utcnow()
+        member.deleted_at = datetime.now(UTC)
         await self.db.flush()

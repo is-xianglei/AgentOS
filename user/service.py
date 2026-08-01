@@ -1,4 +1,5 @@
 import hashlib
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
@@ -53,9 +54,20 @@ class UserService:
             raise AgentException.message("用户不存在")
         return user
 
+    async def get_user_by_email(self, email: str) -> UserRecord | None:
+        """按邮箱查询有效用户，供其他业务域通过 Service 调用。"""
+        user = await self.repo.get_by_email(email)
+        if user is None or user.is_deleted:
+            return None
+        return user
+
     async def list_users(self, limit: int = 100, offset: int = 0) -> list[UserRecord]:
         """获取用户列表"""
         return await self.repo.list_all(limit=limit, offset=offset)
+
+    async def list_users_by_ids(self, user_ids: list[int]) -> list[UserRecord]:
+        """批量获取有效用户，供跨域编排使用。"""
+        return await self.repo.list_by_ids(user_ids)
 
     async def update_user(
         self,

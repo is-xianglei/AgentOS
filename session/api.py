@@ -5,7 +5,6 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
-from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from runtime.agent import AgentRuntime, format_sse
 from session.schemas import (
@@ -15,6 +14,8 @@ from session.schemas import (
     SessionRenameRequest,
     SessionResponse,
     SessionSendMessageRequest,
+    SessionShareRequest,
+    SessionShareResponse,
 )
 from session.service import SessionService
 from user.models import UserRecord
@@ -33,8 +34,7 @@ async def list_sessions(
     workspace_id: CurrentWorkspaceId,
 ):
     service = SessionService(db)
-    # 只返回当前用户的会话
-    sessions = await service.list_by_user_and_workspace(current_user.id, workspace_id)
+    sessions = await service.list_accessible(current_user.id, workspace_id)
     return ok([SessionResponse.model_validate(item) for item in sessions], request)
 
 
@@ -47,10 +47,11 @@ async def send_message(
 ):
     # 如果提供了 session_id，需要验证权限
     if payload.session_id:
-        service = SessionService(db)
-        session = await service.get_required(payload.session_id)
-        if not await service.check_access(session, current_user.id, workspace_id):
-            raise AgentException.message("无权限访问该会话", status_code=403)
+        await SessionService(db).require_write_access(
+            payload.session_id,
+            current_user.id,
+            workspace_id,
+        )
 
     # 传递用户信息和工作区信息到 runtime
     runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
@@ -74,14 +75,11 @@ async def batch_delete_sessions(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    service = SessionService(db)
-    # 验证每个会话的权限
-    for session_id in payload.ids:
-        session = await service.get_required(session_id)
-        if not await service.check_access(session, current_user.id, workspace_id):
-            raise AgentException.message(f"无权限删除会话 {session_id}", status_code=403)
-
-    deleted = await service.delete_many(payload.ids)
+    deleted = await SessionService(db).delete_many(
+        payload.ids,
+        current_user.id,
+        workspace_id,
+    )
     return ok(SessionDeleteResult(deleted=deleted), request)
 
 
@@ -98,11 +96,7 @@ async def list_messages(
     workspace_id: CurrentWorkspaceId,
 ):
     service = SessionService(db)
-    # 验证会话权限
-    session = await service.get_required(session_id)
-    if not await service.check_access(session, current_user.id, workspace_id):
-        raise AgentException.message("无权限访问该会话", status_code=403)
-
+    await service.require_read_access(session_id, current_user.id, workspace_id)
     messages = await service.list_messages(session_id)
     return ok([SessionMessageResponse.model_validate(item) for item in messages], request)
 
@@ -117,13 +111,8 @@ async def archive_session(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    service = SessionService(db)
-    # 验证会话权限
-    session = await service.get_required(session_id)
-    if not await service.check_access(session, current_user.id, workspace_id):
-        raise AgentException.message("无权限归档该会话", status_code=403)
-
-    return ok(SessionResponse.model_validate(await service.archive(session_id)), request)
+    session = await SessionService(db).archive(session_id, current_user.id, workspace_id)
+    return ok(SessionResponse.model_validate(session), request)
 
 
 @router.patch("/{session_id}", summary="重命名会话", response_model=ApiResponse[SessionResponse])
@@ -135,13 +124,12 @@ async def rename_session(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    service = SessionService(db)
-    # 验证会话权限
-    session = await service.get_required(session_id)
-    if not await service.check_access(session, current_user.id, workspace_id):
-        raise AgentException.message("无权限修改该会话", status_code=403)
-
-    session = await service.rename(session_id, payload.title)
+    session = await SessionService(db).rename(
+        session_id,
+        payload.title,
+        current_user.id,
+        workspace_id,
+    )
     return ok(SessionResponse.model_validate(session), request)
 
 
@@ -153,11 +141,39 @@ async def delete_session(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    service = SessionService(db)
-    # 验证会话权限
-    session = await service.get_required(session_id)
-    if not await service.check_access(session, current_user.id, workspace_id):
-        raise AgentException.message("无权限删除该会话", status_code=403)
-
-    await service.delete(session_id)
+    await SessionService(db).delete(session_id, current_user.id, workspace_id)
     return ok(SessionDeleteResult(deleted=1), request)
+
+
+@router.post(
+    "/{session_id}/share",
+    summary="覆盖会话共享范围",
+    response_model=ApiResponse[SessionShareResponse],
+)
+async def share_session(
+    session_id: int,
+    payload: SessionShareRequest,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    session = await SessionService(db).share(
+        session_id,
+        current_user.id,
+        workspace_id,
+        visibility=payload.visibility,
+        user_ids=payload.share_with.users,
+        department_ids=payload.share_with.departments,
+        group_ids=payload.share_with.groups,
+    )
+    return ok(
+        SessionShareResponse(
+            session_id=session.id,
+            visibility=session.visibility,
+            users=session.shared_with,
+            departments=session.shared_with_departments,
+            groups=session.shared_with_groups,
+        ),
+        request,
+    )

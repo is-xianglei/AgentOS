@@ -29,11 +29,34 @@ async def _require_session_access(
     session_id: int,
     user_id: int,
     workspace_id: int,
+    *,
+    write: bool = False,
 ) -> None:
     service = SessionService(db)
     session = await service.get_required(session_id)
-    if not await service.check_access(session, user_id, workspace_id):
-        raise AgentException.message("无权限访问该会话", status_code=403)
+    allowed = (
+        await service.check_write_access(session, user_id, workspace_id)
+        if write
+        else await service.check_access(session, user_id, workspace_id)
+    )
+    if not allowed:
+        message = "无权限修改该会话" if write else "无权限访问该会话"
+        raise AgentException.message(message, status_code=403)
+
+
+async def _require_session_write_access(
+    db: AsyncSession,
+    session_id: int,
+    user_id: int,
+    workspace_id: int,
+) -> None:
+    await _require_session_access(
+        db,
+        session_id,
+        user_id,
+        workspace_id,
+        write=True,
+    )
 
 
 @router.get(
@@ -65,7 +88,7 @@ async def resolve_interaction(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    await _require_session_access(db, session_id, current_user.id, workspace_id)
+    await _require_session_write_access(db, session_id, current_user.id, workspace_id)
     runtime = AgentRuntime(
         db,
         user_id=current_user.id,
@@ -110,7 +133,7 @@ async def cancel_interaction(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    await _require_session_access(db, session_id, current_user.id, workspace_id)
+    await _require_session_write_access(db, session_id, current_user.id, workspace_id)
     suspension = await AgentRuntime(
         db,
         user_id=current_user.id,

@@ -28,6 +28,18 @@ class SessionResponse(BaseModel):
     status: str = Field(description="会话状态")
     model_name: str | None = Field(default=None, description="模型名称")
     system_prompt: str | None = Field(default=None, description="系统提示词")
+    user_id: int | None = Field(default=None, description="创建用户ID")
+    workspace_id: int | None = Field(default=None, description="所属工作区ID")
+    visibility: str = Field(description="可见性")
+    shared_with: list[int] = Field(default_factory=list, description="共享用户ID列表")
+    shared_with_departments: list[int] = Field(
+        default_factory=list,
+        description="共享部门ID列表",
+    )
+    shared_with_groups: list[int] = Field(
+        default_factory=list,
+        description="共享群组ID列表",
+    )
     # ORM 属性名为 extra(DB 列名 metadata);注意 SQLAlchemy 模型自带 metadata 属性
     # (指 MetaData 对象),因此只能从 extra 读取,对外仍序列化为 metadata。
     metadata: dict[str, Any] = Field(
@@ -40,6 +52,27 @@ class SessionResponse(BaseModel):
     last_active_at: datetime = Field(description="最后活跃时间")
 
     model_config = {"from_attributes": True, "populate_by_name": True}
+
+
+class SessionShareTargetsRequest(BaseModel):
+    users: list[int] = Field(default_factory=list, description="共享用户ID列表")
+    departments: list[int] = Field(default_factory=list, description="共享部门ID列表")
+    groups: list[int] = Field(default_factory=list, description="共享群组ID列表")
+
+
+class SessionShareRequest(BaseModel):
+    """覆盖会话当前的完整共享范围。"""
+
+    visibility: Literal["private", "workspace", "public"] = Field(description="可见性")
+    share_with: SessionShareTargetsRequest = Field(default_factory=SessionShareTargetsRequest)
+
+
+class SessionShareResponse(BaseModel):
+    session_id: int = Field(description="会话ID")
+    visibility: str = Field(description="可见性")
+    users: list[int] = Field(default_factory=list, description="共享用户ID列表")
+    departments: list[int] = Field(default_factory=list, description="共享部门ID列表")
+    groups: list[int] = Field(default_factory=list, description="共享群组ID列表")
 
 
 class SessionMessageResponse(BaseModel):

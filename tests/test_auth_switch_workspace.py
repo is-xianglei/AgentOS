@@ -1,5 +1,7 @@
 """switch_workspace 的成员校验测试：Token 作用域不得越权签发。"""
 
+from types import SimpleNamespace
+
 import pytest
 
 # 跨包 relationship 依赖全部实体已登记，实例化 UserRecord 前必须先导入 registry。
@@ -93,6 +95,80 @@ async def test_有效成员切换工作区签发带作用域的_token(monkeypatc
     )
     assert payload["workspace_id"] == 42
     assert payload["sub"] == "7"
+    refresh_payload = jwt.decode(
+        result["refresh_token"],
+        settings.jwt_secret_key,
+        algorithms=[settings.jwt_algorithm],
+    )
+    assert refresh_payload["workspace_id"] == 42
+
+
+@pytest.mark.anyio
+async def test_刷新令牌保留工作区并实时复核成员关系(monkeypatch: pytest.MonkeyPatch):
+    import jwt
+
+    from core.config import settings
+
+    service, calls = _build_service(monkeypatch, user=_user(), member_error=None)
+    refresh_token = service._generate_tokens_with_workspace(_user(), 42)["refresh_token"]
+
+    result = await service.refresh_token(refresh_token)
+
+    assert calls == [(42, 7)]
+    payload = jwt.decode(
+        result["access_token"],
+        settings.jwt_secret_key,
+        algorithms=[settings.jwt_algorithm],
+    )
+    assert payload["workspace_id"] == 42
+
+
+@pytest.mark.anyio
+async def test_成员失效后原工作区刷新令牌被拒绝(monkeypatch: pytest.MonkeyPatch):
+    service, calls = _build_service(
+        monkeypatch,
+        user=_user(),
+        member_error="当前用户不是该工作区的有效成员",
+    )
+    refresh_token = service._generate_tokens_with_workspace(_user(), 42)["refresh_token"]
+
+    with pytest.raises(AgentException, match="有效成员"):
+        await service.refresh_token(refresh_token)
+
+    assert calls == [(42, 7)]
+
+
+@pytest.mark.anyio
+async def test_旧刷新令牌从实时成员关系选择个人工作区(monkeypatch: pytest.MonkeyPatch):
+    import jwt
+
+    from core.config import settings
+
+    class _LegacyWorkspaceService:
+        def __init__(self, db) -> None:
+            self.db = db
+
+        async def list_user_workspaces(self, user_id: int):
+            assert user_id == 7
+            return [SimpleNamespace(id=51, workspace_type="personal")]
+
+    monkeypatch.setattr(auth_service_module, "WorkspaceService", _LegacyWorkspaceService)
+    service = AuthService(_FakeSession())
+
+    async def _get_by_id(_: int) -> UserRecord:
+        return _user()
+
+    monkeypatch.setattr(service.repo, "get_by_id", _get_by_id)
+    legacy_refresh_token = service._generate_tokens(_user())["refresh_token"]
+
+    result = await service.refresh_token(legacy_refresh_token)
+
+    payload = jwt.decode(
+        result["access_token"],
+        settings.jwt_secret_key,
+        algorithms=[settings.jwt_algorithm],
+    )
+    assert payload["workspace_id"] == 51
 
 
 @pytest.mark.anyio

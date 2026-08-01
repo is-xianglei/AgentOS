@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -28,7 +29,20 @@ if TYPE_CHECKING:
 
 class SessionRecord(Base):
     __tablename__ = "sessions"
-    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话主记录"}
+    __table_args__ = (
+        Index("ix_sessions_shared_with_gin", "shared_with", postgresql_using="gin"),
+        Index(
+            "ix_sessions_shared_with_departments_gin",
+            "shared_with_departments",
+            postgresql_using="gin",
+        ),
+        Index(
+            "ix_sessions_shared_with_groups_gin",
+            "shared_with_groups",
+            postgresql_using="gin",
+        ),
+        {"comment": "会话主记录"},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="会话ID")
     title: Mapped[str] = mapped_column(String(200), default="新会话", comment="会话标题")
@@ -68,12 +82,22 @@ class SessionRecord(Base):
         String(32),
         default="private",
         index=True,
-        comment="可见性: private/team/workspace/public",
+        comment="可见性: private/workspace/public",
     )
     shared_with: Mapped[list[int]] = mapped_column(
         MutableList.as_mutable(json_type()),
         default=list,
         comment="共享用户ID列表",
+    )
+    shared_with_departments: Mapped[list[int]] = mapped_column(
+        MutableList.as_mutable(json_type()),
+        default=list,
+        comment="共享部门ID列表（访问时动态包含子部门）",
+    )
+    shared_with_groups: Mapped[list[int]] = mapped_column(
+        MutableList.as_mutable(json_type()),
+        default=list,
+        comment="共享群组ID列表",
     )
 
     messages: Mapped[list[SessionMessage]] = relationship(
