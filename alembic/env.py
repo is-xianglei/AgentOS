@@ -2,10 +2,12 @@ from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import create_engine, pool
+from sqlalchemy.engine import Connection
 
+import database.registry  # noqa: F401  汇总所有实体，autogenerate 依赖其副作用导入
 from core.config import settings
 from database.base import Base
-import database.registry  # noqa: F401  汇总所有实体，autogenerate 依赖其副作用导入
+from database.migration_history import include_alembic_name, record_version_apply
 
 config = context.config
 
@@ -27,6 +29,7 @@ def run_migrations_offline() -> None:
     context.configure(
         url=database_url,
         target_metadata=target_metadata,
+        include_name=include_alembic_name,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -35,14 +38,27 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run_migrations(connection: Connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_name=include_alembic_name,
+        on_version_apply=record_version_apply,
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        _run_migrations(supplied_connection)
+        return
+
     connectable = create_engine(database_url, poolclass=pool.NullPool)
-
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_migrations(connection)
 
 
 if context.is_offline_mode():
