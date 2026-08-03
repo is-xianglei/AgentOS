@@ -109,7 +109,9 @@ class MemoryExportRunner:
                     raise RuntimeError("Memory导出必须运行在REPEATABLE READ事务")
                 await WorkspaceService(db).require_active_member(workspace_id, user_id)
                 result = await MemoryService(db).export_memories(workspace_id, user_id)
-                # 导出是纯读取，回滚即可释放快照并避免误提交未来新增的副作用。
+                # rollback 会过期 Session 内的 ORM 状态，先分离已加载的导出投影，
+                # 使请求层在快照事务释放后仍可安全完成 Schema 转换。
+                db.expunge_all()
                 await db.rollback()
                 return result
             except Exception:

@@ -43,6 +43,61 @@ async def test_创建工作区时创建者落为_owner() -> None:
 
 
 @pytest.mark.anyio
+async def test_用户工作区列表跳过被软删除过滤的空关系() -> None:
+    service = WorkspaceService(_FakeSession())
+    active = SimpleNamespace(is_deleted=False, suspended=False)
+    suspended = SimpleNamespace(is_deleted=False, suspended=True)
+    owner = SimpleNamespace(workspace=active, role="owner")
+    service.member_repo.list_by_user = AsyncMock(
+        return_value=[
+            SimpleNamespace(workspace=None, role="member"),
+            owner,
+            SimpleNamespace(workspace=suspended, role="admin"),
+        ]
+    )
+
+    memberships = await service.list_user_workspace_memberships(9)
+    result = await service.list_user_workspaces(9)
+
+    assert memberships == [owner]
+    assert result == [active]
+
+
+@pytest.mark.anyio
+async def test_更新工作区可清空显式提交的可选字段() -> None:
+    service = WorkspaceService(_FakeSession())
+    workspace = SimpleNamespace(
+        display_name="原显示名称",
+        logo_url="https://example.invalid/logo.png",
+        industry="制造业",
+        company_size="100-499",
+        billing_email="billing@example.invalid",
+        settings={"locale": "zh-CN"},
+    )
+    service.require_workspace_role = AsyncMock()
+    service.get_workspace = AsyncMock(return_value=workspace)
+    service.repo.update = AsyncMock(side_effect=lambda item: item)
+
+    result = await service.update_workspace(
+        workspace_id=8,
+        actor_user_id=5,
+        logo_url=None,
+        industry=None,
+        company_size=None,
+        billing_email=None,
+        settings=None,
+    )
+
+    assert result is workspace
+    assert workspace.display_name == "原显示名称"
+    assert workspace.logo_url is None
+    assert workspace.industry is None
+    assert workspace.company_size is None
+    assert workspace.billing_email is None
+    assert workspace.settings == {}
+
+
+@pytest.mark.anyio
 async def test_部门不能移动到自身子孙节点() -> None:
     service = DepartmentService(_FakeSession())
     department = SimpleNamespace(id=1, parent_id=None, manager_id=None)

@@ -60,9 +60,15 @@ async def list_workspaces(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
-    workspaces = await WorkspaceService(db).list_user_workspaces(current_user.id)
-    selected = workspaces[offset : offset + limit]
-    return ok([WorkspaceResponse.model_validate(item) for item in selected], request)
+    memberships = await WorkspaceService(db).list_user_workspace_memberships(current_user.id)
+    selected = memberships[offset : offset + limit]
+    workspaces = [
+        WorkspaceResponse.model_validate(member.workspace).model_copy(
+            update={"membership_role": member.role}
+        )
+        for member in selected
+    ]
+    return ok(workspaces, request)
 
 
 @router.get(
@@ -100,12 +106,7 @@ async def update_workspace(
     workspace = await WorkspaceService(db).update_workspace(
         workspace_id=workspace_id,
         actor_user_id=current_user.id,
-        display_name=payload.display_name,
-        logo_url=payload.logo_url,
-        industry=payload.industry,
-        company_size=payload.company_size,
-        billing_email=payload.billing_email,
-        settings=payload.settings,
+        **payload.model_dump(exclude_unset=True),
     )
     return ok(WorkspaceResponse.model_validate(workspace), request)
 

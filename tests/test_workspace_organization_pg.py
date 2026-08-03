@@ -121,6 +121,39 @@ async def organization(db: AsyncSession) -> SimpleNamespace:
 
 
 @pytest.mark.anyio
+async def test_用户工作区列表忽略已软删除工作区(db: AsyncSession) -> None:
+    suffix = uuid4().hex
+    user = UserRecord(
+        email=f"workspace-list-{suffix}@example.invalid",
+        username=f"workspace-list-{suffix[:16]}",
+        password="test-only-hash",
+    )
+    db.add(user)
+    await db.flush()
+    user_id = user.id
+    service = WorkspaceService(db)
+    deleted = await service.create_workspace(
+        creator_user_id=user_id,
+        name=f"deleted-{suffix}",
+        slug=f"deleted-{suffix}",
+        display_name="待删除工作区",
+    )
+    active = await service.create_workspace(
+        creator_user_id=user_id,
+        name=f"active-{suffix}",
+        slug=f"active-{suffix}",
+        display_name="活跃工作区",
+    )
+    active_id = active.id
+    await service.delete_workspace(deleted.id, user_id)
+    db.expunge_all()
+
+    result = await WorkspaceService(db).list_user_workspaces(user_id)
+
+    assert [workspace.id for workspace in result] == [active_id]
+
+
+@pytest.mark.anyio
 async def test_递归部门查询保持层级顺序并隔离工作区(
     db: AsyncSession,
     organization: SimpleNamespace,

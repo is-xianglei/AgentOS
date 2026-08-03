@@ -11,6 +11,13 @@ from workspace.repository import WorkspaceMemberRepository, WorkspaceRepository
 WorkspaceRole = Literal["owner", "admin", "member"]
 
 
+class _Unset:
+    pass
+
+
+UNSET = _Unset()
+
+
 class WorkspaceService:
     """维护工作区及其成员，是工作区角色与成员归属的唯一业务入口。"""
 
@@ -69,40 +76,51 @@ class WorkspaceService:
     ) -> list[WorkspaceRecord]:
         return await self.repo.list_all(limit=limit, offset=offset)
 
+    async def list_user_workspace_memberships(
+        self,
+        user_id: int,
+    ) -> list[WorkspaceMemberRecord]:
+        """返回已经正式加入且工作区仍可用的成员关系。"""
+        memberships = await self.member_repo.list_by_user(user_id)
+        active_memberships: list[WorkspaceMemberRecord] = []
+        for member in memberships:
+            workspace = member.workspace
+            # 全局软删除过滤会让指向已删除工作区的已加载关系表现为 None。
+            if workspace is None or workspace.is_deleted or workspace.suspended:
+                continue
+            active_memberships.append(member)
+        return active_memberships
+
     async def list_user_workspaces(self, user_id: int) -> list[WorkspaceRecord]:
         """仅返回已经正式加入且仍可用的工作区。"""
-        memberships = await self.member_repo.list_by_user(user_id)
-        return [
-            member.workspace
-            for member in memberships
-            if not member.workspace.is_deleted and not member.workspace.suspended
-        ]
+        memberships = await self.list_user_workspace_memberships(user_id)
+        return [member.workspace for member in memberships]
 
     async def update_workspace(
         self,
         workspace_id: int,
         actor_user_id: int,
-        display_name: str | None = None,
-        logo_url: str | None = None,
-        industry: str | None = None,
-        company_size: str | None = None,
-        billing_email: str | None = None,
-        settings: dict | None = None,
+        display_name: str | None | _Unset = UNSET,
+        logo_url: str | None | _Unset = UNSET,
+        industry: str | None | _Unset = UNSET,
+        company_size: str | None | _Unset = UNSET,
+        billing_email: str | None | _Unset = UNSET,
+        settings: dict | None | _Unset = UNSET,
     ) -> WorkspaceRecord:
         await self.require_workspace_role(workspace_id, actor_user_id, {"owner", "admin"})
         workspace = await self.get_workspace(workspace_id)
-        if display_name is not None:
+        if not isinstance(display_name, _Unset) and display_name is not None:
             workspace.display_name = display_name
-        if logo_url is not None:
+        if not isinstance(logo_url, _Unset):
             workspace.logo_url = logo_url
-        if industry is not None:
+        if not isinstance(industry, _Unset):
             workspace.industry = industry
-        if company_size is not None:
+        if not isinstance(company_size, _Unset):
             workspace.company_size = company_size
-        if billing_email is not None:
+        if not isinstance(billing_email, _Unset):
             workspace.billing_email = billing_email
-        if settings is not None:
-            workspace.settings = settings
+        if not isinstance(settings, _Unset):
+            workspace.settings = settings or {}
         return await self.repo.update(workspace)
 
     async def delete_workspace(self, workspace_id: int, actor_user_id: int) -> None:

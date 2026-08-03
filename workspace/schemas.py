@@ -42,6 +42,10 @@ class WorkspaceResponse(BaseModel):
     plan: str = Field(description="订阅计划")
     quotas: dict[str, Any] = Field(default_factory=dict, description="配额配置")
     settings: dict[str, Any] = Field(default_factory=dict, description="工作区设置")
+    membership_role: Literal["owner", "admin", "member"] | None = Field(
+        default=None,
+        description="当前用户在该工作区中的角色；仅我的工作区列表返回",
+    )
     created_at: datetime = Field(description="创建时间")
     updated_at: datetime = Field(description="更新时间")
 

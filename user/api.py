@@ -10,8 +10,8 @@ from user.schemas import (
     UserResponse,
     UserUpdateRequest,
 )
-from workspace.schemas import WorkspaceResponse
 from user.service import UserService
+from workspace.schemas import WorkspaceResponse
 from workspace.service import WorkspaceService
 
 router = APIRouter()
@@ -26,7 +26,11 @@ async def get_current_user_info(
     return ok(UserResponse.model_validate(current_user), request)
 
 
-@router.get("/me/workspaces", summary="获取当前用户的工作区列表", response_model=ApiResponse[list[WorkspaceResponse]])
+@router.get(
+    "/me/workspaces",
+    summary="获取当前用户的工作区列表",
+    response_model=ApiResponse[list[WorkspaceResponse]],
+)
 async def get_current_user_workspaces(
     request: Request,
     current_user: UserRecord = Depends(get_current_active_user),
@@ -34,8 +38,14 @@ async def get_current_user_workspaces(
 ):
     """获取当前用户加入的所有工作区列表"""
     workspace_service = WorkspaceService(db)
-    workspaces = await workspace_service.list_user_workspaces(current_user.id)
-    return ok([WorkspaceResponse.model_validate(ws) for ws in workspaces], request)
+    memberships = await workspace_service.list_user_workspace_memberships(current_user.id)
+    workspaces = [
+        WorkspaceResponse.model_validate(member.workspace).model_copy(
+            update={"membership_role": member.role}
+        )
+        for member in memberships
+    ]
+    return ok(workspaces, request)
 
 
 @router.patch("/me", summary="更新当前用户信息", response_model=ApiResponse[UserResponse])
@@ -49,13 +59,14 @@ async def update_current_user(
     service = UserService(db)
     user = await service.update_user(
         user_id=current_user.id,
-        full_name=payload.full_name,
-        avatar_url=payload.avatar_url,
+        **payload.model_dump(exclude_unset=True),
     )
     return ok(UserResponse.model_validate(user), request)
 
 
-@router.post("/me/change-password", summary="修改当前用户密码", response_model=ApiResponse[UserResponse])
+@router.post(
+    "/me/change-password", summary="修改当前用户密码", response_model=ApiResponse[UserResponse]
+)
 async def change_current_user_password(
     payload: UserChangePasswordRequest,
     request: Request,
@@ -127,10 +138,7 @@ async def update_user(
     service = UserService(db)
     user = await service.update_user(
         user_id=user_id,
-        full_name=payload.full_name,
-        avatar_url=payload.avatar_url,
-        bio=payload.bio,
-        extra_data=payload.extra_data,
+        **payload.model_dump(exclude_unset=True),
     )
     return ok(UserResponse.model_validate(user), request)
 

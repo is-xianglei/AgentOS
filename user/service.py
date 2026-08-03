@@ -7,6 +7,13 @@ from user.models import UserRecord
 from user.repository import UserRepository
 
 
+class _Unset:
+    pass
+
+
+UNSET = _Unset()
+
+
 class UserService:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -72,22 +79,22 @@ class UserService:
     async def update_user(
         self,
         user_id: int,
-        full_name: str | None = None,
-        avatar_url: str | None = None,
-        phone: str | None = None,
-        preferences: dict | None = None,
+        full_name: str | None | _Unset = UNSET,
+        avatar_url: str | None | _Unset = UNSET,
+        phone: str | None | _Unset = UNSET,
+        preferences: dict | None | _Unset = UNSET,
     ) -> UserRecord:
         """更新用户信息"""
         user = await self.get_user(user_id)
 
-        if full_name is not None:
+        if not isinstance(full_name, _Unset):
             user.full_name = full_name
-        if avatar_url is not None:
+        if not isinstance(avatar_url, _Unset):
             user.avatar_url = avatar_url
-        if phone is not None:
+        if not isinstance(phone, _Unset):
             user.phone = phone
-        if preferences is not None:
-            user.preferences = preferences
+        if not isinstance(preferences, _Unset):
+            user.preferences = preferences or {}
 
         await self.repo.update(user)
         return user
