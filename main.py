@@ -14,8 +14,9 @@ from core.errors import (
 )
 from core.logging import request_context_middleware, setup_logging
 from database.base import Base
-from database.engine import engine
+from database.engine import AsyncSessionLocal, engine
 from hooks.builtin import register_builtin_hooks
+from tools.service import ToolCatalogService
 
 
 @asynccontextmanager
@@ -23,6 +24,13 @@ async def lifespan(app: FastAPI):
     if settings.create_tables:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+    async with AsyncSessionLocal() as db:
+        try:
+            await ToolCatalogService(db).sync_builtins()
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
     yield
 
 

@@ -25,6 +25,7 @@ class SessionService:
         metadata: dict[str, Any] | None = None,
         user_id: int | None = None,
         workspace_id: int | None = None,
+        agent_id: int | None = None,
     ) -> SessionRecord:
         """创建会话。提交交给请求边界（get_db）统一处理。"""
         session: SessionRecord = await self.repo.create(
@@ -34,11 +35,16 @@ class SessionService:
             metadata=metadata or {},
             user_id=user_id,
             workspace_id=workspace_id,
+            agent_id=agent_id,
         )
         return session
 
     async def create_from_first_message(
-        self, content: str, user_id: int | None = None, workspace_id: int | None = None
+        self,
+        content: str,
+        user_id: int | None = None,
+        workspace_id: int | None = None,
+        agent_id: int | None = None,
     ) -> SessionRecord:
         """根据首条用户消息创建会话。"""
         title = self._summarize_title(content)
@@ -49,6 +55,7 @@ class SessionService:
             metadata={},
             user_id=user_id,
             workspace_id=workspace_id,
+            agent_id=agent_id,
         )
 
     async def list(self) -> list[SessionRecord]:
@@ -322,14 +329,29 @@ class SessionService:
         content: str,
         user_id: int,
         workspace_id: int,
+        agent_id: int | None = None,
     ) -> SessionRecord:
         """获取或创建本次消息所属会话，并标记为运行中。"""
         if session_id is None:
+            if agent_id is not None:
+                from agent.service import AgentService
+
+                await AgentService(self.db).require_runnable(agent_id, workspace_id)
             session: SessionRecord = await self.create_from_first_message(
-                content, user_id, workspace_id
+                content,
+                user_id,
+                workspace_id,
+                agent_id,
             )
             await self.repo.update_status(session, "running")
             return session
+        session = await self.get_required(session_id)
+        if agent_id is not None and agent_id != session.agent_id:
+            raise AgentException.message("已有会话不能切换Agent", status_code=409)
+        if session.agent_id is not None:
+            from agent.service import AgentService
+
+            await AgentService(self.db).require_runnable(session.agent_id, workspace_id)
         return await self.mark_running(session_id)
 
     async def start_turn(

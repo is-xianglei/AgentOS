@@ -199,6 +199,8 @@ class _Ctx:
     turn_id = None
     user_id = None
     workspace_id = None
+    allowed_tool_names = frozenset({"Agent", "Read"})
+    allowed_skill_names = frozenset({"workspace-skill"})
 
 
 def _tool_with_report(report: str) -> AgentTool:
@@ -214,6 +216,21 @@ def _tool_with_report(report: str) -> AgentTool:
 
 @pytest.mark.anyio
 class TestAgentToolReturnBoundary:
+    async def test_父Agent能力边界传给一次性子代理(self) -> None:
+        seen: list[tuple[object, ...]] = []
+        tool = AgentTool()
+
+        async def fake_dispatch(*args: object) -> str:
+            seen.append(args)
+            return "完成"
+
+        tool._dispatch = fake_dispatch  # type: ignore[method-assign]
+
+        await tool.run(AgentToolInput(prompt="查一下"), _Ctx())
+
+        assert seen[0][-2] == _Ctx.allowed_tool_names
+        assert seen[0][-1] == _Ctx.allowed_skill_names
+
     async def test_verification结果带机器可读判定(self) -> None:
         """主代理不必自己解析报告文本,也就无法把 FAIL 读成 PASS。"""
         tool = _tool_with_report(f"{_EVIDENCE}\n\nVERDICT: PASS")

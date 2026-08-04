@@ -23,6 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database.base import Base, json_type
 
 if TYPE_CHECKING:
+    from agent.models import AgentRecord
     from user.models import UserRecord
     from workspace.models import WorkspaceRecord
 
@@ -76,6 +77,12 @@ class SessionRecord(Base):
         index=True,
         comment="所属工作区ID",
     )
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="会话绑定的Agent ID，空表示使用默认Agent",
+    )
 
     # 共享与权限（新增字段）
     visibility: Mapped[str] = mapped_column(
@@ -119,6 +126,10 @@ class SessionRecord(Base):
     )
     workspace: Mapped[WorkspaceRecord | None] = relationship(
         "WorkspaceRecord", foreign_keys=[workspace_id], back_populates="sessions"
+    )
+    agent: Mapped[AgentRecord | None] = relationship(
+        "AgentRecord",
+        foreign_keys=[agent_id],
     )
 
 

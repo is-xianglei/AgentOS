@@ -4,12 +4,18 @@
 而非提示词内容:提示词能被模型忽略,执行边界不能。
 """
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+import database.engine as database_engine
 import database.registry  # noqa: F401
+import runtime.subagent as subagent_runtime
+import team.service as team_service_module
+from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
+from tools.registry import build_tool_registry
 from tools.shell_policy import ShellAccess
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import SUBAGENT_SPECS
@@ -90,6 +96,99 @@ def _spec(**overrides: Any) -> SubAgentSpec:
     }
     base.update(overrides)
     return SubAgentSpec(**base)
+
+
+class TestParentAgentBoundary:
+    def test_子代理工具集先与父Agent白名单求交(self) -> None:
+        spec = _spec(agent_type=AgentType.GENERAL_PURPOSE, shell_access=ShellAccess.FULL)
+
+        registry = SubAgentRunner._resolve_tools(
+            spec,
+            frozenset({"Agent", "Read"}),
+        )
+
+        assert registry.names == {"Read"}
+
+    def test_默认Agent仍按原有全量注册表解析(self) -> None:
+        spec = _spec(agent_type=AgentType.GENERAL_PURPOSE, shell_access=ShellAccess.FULL)
+
+        unrestricted = SubAgentRunner._resolve_tools(spec, None)
+        inherited_default = SubAgentRunner._resolve_tools(
+            spec,
+            build_tool_registry().names,
+        )
+
+        assert inherited_default.names == unrestricted.names
+        assert {"Read", "Write", "Bash", "Skill"}.issubset(inherited_default.names)
+
+    @pytest.mark.anyio
+    async def test_Skill白名单透传到子代理工具执行边界(self) -> None:
+        runner, tools, _ = _runner()
+        allowed = frozenset({"approved-skill"})
+
+        await runner._execute_tool_uses(
+            1,
+            None,
+            [_ToolUse("Skill")],
+            [],
+            tools,
+            _spec(),
+            None,
+            None,
+            3,
+            allowed_skill_names=allowed,
+        )
+
+        assert tools.calls[0]["allowed_skill_names"] == allowed
+
+    @pytest.mark.anyio
+    async def test_队友唤醒继承父Agent工具和Skill边界(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class _SessionContext:
+            async def __aenter__(self) -> object:
+                return object()
+
+            async def __aexit__(self, *args: object) -> None:
+                return None
+
+        class _TeamService:
+            async def list_members(self, session_id: int) -> list[SimpleNamespace]:
+                return [
+                    SimpleNamespace(
+                        id=8,
+                        name="reviewer",
+                        status="working",
+                        agent_type="general-purpose",
+                    )
+                ]
+
+        class _SubAgentRunner:
+            def __init__(self, db: object, bus: object = None) -> None:
+                pass
+
+            async def run_teammate(self, *args: object, **kwargs: Any) -> str:
+                calls.append(kwargs)
+                return "完成"
+
+        monkeypatch.setattr(database_engine, "AsyncSessionLocal", _SessionContext)
+        monkeypatch.setattr(team_service_module, "TeamService", lambda db: _TeamService())
+        monkeypatch.setattr(subagent_runtime, "SubAgentRunner", _SubAgentRunner)
+
+        runtime = AgentRuntime.__new__(AgentRuntime)
+        runtime.db = object()  # type: ignore[assignment]
+        runtime.bus = None  # type: ignore[assignment]
+        runtime.tool_registry = build_tool_registry().only("Agent", "Read", "Skill")
+        runtime.allowed_skill_names = frozenset({"workspace-skill"})
+        turn = SimpleNamespace(id=None, user_id=5, workspace_id=3)
+
+        await runtime._wake_team_members(7, turn)
+
+        assert calls[0]["parent_allowed_tool_names"] == runtime.tool_registry.names
+        assert calls[0]["allowed_skill_names"] == runtime.allowed_skill_names
 
 
 @pytest.mark.anyio

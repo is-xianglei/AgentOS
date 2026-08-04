@@ -50,6 +50,7 @@ class SessionRepository:
         metadata: dict[str, Any],
         user_id: int | None = None,
         workspace_id: int | None = None,
+        agent_id: int | None = None,
     ) -> SessionRecord:
         session = SessionRecord(
             title=title,
@@ -59,6 +60,7 @@ class SessionRepository:
             extra=metadata,
             user_id=user_id,
             workspace_id=workspace_id,
+            agent_id=agent_id,
         )
         self.db.add(session)
         await self.db.flush()

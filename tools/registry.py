@@ -64,6 +64,11 @@ class ToolRegistry:
     def names(self) -> frozenset[str]:
         return frozenset(self._tools)
 
+    @property
+    def tools(self) -> tuple[BaseTool, ...]:
+        """返回稳定快照，供数据库目录同步使用。"""
+        return tuple(self._tools.values())
+
     def without(self, *names: str) -> "ToolRegistry":
         excluded = set(names)
         return ToolRegistry([tool for name, tool in self._tools.items() if name not in excluded])

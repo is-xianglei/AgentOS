@@ -48,6 +48,10 @@ def _human_size(n: int) -> str:
     return f"{n}B"
 
 
+def _can_access_skill(name: str, ctx: ToolContext) -> bool:
+    return ctx.allowed_skill_names is None or name in ctx.allowed_skill_names
+
+
 # ---------------------------------------------------------------------------
 # SkillTool:加载正文
 # ---------------------------------------------------------------------------
@@ -64,10 +68,12 @@ class SkillTool(BaseTool):
     input_model = SkillInput
 
     async def run(self, args: SkillInput, ctx: ToolContext) -> str:
+        if ctx.workspace_id is None or not _can_access_skill(args.name, ctx):
+            return f"错误:未知 skill '{args.name}'。"
         service = SkillService(ctx.db)
         try:
-            body = await service.load_body(args.name)
-            resources = await service.list_resources(args.name)
+            body = await service.load_body(ctx.workspace_id, args.name)
+            resources = await service.list_resources(ctx.workspace_id, args.name)
         except AgentException:
             # skill 不存在等领域错误统一转可读文本(不抛)。
             return f"错误:未知 skill '{args.name}'。"
@@ -106,9 +112,15 @@ class SkillResourceTool(BaseTool):
     input_model = SkillResourceInput
 
     async def run(self, args: SkillResourceInput, ctx: ToolContext) -> str:
+        if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):
+            return f"错误:未知 skill '{args.skill_name}'。"
         service = SkillService(ctx.db)
         try:
-            data, mime = await service.read_resource(args.skill_name, args.relative_path)
+            data, mime = await service.read_resource(
+                ctx.workspace_id,
+                args.skill_name,
+                args.relative_path,
+            )
         except AgentException as exc:
             return f"错误:{exc.message}"
         if _is_text_mime(mime):
@@ -138,10 +150,16 @@ class SkillRunTool(BaseTool):
     input_model = SkillRunInput
 
     async def run(self, args: SkillRunInput, ctx: ToolContext) -> str:
+        if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):
+            return f"错误:未知 skill '{args.skill_name}'。"
         service = SkillService(ctx.db)
         try:
             result = await service.run_script(
-                args.skill_name, args.relative_path, args.args, args.stdin
+                ctx.workspace_id,
+                args.skill_name,
+                args.relative_path,
+                args.args,
+                args.stdin,
             )
         except AgentException as exc:
             return f"错误:{exc.message}"

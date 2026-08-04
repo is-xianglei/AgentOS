@@ -67,6 +67,17 @@ class SubAgentRunner:
         self.run_repo = SubAgentRunRepository(db)
         self.permission_service = PermissionService(db)
 
+    @staticmethod
+    def _resolve_tools(
+        spec: SubAgentSpec,
+        parent_allowed_tool_names: frozenset[str] | None,
+    ) -> ToolRegistry:
+        """先继承父 Agent 工具边界，再叠加子代理自身规则。"""
+        registry = build_tool_registry()
+        if parent_allowed_tool_names is not None:
+            registry = registry.only(*parent_allowed_tool_names)
+        return spec.resolve_tools(registry)
+
     async def run(
         self,
         session_id: int,
@@ -76,6 +87,8 @@ class SubAgentRunner:
         parent_turn_id: UUID | None = None,
         user_id: int | None = None,
         workspace_id: int | None = None,
+        parent_allowed_tool_names: frozenset[str] | None = None,
+        allowed_skill_names: frozenset[str] | None = None,
     ) -> str:
         """无状态执行一次子代理:按 spec 配置跑 ReAct 并返回报告。
 
@@ -83,7 +96,7 @@ class SubAgentRunner:
         member_name 复用为 agent_type 值,兼容运行记录表与前端事件契约。
         """
         member_name = spec.agent_type.value
-        tool_registry = spec.resolve_tools(build_tool_registry())
+        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         tool_service = ToolService(self.db, tool_registry)
         # omit_inherited_memory 的 spec(如 Explore)不继承父 Turn 记忆:
         # 它只做代码检索,注入用户偏好等长期记忆既无用又占满上下文预算。
@@ -127,6 +140,7 @@ class SubAgentRunner:
                         parent_turn_id,
                         user_id,
                         workspace_id,
+                        allowed_skill_names=allowed_skill_names,
                     )
                 await self.run_repo.succeed(run, report)
                 await self.db.commit()
@@ -247,6 +261,8 @@ class SubAgentRunner:
         parent_turn_id: UUID | None,
         user_id: int | None,
         workspace_id: int | None,
+        *,
+        allowed_skill_names: frozenset[str] | None = None,
     ) -> None:
         """裁决并执行一轮 tool_use,把结果追加回 messages。
 
@@ -271,6 +287,7 @@ class SubAgentRunner:
                     turn_id=parent_turn_id,
                     user_id=user_id,
                     workspace_id=workspace_id,
+                    allowed_skill_names=allowed_skill_names,
                     shell_access=spec.shell_access,
                     shell_tmp_root=spec.shell_tmp_root(),
                 )
@@ -324,6 +341,8 @@ class SubAgentRunner:
         parent_turn_id: UUID | None,
         user_id: int | None,
         workspace_id: int | None,
+        *,
+        allowed_skill_names: frozenset[str] | None = None,
     ) -> str:
         """执行子代理 ReAct 循环并返回报告。系统提示、工具集与轮次上限均取自 spec。"""
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
@@ -355,6 +374,7 @@ class SubAgentRunner:
                 parent_turn_id,
                 user_id,
                 workspace_id,
+                allowed_skill_names=allowed_skill_names,
             )
             await self.db.flush()
 
@@ -381,6 +401,8 @@ class SubAgentRunner:
         parent_turn_id: UUID | None = None,
         user_id: int | None = None,
         workspace_id: int | None = None,
+        parent_allowed_tool_names: frozenset[str] | None = None,
+        allowed_skill_names: frozenset[str] | None = None,
     ) -> str:
         """恢复并单次推进一个 teammate:读历史→注入身份→排空收件箱→认领→ReAct→写回。
 
@@ -400,10 +422,8 @@ class SubAgentRunner:
             user_id,
             workspace_id,
         )
-        # 拆分后通信类工具(SendMessage / ReadInbox / ListMessages / TeamList)不在黑名单内,
-        # spec.resolve_tools 只剔除造人 / 派子代理 / shell(TeamCreate/TeamSpawn/Agent/Bash),
-        # 因此 teammate 天然能通信但不能越权,无需再补回受限工具实例。
-        tool_registry = spec.resolve_tools(build_tool_registry())
+        # 先继承父 Agent 的硬白名单，再叠加 teammate 规格；通信工具同样不得越过父边界。
+        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         tool_service = ToolService(self.db, tool_registry)
 
         # 为本次推进设置独立隔离 id(收件箱消费按该 id 隔离;任务认领不隔离)。
@@ -452,6 +472,7 @@ class SubAgentRunner:
                 parent_turn_id,
                 user_id,
                 workspace_id,
+                allowed_skill_names=allowed_skill_names,
             )
 
             # 5) 写回历史 + 据剩余待办决定 idle / working。
@@ -538,6 +559,8 @@ class SubAgentRunner:
         parent_turn_id: UUID | None,
         user_id: int | None,
         workspace_id: int | None,
+        *,
+        allowed_skill_names: frozenset[str] | None = None,
     ) -> str:
         """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环。"""
         name = actor.name
@@ -571,6 +594,7 @@ class SubAgentRunner:
                 parent_turn_id,
                 user_id,
                 workspace_id,
+                allowed_skill_names=allowed_skill_names,
             )
             await self.db.flush()
 

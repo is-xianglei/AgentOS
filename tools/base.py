@@ -20,6 +20,8 @@ class ToolContext:
     turn_id: UUID | None = None
     user_id: int | None = None
     workspace_id: int | None = None
+    allowed_tool_names: frozenset[str] | None = None
+    allowed_skill_names: frozenset[str] | None = None
     # shell 访问级别与可写临时目录:由 SubAgent 规格下发,Bash 工具据此自校验。
     # 主代理路径不设置,等价于 FULL。
     shell_access: ShellAccess = ShellAccess.FULL

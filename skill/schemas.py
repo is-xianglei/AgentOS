@@ -18,10 +18,11 @@ class SkillResponse(BaseModel):
     """列表精简视图:仅元数据,无正文、无资源清单。"""
 
     id: int = Field(description="skillID")
+    workspace_id: int = Field(description="所属工作区ID")
     name: str = Field(description="skill 名称(kebab-case)")
     description: str = Field(description="skill 描述")
     version: str | None = Field(default=None, description="版本号")
-    scope: str = Field(description="作用域,本期恒为 global")
+    scope: str = Field(description="作用域，MVP恒为workspace")
     created_at: datetime = Field(description="创建时间")
     updated_at: datetime = Field(description="更新时间")
 

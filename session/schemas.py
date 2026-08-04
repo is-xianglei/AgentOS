@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 
 class SessionSendMessageRequest(BaseModel):
     session_id: int | None = Field(default=None, description="会话ID，不传则自动创建新会话")
+    agent_id: int | None = Field(
+        default=None,
+        description="新会话使用的Agent ID，空表示使用默认Agent",
+    )
     content: str = Field(description="用户消息")
 
 
@@ -30,6 +34,7 @@ class SessionResponse(BaseModel):
     system_prompt: str | None = Field(default=None, description="系统提示词")
     user_id: int | None = Field(default=None, description="创建用户ID")
     workspace_id: int | None = Field(default=None, description="所属工作区ID")
+    agent_id: int | None = Field(default=None, description="绑定的Agent ID")
     visibility: str = Field(description="可见性")
     shared_with: list[int] = Field(default_factory=list, description="共享用户ID列表")
     shared_with_departments: list[int] = Field(

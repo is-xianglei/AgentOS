@@ -11,6 +11,7 @@ from uuid import UUID
 from anthropic.types import TextBlockParam, ToolParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.service import AgentService
 from core.config import settings
 from core.errors import AgentException
 from core.event_bus import StreamBus
@@ -112,15 +113,26 @@ class AgentRuntime:
         self.llm = LLMClient()
         self.tool_registry = build_tool_registry()
         self.tool_service = ToolService(db, self.tool_registry)
+        self.active_agent_id: int | None = None
+        self.active_agent_prompt: str | None = None
+        self.active_model_name: str | None = None
+        self.active_skill_ids: tuple[int, ...] | None = None
+        self.allowed_skill_names: frozenset[str] | None = None
         self.bus = StreamBus()
 
-    async def run(self, session_id: int | None, user_content: str) -> AsyncIterator[dict[str, Any]]:
+    async def run(
+        self,
+        session_id: int | None,
+        user_content: str,
+        *,
+        agent_id: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         """执行一次会话消息处理并产出流式事件。
 
         采用生产者-消费者模式:后台任务跑 ReAct 主流程并把所有事件(含 lead 增量、
         工具事件、子代理增量)emit 到会话级事件总线;本协程从总线抽干并 yield 给 SSE。
         """
-        producer = asyncio.create_task(self._produce(session_id, user_content))
+        producer = asyncio.create_task(self._produce(session_id, user_content, agent_id))
         try:
             async for event in self.bus.stream():
                 yield event
@@ -133,7 +145,12 @@ class AgentRuntime:
             except asyncio.CancelledError:
                 pass
 
-    async def _produce(self, session_id: int | None, user_content: str) -> None:
+    async def _produce(
+        self,
+        session_id: int | None,
+        user_content: str,
+        agent_id: int | None = None,
+    ) -> None:
         """后台生产者:跑完整流程,所有事件 emit 到 bus,最终 close。"""
         session: SessionRecord | None = None
         turn: SessionTurnRecord | None = None
@@ -142,8 +159,13 @@ class AgentRuntime:
             if self.user_id is None or self.workspace_id is None:
                 raise AgentException.message("缺少可信用户或工作区上下文")
             session: SessionRecord = await self.session_service.prepare_for_message(
-                session_id, user_content, self.user_id, self.workspace_id
+                session_id,
+                user_content,
+                self.user_id,
+                self.workspace_id,
+                agent_id,
             )
+            await self._configure_agent(session)
             session_id = session.id
             turn, _ = await self.session_service.start_turn(
                 session,
@@ -256,6 +278,7 @@ class AgentRuntime:
             raise AgentException.message("缺少可信用户或工作区上下文")
 
         session = await self.session_service.lock_required(session_id)
+        await self._configure_agent(session)
         current = await self.interaction_service.get_request_required(
             request_id,
             session_id=session_id,
@@ -352,6 +375,7 @@ class AgentRuntime:
             # 所有恢复者都按 Session -> Suspension 的顺序重新加锁。竞争者会在首个
             # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
             session = await self.session_service.lock_required(session_id)
+            await self._configure_agent(session)
             request = await self.interaction_service.get_request_required(
                 request_id,
                 session_id=session_id,
@@ -545,7 +569,12 @@ class AgentRuntime:
 
         # skill catalog 每次 run 取一次缓存复用(仅主代理注入,§15.2):进 for 循环前取一次,
         # 循环内各轮共用,避免每轮 loop 都打 DB。
-        skills_catalog = await SkillService(self.db).get_catalog()
+        if self.workspace_id is None:
+            raise AgentException.message("缺少可信工作区上下文")
+        skills_catalog = await SkillService(self.db).get_catalog(
+            self.workspace_id,
+            list(self.active_skill_ids) if self.active_skill_ids is not None else None,
+        )
         memory_context = await self.memory_recall_service.get_or_create_context(turn)
         # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
         if memory_context is not None:
@@ -556,7 +585,11 @@ class AgentRuntime:
         system_prompt: list[TextBlockParam] = compose_lead_blocks(
             PromptContext.create(
                 skills_catalog=skills_catalog,
-                session_prompt=session.system_prompt,
+                session_prompt=(
+                    self.active_agent_prompt
+                    if self.active_agent_id is not None
+                    else session.system_prompt
+                ),
                 memory_catalog=memory_context.rendered_catalog if memory_context else None,
             )
         )
@@ -586,7 +619,16 @@ class AgentRuntime:
             )
             context = history + current
             final_content: list[dict[str, Any]] | None = None
-            async for chunk in self.llm.stream(context, system_prompt, tools=tools):
+            async for chunk in self.llm.stream(
+                context,
+                system_prompt,
+                tools=tools,
+                model=(
+                    self.active_model_name
+                    if self.active_agent_id is not None
+                    else session.model_name
+                ),
+            ):
                 if chunk.get("type") == "message_final":
                     final_content = chunk.get("content")
                 # 原始 chunk 交给翻译器产出协议事件
@@ -642,6 +684,11 @@ class AgentRuntime:
                 additional_context,
                 rendered_memories,
                 system_prompt,
+                (
+                    self.active_model_name
+                    if self.active_agent_id is not None
+                    else session.model_name
+                ),
             )
             stop_reason = translator.stop_reason or "max_iterations"
 
@@ -916,6 +963,8 @@ class AgentRuntime:
             turn_id=turn_id,
             user_id=self.user_id,
             workspace_id=self.workspace_id,
+            agent_id=self.active_agent_id,
+            allowed_skill_names=self.allowed_skill_names,
         )
         await self.bus.emit(
             StreamEvent.tool_result(
@@ -1000,8 +1049,12 @@ class AgentRuntime:
     ) -> SuspendedInteraction:
         """冻结 continuation 并创建一项业务交互请求。"""
         target = remaining[0]
-        record = await self.tool_service.tool_repo.start(
-            session_id, target.name, target.input, message_id=assistant_message_id
+        record = await self.tool_service.start_call(
+            session_id,
+            target.name,
+            target.input,
+            message_id=assistant_message_id,
+            agent_id=self.active_agent_id,
         )
         await self.tool_service.tool_repo.mark_awaiting_interaction(record)
         continuation = {
@@ -1393,6 +1446,33 @@ class AgentRuntime:
             return self.tool_registry.only(*PLAN_MODE_ALLOWED_TOOLS)
         return self.tool_registry.without("ExitPlanMode", "WritePlan")
 
+    async def _configure_agent(self, session: SessionRecord) -> None:
+        """按会话绑定刷新本次运行的提示词、模型、Tool与Skill边界。"""
+        base_registry = build_tool_registry()
+        session_agent_id = getattr(session, "agent_id", None)
+        if session_agent_id is None:
+            self.active_agent_id = None
+            self.active_agent_prompt = None
+            self.active_model_name = None
+            self.active_skill_ids = None
+            self.allowed_skill_names = None
+            self.tool_registry = base_registry
+        else:
+            if self.workspace_id is None:
+                raise AgentException.message("缺少可信工作区上下文")
+            config = await AgentService(self.db).get_runtime_config(
+                self.workspace_id,
+                session_agent_id,
+            )
+            runtime_names = set(config.tool_runtime_names)
+            self.active_agent_id = config.agent_id
+            self.active_agent_prompt = config.system_prompt
+            self.active_model_name = config.model_name
+            self.active_skill_ids = config.skill_ids
+            self.allowed_skill_names = frozenset(config.skill_names)
+            self.tool_registry = base_registry.only(*runtime_names)
+        self.tool_service = ToolService(self.db, self.tool_registry)
+
     async def _get_pending_interaction(self, session_id: int) -> SuspendedInteraction:
         """读取已提交的唯一待处理请求，用于幂等重放 SSE 通知。"""
         pending = await self.interaction_service.get_pending(session_id)
@@ -1500,6 +1580,7 @@ class AgentRuntime:
         additional_context: str | None,
         rendered_memories: str | None,
         system_prompt: str | list[TextBlockParam],
+        model_name: str | None,
     ) -> SessionMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。沿用同一翻译器维持事件连续。"""
         history, current, through_message_id = await self.session_service.load_context_for_turn(
@@ -1515,7 +1596,12 @@ class AgentRuntime:
         context = history + current
         final_content: list[dict[str, Any]] | None = None
 
-        async for chunk in self.llm.stream(context, system_prompt, tools=[]):
+        async for chunk in self.llm.stream(
+            context,
+            system_prompt,
+            tools=[],
+            model=model_name,
+        ):
             if chunk.get("type") == "message_final":
                 final_content = chunk.get("content")
             for event in translator.translate(chunk):
@@ -1602,6 +1688,8 @@ class AgentRuntime:
                         parent_turn_id=turn.id,
                         user_id=turn.user_id,
                         workspace_id=turn.workspace_id,
+                        parent_allowed_tool_names=self.tool_registry.names,
+                        allowed_skill_names=self.allowed_skill_names,
                     )
             except Exception as exc:  # noqa: BLE001 - 单个队友失败必须与主流程隔离
                 # 单个队友失败隔离:发 error 事件后继续唤醒其余成员。

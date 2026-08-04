@@ -15,13 +15,12 @@ class ObjectMeta:
     size: int
 
 
-def skill_object_key(name: str, relative_path: str) -> str:
-    """拼装 skill 资源的对象存储 key:{name}/{relative_path}。
+def skill_object_key(workspace_id: int, name: str, relative_path: str) -> str:
+    """拼装Skill资源对象键:{workspace_id}/{name}/{relative_path}。
 
-    桶(skills)已专用于 skill,桶内直接以 name 分目录,不套额外前缀。
-    例:skill_object_key("pdf-tools", "references/cli.md") -> "pdf-tools/references/cli.md"
+    工作区ID必须进入前缀，避免不同工作区同名Skill互相覆盖。
     """
-    return f"{name}/{relative_path}"
+    return f"{workspace_id}/{name}/{relative_path}"
 
 
 class ObjectStorage(ABC):

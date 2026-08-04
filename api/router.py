@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from agent import api as agent_api
 from auth import api as auth_api
 from department import api as department_api
 from group import api as group_api
@@ -16,6 +17,7 @@ from user import api as user_api
 from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
+api_router.include_router(agent_api.router, prefix="/agents", tags=["agents"])
 api_router.include_router(auth_api.router, prefix="/auth", tags=["auth"])
 api_router.include_router(
     department_api.router,

@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
+from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from runtime.agent import AgentRuntime, format_sse
 from session.schemas import (
@@ -47,17 +48,23 @@ async def send_message(
 ):
     # 如果提供了 session_id，需要验证权限
     if payload.session_id:
-        await SessionService(db).require_write_access(
+        session = await SessionService(db).require_write_access(
             payload.session_id,
             current_user.id,
             workspace_id,
         )
+        if payload.agent_id is not None and payload.agent_id != session.agent_id:
+            raise AgentException.message("已有会话不能切换Agent", status_code=409)
 
     # 传递用户信息和工作区信息到 runtime
     runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
 
     async def event_stream():
-        async for event in runtime.run(payload.session_id, payload.content):
+        async for event in runtime.run(
+            payload.session_id,
+            payload.content,
+            agent_id=payload.agent_id,
+        ):
             yield format_sse(event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")

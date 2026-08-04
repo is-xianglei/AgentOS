@@ -1,12 +1,60 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database.base import Base
 from database.base import json_type
+
+
+class ToolRecord(Base):
+    __tablename__ = "tools"
+    __table_args__ = {"comment": "内置工具目录"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="工具ID")
+    tool_key: Mapped[str] = mapped_column(
+        String(120),
+        unique=True,
+        index=True,
+        comment="工具稳定标识",
+    )
+    name: Mapped[str] = mapped_column(String(120), comment="工具名称")
+    description: Mapped[str] = mapped_column(Text, comment="工具描述")
+    tool_type: Mapped[str] = mapped_column(
+        String(32),
+        default="builtin",
+        index=True,
+        comment="工具类型，MVP仅支持builtin",
+    )
+    runtime_name: Mapped[str] = mapped_column(
+        String(120),
+        unique=True,
+        index=True,
+        comment="代码注册表名称",
+    )
+    input_schema: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(json_type()),
+        default=dict,
+        comment="工具输入JSON Schema",
+    )
+    implementation_config: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(json_type()),
+        default=dict,
+        comment="工具实现配置，内置工具为空",
+    )
+    is_system: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        comment="是否系统内置工具",
+    )
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        index=True,
+        comment="是否启用",
+    )
 
 
 class ToolCallRecord(Base):
@@ -24,6 +72,18 @@ class ToolCallRecord(Base):
         nullable=True,
         index=True,
         comment="关联消息ID",
+    )
+    tool_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tools.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="调用的工具ID",
+    )
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="发起调用的Agent ID",
     )
     tool_name: Mapped[str] = mapped_column(String(120), index=True, comment="工具名称")
     input_args: Mapped[dict[str, Any]] = mapped_column(

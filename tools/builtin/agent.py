@@ -84,6 +84,8 @@ class AgentTool(BaseTool):
             ctx.turn_id,
             ctx.user_id,
             ctx.workspace_id,
+            ctx.allowed_tool_names,
+            ctx.allowed_skill_names,
         )
         result = SubAgentRunReport(agent=args.agent_type.value, report=report)
         if args.agent_type is AgentType.VERIFICATION:
@@ -119,6 +121,8 @@ class AgentTool(BaseTool):
         parent_turn_id: UUID | None,
         user_id: int | None,
         workspace_id: int | None,
+        parent_allowed_tool_names: frozenset[str] | None,
+        allowed_skill_names: frozenset[str] | None,
     ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
         from database.engine import AsyncSessionLocal
@@ -132,4 +136,6 @@ class AgentTool(BaseTool):
                 parent_turn_id=parent_turn_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                parent_allowed_tool_names=parent_allowed_tool_names,
+                allowed_skill_names=allowed_skill_names,
             )
