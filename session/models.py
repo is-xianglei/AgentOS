@@ -153,6 +153,17 @@ class SessionMessage(Base):
     role: Mapped[str] = mapped_column(String(32), index=True, comment="消息角色")
     content: Mapped[Any] = mapped_column(json_type(), comment="消息内容")
     token_estimate: Mapped[int] = mapped_column(Integer, default=0, comment="预估token数")
+    # 成本归因元数据：仅 LLM 产出的 assistant 消息填写，user/tool 消息必须留空。
+    provider: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="产出该消息的LLM提供商标识（anthropic/openai），非模型产出的消息为空",
+    )
+    model: Mapped[str | None] = mapped_column(
+        String(120),
+        nullable=True,
+        comment="本次调用实际生效的模型ID，非模型产出的消息为空",
+    )
 
     session: Mapped[SessionRecord] = relationship(back_populates="messages")
     turn: Mapped[SessionTurnRecord | None] = relationship(

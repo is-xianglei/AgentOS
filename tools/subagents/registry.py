@@ -38,7 +38,7 @@ _WRITE_TOOLS: tuple[str, ...] = ("Write", "Edit", "SkillRun")
 
 
 def _build_specs() -> dict[AgentType, SubAgentSpec]:
-    """构造四种内置规格。模型档位从配置读取,便于按环境调整而不散落硬编码。"""
+    """构造四种内置规格。轮次等参数从配置读取;模型档位由 model_scenario 在调用期惰性解析。"""
     return {
         AgentType.GENERAL_PURPOSE: SubAgentSpec(
             agent_type=AgentType.GENERAL_PURPOSE,
@@ -46,7 +46,7 @@ def _build_specs() -> dict[AgentType, SubAgentSpec]:
             when_to_use=GENERAL_PURPOSE_WHEN_TO_USE,
             # 除全局禁用外全部可用;危险工具仍逐次经 permission 裁决。
             allowed_tools=None,
-            # 不在此处写死:resolve_model() 已把 subagent_default_model 作为兜底。
+            # 不在此处写死:默认档模型由 SubAgentRunner 的客户端按 subagent 场景解析。
             model=None,
             max_rounds=settings.subagent_max_rounds,
             # shell 不额外限制,但 Bash 属危险工具,默认 ask 会坍缩为拒绝。
@@ -58,8 +58,9 @@ def _build_specs() -> dict[AgentType, SubAgentSpec]:
             when_to_use=EXPLORE_WHEN_TO_USE,
             allowed_tools=_READ_ONLY_TOOLS,
             disallowed_tools=_WRITE_TOOLS,
-            # 速度优先档位。留空则回落主会话模型。
-            model=settings.subagent_fast_model,
+            # 速度优先档:调用时按 {provider}_subagent_fast_model 场景惰性解析,
+            # 未配置覆盖时回落 provider 主模型。
+            model_scenario="subagent_fast",
             max_rounds=settings.subagent_max_rounds,
             shell_access=ShellAccess.READ_ONLY,
             # 只读检索不需要父会话的历史偏好,注入反而稀释任务并可能引入陈旧信息。

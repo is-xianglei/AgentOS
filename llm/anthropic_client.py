@@ -1,13 +1,13 @@
 import logging
 from collections.abc import AsyncIterator
-from typing import Any
-from warnings import deprecated
+from typing import Any, cast
 
 from anthropic import NOT_GIVEN, AsyncAnthropic
-from anthropic.types import TextBlockParam, ToolParam
+from anthropic.types import MessageParam, TextBlockParam, ToolChoiceToolParam, ToolParam
 from pydantic import BaseModel, ValidationError
 
 from core.config import settings
+from llm.base import BaseLLMClient
 from llm.types import LLMRawChunk
 
 logger = logging.getLogger(__name__)
@@ -16,33 +16,55 @@ logger = logging.getLogger(__name__)
 _STRUCTURED_TOOL_NAME = "emit_structured_output"
 
 
-class LLMClient:
-    def __init__(self):
-        self.model = settings.anthropic_model
-        self.api_key = settings.anthropic_api_key
-        self.base_url = settings.anthropic_base_url
+class AnthropicClient(BaseLLMClient):
+    def __init__(
+        self,
+        model: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        max_retries: int = 2,
+        timeout: float | None = None,
+    ):
+        self.model = model
+        self.api_key = api_key or settings.anthropic_api_key
+        self.base_url = base_url or settings.anthropic_base_url
+        self.max_retries = max_retries
+        self.timeout = timeout
+
+    @property
+    def provider(self) -> str:
+        return "anthropic"
 
     async def stream(
         self,
         messages: list[dict],
-        system_prompt: str | list[TextBlockParam] | None = None,
-        tools: list[ToolParam] | None = None,
+        system_prompt: str | list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
     ) -> AsyncIterator[LLMRawChunk]:
         """流式调用。system_prompt 传 TextBlockParam 列表时可携带 cache 断点。
 
-        model 留空时回落主会话模型,供 SubAgent 按类型指定档位(如 Explore 走
-        速度优先档)。别名与云厂商区域前缀原样透传,不做改写,避免继承时丢前缀。
+        model 留空时回落构造时由工厂按场景解析的模型,供 SubAgent 按类型指定
+        档位(如 Explore 走速度优先档)。别名与云厂商区域前缀原样透传,
+        不做改写,避免继承时丢前缀。
         """
 
-        client = AsyncAnthropic(base_url=self.base_url, api_key=self.api_key)
+        client = AsyncAnthropic(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            max_retries=self.max_retries,
+            # 客户端级 timeout 显式传 None 会被 SDK 视为「禁用超时」,
+            # 此处转成 NOT_GIVEN 以保留 SDK 的默认超时计算。
+            timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
+        )
 
         async with client.messages.stream(
-            max_tokens=131072,
+            max_tokens=settings.llm_default_max_tokens,
             model=model or self.model,
-            system=system_prompt or "",
-            messages=messages,
-            tools=tools or [],
+            # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
+            system=cast("str | list[TextBlockParam]", system_prompt or ""),
+            messages=cast("list[MessageParam]", messages),
+            tools=cast("list[ToolParam]", tools or []),
         ) as stream:
             async for event in stream:
                 yield (
@@ -87,47 +109,6 @@ class LLMClient:
             extra={"cache_write": write, "cache_read": read},
         )
 
-    @deprecated(
-        "依赖服务端 structured outputs，第三方中转端点普遍不实现 output_config 且静默丢弃该字段，"
-        "导致模型退回自由文本、SDK 对整段 text 做 validate_json 必然失败。"
-        "请改用 complete_structured_by_tool。"
-    )
-    async def _complete_structured[T: BaseModel](
-        self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *, # * 是仅限关键字参数（keyword-only）的分隔符：它自己不接收任何值，只标记"从这里往后的参数，调用时必须写参数名"。
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
-    ) -> T:
-        """已废弃：走服务端 structured outputs，仅在端点真实支持 output_config 时可用。
-
-        废弃原因：该实现把 schema 约束下放给服务端做约束解码，SDK 侧只对返回的
-        text block 整段执行 validate_json，且不校验服务端是否真的生效。第三方中转
-        （如 new-api/one-api 系）会在反序列化阶段静默丢弃 output_config，模型于是按
-        普通对话作答，返回带 <thinking> 与 markdown 围栏的文本，解析必然在首字符失败。
-        官方 API、Bedrock、Vertex 等真实实现该能力的端点仍可正常使用，故保留不删。
-        """
-        client = AsyncAnthropic(base_url=self.base_url, api_key=self.api_key)
-        response = await client.messages.parse(
-            max_tokens=max_tokens,
-            model=model or self.model,
-            system=system_prompt or "",
-            messages=messages,
-            output_format=output_format,
-            temperature=0,
-            # 显式 None 会被 SDK 视为"已给定"从而禁用超时，
-            # 此处转成 NOT_GIVEN 以保留非流式超时的自动计算。
-            timeout=timeout if timeout is not None else NOT_GIVEN,
-        )
-        parsed = response.parsed_output
-        if parsed is None:
-            # 无 text block（如被 max_tokens 截断或模型拒答），与校验失败同归 ValueError。
-            raise ValueError(f"结构化输出缺失，stop_reason={response.stop_reason}")
-        return parsed
-
     async def complete_structured[T: BaseModel](
         self,
         messages: list[dict[str, Any]],
@@ -144,7 +125,13 @@ class LLMClient:
         text block，二者互不干扰，因此不依赖端点是否实现 output_config。tool use 自
         2024 年 GA，第三方中转普遍支持。校验由 Pydantic 在客户端完成。
         """
-        client = AsyncAnthropic(base_url=self.base_url, api_key=self.api_key)
+        client = AsyncAnthropic(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            max_retries=self.max_retries,
+            # 同 stream():None 转 NOT_GIVEN,保留 SDK 默认超时而非禁用超时。
+            timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
+        )
         # Anthropic 的 input_schema 接受标准 JSON Schema，含 $defs/$ref 的嵌套模型可直接使用。
         tool: ToolParam = {
             "name": _STRUCTURED_TOOL_NAME,
@@ -163,10 +150,10 @@ class LLMClient:
                 max_tokens=max_tokens,
                 model=model or self.model,
                 system=system_prompt or "",
-                messages=conversation,
+                messages=cast("list[MessageParam]", conversation),
                 tools=[tool],
                 # 指定工具名即强制调用，模型无法改调其他工具或只返回文本。
-                tool_choice={"type": "tool", "name": _STRUCTURED_TOOL_NAME},
+                tool_choice=ToolChoiceToolParam(type="tool", name=_STRUCTURED_TOOL_NAME),
                 temperature=0,
                 # 显式 None 会被 SDK 视为"已给定"从而禁用超时，
                 # 此处转成 NOT_GIVEN 以保留非流式超时的自动计算。

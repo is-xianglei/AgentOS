@@ -18,7 +18,7 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
-from llm.client import LLMClient
+from llm import BaseLLMClient, create_llm_client
 from llm.types import (
     AnthropicStreamTranslator,
     ToolInfo,
@@ -59,11 +59,18 @@ def _get_concurrency_gate() -> asyncio.Semaphore:
 
 
 class SubAgentRunner:
-    def __init__(self, db: AsyncSession, bus: StreamBus | None = None):
+    def __init__(
+        self,
+        db: AsyncSession,
+        bus: StreamBus | None = None,
+        llm: BaseLLMClient | None = None,
+    ):
         """初始化子代理运行器依赖。"""
         self.db = db
         self.bus = bus
-        self.llm = LLMClient()
+        # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
+        # 在每次调用时以 model 参数覆盖,见 _run_react_loop / _run_teammate_loop。
+        self.llm = llm or create_llm_client(scenario="subagent")
         self.run_repo = SubAgentRunRepository(db)
         self.permission_service = PermissionService(db)
 

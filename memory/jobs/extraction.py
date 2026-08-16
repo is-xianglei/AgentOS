@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from llm.client import LLMClient
+from core.errors import AgentException
+from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
 from memory.models import MemoryItemRecord
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from memory.jobs.repository import MemoryJobRepository
@@ -210,9 +211,9 @@ def _classify_extractor_error(exc: Exception) -> tuple[str, bool]:
 class MemoryExtractionService:
     """构建原始输入、调用 Extractor，并应用严格校验后的候选。"""
 
-    def __init__(self, db: AsyncSession, llm: LLMClient | None = None):
+    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None):
         self.db = db
-        self.llm = llm or LLMClient()
+        self.llm = llm or create_llm_client(scenario="memory_extractor")
         self.job_repo = MemoryJobRepository(db)
         self.memory_repo = MemoryRepository(db)
         self.session_repo = SessionRepository(db)
@@ -273,9 +274,16 @@ class MemoryExtractionService:
         if len(catalog.entries) > MEMORY_CATALOG_MAX_ITEMS:
             raise MemoryExtractionFailure("catalog_full", "Memory Catalog已满", retryable=False)
 
-        model = job.model or settings.memory_extractor_model or settings.anthropic_model
+        # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_extractor 场景解析。
+        # 配置缺失属不可重试失败,转成 Job 语义错误而非让中文 AgentException 裸抛。
+        model = job.model
         if not model:
-            raise MemoryExtractionFailure("model_missing", "未配置Memory提取模型", retryable=False)
+            try:
+                model = resolve_scenario_model("memory_extractor")
+            except AgentException as exc:
+                raise MemoryExtractionFailure(
+                    "model_missing", exc.message, retryable=False
+                ) from exc
         mode = (job.payload or {}).get("mode", "active")
         if mode not in {"active", "shadow"}:
             raise MemoryExtractionFailure(
@@ -306,9 +314,10 @@ class MemoryExtractionService:
     async def extract_with_llm(
         cls,
         prepared: PreparedMemoryExtraction,
-        llm: LLMClient,
+        llm: BaseLLMClient | None = None,
     ) -> MemoryExtractionResult:
         """不持有数据库 Session，调用模型并执行严格二次校验。"""
+        client = llm or create_llm_client(scenario="memory_extractor")
         payload = {
             "messages": [message.to_dict() for message in prepared.messages],
             "memory_catalog": [
@@ -322,12 +331,12 @@ class MemoryExtractionService:
             ],
         }
         try:
-            return await llm.complete_structured(
+            return await client.complete_structured(
                 [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
                 MemoryExtractionResult,
                 system_prompt=cls._system_prompt(prepared.prompt_version),
                 model=prepared.model,
-                max_tokens=4096,
+                max_tokens=settings.llm_memory_extractor_max_tokens,
                 timeout=settings.memory_extractor_timeout_seconds,
             )
         except Exception as exc:

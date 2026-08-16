@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from llm.client import LLMClient
+from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
 from memory.models import MemoryItemRecord, MemoryRevisionRecord, MemorySpaceRecord
 from memory.jobs.repository import MemoryJobRepository
 from memory.repository import MemoryDreamEntry, MemoryRepository
@@ -219,9 +219,9 @@ class _DreamAudit(BaseModel):
 class MemoryDreamService:
     """准备、执行、应用和按作用域回滚 Dream 操作集。"""
 
-    def __init__(self, db: AsyncSession, llm: LLMClient | None = None) -> None:
+    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None) -> None:
         self.db = db
-        self.llm = llm or LLMClient()
+        self.llm = llm or create_llm_client(scenario="memory_dream")
         self.job_repo = MemoryJobRepository(db)
         self.memory_repo = MemoryRepository(db)
 
@@ -248,9 +248,14 @@ class MemoryDreamService:
                 "Dream输入超过配置上限，不能静默遗漏active Memory",
                 retryable=False,
             )
-        model = job.model or settings.memory_dream_model or settings.anthropic_model
+        # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_dream 场景解析,
+        # 不再继承 Extractor 的模型配置(2 层回落:场景覆盖 > provider 主模型)。
+        model = job.model
         if not model:
-            raise MemoryDreamFailure("model_missing", "未配置Memory Dream模型", retryable=False)
+            try:
+                model = resolve_scenario_model("memory_dream")
+            except AgentException as exc:
+                raise MemoryDreamFailure("model_missing", exc.message, retryable=False) from exc
 
         await self.job_repo.update_dream_snapshot(
             job,
@@ -276,11 +281,12 @@ class MemoryDreamService:
     async def complete_with_llm(
         cls,
         prepared: PreparedDream,
-        llm: LLMClient,
+        llm: BaseLLMClient | None = None,
     ) -> MemoryDreamResult:
         """调用结构化输出并执行严格校验。"""
+        client = llm or create_llm_client(scenario="memory_dream")
         try:
-            return await llm.complete_structured(
+            return await client.complete_structured(
                 [
                     {
                         "role": "user",
@@ -293,7 +299,7 @@ class MemoryDreamService:
                 MemoryDreamResult,
                 system_prompt=cls._system_prompt(prepared.prompt_version),
                 model=prepared.model,
-                max_tokens=8192,
+                max_tokens=settings.llm_memory_dream_max_tokens,
                 timeout=settings.memory_dream_timeout_seconds,
             )
         except (APITimeoutError, APIConnectionError, RateLimitError, TimeoutError) as exc:

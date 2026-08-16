@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from core.config import settings
+from llm.factory import resolve_scenario_model
 from tools.shell_policy import ShellAccess
 
 if TYPE_CHECKING:
@@ -67,8 +67,11 @@ class SubAgentSpec:
     when_to_use: str = ""
     allowed_tools: tuple[str, ...] | None = None
     disallowed_tools: tuple[str, ...] = ()
-    # None 表示继承主会话模型;非空表示该类型固定档位(如速度优先)。
+    # None 表示走档位场景解析;非空表示该类型固定模型(优先级高于场景档位)。
     model: str | None = None
+    # 模型档位场景:"subagent"(默认档,继承客户端模型)或 "subagent_fast"(速度档)。
+    # 在 resolve_model() 惰性解析,不在导入期读配置,避免 provider 未配置时崩掉导入。
+    model_scenario: str = "subagent"
     # ReAct 轮次上限。verification 需跑构建 + 测试 + 对抗探测,须显著放宽。
     max_rounds: int = 6
     # shell 访问级别,由 ToolService 在执行边界强制,不依赖提示词自律。
@@ -103,19 +106,21 @@ class SubAgentSpec:
         return tuple(name for name in self.allowed_tools if name not in denied)
 
     def resolve_model(self, override: str | None = None) -> str | None:
-        """按优先级定出本次调用使用的模型,None 表示继承 LLMClient 的会话模型。
+        """按优先级定出本次调用使用的模型,None 表示继承客户端的档位模型。
 
-        优先级:显式入参 > spec 声明 > 环境兜底(subagent_default_model)> 继承。
-        环境键取名 default 就按兜底处理,放最低优先级:否则一配上去会把 Explore
-        的速度档位一并顶掉,那与"默认值"的语义相反。要固定某类型改其 spec 或传 override。
+        优先级:显式入参 > spec 固定声明 > 场景档位解析(仅速度档)。
+        默认档返回 None:SubAgentRunner 的客户端已按 subagent 场景解析过模型
+        ({provider}_subagent_model → {provider}_model),无需重复解析。
+        速度档经工厂按 {provider}_subagent_fast_model → {provider}_model 两层回落,
+        在调用时惰性解析而非导入期,避免 provider 未配置时崩掉模块导入。
         .env 里留空的键会被读成空串,一律归一成 None,避免把 "" 当模型名发给 API。
         """
-        candidates = (
-            _blank_to_none(override),
-            _blank_to_none(self.model),
-            _blank_to_none(settings.subagent_default_model),
-        )
-        return next((value for value in candidates if value is not None), None)
+        explicit = _blank_to_none(override) or _blank_to_none(self.model)
+        if explicit is not None:
+            return explicit
+        if self.model_scenario != "subagent":
+            return resolve_scenario_model(self.model_scenario)
+        return None
 
     def shell_tmp_root(self) -> Path | None:
         """TMP_WRITABLE 档位的可写临时目录;其余档位无可写目录。"""

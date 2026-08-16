@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core.config import settings
 from core.errors import AgentException
 from database.engine import AsyncSessionLocal
-from llm.client import LLMClient
+from llm import BaseLLMClient, resolve_scenario_model
 from memory.models import MemoryJobRecord
 from session.models import SessionRecord, SessionTurnRecord
 from memory.jobs.repository import MemoryJobRepository
@@ -85,7 +85,9 @@ class MemoryJobService:
             turn_id=turn.id,
             idempotency_key=idempotency_key,
             max_attempts=settings.memory_job_max_attempts,
-            model=settings.memory_extractor_model or settings.anthropic_model,
+            # 入队即冻结实际生效的模型;解析不出会抛中文 AgentException,
+            # 由调用方的 SAVEPOINT 隔离,不影响主链路。
+            model=resolve_scenario_model("memory_extractor"),
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
             payload={"mode": mode},
@@ -161,11 +163,8 @@ class MemoryJobService:
             space_id=space.id,
             idempotency_key=idempotency_key,
             max_attempts=settings.memory_job_max_attempts,
-            model=(
-                settings.memory_dream_model
-                or settings.memory_extractor_model
-                or settings.anthropic_model
-            ),
+            # Dream 直接按自身场景解析,不再继承 Extractor 的模型配置。
+            model=resolve_scenario_model("memory_dream"),
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
             payload={},
@@ -180,12 +179,14 @@ class MemoryJobRunner:
         self,
         *,
         session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
-        llm: LLMClient | None = None,
+        llm: BaseLLMClient | None = None,
         worker_id: str | None = None,
         claim_scope: tuple[int, int] | None = None,
     ) -> None:
         self.session_factory = session_factory
-        self.llm = llm or LLMClient()
+        # 不再默认创建共享客户端:extraction 与 dream 的模型档位和超时不同,
+        # 保持 None 让各下游服务按自身 scenario 建客户端;注入非 None 时统一覆盖(测试用)。
+        self.llm = llm
         self.worker_id = worker_id or self._default_worker_id()
         self.claim_scope = claim_scope
 

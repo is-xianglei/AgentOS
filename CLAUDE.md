@@ -1,6 +1,6 @@
 你正在维护 AgentOS。这是一个 Python 3.14 后端项目，主要技术栈为 FastAPI、
-Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pytest，
-依赖使用 uv 管理。当前仓库没有前端工程，不要虚构前端技术栈。
+Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK、OpenAI SDK
+和 pytest，依赖使用 uv 管理。当前仓库没有前端工程，不要虚构前端技术栈。
 
 编码前先阅读相邻模块，复用已有分层和抽象，保持改动小而聚焦，不做无关重构，
 不要覆盖用户已有改动，不要自动执行 git push。
@@ -128,6 +128,39 @@ API、错误与日志：
 5. 环境变量继续使用 `AGENTOS_` 前缀，并确保名称能正确映射到 `Settings` 中的字段。
 6. 修改配置后，应验证 `Settings` 能成功加载，并检查必填项、类型转换和默认值是否符合预期。
 7. `.env.example` 不得包含 `.env` 中的真实密码、Token、密钥、数据库连接串或 Redis 凭证。
+
+多 Provider LLM 配置：
+1. AgentOS 同时支持 Anthropic 和 OpenAI 两个 LLM provider，由 `llm_provider`
+   （环境变量 `AGENTOS_LLM_PROVIDER`，取值 anthropic / openai）全局切换；
+   该开关必填且无默认值，配置固定、重启生效，不支持运行时切换或按场景混用 provider。
+2. 每个 provider 一组连接配置：`{provider}_base_url`、`{provider}_api_key`、
+   `{provider}_model`（主模型，所有场景的回落终点）、`{provider}_max_retries`
+   和 `{provider}_timeout_seconds`；重试与超时直接使用 SDK 内置机制，不要自造重试框架。
+3. 场景覆盖配置为 `{provider}_{scenario}_model`，scenario 共七个：agent、subagent、
+   subagent_fast、compact、memory_selector、memory_extractor、memory_dream；
+   场景覆盖未配置时回落到 `{provider}_model` 主模型。新增或调整这些配置项时，
+   同样遵守上文「配置同步规则」。
+4. token 上限读取 `llm_default_max_tokens`（流式调用）和
+   `llm_memory_selector_max_tokens` 等场景专用配置，不要在代码中硬编码 max_tokens。
+5. 新代码一律通过 create_llm_client(scenario=...) 工厂创建客户端，类型注解使用
+   BaseLLMClient，不要直接实例化 AnthropicClient / OpenAIClient；Service 和 Runtime
+   的 __init__ 应接受可选 llm: BaseLLMClient | None = None，未注入时回落工厂，
+   便于测试注入替身；只需模型名而不建客户端时使用 resolve_scenario_model(scenario)。
+6. 无静默兜底：provider 未配置或取值不支持、对应 api_key 缺失、场景名未知、
+   模型解析不出，一律抛具体中文 AgentException，不得回落到默认 provider 或硬编码模型。
+7. 需要判断当前使用哪家 provider 时，读客户端实例的 provider 属性
+   （BaseLLMClient 的抽象属性），不要用 isinstance 判断具体客户端类，
+   也不要直接读 settings.llm_provider，注入测试替身时这两种方式都会失真。
+8. 两家 SDK 对 base_url 的拼接规则相反：Anthropic 的 base_url 不带 /v1，
+   SDK 内部路径已是 /v1/messages，多写会拼成 /v1/v1/messages 报 404；
+   OpenAI 的 base_url 必须带 /v1，SDK 内部路径是 /chat/completions，
+   少写会让网关返回 HTML，SDK 报出 'str' object has no attribute 'choices'
+   这类看似无关的错误。
+9. `{provider}_timeout_seconds` 留空表示交给 SDK 自动计算超时；
+   给 SDK 显式传 None 会被理解为禁用超时，现有代码统一转成 NOT_GIVEN 规避，
+   新代码沿用该写法。
+10. OpenAI 客户端目前仅实现结构化输出 complete_structured()，流式 stream() 尚未实现；
+    依赖流式的场景（主 Agent、SubAgent、Compact）当前只能使用 Anthropic。
 
 Anthropic SDK 使用规范：
 1. 新增或修改 Anthropic SDK 相关代码前，必须先查阅 Anthropic 官方文档：

@@ -399,8 +399,14 @@ class SessionService:
         role: str,
         content: Any,
         turn_id: UUID | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> SessionMessage:
-        """保存会话消息并估算 token 数。"""
+        """保存会话消息并估算 token 数。
+
+        provider/model 是成本归因元数据，仅 LLM 产出的 assistant 消息由调用方
+        显式传入（实际生效的模型 ID，非场景档位名）；user/tool 消息保持默认 None。
+        """
         token_estimate = len(str(content)) // 4
         return await self.repo.add_message(
             session_id,
@@ -408,6 +414,8 @@ class SessionService:
             content,
             token_estimate,
             turn_id=turn_id,
+            provider=provider,
+            model=model,
         )
 
     async def list_messages(self, session_id: int) -> list[SessionMessage]:

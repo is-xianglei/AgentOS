@@ -214,6 +214,8 @@ class SessionRepository:
         content: Any,
         token_estimate: int,
         turn_id: UUID | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> SessionMessage:
         message = SessionMessage(
             session_id=session_id,
@@ -221,6 +223,8 @@ class SessionRepository:
             content=content,
             token_estimate=token_estimate,
             turn_id=turn_id,
+            provider=provider,
+            model=model,
         )
         self.db.add(message)
         await self.db.flush()

@@ -29,7 +29,7 @@ from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
-from llm.client import LLMClient
+from llm import BaseLLMClient, create_llm_client
 from llm.types import (
     AnthropicStreamTranslator,
     ToolResultMessage,
@@ -98,7 +98,11 @@ class SuspendedInteraction:
 
 class AgentRuntime:
     def __init__(
-        self, db: AsyncSession, user_id: int | None = None, workspace_id: int | None = None
+        self,
+        db: AsyncSession,
+        user_id: int | None = None,
+        workspace_id: int | None = None,
+        llm: BaseLLMClient | None = None,
     ):
         """初始化 Agent 主运行时依赖。"""
         self.db = db
@@ -110,7 +114,7 @@ class AgentRuntime:
         self.interaction_service = InteractionService(db)
         self.plan_service = PlanService(db)
         self.memory_recall_service = MemoryRecallService(db)
-        self.llm = LLMClient()
+        self.llm = llm or create_llm_client(scenario="agent")
         self.tool_registry = build_tool_registry()
         self.tool_service = ToolService(db, self.tool_registry)
         self.active_agent_id: int | None = None
@@ -561,7 +565,8 @@ class AgentRuntime:
         返回结果包含是否挂起；成功结束时还包含最终助手消息 ID。
         """
         actor = ORCHESTRATOR_ACTOR
-        # 翻译器跨本回合多次 LLM 调用共用:block index 持续递增、tool_use 入参累积。
+        # 翻译器跨本回合多次 LLM 调用共用,以延续 tool_use 入参累积。
+        # 注意 block index 每次 API 调用从 0 重新开始,不跨调用递增(详见翻译器 docstring)。
         translator = AnthropicStreamTranslator(actor, session_id)
 
         # 回合开始(开场事件,带完整 actor)。
@@ -619,15 +624,16 @@ class AgentRuntime:
             )
             context = history + current
             final_content: list[dict[str, Any]] | None = None
+            model_override = (
+                self.active_model_name
+                if self.active_agent_id is not None
+                else session.model_name
+            )
             async for chunk in self.llm.stream(
                 context,
                 system_prompt,
                 tools=tools,
-                model=(
-                    self.active_model_name
-                    if self.active_agent_id is not None
-                    else session.model_name
-                ),
+                model=model_override,
             ):
                 if chunk.get("type") == "message_final":
                     final_content = chunk.get("content")
@@ -638,11 +644,14 @@ class AgentRuntime:
             stop_reason = translator.stop_reason
             tool_uses = extract_tool_uses(final_content)
 
+            provider, effective_model = self._llm_attribution(model_override)
             assistant_message = await self.session_service.add_message(
                 session_id,
                 "assistant",
                 final_content if final_content else "",
                 turn_id=turn.id,
+                provider=provider,
+                model=effective_model,
             )
 
             if not tool_uses:
@@ -1572,6 +1581,16 @@ class AgentRuntime:
             )
         )
 
+    def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
+        """返回本次 LLM 调用实际生效的 (provider, model)，用于 assistant 消息成本归因。
+
+        provider 由客户端自报（BaseLLMClient.provider 属性），注入的测试替身若未实现
+        该属性则留空。model 取逐调用覆盖值，未覆盖时回落客户端构造时解析好的模型。
+        """
+        provider = getattr(self.llm, "provider", None)
+        model = model_override or getattr(self.llm, "model", None)
+        return provider, model
+
     async def _finalize_without_tools(
         self,
         session_id: int,
@@ -1607,11 +1626,14 @@ class AgentRuntime:
             for event in translator.translate(chunk):
                 await self.bus.emit(event)
 
+        provider, effective_model = self._llm_attribution(model_name)
         return await self.session_service.add_message(
             session_id,
             "assistant",
             final_content if final_content else "",
             turn_id=turn.id,
+            provider=provider,
+            model=effective_model,
         )
 
     async def _apply_user_prompt_hooks(

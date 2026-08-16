@@ -3,7 +3,7 @@ from typing import Any
 
 from anthropic.types import MessageParam
 
-from llm.client import LLMClient
+from llm import BaseLLMClient, create_llm_client
 from llm.types import chunk_type, text_from_content
 from session.repository import SessionRepository
 
@@ -21,12 +21,12 @@ class CompactService:
     def __init__(
         self,
         session_repo: SessionRepository,
-        llm: LLMClient | None = None,
+        llm: BaseLLMClient | None = None,
         threshold: int = 50_000,
     ):
         """初始化上下文压缩服务依赖。"""
         self.session_repo = session_repo
-        self.llm = llm or LLMClient()
+        self.llm = llm or create_llm_client(scenario="compact")
         self.threshold = threshold
 
     async def maybe_compact(

@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from llm.client import LLMClient
+from llm import BaseLLMClient, create_llm_client
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from session.models import SessionTurnRecord
 from memory.recall.repository import (
@@ -50,12 +50,12 @@ class _SelectionResult:
 
 
 class MemoryRecallService:
-    def __init__(self, db: AsyncSession, llm: LLMClient | None = None):
+    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None):
         self.db = db
         self.repo = MemoryRecallRepository(db)
         self.memory_repo = MemoryRepository(db)
         self.memory_service = MemoryService(db)
-        self.llm = llm or LLMClient()
+        self.llm = llm or create_llm_client(scenario="memory_selector")
 
     async def get_or_create_context(
         self,
@@ -169,11 +169,12 @@ class MemoryRecallService:
         degraded_reason: str
         try:
             async with asyncio.timeout(settings.memory_selector_timeout_seconds):
+                # 模型已在客户端构造时按 memory_selector 场景解析,此处不再显式传入。
                 output = await self.llm.complete_structured(
                     [{"role": "user", "content": prompt}],
                     _MemorySelection,
                     system_prompt=_SELECTOR_SYSTEM_PROMPT,
-                    model=settings.memory_selector_model,
+                    max_tokens=settings.llm_memory_selector_max_tokens,
                     timeout=settings.memory_selector_timeout_seconds,
                 )
             memory_ids = self._deduplicate(output.selected_memory_ids)

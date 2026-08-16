@@ -16,11 +16,15 @@ from core.logging import request_context_middleware, setup_logging
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
 from hooks.builtin import register_builtin_hooks
+from llm import create_llm_client
 from tools.service import ToolCatalogService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # LLM 配置启动自检:provider/api_key/模型缺失在启动时立刻暴露,
+    # 而非拖到首次对话或首个 Memory 作业(工厂本身仍是权威关卡)。
+    create_llm_client()
     if settings.create_tables:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

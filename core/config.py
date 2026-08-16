@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -17,22 +17,55 @@ class Settings(BaseSettings):
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
-        # extra="ignore",  # .env 中未在此声明的键忽略,不报错
+        extra="forbid",  # 严格校验:.env 出现未声明的键立即报错,强制 .env/.env.example/Settings 三处同步
     )
+
+    # --- LLM Provider 全局开关 -----------------------------------------------
+    # 必填,无默认值:未配置、取值不支持、api_key 缺失、模型解析不出时,
+    # create_llm_client() 与启动自检一律抛中文 AgentException,不做静默回落。
+    llm_provider: str | None = None  # "anthropic" | "openai"
 
     # --- LLM(Anthropic) -----------------------------------------------------
     anthropic_base_url: str | None = None
     anthropic_api_key: str | None = None
-    anthropic_model: str | None = None
+    anthropic_model: str | None = None  # provider 主模型,所有场景的回落终点
+    anthropic_max_retries: int = 2  # SDK 内置重试次数(429/5xx/网络超时,指数退避)
+    anthropic_timeout_seconds: float | None = None  # None 表示交给 SDK 自动计算
+    # 场景覆盖(可选,留空回落 anthropic_model)。字段名必须满足工厂的拼接规则
+    # {provider}_{scenario}_model,见 llm/factory.py 的 _resolve_model()。
+    anthropic_agent_model: str | None = None
+    anthropic_subagent_model: str | None = None  # 未声明模型的 SubAgent 类型的兜底
+    anthropic_subagent_fast_model: str | None = None  # Explore 用,速度优先档位
+    anthropic_compact_model: str | None = None
+    anthropic_memory_selector_model: str | None = None
+    anthropic_memory_extractor_model: str | None = None
+    anthropic_memory_dream_model: str | None = None
+
+    # --- LLM(OpenAI) ---------------------------------------------------------
+    # 仅 llm_provider="openai" 时 api_key 与主模型必填;场景覆盖语义同 Anthropic 组。
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str | None = None  # provider 主模型,所有场景的回落终点
+    openai_max_retries: int = 2
+    openai_timeout_seconds: float | None = None  # None 表示交给 SDK 自动计算
+    openai_agent_model: str | None = None
+    openai_subagent_model: str | None = None
+    openai_subagent_fast_model: str | None = None
+    openai_compact_model: str | None = None
+    openai_memory_selector_model: str | None = None
+    openai_memory_extractor_model: str | None = None
+    openai_memory_dream_model: str | None = None
+
+    # --- LLM 调用通用配置 ----------------------------------------------------
+    llm_default_max_tokens: int = 131072  # 流式调用的 max_tokens
+    llm_memory_selector_max_tokens: int = 256
+    llm_memory_extractor_max_tokens: int = 4096
+    llm_memory_dream_max_tokens: int = 8192
     max_tool_iterations: int = 50  # 工具调用上限,防止模型在工具循环里无限调用
 
     # --- SubAgent ------------------------------------------------------------
-    # 模型档位:留空表示继承主会话模型(anthropic_model)。
-    # 优先级为「调用方显式指定 > spec 声明 > 本项兜底 > 继承主会话」,
-    # 见 tools/subagents/definition.py 的 resolve_model()。default 按兜底处理,
-    # 否则一配上去会把 Explore 的速度档位一并顶掉,与"默认值"语义相反。
-    subagent_default_model: str | None = None  # 未声明模型的类型的兜底
-    subagent_fast_model: str | None = None  # Explore 用,速度优先档位
+    # 模型档位配置已并入 LLM provider 组({provider}_subagent_model 等),
+    # 解析优先级见 tools/subagents/definition.py 的 resolve_model() 与 llm/factory.py。
     # ReAct 轮次上限,按类型分档。verification 须跑构建+测试+lint+对抗探测。
     subagent_max_rounds: int = 6
     subagent_plan_max_rounds: int = 12
@@ -66,7 +99,8 @@ class Settings(BaseSettings):
     skill_exec_max_output: int = 65536  # stdout/stderr 各自字节上限
 
     # --- 长期 Memory -----------------------
-    memory_selector_model: str | None = None
+    # Selector/Extractor/Dream 的模型配置已并入 LLM provider 组
+    # ({provider}_memory_selector_model 等),由 llm/factory.py 统一解析。
     memory_selector_timeout_seconds: float = 5.0
     memory_selector_query_max_chars: int = 12_000
     memory_recall_max_items: int = 5
@@ -75,7 +109,6 @@ class Settings(BaseSettings):
     memory_session_max_bytes: int = 60 * 1024
     memory_extraction_enabled: bool = True
     memory_extraction_inline: bool = True
-    memory_extractor_model: str | None = None
     memory_extractor_timeout_seconds: float = 20.0
     memory_extractor_prompt_version: str = "v1"
     memory_extractor_max_messages: int = 10
@@ -86,7 +119,6 @@ class Settings(BaseSettings):
     memory_job_claim_batch_size: int = 10
     memory_worker_poll_seconds: float = 1.0
     memory_dream_enabled: bool = True
-    memory_dream_model: str | None = None
     memory_dream_timeout_seconds: float = 60.0
     memory_dream_prompt_version: str = "v1"
     memory_dream_min_items: int = 10
@@ -111,6 +143,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 15
     jwt_refresh_token_expire_days: int = 7
+
+    @field_validator("anthropic_timeout_seconds", "openai_timeout_seconds", mode="before")
+    @classmethod
+    def _empty_timeout_to_none(cls, value: object) -> object:
+        """.env 留空的键会被读成空串,归一成 None(交给 SDK 自动计算超时)。"""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @classmethod
     def settings_customise_sources(

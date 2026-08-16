@@ -118,9 +118,15 @@ class _OpenBlock:
 class AnthropicStreamTranslator:
     """把 Anthropic 原始流翻译成协议 StreamEvent 序列。
 
-    有状态:跨一个 turn 内多次 LLM 调用沿用同一个翻译器,block index 持续递增,
-    tool_use 的 input JSON 在 content_block_stop 时累积完整后一次性产出(不逐字发)。
+    有状态:跨一个 turn 内多次 LLM 调用沿用同一个翻译器,tool_use 的 input JSON 在
+    content_block_stop 时累积完整后一次性产出(不逐字发)。
     turn_start / turn_end / tool_result 由调用方(runner)负责,翻译器只管中间内容。
+
+    block index 语义:直接透传 Anthropic 原始 index,**每次 API 调用从 0 重新开始**,
+    并非跨调用递增。故一个 turn 内若发生 tool use 多轮,消费方会重复收到 index=0。
+    index 仅用于关联同一次调用内的 block_start/delta/stop,不可当全局唯一标识。
+    另注意 tool_use 块走 tool_use 事件路径时不发 block_stop(见 _on_block_stop),
+    即 block_start/block_stop 并不成对。
     """
 
     def __init__(self, actor: Actor, session_id: int):
