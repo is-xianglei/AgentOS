@@ -1,0 +1,30 @@
+{
+  "id": "插件化架构改造",
+  "name": "插件化架构改造",
+  "title": "插件化架构改造（一切皆插件）",
+  "description": "",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "liuxianglei",
+  "assignee": "liuxianglei",
+  "createdAt": "2026-08-14",
+  "completedAt": "2026-08-15",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "cancelled": "true",
+    "cancelled_reason": "用户于 2026-08-15 决定作废；归档 status 被脚本强制写为 completed，实际未完成也未实施",
+    "cancelled_at": "2026-08-15"
+  }
+}

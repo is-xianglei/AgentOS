@@ -60,4 +60,6 @@ htmlcov/
 .tox/
 
 
-tasks/
+# 仅忽略仓库根目录的 tasks/。不能写成裸 tasks/：那会匹配任意深度的同名目录，
+# 把 .trellis/tasks/ 下的任务文档一并排除，且 git status 显示干净、不易察觉。
+/tasks/
