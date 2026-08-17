@@ -898,7 +898,6 @@ class AgentRuntime:
                     session_id,
                     session,
                     turn,
-                    actor,
                     assistant_message_id,
                     remaining,
                     done_ids,
@@ -916,7 +915,6 @@ class AgentRuntime:
                     session_id,
                     session,
                     turn,
-                    actor,
                     assistant_message_id,
                     remaining,
                     done_ids,
@@ -1046,7 +1044,6 @@ class AgentRuntime:
         session_id: int,
         session: SessionRecord,
         turn: SessionTurnRecord,
-        actor: Actor,
         assistant_message_id: int,
         remaining: list[ToolUse],
         done_ids: list[str],
@@ -1066,7 +1063,6 @@ class AgentRuntime:
         await self.tool_service.tool_repo.mark_awaiting_interaction(record)
         continuation = {
             "assistant_message_id": assistant_message_id,
-            "actor": actor.to_dict_compact(),
             "pending": [
                 {
                     "tool_use_id": tu.id,
