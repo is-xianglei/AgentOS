@@ -244,7 +244,7 @@ class AnthropicClient(BaseLLMClient):
 
     async def stream(
         self,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         system_prompt: str | list[PromptBlock] | None = None,
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
