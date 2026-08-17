@@ -1,10 +1,9 @@
 import json
 from typing import Any
 
-from anthropic.types import MessageParam
-
+from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client
-from llm.types import chunk_type, text_from_content
+from llm.types import LLMEventKind, LLMTurnResult
 from session.repository import SessionRepository
 
 # 压缩 L1 的保留参考资料工具白名单:这类工具的输出一旦被替换,模型只能重读文件,反而更费 token.
@@ -118,13 +117,15 @@ class CompactService:
             f"{json.dumps(messages, ensure_ascii=False, default=str)}"
         )
 
-        final_content: list[dict[str, Any]] | None = None
+        # 压缩只要一段摘要文本,不往 bus 发事件,故不建装配器、直接消费中立流。
+        result: LLMTurnResult | None = None
+        async for event in self.llm.stream(messages=[{"role": "user", "content": compact_prompt}]):
+            if event.kind is LLMEventKind.TURN_RESULT:
+                result = event.result
+        if result is None:
+            raise AgentException.message("自动压缩失败：LLM 流未产出终局结果")
 
-        async for chunk in self.llm.stream(messages=[MessageParam(role="user", content=compact_prompt)]):
-            if chunk_type(chunk) == "message_final":
-                final_content = chunk.get("content")
-
-        summary = text_from_content(final_content)
+        summary = result.text
         return [
             {
                 "role": "user",

@@ -31,10 +31,8 @@ from interaction.schemas import AskUserQuestionRequestPayload, InteractionReques
 from interaction.service import InteractionService
 from llm import BaseLLMClient, create_llm_client
 from llm.types import (
-    AnthropicStreamTranslator,
     ToolResultMessage,
     ToolUse,
-    extract_tool_uses,
 )
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
@@ -43,6 +41,7 @@ from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
 from runtime.compact import CompactService
+from runtime.stream_assembler import TurnEventAssembler
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from skill.service import SkillService
@@ -565,9 +564,9 @@ class AgentRuntime:
         返回结果包含是否挂起；成功结束时还包含最终助手消息 ID。
         """
         actor = ORCHESTRATOR_ACTOR
-        # 翻译器跨本回合多次 LLM 调用共用,以延续 tool_use 入参累积。
-        # 注意 block index 每次 API 调用从 0 重新开始,不跨调用递增(详见翻译器 docstring)。
-        translator = AnthropicStreamTranslator(actor, session_id)
+        # 装配器跨本回合多次 LLM 调用共用:块 index 需在 turn 内全局递增连号,
+        # 这是它唯一的跨调用状态(详见装配器 docstring)。
+        assembler = TurnEventAssembler(actor, session_id)
 
         # 回合开始(开场事件,带完整 actor)。
         await self.bus.emit(StreamEvent.turn_start(actor, session_id))
@@ -623,26 +622,25 @@ class AgentRuntime:
                 through_message_id=through_message_id,
             )
             context = history + current
-            final_content: list[dict[str, Any]] | None = None
             model_override = (
                 self.active_model_name
                 if self.active_agent_id is not None
                 else session.model_name
             )
-            async for chunk in self.llm.stream(
-                context,
-                system_prompt,
-                tools=tools,
-                model=model_override,
+            async for event in assembler.consume(
+                self.llm.stream(
+                    context,
+                    system_prompt,
+                    tools=tools,
+                    model=model_override,
+                )
             ):
-                if chunk.get("type") == "message_final":
-                    final_content = chunk.get("content")
-                # 原始 chunk 交给翻译器产出协议事件
-                for event in translator.translate(chunk):
-                    await self.bus.emit(event)
+                await self.bus.emit(event)
 
-            stop_reason = translator.stop_reason
-            tool_uses = extract_tool_uses(final_content)
+            result = assembler.last_result
+            stop_reason = result.stop_reason
+            tool_uses = result.tool_uses
+            final_content = result.provider_content
 
             provider, effective_model = self._llm_attribution(model_override)
             assistant_message = await self.session_service.add_message(
@@ -689,7 +687,7 @@ class AgentRuntime:
             assistant_message = await self._finalize_without_tools(
                 session_id,
                 turn,
-                translator,
+                assembler,
                 additional_context,
                 rendered_memories,
                 system_prompt,
@@ -699,11 +697,11 @@ class AgentRuntime:
                     else session.model_name
                 ),
             )
-            stop_reason = translator.stop_reason or "max_iterations"
+            stop_reason = assembler.last_result.stop_reason or "max_iterations"
 
         # 回合结束
         await self.bus.emit(
-            StreamEvent.turn_end(actor, session_id, stop_reason, translator.last_usage)
+            StreamEvent.turn_end(actor, session_id, stop_reason, assembler.last_result.usage)
         )
         return TurnLoopResult(
             suspended=False,
@@ -1595,13 +1593,16 @@ class AgentRuntime:
         self,
         session_id: int,
         turn: SessionTurnRecord,
-        translator: AnthropicStreamTranslator,
+        assembler: TurnEventAssembler,
         additional_context: str | None,
         rendered_memories: str | None,
         system_prompt: str | list[TextBlockParam],
         model_name: str | None,
     ) -> SessionMessage:
-        """禁用工具再调一次 LLM,产出最终答复并落库。沿用同一翻译器维持事件连续。"""
+        """禁用工具再调一次 LLM,产出最终答复并落库。
+
+        沿用同一装配器,使收尾这次调用的块 index 接在前面的块之后,不从 0 重来。
+        """
         history, current, through_message_id = await self.session_service.load_context_for_turn(
             turn,
             additional_context,
@@ -1613,19 +1614,18 @@ class AgentRuntime:
             through_message_id=through_message_id,
         )
         context = history + current
-        final_content: list[dict[str, Any]] | None = None
 
-        async for chunk in self.llm.stream(
-            context,
-            system_prompt,
-            tools=[],
-            model=model_name,
+        async for event in assembler.consume(
+            self.llm.stream(
+                context,
+                system_prompt,
+                tools=[],
+                model=model_name,
+            )
         ):
-            if chunk.get("type") == "message_final":
-                final_content = chunk.get("content")
-            for event in translator.translate(chunk):
-                await self.bus.emit(event)
+            await self.bus.emit(event)
 
+        final_content = assembler.last_result.provider_content
         provider, effective_model = self._llm_attribution(model_name)
         return await self.session_service.add_message(
             session_id,

@@ -15,28 +15,25 @@ from core.events import (
     ErrorInfo,
     StreamEvent,
     TeamRef,
+    ToolInfo,
     subagent_actor,
     teammate_actor,
 )
 from llm import BaseLLMClient, create_llm_client
-from llm.types import (
-    AnthropicStreamTranslator,
-    ToolInfo,
-    extract_tool_uses,
-    text_from_content,
-)
+from llm.types import LLMTurnResult
 from memory.recall.repository import MemoryRecallRepository
 from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
-from team.subagent_run_repository import SubAgentRunRepository
-from team.service import TeamService
+from runtime.stream_assembler import TurnEventAssembler
 from team.isolation import (
     new_team_task_instance_id,
     reset_team_task_instance_id,
     set_team_task_instance_id,
 )
-from tools.service import ToolService
+from team.service import TeamService
+from team.subagent_run_repository import SubAgentRunRepository
 from tools.registry import ToolRegistry, build_tool_registry
+from tools.service import ToolService
 from tools.subagents.definition import SubAgentSpec
 
 logger = logging.getLogger(__name__)
@@ -128,7 +125,7 @@ class SubAgentRunner:
             run = await self.run_repo.create(session_id, member_name, prompt)
             # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt。
             actor = subagent_actor(member_name, run_id=f"run-{run.id}", task=prompt)
-            translator = AnthropicStreamTranslator(actor, session_id)
+            assembler = TurnEventAssembler(actor, session_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:
                 # 并发闸门只圈住 ReAct 循环本身(LLM + 工具),不含建记录与事件收尾,
@@ -137,7 +134,7 @@ class SubAgentRunner:
                     report = await self._run_react_loop(
                         session_id,
                         actor,
-                        translator,
+                        assembler,
                         prompt,
                         system_prompt,
                         rendered_memories,
@@ -151,10 +148,9 @@ class SubAgentRunner:
                     )
                 await self.run_repo.succeed(run, report)
                 await self.db.commit()
+                result = assembler.last_result
                 await self._emit_event(
-                    StreamEvent.turn_end(
-                        actor, session_id, translator.stop_reason, translator.last_usage
-                    )
+                    StreamEvent.turn_end(actor, session_id, result.stop_reason, result.usage)
                 )
                 return report
             except Exception as exc:
@@ -215,29 +211,27 @@ class SubAgentRunner:
             return
         await self.bus.emit(event)
 
-    async def _stream_and_translate(
+    async def _stream_and_collect(
         self,
         messages: list[dict[str, Any]],
         system_prompt: str,
         tool_registry: ToolRegistry,
-        translator: AnthropicStreamTranslator,
+        assembler: TurnEventAssembler,
         rendered_memories: str | None = None,
         model: str | None = None,
-    ) -> list[dict[str, Any]] | None:
-        """跑一次 LLM 流:原始 chunk 经翻译器产出协议事件并 emit,返回 final_content。"""
-        final_content: list[dict[str, Any]] | None = None
+    ) -> LLMTurnResult:
+        """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。"""
         request_messages = self._with_memory_context(messages, rendered_memories)
-        async for chunk in self.llm.stream(
-            request_messages,
-            system_prompt,
-            tools=tool_registry.to_anthropic_tools(),
-            model=model,
+        async for event in assembler.consume(
+            self.llm.stream(
+                request_messages,
+                system_prompt,
+                tools=tool_registry.to_anthropic_tools(),
+                model=model,
+            )
         ):
-            if chunk.get("type") == "message_final":
-                final_content = chunk.get("content")
-            for event in translator.translate(chunk):
-                await self._emit_event(event)
-        return final_content
+            await self._emit_event(event)
+        return assembler.last_result
 
     async def _emit_tool_result(
         self,
@@ -338,7 +332,7 @@ class SubAgentRunner:
         self,
         session_id: int,
         actor: Actor,
-        translator: AnthropicStreamTranslator,
+        assembler: TurnEventAssembler,
         prompt: str,
         system_prompt: str,
         rendered_memories: str | None,
@@ -356,20 +350,20 @@ class SubAgentRunner:
         model = spec.resolve_model()
         last_text = ""
         for _ in range(max(1, spec.max_rounds)):
-            final_content = await self._stream_and_translate(
+            result = await self._stream_and_collect(
                 messages,
                 system_prompt,
                 tool_registry,
-                translator,
+                assembler,
                 rendered_memories,
                 model=model,
             )
-            tool_uses = extract_tool_uses(final_content)
-            messages.append({"role": "assistant", "content": final_content or ""})
-            last_text = text_from_content(final_content) or last_text
+            tool_uses = result.tool_uses
+            messages.append({"role": "assistant", "content": result.provider_content or ""})
+            last_text = result.text or last_text
 
             if not tool_uses:
-                return text_from_content(final_content)
+                return result.text
 
             await self._execute_tool_uses(
                 session_id,
@@ -440,7 +434,7 @@ class SubAgentRunner:
         # task=初始任务,team 携带 team_id(若已归属团队)。
         team_ref = TeamRef(id=member.team_id) if member.team_id is not None else None
         actor = teammate_actor(name, run_id=instance_id, task=member.prompt, team=team_ref)
-        translator = AnthropicStreamTranslator(actor, session_id)
+        assembler = TurnEventAssembler(actor, session_id)
         try:
             # 1) 从 member.history 反序列化历史;为空则用初始 prompt 起一条 user 消息。
             messages = self._load_history(member)
@@ -469,7 +463,7 @@ class SubAgentRunner:
             report = await self._run_teammate_loop(
                 session_id,
                 actor,
-                translator,
+                assembler,
                 messages,
                 system_prompt,
                 rendered_memories,
@@ -488,10 +482,9 @@ class SubAgentRunner:
             )
             await self._settle_member_status(session_id, name, member, team_service)
             await self.db.commit()
+            result = assembler.last_result
             await self._emit_event(
-                StreamEvent.turn_end(
-                    actor, session_id, translator.stop_reason, translator.last_usage
-                )
+                StreamEvent.turn_end(actor, session_id, result.stop_reason, result.usage)
             )
             return report
         except Exception as exc:
@@ -556,7 +549,7 @@ class SubAgentRunner:
         self,
         session_id: int,
         actor: Actor,
-        translator: AnthropicStreamTranslator,
+        assembler: TurnEventAssembler,
         messages: list[dict[str, Any]],
         system_prompt: str,
         rendered_memories: str | None,
@@ -576,20 +569,20 @@ class SubAgentRunner:
             # 轮首尝试认领可处理任务(只按 session_id,不加实例隔离)。
             await self._try_claim_tasks(session_id, name, messages)
 
-            final_content = await self._stream_and_translate(
+            result = await self._stream_and_collect(
                 messages,
                 system_prompt,
                 tool_registry,
-                translator,
+                assembler,
                 rendered_memories,
                 model=model,
             )
-            tool_uses = extract_tool_uses(final_content)
-            # final_content 已是 model_dump(mode="json") 产物(JSON 原生),可直接落库。
-            messages.append({"role": "assistant", "content": final_content or ""})
+            tool_uses = result.tool_uses
+            # provider_content 已是 model_dump(mode="json") 产物(JSON 原生),可直接落库。
+            messages.append({"role": "assistant", "content": result.provider_content or ""})
 
             if not tool_uses:
-                return text_from_content(final_content)
+                return result.text
 
             await self._execute_tool_uses(
                 session_id,

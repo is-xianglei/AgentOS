@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from core.config import settings
 from llm.base import BaseLLMClient
+from llm.types import LLMEventKind, LLMStreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,8 @@ class OpenAIClient(BaseLLMClient):
         system_prompt: str | list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncIterator[LLMStreamEvent]:
         """流式调用（待实现）。"""
         raise NotImplementedError("OpenAI 流式在后续 Phase 实现")
         # 不可达的 yield 使本方法成为 async generator，与基类签名保持一致。
-        yield {}
+        yield LLMStreamEvent(kind=LLMEventKind.TURN_RESULT)

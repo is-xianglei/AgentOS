@@ -1,15 +1,12 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from core.events import (
-    Actor,
     BlockType,
-    StreamEvent,
     ToolInfo,
     Usage,
 )
-
-LLMRawChunk = dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -61,166 +58,69 @@ class ToolResultMessage:
         )
 
 
-def chunk_type(chunk: LLMRawChunk) -> str | None:
-    """读取 Anthropic 原始事件的顶层类型。"""
-    value = chunk.get("type")
-    return value if isinstance(value, str) else None
+class LLMEventKind(str, Enum):
+    """中立流事件种类。刻意与 core.events.EventType 分开:
+    前者是 provider 出口,后者是对外协议,二者不应互相绑定演进。"""
+
+    BLOCK_START = "block_start"  # 内容块开始
+    TEXT_DELTA = "text_delta"  # 文本增量
+    THINKING_DELTA = "thinking_delta"  # 思考增量
+    TOOL_USE = "tool_use"  # 工具调用(入参已解析完整)
+    BLOCK_STOP = "block_stop"  # 内容块结束
+    TURN_RESULT = "turn_result"  # 本次调用终局(流的最后一个事件)
 
 
-def chunk_text(chunk: LLMRawChunk) -> str:
-    """从原始 content_block_delta 中取出文本增量,非文本事件返回空串。"""
-    delta = chunk.get("delta")
-    if (
-        isinstance(delta, dict)
-        and delta.get("type") == "text_delta"
-        and isinstance(delta.get("text"), str)
-    ):
-        return delta["text"]
-    return ""
+@dataclass(frozen=True)
+class LLMTurnResult:
+    """单次 LLM 调用的终局信息,取代原先 runtime 自行解析 message_final。"""
+
+    text: str = ""
+    tool_uses: list[ToolUse] = field(default_factory=list)
+    usage: Usage | None = None
+    stop_reason: str | None = None
+    # 遗留承载:assistant 消息落库仍是 provider 形状的 content 块数组,
+    # 由客户端原样带出给 runtime 落库。消息体中立化属另一改造半径,本期不做;
+    # 不得再新增第二个同类透传字段。
+    provider_content: list[dict[str, Any]] = field(default_factory=list)
 
 
-def extract_tool_uses(content: list[dict[str, Any]] | None) -> list[ToolUse]:
-    """从完整消息内容中提取 tool_use 块,返回类型化的 ToolUse 列表。"""
-    return [
-        ToolUse(id=block["id"], name=block["name"], input=block.get("input") or {})
-        for block in (content or [])
-        if isinstance(block, dict) and block.get("type") == "tool_use"
-    ]
+@dataclass(frozen=True)
+class LLMStreamEvent:
+    """provider 适配后的中立流事件。
 
+    不含 actor / session_id / 全局 index —— 那是 runtime 的装配职责。
+    block_ref 是**单次 stream() 调用内**的块序号,由 provider 自行分配、
+    从 0 递增即可;跨调用的全局唯一性由 TurnEventAssembler 负责。
 
-def text_from_content(content: list[dict[str, Any]] | None) -> str:
-    """从完整消息内容中拼接文本块。"""
-    return "".join(
-        block.get("text", "")
-        for block in (content or [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-
-
-_BLOCK_TYPE_MAP = {
-    "text": BlockType.TEXT,
-    "thinking": BlockType.THINKING,
-    "tool_use": BlockType.TOOL_USE,
-}
-
-
-@dataclass
-class _OpenBlock:
-    """翻译过程中正在累积的内容块状态。"""
-
-    index: int
-    block_type: BlockType
-    tool_id: str = ""
-    tool_name: str = ""
-    json_buffer: str = ""
-
-
-class AnthropicStreamTranslator:
-    """把 Anthropic 原始流翻译成协议 StreamEvent 序列。
-
-    有状态:跨一个 turn 内多次 LLM 调用沿用同一个翻译器,tool_use 的 input JSON 在
-    content_block_stop 时累积完整后一次性产出(不逐字发)。
-    turn_start / turn_end / tool_result 由调用方(runner)负责,翻译器只管中间内容。
-
-    block index 语义:直接透传 Anthropic 原始 index,**每次 API 调用从 0 重新开始**,
-    并非跨调用递增。故一个 turn 内若发生 tool use 多轮,消费方会重复收到 index=0。
-    index 仅用于关联同一次调用内的 block_start/delta/stop,不可当全局唯一标识。
-    另注意 tool_use 块走 tool_use 事件路径时不发 block_stop(见 _on_block_stop),
-    即 block_start/block_stop 并不成对。
+    契约:每次 stream() 必须以恰好一个 TURN_RESULT 事件收尾且 result 非空;
+    提前耗尽视为 provider 实现错误,由消费方抛中文 AgentException。
     """
 
-    def __init__(self, actor: Actor, session_id: int):
-        self._actor = actor
-        self._session_id = session_id
-        self._open: dict[int, _OpenBlock] = {}
-        self._last_usage: Usage | None = None
-        self._stop_reason: str | None = None
+    kind: LLMEventKind
+    block_ref: int | None = None
+    block_type: BlockType | None = None  # 仅 BLOCK_START
+    text: str = ""  # 仅 TEXT_DELTA / THINKING_DELTA
+    tool: ToolInfo | None = None  # 仅 TOOL_USE
+    result: LLMTurnResult | None = None  # 仅 TURN_RESULT
 
-    @property
-    def last_usage(self) -> Usage | None:
-        """最近一次 message_final 解析到的用量(供 turn_end 使用)。"""
-        return self._last_usage
 
-    @property
-    def stop_reason(self) -> str | None:
-        """最近一次 message_final 的停止原因(供 turn_end 使用)。"""
-        return self._stop_reason
+@dataclass(frozen=True)
+class ToolSpec:
+    """中立工具描述。各家客户端自行编码成本家 tools 参数形状。"""
 
-    def translate(self, chunk: LLMRawChunk) -> list[StreamEvent]:
-        """翻译单个原始 chunk 为零或多个协议事件。"""
-        ctype = chunk.get("type")
-        if ctype == "content_block_start":
-            return self._on_block_start(chunk)
-        if ctype == "content_block_delta":
-            return self._on_block_delta(chunk)
-        if ctype == "content_block_stop":
-            return self._on_block_stop(chunk)
-        if ctype == "message_final":
-            self._on_message_final(chunk)
-        # ping / message_start / message_delta / signature 等噪声不产出协议事件。
-        return []
+    name: str
+    description: str
+    input_schema: dict[str, Any] = field(default_factory=dict)
 
-    def _on_block_start(self, chunk: LLMRawChunk) -> list[StreamEvent]:
-        index = int(chunk.get("index", 0))
-        cb = chunk.get("content_block") or {}
-        raw_type = cb.get("type", "text")
-        block_type = _BLOCK_TYPE_MAP.get(raw_type, BlockType.TEXT)
-        self._open[index] = _OpenBlock(
-            index=index,
-            block_type=block_type,
-            tool_id=cb.get("id", "") or "",
-            tool_name=cb.get("name", "") or "",
-        )
-        return [StreamEvent.block_start(self._actor, self._session_id, index, block_type)]
 
-    def _on_block_delta(self, chunk: LLMRawChunk) -> list[StreamEvent]:
-        index = int(chunk.get("index", 0))
-        delta = chunk.get("delta") or {}
-        dtype = delta.get("type")
-        if dtype == "text_delta":
-            return [
-                StreamEvent.text_delta(self._actor, self._session_id, index, delta.get("text", ""))
-            ]
-        if dtype == "thinking_delta":
-            return [
-                StreamEvent.thinking_delta(
-                    self._actor, self._session_id, index, delta.get("thinking", "")
-                )
-            ]
-        if dtype == "input_json_delta":
-            # 累积 tool_use 的入参 JSON,等 block_stop 一次性产出。
-            block = self._open.get(index)
-            if block is not None:
-                block.json_buffer += delta.get("partial_json", "")
-            return []
-        # signature_delta 等:噪声,不产出。
-        return []
+@dataclass(frozen=True)
+class PromptBlock:
+    """中立 system prompt 块。
 
-    def _on_block_stop(self, chunk: LLMRawChunk) -> list[StreamEvent]:
-        import json as _json
+    cache_breakpoint=True 表示「此块末尾是一个缓存断点」,语义中立;
+    Anthropic 编码为 cache_control={"type": "ephemeral"},
+    不支持缓存的 provider 直接忽略该标志并拼接纯文本。
+    """
 
-        index = int(chunk.get("index", 0))
-        block = self._open.pop(index, None)
-        if block is None:
-            return [StreamEvent.block_stop(self._actor, self._session_id, index)]
-        if block.block_type is BlockType.TOOL_USE:
-            # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件(不发 block_stop)。
-            try:
-                tool_input = _json.loads(block.json_buffer) if block.json_buffer else {}
-            except _json.JSONDecodeError:
-                tool_input = {}
-            tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
-            return [StreamEvent.tool_use(self._actor, self._session_id, index, tool)]
-        return [StreamEvent.block_stop(self._actor, self._session_id, index)]
-
-    def _on_message_final(self, chunk: LLMRawChunk) -> None:
-        """记录 usage / stop_reason,供 runner 构造 turn_end。"""
-        self._stop_reason = chunk.get("stop_reason")
-        usage = chunk.get("usage")
-        if isinstance(usage, dict):
-            self._last_usage = Usage(
-                input_tokens=int(usage.get("input_tokens", 0) or 0),
-                output_tokens=int(usage.get("output_tokens", 0) or 0),
-                cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
-                cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
-            )
+    text: str
+    cache_breakpoint: bool = False

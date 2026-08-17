@@ -1,10 +1,10 @@
-"""Anthropic 原始流式 chunk 的手写基线样本(Phase 0)。
+"""Anthropic 原始流式 chunk 的手写基线样本(Phase 0 录制,Phase 1 沿用)。
 
-形状严格对齐 llm/anthropic_client.py `stream()` 实际 yield 的结构:
+形状严格对齐 llm/anthropic_client.py `stream()` 内部实际产生的结构:
 SDK 事件的 `event.model_dump(mode="json", warnings=False)`,外加流末尾
 一个合成的 `message_final`。手写而非真实调用录制,避免联网与 API Key 进仓库。
 
-翻译器只消费 content_block_start / content_block_delta / content_block_stop /
+适配器只消费 content_block_start / content_block_delta / content_block_stop /
 message_final 四种 type,其余(ping / message_start / message_delta /
 signature_delta 等)是噪声;各序列刻意掺入噪声 chunk,固化「噪声不产出
 协议事件」这一行为。
@@ -138,7 +138,7 @@ CHUNKS_THINKING_TEXT_INTERLEAVED: list[dict[str, Any]] = [
     },
 ]
 
-# ---- 序列 d:tool_use 入参 JSON 非法(截断),供固化当前兜底成 {} 的行为 ----
+# ---- 序列 d:tool_use 入参 JSON 非法(截断),Phase 1 起断言抛中文 AgentException ----
 
 CHUNKS_TOOL_USE_BAD_JSON: list[dict[str, Any]] = [
     {

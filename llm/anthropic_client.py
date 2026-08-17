@@ -1,5 +1,7 @@
+import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, cast
 
 from anthropic import NOT_GIVEN, AsyncAnthropic
@@ -7,13 +9,183 @@ from anthropic.types import MessageParam, TextBlockParam, ToolChoiceToolParam, T
 from pydantic import BaseModel, ValidationError
 
 from core.config import settings
+from core.errors import AgentException
+from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
-from llm.types import LLMRawChunk
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, ToolUse
 
 logger = logging.getLogger(__name__)
 
 # 承载 schema 的工具名，语义中立，避免模型将其误解为业务动作。
 _STRUCTURED_TOOL_NAME = "emit_structured_output"
+
+_BLOCK_TYPE_MAP = {
+    "text": BlockType.TEXT,
+    "thinking": BlockType.THINKING,
+    "tool_use": BlockType.TOOL_USE,
+}
+
+
+def _chunk_type(chunk: dict[str, Any]) -> str | None:
+    """读取 Anthropic 原始事件的顶层类型。"""
+    value = chunk.get("type")
+    return value if isinstance(value, str) else None
+
+
+def _chunk_text(chunk: dict[str, Any]) -> str:
+    """从原始 content_block_delta 中取出文本增量,非文本事件返回空串。"""
+    delta = chunk.get("delta")
+    if (
+        isinstance(delta, dict)
+        and delta.get("type") == "text_delta"
+        and isinstance(delta.get("text"), str)
+    ):
+        return delta["text"]
+    return ""
+
+
+def _extract_tool_uses(content: list[dict[str, Any]] | None) -> list[ToolUse]:
+    """从完整消息内容中提取 tool_use 块,返回类型化的 ToolUse 列表。"""
+    return [
+        ToolUse(id=block["id"], name=block["name"], input=block.get("input") or {})
+        for block in (content or [])
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+    ]
+
+
+def _text_from_content(content: list[dict[str, Any]] | None) -> str:
+    """从完整消息内容中拼接文本块。"""
+    return "".join(
+        block.get("text", "")
+        for block in (content or [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+@dataclass
+class _OpenBlock:
+    """适配过程中正在累积的内容块状态。"""
+
+    index: int
+    block_type: BlockType
+    tool_id: str = ""
+    tool_name: str = ""
+    json_buffer: str = ""
+
+
+class _AnthropicChunkAdapter:
+    """把 Anthropic 原始 chunk 适配成中立 LLMStreamEvent 序列(模块私有)。
+
+    生命周期为单次 stream() 调用:流开始时创建,结束即弃。
+    block_ref 直接沿用 Anthropic 原始 index(调用内本就唯一),
+    跨调用全局化由 runtime 侧 TurnEventAssembler 负责。
+    tool_use 的入参 JSON 在 content_block_stop 时累积完整后一次性产出;
+    合成的 message_final 转为 TURN_RESULT 终结事件。
+    """
+
+    def __init__(self) -> None:
+        self._open: dict[int, _OpenBlock] = {}
+
+    def adapt(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+        """适配单个原始 chunk 为零或多个中立事件。"""
+        ctype = _chunk_type(chunk)
+        if ctype == "content_block_start":
+            return self._on_block_start(chunk)
+        if ctype == "content_block_delta":
+            return self._on_block_delta(chunk)
+        if ctype == "content_block_stop":
+            return self._on_block_stop(chunk)
+        if ctype == "message_final":
+            return self._on_message_final(chunk)
+        # ping / message_start / message_delta / signature 等噪声不产出事件。
+        return []
+
+    def _on_block_start(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+        index = int(chunk.get("index", 0))
+        cb = chunk.get("content_block") or {}
+        raw_type = cb.get("type", "text")
+        block_type = _BLOCK_TYPE_MAP.get(raw_type, BlockType.TEXT)
+        self._open[index] = _OpenBlock(
+            index=index,
+            block_type=block_type,
+            tool_id=cb.get("id", "") or "",
+            tool_name=cb.get("name", "") or "",
+        )
+        return [
+            LLMStreamEvent(kind=LLMEventKind.BLOCK_START, block_ref=index, block_type=block_type)
+        ]
+
+    def _on_block_delta(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+        index = int(chunk.get("index", 0))
+        delta = chunk.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            return [
+                LLMStreamEvent(
+                    kind=LLMEventKind.TEXT_DELTA, block_ref=index, text=_chunk_text(chunk)
+                )
+            ]
+        if dtype == "thinking_delta":
+            return [
+                LLMStreamEvent(
+                    kind=LLMEventKind.THINKING_DELTA,
+                    block_ref=index,
+                    text=delta.get("thinking", ""),
+                )
+            ]
+        if dtype == "input_json_delta":
+            # 累积 tool_use 的入参 JSON,等 block_stop 一次性产出。
+            block = self._open.get(index)
+            if block is not None:
+                block.json_buffer += delta.get("partial_json", "")
+            return []
+        # signature_delta 等:噪声,不产出。
+        return []
+
+    def _on_block_stop(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+        index = int(chunk.get("index", 0))
+        block = self._open.pop(index, None)
+        if block is None:
+            # 从没开过的块:原样透传 stop,由装配器判定丢弃并留日志。
+            return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+        if block.block_type is BlockType.TOOL_USE:
+            # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件;
+            # 协议层的 block_stop 配对由装配器补发,provider 侧不参与协议决策。
+            try:
+                tool_input = json.loads(block.json_buffer) if block.json_buffer else {}
+            except json.JSONDecodeError as exc:
+                # 无静默兜底:兜成 {} 会让工具带空参执行,失败原因在链路上彻底消失。
+                raise AgentException.message(
+                    "工具调用入参 JSON 解析失败",
+                    {"tool_name": block.tool_name, "tool_use_id": block.tool_id},
+                ) from exc
+            tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
+            return [LLMStreamEvent(kind=LLMEventKind.TOOL_USE, block_ref=index, tool=tool)]
+        return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+
+    def _on_message_final(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+        """把合成的 message_final 组装成 TURN_RESULT 终结事件。"""
+        usage_dict = chunk.get("usage")
+        usage: Usage | None = None
+        if isinstance(usage_dict, dict):
+            usage = Usage(
+                input_tokens=int(usage_dict.get("input_tokens", 0) or 0),
+                output_tokens=int(usage_dict.get("output_tokens", 0) or 0),
+                cache_creation_input_tokens=int(
+                    usage_dict.get("cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_input_tokens=int(usage_dict.get("cache_read_input_tokens", 0) or 0),
+            )
+        content = chunk.get("content") or []
+        result = LLMTurnResult(
+            text=_text_from_content(content),
+            tool_uses=_extract_tool_uses(content),
+            usage=usage,
+            stop_reason=chunk.get("stop_reason"),
+            # assistant 消息落库仍是 provider 形状,原样带出(见 llm/types.py 字段注释)。
+            provider_content=content,
+        )
+        return [LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=result)]
 
 
 class AnthropicClient(BaseLLMClient):
@@ -41,9 +213,11 @@ class AnthropicClient(BaseLLMClient):
         system_prompt: str | list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
-    ) -> AsyncIterator[LLMRawChunk]:
-        """流式调用。system_prompt 传 TextBlockParam 列表时可携带 cache 断点。
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """流式调用,产出中立 LLMStreamEvent。system_prompt 传块列表时可携带 cache 断点。
 
+        SDK 原始事件在内部经 _AnthropicChunkAdapter 消化,不外露;
+        流末尾以恰好一个 TURN_RESULT 事件收尾(含终局文本、工具调用与用量)。
         model 留空时回落构造时由工厂按场景解析的模型,供 SubAgent 按类型指定
         档位(如 Explore 走速度优先档)。别名与云厂商区域前缀原样透传,
         不做改写,避免继承时丢前缀。
@@ -58,6 +232,8 @@ class AnthropicClient(BaseLLMClient):
             timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
         )
 
+        # 适配器生命周期即单次调用:流开始创建,结束即弃。
+        adapter = _AnthropicChunkAdapter()
         async with client.messages.stream(
             max_tokens=settings.llm_default_max_tokens,
             model=model or self.model,
@@ -67,11 +243,13 @@ class AnthropicClient(BaseLLMClient):
             tools=cast("list[ToolParam]", tools or []),
         ) as stream:
             async for event in stream:
-                yield (
+                chunk = (
                     event.model_dump(mode="json", warnings=False)
                     if hasattr(event, "model_dump")
                     else {"type": str(event)}
                 )
+                for neutral_event in adapter.adapt(chunk):
+                    yield neutral_event
 
             final = await stream.get_final_message()
 
@@ -79,15 +257,17 @@ class AnthropicClient(BaseLLMClient):
             if hasattr(final, "usage") and final.usage is not None:
                 usage = final.usage.model_dump(mode="json", warnings=False)
                 self._log_cache_usage(usage)
-            yield {
-                "type": "message_final",
-                "stop_reason": final.stop_reason,
-                "usage": usage,
-                "content": [
-                    block.model_dump(mode="json", warnings=False)
-                    for block in final.content
-                ],
-            }
+            for neutral_event in adapter.adapt(
+                {
+                    "type": "message_final",
+                    "stop_reason": final.stop_reason,
+                    "usage": usage,
+                    "content": [
+                        block.model_dump(mode="json", warnings=False) for block in final.content
+                    ],
+                }
+            ):
+                yield neutral_event
 
     @staticmethod
     def _log_cache_usage(usage: dict[str, Any]) -> None:
