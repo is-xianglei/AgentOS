@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验收时的通用质量检查项"}
+{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "核对 provider 抽象是否违反既有约定"}
