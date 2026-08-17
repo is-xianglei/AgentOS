@@ -14,7 +14,7 @@ class PromptContext:
     """主 Agent system prompt 的组装输入。
 
     frozen 使其可直接用 == 比较，无需额外的序列化 cache key。
-    字段按易失性从低到高声明，与 compose_lead_prompt 的拼接顺序一致。
+    字段按易失性从低到高声明，与 compose_lead_blocks 的分段顺序一致。
     """
 
     cwd: str

@@ -2,7 +2,6 @@
 
 from prompt.compose import (
     compose_lead_blocks,
-    compose_lead_prompt,
     compose_subagent_prompt,
     compose_teammate_prompt,
 )
@@ -11,7 +10,6 @@ from prompt.context import PromptContext
 __all__ = [
     "PromptContext",
     "compose_lead_blocks",
-    "compose_lead_prompt",
     "compose_subagent_prompt",
     "compose_teammate_prompt",
 ]

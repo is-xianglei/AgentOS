@@ -38,19 +38,12 @@ def _volatile_sections(ctx: PromptContext) -> list[str]:
     return []
 
 
-def compose_lead_prompt(ctx: PromptContext) -> str:
-    """组装主 Agent 的 system prompt。"""
-    sections = _stable_sections(ctx) + _volatile_sections(ctx)
-    return "\n\n".join(section.strip() for section in sections)
-
-
 def compose_lead_blocks(ctx: PromptContext) -> list[PromptBlock]:
     """组装带 cache 断点的中立 system 块，供 prompt caching 使用。
 
     两个断点：稳定段末尾一个（跨 turn 复用），Memory Catalog 末尾一个
     （供同一 turn 内多轮工具迭代复用完整 system）。断点如何落成各家 SDK
     形状由客户端编码决定，不支持缓存的 provider 忽略该标志。
-    拼接后的纯文本与 compose_lead_prompt 完全一致，二者可互换。
     """
     stable = "\n\n".join(section.strip() for section in _stable_sections(ctx))
     blocks: list[PromptBlock] = [PromptBlock(text=stable, cache_breakpoint=True)]
