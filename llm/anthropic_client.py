@@ -12,7 +12,7 @@ from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, ToolUse
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec, ToolUse
 
 logger = logging.getLogger(__name__)
 
@@ -207,15 +207,51 @@ class AnthropicClient(BaseLLMClient):
     def provider(self) -> str:
         return "anthropic"
 
+    @staticmethod
+    def _encode_system(
+        system_prompt: str | list[PromptBlock] | None,
+    ) -> str | list[TextBlockParam]:
+        """把中立 system 描述编成 Anthropic SDK 形状。
+
+        cache_breakpoint=True 落成 cache_control={"type": "ephemeral"}，默认 5m TTL
+        （turn 内迭代是密集调用，5m 足够，避免 1h 的 2 倍写溢价）。渲染顺序为
+        tools → system → messages，故断点落在稳定段末尾时会连 tools 数组一起缓存。
+        str 形态（子代理整段纯文本）在此归一化，原样透传。
+        """
+        if system_prompt is None:
+            return ""
+        if isinstance(system_prompt, str):
+            return system_prompt
+        blocks: list[TextBlockParam] = []
+        for block in system_prompt:
+            encoded: TextBlockParam = {"type": "text", "text": block.text}
+            if block.cache_breakpoint:
+                encoded["cache_control"] = {"type": "ephemeral"}
+            blocks.append(encoded)
+        return blocks
+
+    @staticmethod
+    def _encode_tools(tools: list[ToolSpec] | None) -> list[ToolParam]:
+        """把中立工具描述编成 Anthropic 平铺的 ToolParam 形状。"""
+        return [
+            ToolParam(
+                name=spec.name,
+                description=spec.description,
+                input_schema=spec.input_schema,
+            )
+            for spec in (tools or [])
+        ]
+
     async def stream(
         self,
         messages: list[dict],
-        system_prompt: str | list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str | list[PromptBlock] | None = None,
+        tools: list[ToolSpec] | None = None,
         model: str | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
         """流式调用,产出中立 LLMStreamEvent。system_prompt 传块列表时可携带 cache 断点。
 
+        中立入参经私有 _encode_system / _encode_tools 编成 SDK 形状;
         SDK 原始事件在内部经 _AnthropicChunkAdapter 消化,不外露;
         流末尾以恰好一个 TURN_RESULT 事件收尾(含终局文本、工具调用与用量)。
         model 留空时回落构造时由工厂按场景解析的模型,供 SubAgent 按类型指定
@@ -237,10 +273,9 @@ class AnthropicClient(BaseLLMClient):
         async with client.messages.stream(
             max_tokens=settings.llm_default_max_tokens,
             model=model or self.model,
-            # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
-            system=cast("str | list[TextBlockParam]", system_prompt or ""),
+            system=self._encode_system(system_prompt),
             messages=cast("list[MessageParam]", messages),
-            tools=cast("list[ToolParam]", tools or []),
+            tools=self._encode_tools(tools),
         ) as stream:
             async for event in stream:
                 chunk = (

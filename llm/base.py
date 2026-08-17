@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from llm.types import LLMStreamEvent
+from llm.types import LLMStreamEvent, PromptBlock, ToolSpec
 
 
 class BaseLLMClient(ABC):
@@ -21,11 +21,14 @@ class BaseLLMClient(ABC):
     def stream(
         self,
         messages: list[dict],
-        system_prompt: str | list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str | list[PromptBlock] | None = None,
+        tools: list[ToolSpec] | None = None,
         model: str | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
         """流式调用，产出中立 LLMStreamEvent；provider 原始格式在实现内部消化，不外露。
+
+        入参已是中立类型，编码为本家 wire 形状由实现内部私有完成
+        （_encode_system / _encode_tools），调用方不参与。
 
         实现应为 async generator（调用即得 AsyncIterator，无需 await），
         故此处不声明 async，避免签名被推断为「返回 AsyncIterator 的协程」。

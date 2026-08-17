@@ -347,6 +347,20 @@ docstring 里「沿用同一翻译器维持事件连续」这句改成实话—�
 本就与流式协议无关。文件头 `from anthropic.types import TextBlockParam, ToolParam`
 （`:11`）删除——这是主 Agent 里最后一处 Anthropic 直接依赖。
 
+**plan mode 追加块**（`:602-608`，2026-08-17 复查补记，原第九节漏列）：
+`compose_lead_blocks()` 的返回值不是只读的，紧随其后还有一处就地追加——
+active plan 存在时把 `render_plan_mode_instructions()` 作为**第三个 system 块**
+append 进去。Phase 2 改返回类型后这里的字面量 dict 必须同步换成 `PromptBlock`：
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| `:603` | `system_prompt.append({"type": "text", "text": render_plan_mode_instructions(...)})` | `system_prompt.append(PromptBlock(text=render_plan_mode_instructions(...)))` |
+
+**该块不带 cache 断点**（改前就没有 `cache_control`），故 `cache_breakpoint`
+保持默认 `False`，不要顺手加断点：plan 内容随计划编辑而变，是易失段，
+给它加断点会把前面两段的缓存前缀击穿。这也顺带说明 `PromptBlock` 的默认值
+选 `False` 是对的——追加块天然不该是断点。
+
 ### 9.2 `runtime/subagent.py`
 
 两处 `AnthropicStreamTranslator(actor, session_id)`（`:131` 一次性子代理、

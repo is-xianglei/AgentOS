@@ -5,12 +5,12 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 from openai import NOT_GIVEN, AsyncOpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletionFunctionToolParam, ChatCompletionMessageParam
 from pydantic import BaseModel
 
 from core.config import settings
 from llm.base import BaseLLMClient
-from llm.types import LLMEventKind, LLMStreamEvent
+from llm.types import LLMEventKind, LLMStreamEvent, PromptBlock, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,34 @@ class OpenAIClient(BaseLLMClient):
     @property
     def provider(self) -> str:
         return "openai"
+
+    @staticmethod
+    def _encode_system(system_prompt: str | list[PromptBlock] | None) -> str:
+        """把中立 system 描述编成 OpenAI 的纯文本 system 消息内容。
+
+        OpenAI 无 prompt cache 断点概念,cache_breakpoint 标志直接忽略,
+        多块按块间空行拼接成纯文本(与 Anthropic 侧块拼接语义一致)。
+        """
+        if system_prompt is None:
+            return ""
+        if isinstance(system_prompt, str):
+            return system_prompt
+        return "\n\n".join(block.text for block in system_prompt)
+
+    @staticmethod
+    def _encode_tools(tools: list[ToolSpec] | None) -> list[ChatCompletionFunctionToolParam]:
+        """把中立工具描述编成 OpenAI 嵌套的 function tool 形状。"""
+        return [
+            ChatCompletionFunctionToolParam(
+                type="function",
+                function={
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.input_schema,
+                },
+            )
+            for spec in (tools or [])
+        ]
 
     async def complete_structured[T: BaseModel](
         self,
@@ -80,8 +108,8 @@ class OpenAIClient(BaseLLMClient):
     async def stream(
         self,
         messages: list[dict],
-        system_prompt: str | list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str | list[PromptBlock] | None = None,
+        tools: list[ToolSpec] | None = None,
         model: str | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
         """流式调用（待实现）。"""

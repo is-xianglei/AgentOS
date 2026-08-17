@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
-from anthropic.types import TextBlockParam, ToolParam
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.service import AgentService
@@ -31,7 +30,9 @@ from interaction.schemas import AskUserQuestionRequestPayload, InteractionReques
 from interaction.service import InteractionService
 from llm import BaseLLMClient, create_llm_client
 from llm.types import (
+    PromptBlock,
     ToolResultMessage,
+    ToolSpec,
     ToolUse,
 )
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
@@ -586,7 +587,7 @@ class AgentRuntime:
         rendered_memories = memory_context.rendered_memories if memory_context else None
         # blocks 形式携带 cache 断点：tools + 稳定段跨 turn 复用，
         # 完整 system 供本 turn 内多轮工具迭代复用。
-        system_prompt: list[TextBlockParam] = compose_lead_blocks(
+        system_prompt: list[PromptBlock] = compose_lead_blocks(
             PromptContext.create(
                 skills_catalog=skills_catalog,
                 session_prompt=(
@@ -600,13 +601,11 @@ class AgentRuntime:
         active_plan = await self.plan_service.get_active(session_id)
         active_registry = self._registry_for_mode(active_plan is not None)
         if active_plan is not None:
+            # plan 内容随计划编辑而变,属易失段,不设 cache 断点以免击穿前两段的缓存前缀。
             system_prompt.append(
-                {
-                    "type": "text",
-                    "text": render_plan_mode_instructions(active_plan.content),
-                }
+                PromptBlock(text=render_plan_mode_instructions(active_plan.content))
             )
-        tools: list[ToolParam] = active_registry.to_anthropic_tools()
+        tools: list[ToolSpec] = active_registry.to_specs()
 
         stop_reason: str | None = None
         for _ in range(settings.max_tool_iterations):
@@ -1592,7 +1591,7 @@ class AgentRuntime:
         assembler: TurnEventAssembler,
         additional_context: str | None,
         rendered_memories: str | None,
-        system_prompt: str | list[TextBlockParam],
+        system_prompt: str | list[PromptBlock],
         model_name: str | None,
     ) -> SessionMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。

@@ -1,13 +1,12 @@
 """system prompt 组装。
 
 段序按易失性单调排列：恒定文案 → 环境 → Memory 规则 → skills catalog →
-会话指令 → Memory Catalog。渲染顺序是 tools → system → messages，因此把最
-易失的 Memory Catalog 放在末尾，可让其前的 tools + system 前缀跨 turn 复用。
-Memory 正文（rendered_memories）走 messages 而非 system，见 session/service.py。
+会话指令 → Memory Catalog。把最易失的 Memory Catalog 放在末尾，可让其前的
+稳定前缀跨 turn 复用。Memory 正文（rendered_memories）走 messages 而非
+system，见 session/service.py。
 """
 
-from anthropic.types import TextBlockParam
-
+from llm.types import PromptBlock
 from prompt.context import PromptContext
 from prompt.sections import (
     LEAD_SYSTEM_PROMPT,
@@ -45,33 +44,23 @@ def compose_lead_prompt(ctx: PromptContext) -> str:
     return "\n\n".join(section.strip() for section in sections)
 
 
-def compose_lead_blocks(ctx: PromptContext) -> list[TextBlockParam]:
-    """组装带 cache 断点的 system blocks，供 prompt caching 使用。
+def compose_lead_blocks(ctx: PromptContext) -> list[PromptBlock]:
+    """组装带 cache 断点的中立 system 块，供 prompt caching 使用。
 
-    渲染顺序为 tools → system → messages，故第一个断点落在稳定段末尾时，会把
-    tools 数组（22 个工具约 2.8k token，是缓存收益主体）与稳定段一起缓存，跨
-    turn 复用。第二个断点落在 Memory Catalog 末尾，让同一 turn 内多轮工具迭代
-    （max_tool_iterations=50）复用完整 system。
-
-    用默认 5m TTL：一个 turn 内的迭代是密集调用，5m 足够，避免 1h 的 2 倍写溢价。
+    两个断点：稳定段末尾一个（跨 turn 复用），Memory Catalog 末尾一个
+    （供同一 turn 内多轮工具迭代复用完整 system）。断点如何落成各家 SDK
+    形状由客户端编码决定，不支持缓存的 provider 忽略该标志。
     拼接后的纯文本与 compose_lead_prompt 完全一致，二者可互换。
     """
     stable = "\n\n".join(section.strip() for section in _stable_sections(ctx))
-    blocks: list[TextBlockParam] = [
-        {
-            "type": "text",
-            "text": stable,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
+    blocks: list[PromptBlock] = [PromptBlock(text=stable, cache_breakpoint=True)]
     volatile = _volatile_sections(ctx)
     if volatile:
         blocks.append(
-            {
-                "type": "text",
-                "text": "\n\n".join(section.strip() for section in volatile),
-                "cache_control": {"type": "ephemeral"},
-            }
+            PromptBlock(
+                text="\n\n".join(section.strip() for section in volatile),
+                cache_breakpoint=True,
+            )
         )
     return blocks
 

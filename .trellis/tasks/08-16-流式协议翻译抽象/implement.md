@@ -167,6 +167,10 @@ rg -n "message_final|extract_tool_uses|text_from_content|AnthropicStreamTranslat
 - `runtime/agent.py:11` 删除 `from anthropic.types import TextBlockParam, ToolParam`；
   `:590` / `:610` 的类型注解与 `_finalize_without_tools` 的 `system_prompt`
   参数类型同步换成中立类型。
+- **别漏 `:603` 的 plan mode 追加块**——`compose_lead_blocks()` 的返回值紧接着
+  被 `append()` 了一个字面量 dict，改返回类型后这里必须换成 `PromptBlock`，
+  且 `cache_breakpoint` 保持 `False`（design 9.1 表格）。漏改会让 Anthropic
+  收到混形状的 system 列表。
 
 **门禁 G2**：
 

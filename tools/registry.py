@@ -1,9 +1,9 @@
 from typing import Any
 
-from anthropic.types import ToolParam
 from pydantic import ValidationError
 
 from core.errors import AgentException
+from llm.types import ToolSpec
 from tools.base import BaseTool
 from tools.builtin import (
     AgentTool,
@@ -39,8 +39,8 @@ class ToolRegistry:
     def __init__(self, tools: list[BaseTool]):
         self._tools = {tool.name: tool for tool in tools}
 
-    def to_anthropic_tools(self) -> list[ToolParam]:
-        return [tool.to_param() for tool in self._tools.values()]
+    def to_specs(self) -> list[ToolSpec]:
+        return [tool.to_spec() for tool in self._tools.values()]
 
     def get(self, name: str) -> BaseTool:
         tool = self._tools.get(name)

@@ -4,11 +4,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from anthropic.types import ToolParam
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
+from llm.types import ToolSpec
 from tools.shell_policy import ShellAccess
 
 
@@ -33,8 +33,9 @@ class BaseTool(ABC):
     description: str
     input_model: type[BaseModel]
 
-    def to_param(self) -> ToolParam:
-        return ToolParam(
+    def to_spec(self) -> ToolSpec:
+        """产出中立工具描述；编码成各家 SDK 形状由对应客户端内部完成。"""
+        return ToolSpec(
             name=self.name,
             description=self.description,
             input_schema=self.input_model.model_json_schema() if self.input_model else {},

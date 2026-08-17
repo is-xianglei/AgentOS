@@ -226,7 +226,7 @@ class SubAgentRunner:
             self.llm.stream(
                 request_messages,
                 system_prompt,
-                tools=tool_registry.to_anthropic_tools(),
+                tools=tool_registry.to_specs(),
                 model=model,
             )
         ):
