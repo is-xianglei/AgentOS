@@ -27,3 +27,30 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Provider 流式协议翻译抽象
+
+**Date**: 2026-08-17
+**Task**: Provider 流式协议翻译抽象
+**Branch**: `feature/unify-llm-client`
+
+### Summary
+
+把 Anthropic 专属的流翻译、工具与 system prompt 编码收口到 BaseLLMClient，runtime 层完全 provider 无关。新增中立类型 LLMStreamEvent/LLMTurnResult/ToolSpec/PromptBlock 与 runtime/stream_assembler.py 装配器；入站流式适配下沉为各家 Client 私有；出站 to_specs()/compose_lead_blocks() 去 Anthropic 化，编码下沉到客户端。R4 语义变更：block index 改为 turn 内递增、tool_use 块补发 block_stop、入参 JSON 非法改抛中文 AgentException。建 tests/ 骨架共 27 例。真机冒烟验证 index 递增、start/stop 配对、缓存命中(读取量精确等于前次写入量)、挂起-恢复均正常。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0ffbabf` | (see git log) |
+| `35ac33f` | (see git log) |
+| `38335a4` | (see git log) |
+| `bd6b9be` | (see git log) |
+| `afdbd41` | (see git log) |
+| `7a37a8f` | (see git log) |
+| `b892c0d` | (see git log) |
+
+### Status
+
+[OK] **Completed**
