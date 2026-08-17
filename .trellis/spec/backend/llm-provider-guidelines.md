@@ -9,7 +9,7 @@
 **适用范围**：
 
 - 任何需要调用 LLM 的代码（流式对话、结构化输出），包括新增 Service / Runtime / Job
-- 新增或修改 `llm/` 包：`factory.py`、`base.py`、`anthropic_client.py`、`openai_client.py`
+- 新增或修改 `llm/` 包：`factory.py`、`base.py`、`types.py`、`anthropic_client.py`、`openai_client.py`
 - 新增 LLM 使用场景（scenario）或调整 `{provider}_{scenario}_model` 场景模型配置
 - 修改 `session_messages` 的 `provider` / `model` 成本归因列及其写入逻辑
 - 新增、删除、重命名 `AGENTOS_LLM_*` / `AGENTOS_ANTHROPIC_*` / `AGENTOS_OPENAI_*` 配置项
@@ -24,7 +24,9 @@
 
 - `llm/factory.py` — 工厂函数与模型解析（唯一权威校验关卡）
 - `llm/base.py` — `BaseLLMClient` 抽象接口
+- `llm/types.py` — 中立类型：`LLMStreamEvent` / `LLMTurnResult` / `PromptBlock` / `ToolSpec`
 - `llm/anthropic_client.py` / `llm/openai_client.py` — 双 provider 实现
+- `runtime/stream_assembler.py` — `TurnEventAssembler` 协议装配器（见 3.6）
 - `alembic/versions/0021_add_message_llm_attribution.py` — 归因列迁移
 - `runtime/agent.py` — `_llm_attribution()` 归因唯一来源
 - `main.py` — lifespan 启动自检（`main.py:27`）
@@ -70,17 +72,22 @@ class BaseLLMClient(ABC):
     @property
     @abstractmethod
     def provider(self) -> str:
-        """provider 标识（anthropic/openai）。实现：anthropic_client.py:35、openai_client.py:33。"""
+        """provider 标识（anthropic/openai）。实现：anthropic_client.py:207、openai_client.py:34。"""
 
     @abstractmethod
     def stream(
         self,
         messages: list[dict],
-        system_prompt: str | list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str | list[PromptBlock] | None = None,
+        tools: list[ToolSpec] | None = None,
         model: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """流式调用，返回该 provider 的原始事件流（归一化由翻译器层负责）。"""
+    ) -> AsyncIterator[LLMStreamEvent]:
+        """流式调用，产出中立 LLMStreamEvent；provider 原始格式在实现内部消化，不外露。
+
+        入参已是中立类型，编码为本家 wire 形状由实现内部私有完成
+        （_encode_system / _encode_tools），调用方不参与。
+        契约：每次调用必须以恰好一个 TURN_RESULT 事件收尾且 result 非空。
+        """
 
     @abstractmethod
     async def complete_structured[T: BaseModel](
@@ -96,6 +103,9 @@ class BaseLLMClient(ABC):
         """结构化输出，返回 Pydantic 模型实例。"""
 ```
 
+中立类型 `LLMStreamEvent` / `LLMTurnResult` / `PromptBlock` / `ToolSpec` 定义于
+`llm/types.py`；流式协议的分层约定见 3.6。
+
 **`stream()` 基类声明为 `def` 而非 `async def` 是刻意写法**：实现类是带 `yield` 的
 `async def`（异步生成器函数），调用即得可直接 `async for` 的迭代器、无需 `await`。
 基类若写 `async def`，签名会被推断为「返回 AsyncIterator 的协程」。不要「修复」这一点。
@@ -103,7 +113,7 @@ class BaseLLMClient(ABC):
 ### 2.3 客户端构造器（双实现签名一致）
 
 ```python
-class AnthropicClient(BaseLLMClient):  # anthropic_client.py:19
+class AnthropicClient(BaseLLMClient):  # anthropic_client.py:191
     def __init__(
         self,
         model: str,  # 必填：工厂已解析好的模型，客户端不再自行读模型配置
@@ -113,7 +123,7 @@ class AnthropicClient(BaseLLMClient):  # anthropic_client.py:19
         timeout: float | None = None,
     ): ...
 
-class OpenAIClient(BaseLLMClient):  # openai_client.py:17，构造器签名与上完全一致
+class OpenAIClient(BaseLLMClient):  # openai_client.py:18，构造器签名与上完全一致
     ...
 ```
 
@@ -130,9 +140,9 @@ def __init__(self, ..., llm: BaseLLMClient | None = None):
 
 | 注入点 | scenario |
 |---|---|
-| `runtime/agent.py:105` `AgentRuntime.__init__` | `agent` |
-| `runtime/subagent.py:66` `SubAgentRunner.__init__` | `subagent` |
-| `runtime/compact.py:24` `CompactService.__init__` | `compact` |
+| `runtime/agent.py:100` `AgentRuntime.__init__` | `agent` |
+| `runtime/subagent.py:59` `SubAgentRunner.__init__` | `subagent` |
+| `runtime/compact.py:20` `CompactService.__init__` | `compact` |
 | `memory/recall/service.py:53` `MemoryRecallService.__init__` | `memory_selector` |
 | `memory/jobs/service.py:182`（构造器接受注入并透传；入队冻结模型见 `:90` / `:167` 的 `resolve_scenario_model()`） | `memory_extractor` / `memory_dream` |
 | `memory/jobs/extraction.py:214` / `:317` | `memory_extractor` |
@@ -157,7 +167,7 @@ down_revision = "0020_agent_mvp_comments"   # 同样是 revision id，不是文�
 写入链路：
 
 ```python
-# runtime/agent.py:1584 — 归因唯一来源
+# runtime/agent.py:1577 — 归因唯一来源
 def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
     provider = getattr(self.llm, "provider", None)               # 客户端自报
     model = model_override or getattr(self.llm, "model", None)   # 逐调用覆盖优先
@@ -201,7 +211,7 @@ async def add_message(
 
 | 环境变量 | 默认值 | 使用方 |
 |---|---|---|
-| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:62`） |
+| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:274`） |
 | `AGENTOS_LLM_MEMORY_SELECTOR_MAX_TOKENS` | 256 | Memory 召回选择器 |
 | `AGENTOS_LLM_MEMORY_EXTRACTOR_MAX_TOKENS` | 4096 | Memory 提取 |
 | `AGENTOS_LLM_MEMORY_DREAM_MAX_TOKENS` | 8192 | Memory Dream |
@@ -223,11 +233,11 @@ async def add_message(
 
 - 配置留空（`None`）= 交给 SDK 自动计算超时
 - 但把 `None` **显式传给 SDK** 会被理解成「禁用超时」，语义完全相反
-- 统一转 `NOT_GIVEN` 规避：`openai_client.py:53`、`anthropic_client.py:58/133/160`；新代码沿用该写法
+- 统一转 `NOT_GIVEN` 规避：`openai_client.py:82`、`anthropic_client.py:268/348/375`；新代码沿用该写法
 
 ### 3.4 能力边界（当前实现）
 
-- `OpenAIClient` 仅实现 `complete_structured()`；`stream()` 抛 `NotImplementedError`（`openai_client.py:87`）
+- `OpenAIClient` 仅实现 `complete_structured()`；`stream()` 抛 `NotImplementedError`（`openai_client.py:116`）
 - 依赖流式的场景（`agent` / `subagent` / `compact`）当前只能使用 Anthropic
 - `main.py:27` 在 lifespan 中调用一次 `create_llm_client()` 做启动自检，
   让配置错误在启动时暴露而非拖到首次对话；工厂本身仍是权威关卡，
@@ -237,7 +247,7 @@ async def add_message(
 
 | 消息来源 | `provider` 列 | `model` 列 |
 |---|---|---|
-| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:647` / `:1629`） | 客户端自报的 provider | 实际生效的模型 ID |
+| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:645` / `:1625`） | 客户端自报的 provider | 实际生效的模型 ID |
 | user 消息 | NULL | NULL |
 | tool 消息 | NULL | NULL |
 | 存量历史消息 | NULL（迁移不回填） | NULL |
@@ -245,6 +255,30 @@ async def add_message(
 - **仅 LLM 产出的 assistant 消息填写**；user/tool 消息不经过模型，填了等于伪造归因
 - `model` 存**实际生效的模型 ID**（`_resolve_model()` 解析后的最终值），不是配置里的场景档位名
 - 归因唯一来源是 `_llm_attribution()`；注入的测试替身若未实现 `provider` 属性则留空 `None`
+
+### 3.6 流式协议分层（入站适配私有、装配归 runtime）
+
+| 职责 | 归属 | 位置 |
+|---|---|---|
+| 入站流式适配（provider 原始 chunk → 中立 `LLMStreamEvent`） | 各家 Client **私有实现** | `anthropic_client.py:76` `_AnthropicChunkAdapter`（模块私有） |
+| 自有协议装配（打 actor/session_id 戳、分配 turn 内全局 block index、block_start/block_stop 配对） | runtime 侧装配器，**不是 provider 契约** | `runtime/stream_assembler.py:13` `TurnEventAssembler` |
+| 出站编码（中立 `PromptBlock` / `ToolSpec` → 本家 wire 形状） | 各家 Client **私有方法**，不上 ABC | `_encode_system` / `_encode_tools`（`anthropic_client.py:211/234`、`openai_client.py:38/51`） |
+
+- **入站**：`stream()` 只产中立 `LLMStreamEvent`（`llm/types.py`），provider 原始格式
+  在实现内部消化、不外露；必须以恰好一个 `TURN_RESULT` 事件收尾且 `result` 非空，
+  提前耗尽视为 provider 实现错误，由消费方抛中文 `AgentException`。
+- **装配**：中立事件不含 `actor` / `session_id` / 全局 index——那是 runtime 概念，
+  不下沉进 `llm/`。块级协议规则（index 分配、start/stop 配对，含 tool_use 块补发
+  `block_stop`）由 `TurnEventAssembler` 用代码统一保证，provider 不参与分配，
+  两家语义想不一致都做不到；该类的类级 docstring 是这套块级协议的唯一定义处，
+  不要把这些规则写成各 provider 需遵守的 docstring 契约。
+- **出站**：编码是 `stream()` 的内部步骤，没有外部调用方，**刻意不提成抽象方法**——
+  `BaseLLMClient` 抽象成员维持 3 个（`provider` / `stream` / `complete_structured`），
+  不要「补全」`encode_*` 到 ABC 上。中立描述的产出方：`tools/base.py:36` `to_spec()`、
+  `tools/registry.py:42` `to_specs()`、`prompt/compose.py:41` `compose_lead_blocks()`。
+- **不引入第二个 provider 抽象**：不建 `StreamTranslator` ABC、不建 `create_translator()`
+  工厂；新增 provider 只写一个客户端。`runtime/` / `tools/` / `prompt/` 对 `anthropic`
+  保持零引用。
 
 ---
 
@@ -340,9 +374,14 @@ await self.session_service.add_message(
 
 ## 6. Tests Required
 
-> **状态声明：以下测试全部尚未编写。** `tests/` 目录已在 commit `e872cdc` 整体删除，
-> 本次改动未补任何测试。本节是待办契约：后续为 `llm/` 或归因链路补测试时，
-> 必须覆盖以下用例与断言点；在测试真正写出并运行前，不得声称已验证通过。
+> **状态声明（2026-08 更新）**：`tests/` 目录已随「流式协议翻译抽象」任务重建，
+> 现有 `tests/test_stream_assembler.py`（装配器 13 例）、`tests/test_stream_baseline.py`
+> （Anthropic 适配器 + 装配器组合基线 8 例）、`tests/test_encoders.py`
+> （两家 `_encode_system` / `_encode_tools` 编码形状 6 例），共 27 passed——
+> 即 3.6 节的流式分层已有覆盖。**但以下 5 个文件仍全部尚未编写**，属另外的欠账：
+> 工厂校验、客户端构造参数（timeout 归一、max_tokens 来源、`stream()` 能力边界）、
+> 注入点回落与归因链路均无测试。后续补齐时必须覆盖以下用例与断言点；
+> 在测试真正写出并运行前，不得声称已验证通过。
 
 ### 6.1 `tests/test_llm_factory.py`（待编写）
 
@@ -445,7 +484,7 @@ client = AsyncOpenAI(
 )
 ```
 
-现有实现参照：`openai_client.py:53`、`anthropic_client.py:58/133/160`。
+现有实现参照：`openai_client.py:82`、`anthropic_client.py:268/348/375`。
 
 ---
 
@@ -453,7 +492,9 @@ client = AsyncOpenAI(
 
 - 工厂与全部校验：`llm/factory.py`
 - 接口定义：`llm/base.py`
+- 中立类型：`llm/types.py`
 - 双实现：`llm/anthropic_client.py`、`llm/openai_client.py`
+- 协议装配器：`runtime/stream_assembler.py`（`TurnEventAssembler`）
 - 配置声明：`core/config.py`（`Settings`，`extra="forbid"`）
 - 归因迁移：`alembic/versions/0021_add_message_llm_attribution.py`
 - 归因写入：`runtime/agent.py`（`_llm_attribution()`）、`session/service.py`、`session/repository.py`
