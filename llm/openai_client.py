@@ -443,14 +443,18 @@ class OpenAIClient(BaseLLMClient):
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _OpenAIChunkAdapter()
-        raw_stream = await client.chat.completions.create(**request_kwargs)
-        async for chunk in raw_stream:
-            chunk_dict = (
-                chunk.model_dump(mode="json", warnings=False)
-                if hasattr(chunk, "model_dump")
-                else cast("dict[str, Any]", chunk)
-            )
-            for neutral_event in adapter.adapt(chunk_dict):
-                yield neutral_event
+        # async with 保证消费方提前中断(用户取消、Agent 提前收束)时底层 HTTP 连接
+        # 被显式关闭而非留给 GC;否则解释器回收异步生成器时会抛
+        # "generator didn't stop after athrow()"。Anthropic 侧由 messages.stream()
+        # 的上下文管理器承担同一职责。
+        async with await client.chat.completions.create(**request_kwargs) as raw_stream:
+            async for chunk in raw_stream:
+                chunk_dict = (
+                    chunk.model_dump(mode="json", warnings=False)
+                    if hasattr(chunk, "model_dump")
+                    else cast("dict[str, Any]", chunk)
+                )
+                for neutral_event in adapter.adapt(chunk_dict):
+                    yield neutral_event
         for neutral_event in adapter.finalize():
             yield neutral_event
