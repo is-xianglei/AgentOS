@@ -27,8 +27,18 @@ class BaseLLMClient(ABC):
     ) -> AsyncIterator[LLMStreamEvent]:
         """流式调用，产出中立 LLMStreamEvent；provider 原始格式在实现内部消化，不外露。
 
-        入参已是中立类型，编码为本家 wire 形状由实现内部私有完成
-        （_encode_system / _encode_tools），调用方不参与。
+        入参全部是中立类型，编码为本家 wire 形状由实现内部私有完成
+        （_encode_messages / _encode_system / _encode_tools），调用方不参与。
+
+        messages 契约：中立消息形状，而非任何 provider 的 wire 形状。三类角色：
+        - {"role": "user", "content": "纯文本"}
+        - {"role": "assistant", "content": [中立块数组]}，块以 kind 判别
+          （见 llm.types 的 TextBlock / ToolUseBlock）
+        - {"role": "tool", "content": ToolResultMessage.to_content_dict()}
+
+        出站翻译刻意收在实现内部而非调用方：stream() 有多个调用点（主 Agent、
+        SubAgent、Compact），且快照与落库一律只存中立形状，翻译放在调用方则每处
+        都要记得翻一次，漏一处即是一次 provider 形状不匹配的请求失败。
 
         实现应为 async generator（调用即得 AsyncIterator，无需 await），
         故此处不声明 async，避免签名被推断为「返回 AsyncIterator 的协程」。

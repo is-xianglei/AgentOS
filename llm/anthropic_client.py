@@ -12,7 +12,20 @@ from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec, ToolUse
+from llm.types import (
+    LLMEventKind,
+    LLMStreamEvent,
+    LLMTurnResult,
+    PromptBlock,
+    TextBlock,
+    ToolResultMessage,
+    ToolSpec,
+    ToolUse,
+    ToolUseBlock,
+    parse_assistant_blocks,
+    parse_tool_result,
+    parse_user_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +72,46 @@ def _text_from_content(content: list[dict[str, Any]] | None) -> str:
         block.get("text", "")
         for block in (content or [])
         if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _encode_assistant_block(block: TextBlock | ToolUseBlock) -> dict[str, Any]:
+    """把 assistant 中立块编成 Anthropic wire 块。"""
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    return {
+        "type": "tool_use",
+        "id": block.id,
+        "name": block.name,
+        "input": block.input,
+    }
+
+
+def _encode_tool_result(tool_result: ToolResultMessage) -> dict[str, Any]:
+    """把中立工具结果编成 Anthropic 的 tool_result 块。
+
+    is_error 仅在为真时下发:Anthropic 该字段缺省即 false,恒发会让 wire 变噪。
+    """
+    block: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": tool_result.tool_use_id,
+        "content": tool_result.output,
+    }
+    if tool_result.is_error:
+        block["is_error"] = True
+    return block
+
+
+def _is_tool_result_carrier(message: dict[str, Any]) -> bool:
+    """判断某条已编码消息是否为可继续追加 tool_result 的 user 消息。"""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "tool_result"
     )
 
 
@@ -182,8 +235,6 @@ class _AnthropicChunkAdapter:
             tool_uses=_extract_tool_uses(content),
             usage=usage,
             stop_reason=chunk.get("stop_reason"),
-            # assistant 消息落库仍是 provider 形状,原样带出(见 llm/types.py 字段注释)。
-            provider_content=content,
         )
         return [LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=result)]
 
@@ -242,6 +293,43 @@ class AnthropicClient(BaseLLMClient):
             for spec in (tools or [])
         ]
 
+    @staticmethod
+    def _encode_messages(messages: list[dict[str, Any]]) -> list[MessageParam]:
+        """把中立消息编成 Anthropic wire 形状(出站翻译,Client 私有)。
+
+        三类中立角色的映射:
+        - user:纯文本,原样成为 user 消息;
+        - assistant:中立块数组编成 text / tool_use 块;空块数组落成空串
+          (Anthropic 拒绝空 content 数组);
+        - tool:编成 tool_result 块塞进 role="user" 消息——Anthropic 没有 tool 角色。
+          连续的工具结果必须合并进同一条 user 消息,否则会出现连续 user 消息而
+          违反角色交替约束(该合并逻辑原在 session/service.py,随出站翻译一并迁入)。
+
+        ToolResultMessage 的 tool_name / input_args 是 AgentOS 自有的排障字段,
+        Anthropic 协议无对应位置,不发给模型。
+        """
+        encoded: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role == "user":
+                encoded.append({"role": "user", "content": parse_user_text(content)})
+            elif role == "assistant":
+                blocks = [
+                    _encode_assistant_block(block) for block in parse_assistant_blocks(content)
+                ]
+                encoded.append({"role": "assistant", "content": blocks or ""})
+            elif role == "tool":
+                block = _encode_tool_result(parse_tool_result(content))
+                if encoded and _is_tool_result_carrier(encoded[-1]):
+                    encoded[-1]["content"].append(block)
+                else:
+                    encoded.append({"role": "user", "content": [block]})
+            else:
+                raise AgentException.message("未知的消息角色", {"role": role})
+        # 接口层用 dict[str, Any] 承载动态 JSON,此处收窄为 SDK 的 TypedDict。
+        return cast("list[MessageParam]", encoded)
+
     async def stream(
         self,
         messages: list[dict[str, Any]],
@@ -274,7 +362,7 @@ class AnthropicClient(BaseLLMClient):
             max_tokens=settings.llm_default_max_tokens,
             model=model or self.model,
             system=self._encode_system(system_prompt),
-            messages=cast("list[MessageParam]", messages),
+            messages=self._encode_messages(messages),
             tools=self._encode_tools(tools),
         ) as stream:
             async for event in stream:

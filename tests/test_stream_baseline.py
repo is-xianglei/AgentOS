@@ -163,9 +163,8 @@ async def test_turn_result_exposes_usage_and_stop_reason() -> None:
         cache_creation_input_tokens=30,
         cache_read_input_tokens=90,
     )
-    # 终局解析收归客户端:text 与 provider_content 由 TURN_RESULT 带出。
+    # 终局解析收归客户端:text 由 TURN_RESULT 带出,不再透传 provider 形状内容。
     assert result.text == "你好，世界"
-    assert result.provider_content == [{"type": "text", "text": "你好，世界"}]
     assert result.tool_uses == []
 
 
