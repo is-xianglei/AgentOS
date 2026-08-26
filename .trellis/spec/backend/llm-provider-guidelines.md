@@ -72,7 +72,7 @@ class BaseLLMClient(ABC):
     @property
     @abstractmethod
     def provider(self) -> str:
-        """provider 标识（anthropic/openai）。实现：anthropic_client.py:207、openai_client.py:34。"""
+        """provider 标识（anthropic/openai）。实现：anthropic_client.py:258、openai_client.py:281。"""
 
     @abstractmethod
     def stream(
@@ -113,7 +113,7 @@ class BaseLLMClient(ABC):
 ### 2.3 客户端构造器（双实现签名一致）
 
 ```python
-class AnthropicClient(BaseLLMClient):  # anthropic_client.py:191
+class AnthropicClient(BaseLLMClient):  # anthropic_client.py:242
     def __init__(
         self,
         model: str,  # 必填：工厂已解析好的模型，客户端不再自行读模型配置
@@ -123,7 +123,7 @@ class AnthropicClient(BaseLLMClient):  # anthropic_client.py:191
         timeout: float | None = None,
     ): ...
 
-class OpenAIClient(BaseLLMClient):  # openai_client.py:18，构造器签名与上完全一致
+class OpenAIClient(BaseLLMClient):  # openai_client.py:265，构造器签名与上完全一致
     ...
 ```
 
@@ -140,7 +140,7 @@ def __init__(self, ..., llm: BaseLLMClient | None = None):
 
 | 注入点 | scenario |
 |---|---|
-| `runtime/agent.py:100` `AgentRuntime.__init__` | `agent` |
+| `runtime/agent.py:101` `AgentRuntime.__init__` | `agent` |
 | `runtime/subagent.py:59` `SubAgentRunner.__init__` | `subagent` |
 | `runtime/compact.py:20` `CompactService.__init__` | `compact` |
 | `memory/recall/service.py:53` `MemoryRecallService.__init__` | `memory_selector` |
@@ -167,13 +167,13 @@ down_revision = "0020_agent_mvp_comments"   # 同样是 revision id，不是文�
 写入链路：
 
 ```python
-# runtime/agent.py:1577 — 归因唯一来源
+# runtime/agent.py:1579 — 归因唯一来源
 def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
     provider = getattr(self.llm, "provider", None)               # 客户端自报
     model = model_override or getattr(self.llm, "model", None)   # 逐调用覆盖优先
     return provider, model
 
-# session/service.py:396 与 session/repository.py:210 — 参数透传，默认 None
+# session/service.py:401 与 session/repository.py:217 — 参数透传，默认 None
 async def add_message(
     self, session_id: int, role: str, content: Any,
     turn_id: UUID | None = None,
@@ -211,7 +211,7 @@ async def add_message(
 
 | 环境变量 | 默认值 | 使用方 |
 |---|---|---|
-| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:274`） |
+| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:362`、`openai_client.py:435`） |
 | `AGENTOS_LLM_MEMORY_SELECTOR_MAX_TOKENS` | 256 | Memory 召回选择器 |
 | `AGENTOS_LLM_MEMORY_EXTRACTOR_MAX_TOKENS` | 4096 | Memory 提取 |
 | `AGENTOS_LLM_MEMORY_DREAM_MAX_TOKENS` | 8192 | Memory Dream |
@@ -233,12 +233,15 @@ async def add_message(
 
 - 配置留空（`None`）= 交给 SDK 自动计算超时
 - 但把 `None` **显式传给 SDK** 会被理解成「禁用超时」，语义完全相反
-- 统一转 `NOT_GIVEN` 规避：`openai_client.py:82`、`anthropic_client.py:268/348/375`；新代码沿用该写法
+- 统一转 `NOT_GIVEN` 规避：`openai_client.py:372/423`、`anthropic_client.py:356/436/463`；新代码沿用该写法
 
 ### 3.4 能力边界（当前实现）
 
-- `OpenAIClient` 仅实现 `complete_structured()`；`stream()` 抛 `NotImplementedError`（`openai_client.py:116`）
-- 依赖流式的场景（`agent` / `subagent` / `compact`）当前只能使用 Anthropic
+- 两家客户端均已实现 `stream()` 与 `complete_structured()`，`BaseLLMClient` 的三个抽象成员
+  （`provider` / `stream` / `complete_structured`）双实现齐备；依赖流式的场景
+  （`agent` / `subagent` / `compact`）两家 provider 均可用
+- OpenAI 侧的 `stream()` 走 `create(stream=True)` 裸 chunk 路径，**不用 SDK 的 `.stream()` helper**，
+  理由见 3.6 末尾的决策记录
 - `main.py:27` 在 lifespan 中调用一次 `create_llm_client()` 做启动自检，
   让配置错误在启动时暴露而非拖到首次对话；工厂本身仍是权威关卡，
   worker、脚本等不走 lifespan 的入口同样跑不掉校验
@@ -247,7 +250,7 @@ async def add_message(
 
 | 消息来源 | `provider` 列 | `model` 列 |
 |---|---|---|
-| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:645` / `:1625`） | 客户端自报的 provider | 实际生效的模型 ID |
+| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:646` / `:1627`） | 客户端自报的 provider | 实际生效的模型 ID |
 | user 消息 | NULL | NULL |
 | tool 消息 | NULL | NULL |
 | 存量历史消息 | NULL（迁移不回填） | NULL |
@@ -260,9 +263,9 @@ async def add_message(
 
 | 职责 | 归属 | 位置 |
 |---|---|---|
-| 入站流式适配（provider 原始 chunk → 中立 `LLMStreamEvent`） | 各家 Client **私有实现** | `anthropic_client.py:76` `_AnthropicChunkAdapter`（模块私有） |
+| 入站流式适配（provider 原始 chunk → 中立 `LLMStreamEvent`） | 各家 Client **私有实现** | `anthropic_client.py:129` `_AnthropicChunkAdapter`、`openai_client.py:98` `_OpenAIChunkAdapter`（均为模块私有） |
 | 自有协议装配（打 actor/session_id 戳、分配 turn 内全局 block index、block_start/block_stop 配对） | runtime 侧装配器，**不是 provider 契约** | `runtime/stream_assembler.py:13` `TurnEventAssembler` |
-| 出站编码（中立 `PromptBlock` / `ToolSpec` → 本家 wire 形状） | 各家 Client **私有方法**，不上 ABC | `_encode_system` / `_encode_tools`（`anthropic_client.py:211/234`、`openai_client.py:38/51`） |
+| 出站编码（中立 `PromptBlock` / `ToolSpec` / 消息块 → 本家 wire 形状） | 各家 Client **私有方法**，不上 ABC | `_encode_system` / `_encode_tools` / `_encode_messages`（`anthropic_client.py:262/285/297`、`openai_client.py:285/298/313`） |
 
 - **入站**：`stream()` 只产中立 `LLMStreamEvent`（`llm/types.py`），provider 原始格式
   在实现内部消化、不外露；必须以恰好一个 `TURN_RESULT` 事件收尾且 `result` 非空，
@@ -276,9 +279,65 @@ async def add_message(
   `BaseLLMClient` 抽象成员维持 3 个（`provider` / `stream` / `complete_structured`），
   不要「补全」`encode_*` 到 ABC 上。中立描述的产出方：`tools/base.py:36` `to_spec()`、
   `tools/registry.py:42` `to_specs()`、`prompt/compose.py:41` `compose_lead_blocks()`。
+  消息体同理由 `_encode_messages()` 在 `stream()` 内部翻译，契约见 3.7。
 - **不引入第二个 provider 抽象**：不建 `StreamTranslator` ABC、不建 `create_translator()`
   工厂；新增 provider 只写一个客户端。`runtime/` / `tools/` / `prompt/` 对 `anthropic`
   保持零引用。
+
+**决策记录：OpenAI 侧不用 SDK 的 `.stream()` helper**（openai 3.0.0，结论取自本机
+`.venv` 源码而非训练记忆）。三条硬约束使 helper 路径不可用，改用
+`create(stream=True)` 裸 chunk + 私有适配器：
+
+1. **strict 强制校验**：`AsyncCompletions.stream()` 方法体首行即调
+   `_validate_input_tools()`，逐个断言 `tool["function"]["strict"] is True`，否则在发出
+   任何 HTTP 请求前就抛 `ValueError`。strict 模式对 JSON Schema 有额外约束（全字段
+   required、`additionalProperties: false`），启用它要倒逼改写全部内置工具 schema，
+   且 Anthropic 侧 `_encode_tools` 同样不带 strict，加上去两家立刻不对称。
+   注意 `create()` **不做**此校验，仅 `parse()` / `stream()` 做。
+2. **截断即丢内容**：`get_final_completion()` 落到 `parse_chat_completion()`，
+   对 `finish_reason == "length"` 无条件抛 `LengthFinishReasonError`——被
+   `max_completion_tokens` 截断时拿不到已生成内容。这与 Anthropic 的
+   `get_final_message()` 行为相反（后者正常返回，由调用方判读 `stop_reason`）。
+   走裸 chunk 则由适配器把 `length` 翻成 `stop_reason="max_tokens"` 正常返回，文本不丢。
+3. **JSON 解析权**：工具入参由适配器自己解析，坏 JSON 才抛得出带工具名上下文的中文
+   `AgentException`；SDK 自行解析时抛的是裸 `json.JSONDecodeError`，不符第 4 段错误矩阵。
+
+附带两条易错项：`stream_options={"include_usage": True}` 必须显式传，SDK 不会自动注入，
+不传则 usage 恒为 `None`；tool call 的 `id` 只在该次调用的**首个** chunk 携带，
+后续 chunk 只有 `index` 与 `arguments` 增量，适配器须自行留存。
+
+### 3.7 消息体中立化（`stream()` 的 messages 入参契约）
+
+**`BaseLLMClient.stream()` 的 messages 入参是中立形状，不是任何一家的 wire 形状。**
+库里（`session_messages.content`、`session_snapshots.messages`）存的也一律是中立形状，
+provider 形状只存在于各家 `stream()` 内部 `_encode_messages()` 之后。
+
+assistant 消息的 content 是块数组，两类块（定义于 `llm/types.py:70/81`，
+经 `build_assistant_blocks()`（`:105`）构造、`parse_assistant_blocks()`（`:121`）解析）：
+
+```python
+{"kind": "text", "text": "..."}
+{"kind": "tool_use", "id": "...", "name": "...", "input": {...}}
+```
+
+`tool` 消息沿用 `ToolResultMessage`（`llm/types.py:27`），形状不变——它本就是自有协议。
+
+- **判别键用 `kind` 而非 `type`，这是刻意的**：两家 wire 的 `type` 取值恰好同名
+  （都叫 `tool_use`），入参字段也都叫 `input`，若沿用 `type`，残留的 provider 形状数据
+  会被静默当成中立格式读下去，错误一路潜伏到运行时。换 `kind` 让它在
+  `parse_assistant_blocks()` 当场抛中文 `AgentException`。新增块类型时沿用 `kind`。
+- **翻译收在 Client 内部，不在调用方**：`llm.stream()` 有 4 个调用点
+  （`agent.py:631`、`agent.py:1616`、`subagent.py:226`、`compact.py:108`），
+  其中 `subagent.py` 自建 messages、不走 `_messages_to_context()`。翻译放调用方则每处
+  都要记得翻一次，漏一处就是一个 400，新增第 5 个调用点时也无人提醒。
+- **两家的工具结果结构性不同**，这正是出站翻译必须存在的理由，不能共用一套形状糊过去：
+  Anthropic 把 tool_result 作为块塞进 `role="user"` 消息并合并连续块；
+  OpenAI 每个工具结果是一条独立的 `role="tool"` 消息，带 `tool_call_id`。
+- **快照同为中立形状**：`compact.py` 在中立形状上工作、落中立快照，
+  `_micro_compact()`（`compact.py:62`）直接读 `role="tool"` 的 `tool_name`，
+  不再从 assistant 的 tool_use 块反查，语义不随 provider 变。
+  切 provider 后旧快照仍可用，无需清库。
+- **无兼容读**：不写旧格式检测分支、不做存量迁移——那个分支永远不会被测试覆盖到。
 
 ---
 
@@ -374,12 +433,14 @@ await self.session_service.add_message(
 
 ## 6. Tests Required
 
-> **状态声明（2026-08 更新）**：`tests/` 目录已随「流式协议翻译抽象」任务重建，
-> 现有 `tests/test_stream_assembler.py`（装配器 13 例）、`tests/test_stream_baseline.py`
-> （Anthropic 适配器 + 装配器组合基线 8 例）、`tests/test_encoders.py`
-> （两家 `_encode_system` / `_encode_tools` 编码形状 6 例），共 27 passed——
-> 即 3.6 节的流式分层已有覆盖。**但以下 5 个文件仍全部尚未编写**，属另外的欠账：
-> 工厂校验、客户端构造参数（timeout 归一、max_tokens 来源、`stream()` 能力边界）、
+> **状态声明（2026-08 更新）**：现有 `tests/test_stream_assembler.py`（装配器 13 例）、
+> `tests/test_stream_baseline.py`（Anthropic 适配器 + 装配器组合基线 8 例）、
+> `tests/test_encoders.py`（两家 `_encode_system` / `_encode_tools` 编码形状 6 例）、
+> `tests/test_llm_openai_client.py`（OpenAI 适配器与 `stream()` 17 例）、
+> `tests/test_message_neutral.py`（中立块往返与双向编码 14 例）、
+> `tests/test_neutral_context.py`（中立上下文装配与 compact 6 例），共 64 passed——
+> 即 3.6 / 3.7 两节的流式分层与消息中立化均已有覆盖。**但以下 4 个文件仍尚未编写**，
+> 属另外的欠账：工厂校验、客户端构造参数（timeout 归一、max_tokens 来源）、
 > 注入点回落与归因链路均无测试。后续补齐时必须覆盖以下用例与断言点；
 > 在测试真正写出并运行前，不得声称已验证通过。
 
@@ -395,13 +456,27 @@ await self.session_service.add_message(
 - provider 分派：`llm_provider=anthropic` 时断言 `client.provider == "anthropic"`
   且 `client.model` 为解析结果；openai 同理。**断言用 `client.provider`，不用 isinstance**
 
-### 6.2 `tests/test_llm_openai_client.py`（待编写）
+### 6.2 `tests/test_llm_openai_client.py`（已编写，17 例）
+
+流式部分已覆盖（新增 provider 或改动适配器时须维持这些断言点）：
+
+- 事件序列：纯文本 / 文本+工具 / 多工具，断言产出的 `LLMStreamEvent` 序列与收尾的
+  单个 `TURN_RESULT`；与 Anthropic 侧同输入的协议等价性对照
+- block_ref 分配：文本占 0、工具为 `1 + tool_call.index`；tool_use 块不发 `BLOCK_STOP`
+  （由 `TurnEventAssembler` 补发，见 3.6）
+- 终局信息：usage 与 stop_reason 映射；缺 usage 时为 `None`；
+  `finish_reason="length"` 保留已生成文本并翻成 `max_tokens`；`content_filter` 透传
+- 错误分支（均须为中文 `AgentException`，见第 4 段矩阵）：工具入参坏 JSON、
+  tool call 缺 id 或 name、流未给 `finish_reason` 即耗尽
+- 分层边界：适配器只产中立事件，不含 `actor` / `session_id` / 全局 index；
+  恒不产出 `THINKING_DELTA`（`ChoiceDelta` 无 reasoning 字段）；噪声 chunk 不产事件
+
+以下非流式用例仍未覆盖，属欠账：
 
 - 参数映射：Mock `AsyncOpenAI`，断言 `parse()` 收到 `messages[0] == {"role": "system", ...}`
   与 `max_completion_tokens`（而非 `max_tokens`）
 - 拒答处理：`message.parsed = None` 时断言抛 `ValueError` 且消息含 `finish_reason`
 - timeout 归一：构造 `timeout=None`，断言 SDK 构造参数收到 `NOT_GIVEN` 而非 `None`
-- 能力边界：消费 `client.stream(...)` 时断言抛 `NotImplementedError`
 
 ### 6.3 `tests/test_llm_anthropic_client.py`（待编写）
 
@@ -484,7 +559,7 @@ client = AsyncOpenAI(
 )
 ```
 
-现有实现参照：`openai_client.py:82`、`anthropic_client.py:268/348/375`。
+现有实现参照：`openai_client.py:372/423`、`anthropic_client.py:356/436/463`。
 
 ---
 
@@ -493,6 +568,9 @@ client = AsyncOpenAI(
 - 工厂与全部校验：`llm/factory.py`
 - 接口定义：`llm/base.py`
 - 中立类型：`llm/types.py`
+- 中立消息构造与解析：`llm/types.py`（`build_assistant_blocks()` / `parse_assistant_blocks()`）、
+  产出方 `session/service.py`（`_messages_to_context()`）、消费方 `runtime/compact.py`、
+  `tools/subagents/trigger.py`、`memory/jobs/extraction.py`
 - 双实现：`llm/anthropic_client.py`、`llm/openai_client.py`
 - 协议装配器：`runtime/stream_assembler.py`（`TurnEventAssembler`）
 - 配置声明：`core/config.py`（`Settings`，`extra="forbid"`）

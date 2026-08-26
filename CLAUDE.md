@@ -159,8 +159,22 @@ API、错误与日志：
 9. `{provider}_timeout_seconds` 留空表示交给 SDK 自动计算超时；
    给 SDK 显式传 None 会被理解为禁用超时，现有代码统一转成 NOT_GIVEN 规避，
    新代码沿用该写法。
-10. OpenAI 客户端目前仅实现结构化输出 complete_structured()，流式 stream() 尚未实现；
-    依赖流式的场景（主 Agent、SubAgent、Compact）当前只能使用 Anthropic。
+10. 两家客户端均已实现 stream() 和 complete_structured()，主 Agent、SubAgent、Compact
+    三个流式场景两家 provider 都可用。OpenAI 侧流式走 create(stream=True) 裸 chunk 路径，
+    不用 SDK 的 .stream() helper：后者会强制校验工具的 strict 字段，在发出请求前就抛
+    ValueError，且 get_final_completion() 在截断时抛异常而非返回已生成内容。
+11. LLM 消息体使用中立形状，provider wire 形状只存在于各家客户端 _encode_messages()
+    之后。BaseLLMClient.stream() 的 messages 入参、session_messages.content 和
+    session_snapshots.messages 一律是中立形状，不得写入或读取任何一家的 wire 形状。
+12. assistant 消息 content 为块数组，判别键用 kind 而非 type：
+    {"kind": "text", "text": ...} 和 {"kind": "tool_use", "id": ..., "name": ..., "input": ...}，
+    经 llm/types.py 的 build_assistant_blocks() 构造、parse_assistant_blocks() 解析。
+    不要改用 type——两家 wire 的 type 取值恰好都叫 tool_use、入参字段也都叫 input，
+    用 type 会让残留的 provider 形状数据被静默误读并潜伏到运行时。
+13. tool 消息沿用 ToolResultMessage，本身即自有协议，形状不变。
+14. 出站编码是 stream() 的内部步骤，_encode_messages / _encode_system / _encode_tools
+    是各家客户端的私有方法，不要提升到 BaseLLMClient 抽象成员（维持 provider、stream、
+    complete_structured 三个）；也不要在调用方翻译消息形状。
 
 Anthropic SDK 使用规范：
 1. 新增或修改 Anthropic SDK 相关代码前，必须先查阅 Anthropic 官方文档：
