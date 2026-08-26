@@ -619,10 +619,11 @@ class MemoryExtractionService:
         if message.role == "assistant":
             text_parts = []
             if isinstance(message.content, list):
+                # 落库的 assistant 消息是中立块数组,判别键为 kind(llm/types.py)。
                 text_parts = [
                     str(block.get("text", ""))
                     for block in message.content
-                    if isinstance(block, dict) and block.get("type") == "text"
+                    if isinstance(block, dict) and block.get("kind") == "text"
                 ]
             elif isinstance(message.content, str):
                 text_parts = [message.content]

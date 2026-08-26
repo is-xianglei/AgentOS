@@ -5,7 +5,6 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from llm.types import ToolResultMessage
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from session.repository import SessionRepository
 from workspace.service import WorkspaceService
@@ -482,44 +481,31 @@ class SessionService:
         rendered_memories_message_id: int | None = None,
         rendered_memories: str | None = None,
     ) -> list[dict[str, Any]]:
-        """把持久化消息转换为模型上下文，可对指定消息创建临时请求副本。"""
+        """把持久化消息转换为中立上下文，可对指定消息创建临时请求副本。
+
+        三类角色均原样透出库中的中立形状（user 纯文本、assistant 中立块数组、
+        tool 为 ToolResultMessage dict），不做任何 provider wire 编码——
+        编码（含 Anthropic 的连续工具结果合并）由各 LLM Client 的出站翻译私有完成。
+        deepcopy 隔离 ORM 可变字段：下游压缩会原地改写上下文，不得写回落库对象。
+        """
         context: list[dict[str, Any]] = []
         for message in messages:
-            if message.role in {"user", "assistant"}:
-                content = deepcopy(message.content)
-                if (
-                    message.id == rendered_memories_message_id
-                    and rendered_memories
-                    and isinstance(content, str)
-                ):
-                    content = f"{rendered_memories}\n\n{content}"
-                if (
-                    message.id == additional_context_message_id
-                    and additional_context
-                    and isinstance(content, str)
-                ):
-                    content = f"{content}\n\n{additional_context}"
-                context.append({"role": message.role, "content": content})
-            elif message.role == "tool":
-                tool_result = ToolResultMessage.from_content_dict(message.content)
-                block: dict[str, Any] = {
-                    "type": "tool_result",
-                    "tool_use_id": tool_result.tool_use_id,
-                    "content": tool_result.output,
-                }
-                if tool_result.is_error:
-                    block["is_error"] = True
-                previous_content = context[-1].get("content") if context else None
-                if (
-                    context
-                    and context[-1].get("role") == "user"
-                    and isinstance(previous_content, list)
-                    and previous_content
-                    and previous_content[0].get("type") == "tool_result"
-                ):
-                    context[-1]["content"].append(block)
-                else:
-                    context.append({"role": "user", "content": [block]})
+            if message.role not in {"user", "assistant", "tool"}:
+                continue
+            content = deepcopy(message.content)
+            if (
+                message.id == rendered_memories_message_id
+                and rendered_memories
+                and isinstance(content, str)
+            ):
+                content = f"{rendered_memories}\n\n{content}"
+            if (
+                message.id == additional_context_message_id
+                and additional_context
+                and isinstance(content, str)
+            ):
+                content = f"{content}\n\n{additional_context}"
+            context.append({"role": message.role, "content": content})
         return context
 
     def _summarize_title(self, content: str) -> str:

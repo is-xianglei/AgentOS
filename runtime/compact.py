@@ -62,49 +62,35 @@ class CompactService:
     def _micro_compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """L1 微压缩:把第 4 条以后的旧工具结果替换为占位符。
 
-        - 仅当历史 tool_result 超过 3 条时才动手;
+        遍历的是中立上下文:工具结果是 role="tool" 的 ToolResultMessage dict,
+        自带 tool_name,无需再从 assistant 的 tool_use 块反查;语义不随 provider 变。
+        - 仅当历史工具结果超过 3 条时才动手;
         - 跳过最近 3 条工具结果(保留近期上下文完整);
         - read_file 类参考资料原样保留;
-        - 内容短于 100 字符的不压(收益太小)。
+        - 内容短于 500 字符的不压(收益太小)。
         """
         tool_results: list[dict[str, Any]] = []
         for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "user":
+            if not isinstance(message, dict) or message.get("role") != "tool":
                 continue
             content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool_results.append(block)
+            if isinstance(content, dict):
+                tool_results.append(content)
 
         if len(tool_results) <= _MICRO_KEEP_RECENT:
             return messages
 
-        # 反查 tool_use_id -> tool_name,assistant 消息的 content 是 tool_use 块列表。
-        tool_name_map: dict[str, str] = {}
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    tool_name_map[block.get("id", "")] = block.get("name", "")
-
         # 注意:这里压缩"前 N-3"条(即较旧的部分),保留最近 3 条。
         for result_item in tool_results[:-_MICRO_KEEP_RECENT]:
-            content_value = result_item.get("content")
-            if not isinstance(content_value, str):
+            output = result_item.get("output")
+            if not isinstance(output, str):
                 continue
-            if len(content_value) <= _MICRO_MIN_LEN:
+            if len(output) <= _MICRO_MIN_LEN:
                 continue
-            tool_id = result_item.get("tool_use_id", "")
-            tool_name = tool_name_map.get(tool_id, "tool")
+            tool_name = result_item.get("tool_name") or "tool"
             if tool_name in _PRESERVE_TOOL_NAMES:
                 continue
-            result_item["content"] = f"[Previous: used {tool_name}]"
+            result_item["output"] = f"[Previous: used {tool_name}]"
 
         return messages
 

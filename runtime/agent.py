@@ -34,6 +34,7 @@ from llm.types import (
     ToolResultMessage,
     ToolSpec,
     ToolUse,
+    build_assistant_blocks,
 )
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
@@ -639,13 +640,14 @@ class AgentRuntime:
             result = assembler.last_result
             stop_reason = result.stop_reason
             tool_uses = result.tool_uses
-            final_content = result.provider_content
+            # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
+            final_content = build_assistant_blocks(result.text, tool_uses)
 
             provider, effective_model = self._llm_attribution(model_override)
             assistant_message = await self.session_service.add_message(
                 session_id,
                 "assistant",
-                final_content if final_content else "",
+                final_content,
                 turn_id=turn.id,
                 provider=provider,
                 model=effective_model,
@@ -1620,12 +1622,13 @@ class AgentRuntime:
         ):
             await self.bus.emit(event)
 
-        final_content = assembler.last_result.provider_content
+        result = assembler.last_result
+        final_content = build_assistant_blocks(result.text, result.tool_uses)
         provider, effective_model = self._llm_attribution(model_name)
         return await self.session_service.add_message(
             session_id,
             "assistant",
-            final_content if final_content else "",
+            final_content,
             turn_id=turn.id,
             provider=provider,
             model=effective_model,

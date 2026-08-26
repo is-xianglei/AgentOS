@@ -20,7 +20,7 @@ from core.events import (
     teammate_actor,
 )
 from llm import BaseLLMClient, create_llm_client
-from llm.types import LLMTurnResult
+from llm.types import LLMTurnResult, ToolResultMessage, build_assistant_blocks
 from memory.recall.repository import MemoryRecallRepository
 from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
@@ -305,16 +305,18 @@ class SubAgentRunner:
                     extra={"session_id": session_id, "agent_type": agent_type},
                 )
             await self._emit_tool_result(actor, session_id, tool_use, output, is_error=is_error)
+            # 中立协议下工具结果是独立的 tool 角色消息,编成各家 wire(Anthropic 的
+            # tool_result 块 / OpenAI 的 role="tool" 消息)由客户端出站翻译负责。
             messages.append(
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": output,
-                        }
-                    ],
+                    "role": "tool",
+                    "content": ToolResultMessage(
+                        tool_use_id=tool_use.id,
+                        tool_name=tool_use.name,
+                        input_args=tool_use.input,
+                        output=output,
+                        is_error=is_error,
+                    ).to_content_dict(),
                 }
             )
 
@@ -359,7 +361,9 @@ class SubAgentRunner:
                 model=model,
             )
             tool_uses = result.tool_uses
-            messages.append({"role": "assistant", "content": result.provider_content or ""})
+            messages.append(
+                {"role": "assistant", "content": build_assistant_blocks(result.text, tool_uses)}
+            )
             last_text = result.text or last_text
 
             if not tool_uses:
@@ -504,7 +508,8 @@ class SubAgentRunner:
         """从 member.history(JSON 字符串)反序列化历史 messages。
 
         history 为空时用 member.prompt 初始化首条 user 消息。历史里的每个元素都是
-        JSON 原生 dict(写回时由 model_dump(mode="json") 保证),可直接 round-trip。
+        中立消息(assistant 块由 to_dict() 产出,tool 结果由 to_content_dict() 产出),
+        均为 JSON 原生结构,可直接 round-trip 后继续发给任一 provider。
         """
         raw = (member.history or "").strip()
         if raw:
@@ -578,8 +583,11 @@ class SubAgentRunner:
                 model=model,
             )
             tool_uses = result.tool_uses
-            # provider_content 已是 model_dump(mode="json") 产物(JSON 原生),可直接落库。
-            messages.append({"role": "assistant", "content": result.provider_content or ""})
+            # 中立块由 to_dict() 产出,均为 JSON 原生结构,可直接随 messages 落
+            # team_members.history 并由 _load_history() 原样 round-trip。
+            messages.append(
+                {"role": "assistant", "content": build_assistant_blocks(result.text, tool_uses)}
+            )
 
             if not tool_uses:
                 return result.text
