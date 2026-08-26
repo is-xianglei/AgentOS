@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentOS 多 Provider 请求全链路</title>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --color-paper:  #f5f5f5;
+    --color-ink:    #2d3142;
+    --color-muted:  #4f5d75;
+    --color-soft:   #7a8399;
+    --color-accent: #eb6c36;
+    --color-link:   #2e5aa8;
+    --font-sans:  'Geist', system-ui, sans-serif;
+    --font-serif: 'Instrument Serif', serif;
+    --font-mono:  'Geist Mono', ui-monospace, monospace;
+  }
+  body {
+    font-family: var(--font-sans);
+    background: var(--color-paper);
+    color: var(--color-ink);
+    display: flex; justify-content: center;
+    padding: 3rem 2rem;
+  }
+  .frame { max-width: 1280px; width: 100%; }
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--color-muted); margin-bottom: 0.5rem;
+  }
+  h1 {
+    font-family: var(--font-serif); font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+    font-weight: 400; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 0.5rem;
+  }
+  .subtitle { color: var(--color-muted); font-size: 0.86rem; margin-bottom: 1.75rem; }
+  svg { width: 100%; min-width: 900px; display: block; }
+  h2 {
+    font-family: var(--font-serif); font-size: 1.35rem; font-weight: 400;
+    margin: 2.5rem 0 1.25rem;
+  }
+  .cards { display: grid; grid-template-columns: 1.1fr 1.1fr 0.9fr; gap: 1rem; }
+  .card {
+    background: #ffffff; border: 1px solid rgba(45,49,66,0.12);
+    border-radius: 6px; padding: 1.25rem;
+  }
+  .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .card-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot-muted  { background: var(--color-muted); }
+  .dot-coral  { background: var(--color-accent); }
+  .dot-ink    { background: var(--color-ink); }
+  .card h3 { font-size: 0.9rem; font-weight: 600; }
+  .card pre {
+    font-family: var(--font-mono); font-size: 0.68rem; line-height: 1.65;
+    background: rgba(45,49,66,0.04); border-radius: 4px; padding: 0.75rem;
+    overflow-x: auto; margin-bottom: 0.75rem; color: var(--color-ink);
+  }
+  .card p, .card li { font-size: 0.78rem; line-height: 1.7; color: var(--color-muted); }
+  .card ul { list-style: none; }
+  .card li { padding-left: 0.9rem; position: relative; }
+  .card li::before {
+    content: '·'; position: absolute; left: 0.2rem; color: var(--color-soft);
+  }
+  .card code {
+    font-family: var(--font-mono); font-size: 0.72rem; color: var(--color-ink);
+  }
+  .verdict {
+    margin-top: 0.75rem; padding-top: 0.75rem;
+    border-top: 1px solid rgba(45,49,66,0.10);
+    font-size: 0.76rem; font-weight: 500;
+  }
+  .bad  { color: var(--color-accent); }
+  .good { color: var(--color-muted); }
+  footer {
+    margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid rgba(45,49,66,0.12);
+    font-family: var(--font-mono); font-size: 0.66rem; color: var(--color-soft);
+  }
+</style>
+</head>
+<body>
+<div class="frame">
+  <p class="eyebrow">Architecture · AgentOS</p>
+  <h1>多 Provider 请求全链路</h1>
+  <p class="subtitle">出站翻译独立成层，入站适配归各家 Client 私有 —— 方案 B 的核心非对称。</p>
+
+  <svg viewBox="0 0 1280 720" role="img" aria-labelledby="t1 d1" xmlns="http://www.w3.org/2000/svg">
+    <title id="t1">AgentOS 多 Provider 请求全链路架构图</title>
+    <desc id="d1">用户 SSE 请求进入 AgentRuntime 后，由 create_llm_client 工厂读取 AGENTOS_LLM_PROVIDER 判定 provider，中立消息经出站翻译层编成各家 wire 形状，Anthropic 与 OpenAI 客户端各自在 stream 内部把原生 chunk 适配回中立事件，再经 TurnEventAssembler 装配为 SSE 事件推给前端，同时以自有协议落库。</desc>
+
+    <defs>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+      </marker>
+      <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/>
+      </marker>
+      <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+      </marker>
+    </defs>
+
+    <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+    <g transform="translate(0,-56)">
+    <!-- ===== 阶段眉标 ===== -->
+    <g font-family="Geist Mono, monospace" font-size="8" letter-spacing="0.14em" fill="#7a8399">
+      <text x="40"  y="132">① 请求进入</text>
+      <text x="240" y="132">② 会话入口与编排</text>
+      <text x="704" y="132" fill="#eb6c36">③ PROVIDER 判定</text>
+      <text x="964" y="132" fill="#eb6c36">④ 出站编码 · 方案 B 新增</text>
+      <text x="776" y="278">⑤ 入站解析 · 归各家 CLIENT 私有</text>
+      <text x="468" y="484">⑥ 落库协议</text>
+    </g>
+
+    <!-- ===== provider 分支 zone ===== -->
+    <rect x="776" y="288" width="440" height="168" rx="8"
+          fill="rgba(235,108,54,0.035)" stroke="rgba(235,108,54,0.50)"
+          stroke-width="1" stroke-dasharray="4,4"/>
+
+    <!-- ===== 连接线（先画，压在节点之下） ===== -->
+    <g fill="none" stroke-linecap="round">
+      <path d="M 160 164 H 240" stroke="#2e5aa8" stroke-width="1.5" marker-end="url(#arrow-link)"/>
+      <path d="M 240 200 H 160" stroke="#2e5aa8" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-link)"/>
+      <path d="M 392 180 H 468" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <path d="M 624 180 H 704" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <path d="M 880 180 H 964" stroke="#eb6c36" stroke-width="1.75" marker-end="url(#arrow-accent)"/>
+      <path d="M 1000 216 V 248 Q 1000 256 992 256 H 872 Q 864 256 864 264 V 328"
+            stroke="#eb6c36" stroke-width="1.75" marker-end="url(#arrow-accent)"/>
+      <path d="M 1128 216 V 328" stroke="#eb6c36" stroke-width="1.75" marker-end="url(#arrow-accent)"/>
+      <path d="M 864 414 V 496"  stroke="#4f5d75" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <path d="M 1128 414 V 496" stroke="#4f5d75" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+      <path d="M 776 530 H 752 Q 744 530 744 538 V 596 Q 744 604 736 604 H 320 Q 312 604 312 596 V 216"
+            stroke="#2e5aa8" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow-link)"/>
+      <path d="M 532 216 V 496" stroke="#4f5d75" stroke-width="1.5" marker-end="url(#arrow)"/>
+      <path d="M 596 496 V 216" stroke="#7a8399" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+    </g>
+
+    <!-- ===== 连接线标签（不透明遮罩 + 6-8px 间隙） ===== -->
+    <g font-family="Geist Mono, monospace" font-size="8" fill="#4f5d75">
+      <rect x="176" y="206" width="48" height="11" fill="#f5f5f5"/>
+      <text x="200" y="215" text-anchor="middle">SSE 事件流</text>
+
+      <rect x="896" y="161" width="56" height="11" fill="#f5f5f5"/>
+      <text x="924" y="170" text-anchor="middle">中立 → wire</text>
+
+      <rect x="872" y="466" width="94" height="11" fill="#f5f5f5"/>
+      <text x="872" y="475">LLMStreamEvent</text>
+
+      <rect x="1136" y="466" width="64" height="11" fill="#f5f5f5"/>
+      <text x="1136" y="475">同一套契约</text>
+
+      <rect x="700" y="296" width="156" height="11" fill="#f5f5f5"/>
+      <text x="856" y="305" text-anchor="end">system + messages + tools[]</text>
+
+      <rect x="988" y="296" width="132" height="11" fill="#f5f5f5"/>
+      <text x="1120" y="305" text-anchor="end">messages + tools[function]</text>
+
+      <rect x="468" y="586" width="122" height="11" fill="#f5f5f5"/>
+      <text x="529" y="595" text-anchor="middle">StreamEvent → SSE 帧</text>
+
+      <rect x="452" y="352" width="72" height="11" fill="#f5f5f5"/>
+      <text x="524" y="361" text-anchor="end">自有协议落库</text>
+
+      <rect x="604" y="352" width="60" height="11" fill="#f5f5f5"/>
+      <text x="604" y="361">历史回灌</text>
+    </g>
+
+    <!-- ===== 节点 ===== -->
+    <g>
+      <!-- 前端 -->
+      <rect x="40" y="144" width="120" height="72" rx="6"
+            fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <text x="100" y="176" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">前端</text>
+      <text x="100" y="192" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">EventSource</text>
+
+      <!-- 会话 SSE 接口 -->
+      <rect x="240" y="144" width="152" height="72" rx="6"
+            fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="316" y="172" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">会话 SSE 接口</text>
+      <text x="316" y="188" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">session/api.py</text>
+      <text x="316" y="202" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">StreamingResponse</text>
+
+      <!-- AgentRuntime -->
+      <rect x="468" y="144" width="156" height="72" rx="6"
+            fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="546" y="172" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">AgentRuntime</text>
+      <text x="546" y="188" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">.run() 编排 turn</text>
+      <text x="546" y="202" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">工具循环 / compact</text>
+
+      <!-- 工厂（焦点 1） -->
+      <rect x="704" y="144" width="176" height="72" rx="6"
+            fill="rgba(235,108,54,0.10)" stroke="#eb6c36" stroke-width="1.5"/>
+      <text x="792" y="170" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">create_llm_client()</text>
+      <text x="792" y="186" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">读 AGENTOS_LLM_PROVIDER</text>
+      <text x="792" y="200" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">场景覆盖 &gt; provider 主模型</text>
+
+      <!-- 出站翻译层（焦点 2） -->
+      <rect x="964" y="144" width="252" height="72" rx="6"
+            fill="rgba(235,108,54,0.10)" stroke="#eb6c36" stroke-width="1.5"/>
+      <text x="1090" y="170" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">出站翻译层</text>
+      <text x="1090" y="186" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">中立消息 → 各家 wire 形状</text>
+      <text x="1090" y="200" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">独立成层 · 往返等价测试</text>
+    </g>
+
+      <!-- Anthropic Client -->
+      <rect x="792" y="328" width="144" height="86" rx="6"
+            fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="864" y="354" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">AnthropicClient</text>
+      <text x="864" y="370" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">messages.stream()</text>
+      <text x="864" y="386" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">_AnthropicChunkAdapter</text>
+      <text x="864" y="402" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">已实现</text>
+
+      <!-- OpenAI Client -->
+      <rect x="1056" y="328" width="144" height="86" rx="6"
+            fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="1128" y="354" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">OpenAIClient</text>
+      <text x="1128" y="370" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">chat.completions.stream()</text>
+      <text x="1128" y="386" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">_OpenAIChunkAdapter</text>
+      <text x="1128" y="402" font-family="Geist Mono, monospace" font-size="9"
+            fill="#eb6c36" text-anchor="middle">本期新建</text>
+
+      <!-- TurnEventAssembler -->
+      <rect x="776" y="496" width="424" height="68" rx="6"
+            fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="988" y="522" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">TurnEventAssembler</text>
+      <text x="988" y="538" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">turn 级 block index 全局递增 · block_stop 配对</text>
+      <text x="988" y="552" font-family="Geist Mono, monospace" font-size="9"
+            fill="#7a8399" text-anchor="middle">协议装配由调用方代码保证，provider 不参与</text>
+
+      <!-- session_messages -->
+      <rect x="416" y="496" width="264" height="68" rx="6"
+            fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="548" y="522" font-family="Geist, sans-serif" font-size="12" font-weight="600"
+            fill="#2d3142" text-anchor="middle">session_messages.content</text>
+      <text x="548" y="538" font-family="Geist Mono, monospace" font-size="9"
+            fill="#4f5d75" text-anchor="middle">PostgreSQL · JSONB</text>
+      <text x="548" y="552" font-family="Geist Mono, monospace" font-size="9"
+            fill="#eb6c36" text-anchor="middle">方案 B：全量自有协议，不再存 wire 原文</text>
+    </g>
+
+    </g>
+
+    <!-- ===== 图例（横条置底，独立于图形区） ===== -->
+    <line x1="40" y1="596" x2="1240" y2="596" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+    <g font-family="Geist Mono, monospace" font-size="8" fill="#4f5d75">
+      <rect x="40" y="618" width="14" height="10" rx="2"
+            fill="rgba(235,108,54,0.10)" stroke="#eb6c36" stroke-width="1.5"/>
+      <text x="62" y="626">本期焦点</text>
+
+      <line x1="184" y1="623" x2="216" y2="623" stroke="#2e5aa8" stroke-width="1.5"/>
+      <text x="224" y="626">HTTP / SSE</text>
+
+      <line x1="320" y1="623" x2="352" y2="623" stroke="#eb6c36" stroke-width="1.75"/>
+      <text x="360" y="626">出站：中立 → wire</text>
+
+      <line x1="512" y1="623" x2="544" y2="623" stroke="#4f5d75" stroke-width="1.5"
+            stroke-dasharray="5,4"/>
+      <text x="552" y="626">入站：wire → 中立事件</text>
+
+      <line x1="752" y1="623" x2="784" y2="623" stroke="#7a8399" stroke-width="1.5"
+            stroke-dasharray="4,3"/>
+      <text x="792" y="626">历史回灌</text>
+
+      <text x="920" y="626" fill="#7a8399">非对称原则：出站翻译独立成层可测；入站适配私有于 stream()，不外露 wire 形状</text>
+    </g>
+  </svg>
+
+  <h2>⑥ 落库的是原始格式还是自有协议？</h2>
+  <div class="cards">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-dot dot-muted"></span>
+        <h3>改造前 · 混着存</h3>
+      </div>
+      <pre>role="assistant"
+  → provider_content 原样落库
+  [{"type":"text",...},
+   {"type":"tool_use","id":"toolu_...",
+    "name":..,"input":{..}}]
+
+role="tool"
+  → ToolResultMessage（已是自有协议）
+  {"tool_use_id":..,"tool_name":..,
+   "input_args":{..},"output":..,
+   "is_error":false}</pre>
+      <ul>
+        <li>assistant 存的是 <code>Anthropic wire 原文</code></li>
+        <li>tool 存的是自有协议，还多出 Anthropic 没有的 <code>tool_name</code> / <code>input_args</code></li>
+        <li>同一张表两套语义，取决于 role</li>
+      </ul>
+      <p class="verdict bad">切到 OpenAI：第一轮能出字，第二轮带工具历史必 400</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-dot dot-coral"></span>
+        <h3>改造后 · 全量自有协议</h3>
+      </div>
+      <pre>role="assistant"
+  → 中立块数组
+  [{"kind":"text","text":..},
+   {"kind":"tool_use","id":..,
+    "name":..,"input":{..}}]
+
+role="tool"
+  → ToolResultMessage（保持不变）
+  {"tool_use_id":..,"tool_name":..,
+   "input_args":{..},"output":..,
+   "is_error":false}</pre>
+      <ul>
+        <li>库里再无任何 provider wire 字段</li>
+        <li>回灌时由<strong>出站翻译层</strong>现编成目标 provider 形状</li>
+        <li><code>LLMTurnResult.provider_content</code> 随之删除</li>
+      </ul>
+      <p class="verdict good">同一段历史可在两家 provider 间来回切换</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-dot dot-ink"></span>
+        <h3>方案 B 的改动半径</h3>
+      </div>
+      <ul>
+        <li><code>llm/openai_client.py</code> — 实现 <code>stream()</code> 与私有 chunk 适配器</li>
+        <li><code>session/service.py:476</code> — <code>_messages_to_context()</code> 改产中立形状</li>
+        <li><code>runtime/subagent.py:308</code> — 子代理自建的 tool_result 同步中立化</li>
+        <li><code>runtime/agent.py:642 / :1623</code> — 两处 assistant 落库改存中立块</li>
+        <li><code>runtime/compact.py:70</code> — 压缩遍历改读中立字段名</li>
+      </ul>
+      <p class="verdict good">出站翻译层为新增，入站适配各自私有，互不牵连</p>
+    </div>
+  </div>
+
+  <footer>
+    AgentOS · 08-18-OpenAI流式实现 · 方案 B（stream 实现 + 消息体中立化合并交付）
+  </footer>
+</div>
+</body>
+</html>
