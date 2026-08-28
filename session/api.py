@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -20,6 +21,8 @@ from session.schemas import (
 )
 from session.service import SessionService
 from user.models import UserRecord
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
@@ -46,6 +49,15 @@ async def send_message(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
+    # 链路起点日志：只记提问字符数，正文可能含敏感内容，严禁入日志。
+    logger.info(
+        "收到用户提问",
+        extra={
+            "session_id": payload.session_id,
+            "agent_id": payload.agent_id,
+            "prompt_chars": len(payload.content),
+        },
+    )
     # 如果提供了 session_id，需要验证权限
     if payload.session_id:
         session = await SessionService(db).require_write_access(

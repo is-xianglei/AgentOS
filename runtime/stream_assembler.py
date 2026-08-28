@@ -1,7 +1,9 @@
 """把 provider 中立流事件装配成对外协议 StreamEvent 的装配器。"""
 
 import logging
+import time
 from collections.abc import AsyncIterator
+from uuid import UUID
 
 from core.errors import AgentException
 from core.events import Actor, StreamEvent
@@ -31,9 +33,11 @@ class TurnEventAssembler:
     runtime 自己 emit,装配器只负责「LLM 一次调用产出的内容块」这一段。
     """
 
-    def __init__(self, actor: Actor, session_id: int) -> None:
+    def __init__(self, actor: Actor, session_id: int, *, turn_id: UUID | None) -> None:
         self._actor = actor
         self._session_id = session_id
+        # 仅供日志串链:设为必填关键字参数,避免新增调用点静默漏传导致链路断点。
+        self._turn_id = turn_id
         # turn 级游标:跨 consume 调用累加,保证 index 全 turn 连号。
         self._next_index = 0
         # 以下三项均为单次 consume 的调用内状态,进入 consume 时重置。
@@ -62,8 +66,26 @@ class TurnEventAssembler:
         self._ref_to_index = {}
         self._open = set()
         self._last_result = None
+        # TTFT 观测:起点与标志位都是单次 consume 的局部变量,不挂 self,
+        # 避免污染装配器唯一的跨调用状态(块 index)。
+        stream_started_at = time.perf_counter()
+        first_delta_logged = False
 
         async for event in stream:
+            if not first_delta_logged and event.kind in (
+                LLMEventKind.TEXT_DELTA,
+                LLMEventKind.THINKING_DELTA,
+            ):
+                first_delta_logged = True
+                # 只记首个增量的 TTFT;delta 为高频事件,后续不再计时、不打日志。
+                logger.info(
+                    "LLM 流首个 token 到达",
+                    extra={
+                        "session_id": self._session_id,
+                        "turn_id": str(self._turn_id) if self._turn_id else None,
+                        "ttft_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
+                    },
+                )
             if event.kind is LLMEventKind.BLOCK_START:
                 index = self._next_index
                 self._next_index += 1

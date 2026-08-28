@@ -55,7 +55,7 @@ async def _run_call(
 
 
 def _new_assembler() -> TurnEventAssembler:
-    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID)
+    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID, turn_id=None)
 
 
 # 序列 a 期望:噪声(message_start / message_delta)与 TURN_RESULT 均不产出协议事件。

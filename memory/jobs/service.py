@@ -275,6 +275,8 @@ class MemoryJobRunner:
                 "Memory提取任务执行成功",
                 extra={
                     "job_id": str(job_id),
+                    "session_id": prepared.session_id,
+                    "turn_id": str(prepared.turn_id),
                     "created_count": len(applied.created_ids),
                     "updated_count": len(applied.updated_ids),
                     "rejected_count": applied.rejected_count,

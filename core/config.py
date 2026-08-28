@@ -20,6 +20,11 @@ class Settings(BaseSettings):
         extra="forbid",  # 严格校验:.env 出现未声明的键立即报错,强制 .env/.env.example/Settings 三处同步
     )
 
+    # --- 日志 ----------------------------------------------------------------
+    # 根日志级别,仅支持 DEBUG/INFO/WARNING/ERROR/CRITICAL(大小写不敏感);
+    # 非法取值由 core/logging.py 的 setup_logging() 抛中文 AgentException,不静默回落。
+    log_level: str = "INFO"
+
     # --- LLM Provider 全局开关 -----------------------------------------------
     # 必填,无默认值:未配置、取值不支持、api_key 缺失、模型解析不出时,
     # create_llm_client() 与启动自检一律抛中文 AgentException,不做静默回落。

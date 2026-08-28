@@ -65,7 +65,7 @@ async def _run_call(
 
 
 def _new_assembler() -> TurnEventAssembler:
-    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID)
+    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID, turn_id=None)
 
 
 # ---- 协议事件序列(经装配器) ----

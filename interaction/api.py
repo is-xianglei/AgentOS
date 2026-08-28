@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 from uuid import UUID
 
@@ -17,6 +18,8 @@ from interaction.service import InteractionService
 from runtime.agent import AgentRuntime, format_sse
 from session.service import SessionService
 from user.models import UserRecord
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
@@ -88,6 +91,12 @@ async def resolve_interaction(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
+    # 交互响应入口日志：打在鉴权前，故只陈述"收到"，不断言已恢复执行；
+    # 实际恢复与否由 runtime/agent.py 的恢复日志体现。用户回答正文不入日志。
+    logger.info(
+        "收到人工交互响应",
+        extra={"session_id": session_id, "kind": payload.kind},
+    )
     await _require_session_write_access(db, session_id, current_user.id, workspace_id)
     runtime = AgentRuntime(
         db,

@@ -1,10 +1,14 @@
 import json
+import logging
+import time
 from typing import Any
 
 from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client
 from llm.types import LLMEventKind, LLMTurnResult
 from session.repository import SessionRepository
+
+logger = logging.getLogger(__name__)
 
 # 压缩 L1 的保留参考资料工具白名单:这类工具的输出一旦被替换,模型只能重读文件,反而更费 token.
 _PRESERVE_TOOL_NAMES: frozenset[str] = frozenset({"read_file"})
@@ -41,9 +45,28 @@ class CompactService:
         """
         messages = self._micro_compact(messages)
 
-        if self._estimate_tokens(messages) <= self.threshold:
+        est_tokens_before = self._estimate_tokens(messages)
+        if est_tokens_before <= self.threshold:
+            logger.debug(
+                "上下文未超阈值,本轮不触发自动压缩",
+                extra={
+                    "session_id": session_id,
+                    "est_tokens": est_tokens_before,
+                    "threshold": self.threshold,
+                },
+            )
             return messages
 
+        # 压缩含一次 LLM 调用,先记触发再记完成,中途失败时可据触发日志定位中断点。
+        logger.info(
+            "上下文超过阈值,触发自动压缩",
+            extra={
+                "session_id": session_id,
+                "est_tokens_before": est_tokens_before,
+                "threshold": self.threshold,
+            },
+        )
+        started_at = time.perf_counter()
         compacted = await self._auto_compact(messages)
         summary = compacted[0]["content"] if compacted else ""
         if through_message_id is not None:
@@ -53,6 +76,15 @@ class CompactService:
                 summary,
                 through_message_id=through_message_id,
             )
+        logger.info(
+            "上下文自动压缩完成",
+            extra={
+                "session_id": session_id,
+                "est_tokens_before": est_tokens_before,
+                "est_tokens_after": self._estimate_tokens(compacted),
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
         return compacted
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:

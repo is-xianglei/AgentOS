@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Any
@@ -144,6 +145,11 @@ class AgentRuntime:
         finally:
             # 确保后台任务结束(正常 close 后 producer 已完成;异常/取消时显式收尾)。
             if not producer.done():
+                # 正常完成时 producer 已结束，走到这里说明事件流被消费方提前中断。
+                logger.warning(
+                    "事件流提前中断，取消会话处理任务，客户端可能已断开连接",
+                    extra={"session_id": session_id},
+                )
                 producer.cancel()
             try:
                 await producer
@@ -220,6 +226,10 @@ class AgentRuntime:
             # 完成状态已提交，独立数据库会话中的队友才能读取到本轮最终回复。
             await self._wake_team_members(session_id, turn)
         except asyncio.CancelledError:
+            logger.warning(
+                "会话处理被取消，客户端可能已断开连接",
+                extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
+            )
             if suspension_committed:
                 await self.db.rollback()
             else:
@@ -349,6 +359,15 @@ class AgentRuntime:
             requests,
             "用户取消了运行暂停点。",
         )
+        logger.info(
+            "人工交互已取消",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(turn.id),
+                "kind": ",".join(req.kind for req in requests),
+                "suspension_id": str(suspension_id),
+            },
+        )
         return suspension
 
     async def _produce_resume(
@@ -464,6 +483,15 @@ class AgentRuntime:
                 )
                 return
 
+            logger.info(
+                "人工交互已恢复执行",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(turn.id),
+                    "kind": request.kind,
+                    "suspension_id": str(suspension.id),
+                },
+            )
             interaction = await self._apply_interaction_and_continue(
                 session_id,
                 session,
@@ -568,7 +596,7 @@ class AgentRuntime:
         actor = ORCHESTRATOR_ACTOR
         # 装配器跨本回合多次 LLM 调用共用:块 index 需在 turn 内全局递增连号,
         # 这是它唯一的跨调用状态(详见装配器 docstring)。
-        assembler = TurnEventAssembler(actor, session_id)
+        assembler = TurnEventAssembler(actor, session_id, turn_id=turn.id)
 
         # 回合开始(开场事件,带完整 actor)。
         await self.bus.emit(StreamEvent.turn_start(actor, session_id))
@@ -608,6 +636,9 @@ class AgentRuntime:
             )
         tools: list[ToolSpec] = active_registry.to_specs()
 
+        # 观测用计时与轮次计数，仅供日志使用，不参与业务控制流。
+        loop_started = time.perf_counter()
+        rounds = 0
         stop_reason: str | None = None
         for _ in range(settings.max_tool_iterations):
             history, current, through_message_id = await self.session_service.load_context_for_turn(
@@ -627,6 +658,19 @@ class AgentRuntime:
                 if self.active_agent_id is not None
                 else session.model_name
             )
+            rounds += 1
+            round_model = self._llm_attribution(model_override)[1]
+            round_started = time.perf_counter()
+            logger.info(
+                "LLM调用开始",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(turn.id),
+                    "round": rounds,
+                    "model": round_model,
+                    "msg_count": len(context),
+                },
+            )
             async for event in assembler.consume(
                 self.llm.stream(
                     context,
@@ -637,6 +681,15 @@ class AgentRuntime:
             ):
                 await self.bus.emit(event)
 
+            logger.info(
+                "LLM调用完成",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(turn.id),
+                    "round": rounds,
+                    "duration_ms": round((time.perf_counter() - round_started) * 1000, 2),
+                },
+            )
             result = assembler.last_result
             stop_reason = result.stop_reason
             tool_uses = result.tool_uses
@@ -701,6 +754,19 @@ class AgentRuntime:
             stop_reason = assembler.last_result.stop_reason or "max_iterations"
 
         # 回合结束
+        usage = assembler.last_result.usage
+        logger.info(
+            "回合结束",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(turn.id),
+                "stop_reason": stop_reason,
+                "rounds": rounds,
+                "in_tokens": usage.input_tokens if usage else None,
+                "out_tokens": usage.output_tokens if usage else None,
+                "duration_ms": round((time.perf_counter() - loop_started) * 1000, 2),
+            },
+        )
         await self.bus.emit(
             StreamEvent.turn_end(actor, session_id, stop_reason, assembler.last_result.usage)
         )
@@ -741,14 +807,31 @@ class AgentRuntime:
             else:
                 await nested.commit()
                 job_id = job.id
+                logger.info(
+                    "Memory提取任务已入队",
+                    extra={
+                        "session_id": str(session.id),
+                        "turn_id": str(turn.id),
+                        "job_id": str(job.id),
+                        "mode": (job.payload or {}).get("mode"),
+                    },
+                )
         # 流式运行需要在生产者生命周期内明确提交最终状态，不能依赖请求收尾。
         await self.db.commit()
+        logger.debug(
+            "回合完成状态已提交",
+            extra={"session_id": str(session.id), "turn_id": str(turn.id)},
+        )
         return job_id
 
     async def _run_inline_memory_job(self, job_id: UUID | None) -> None:
         """终轮提交后就地执行提取；失败时由持久 Job 和 Worker 接管。"""
         if job_id is None or not settings.memory_extraction_inline:
             return
+        logger.info(
+            "开始就地执行Memory提取任务",
+            extra={"job_id": str(job_id)},
+        )
         try:
             if self.workspace_id is None or self.user_id is None:
                 raise RuntimeError("就地执行Memory任务缺少可信作用域")
@@ -911,6 +994,15 @@ class AgentRuntime:
                 session_id, tool_use.name, tool_use.input
             )
             if behavior == "ask":
+                logger.info(
+                    "工具权限策略要求人工审批，挂起等待用户确认",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(turn.id),
+                        "tool_name": tool_use.name,
+                        "decision": "ask",
+                    },
+                )
                 remaining = [item for item in tool_uses[idx:] if item.id not in done_ids]
                 return await self._suspend_for_interaction(
                     session_id,
@@ -924,6 +1016,15 @@ class AgentRuntime:
                     existing_suspension,
                 )
             if behavior == "deny":
+                logger.warning(
+                    "工具权限策略拒绝执行该工具调用",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(turn.id),
+                        "tool_name": tool_use.name,
+                        "decision": "deny",
+                    },
+                )
                 await self._record_tool_response(
                     session_id,
                     turn.id,
@@ -1102,6 +1203,15 @@ class AgentRuntime:
             )
         await self.session_service.repo.update_status(session, "awaiting_interaction")
         await self.session_service.mark_turn_status(turn, "awaiting_interaction")
+        logger.info(
+            "人工交互挂起，等待用户响应",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(turn.id),
+                "kind": kind,
+                "suspension_id": str(suspension.id),
+            },
+        )
         return SuspendedInteraction(
             session_id=session_id,
             suspension_id=suspension.id,
@@ -1711,8 +1821,17 @@ class AgentRuntime:
                         parent_allowed_tool_names=self.tool_registry.names,
                         allowed_skill_names=self.allowed_skill_names,
                     )
-            except Exception as exc:  # noqa: BLE001 - 单个队友失败必须与主流程隔离
+            except Exception as exc:
                 # 单个队友失败隔离:发 error 事件后继续唤醒其余成员。
+                # 客户端断连时 SSE error 事件无人接收，服务端必须留下失败痕迹。
+                logger.exception(
+                    "唤醒队友失败，已隔离该队友并继续主流程",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(turn.id),
+                        "member_name": member.name,
+                    },
+                )
                 await self.bus.emit(
                     StreamEvent.error_event(
                         teammate_actor(member.name, run_id=f"wake-{member.id}"),

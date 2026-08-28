@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 
@@ -66,8 +67,22 @@ class MemoryRecallService:
         if existing is not None:
             return existing
         if not MemoryRolloutService.recall_enabled(turn.user_id):
+            # 灰度未命中属预期跳过（默认 rollout=0 时全量跳过），并非召回失败。
+            logger.debug(
+                "记忆召回跳过：用户未命中灰度，并非召回失败",
+                extra={
+                    "session_id": turn.session_id,
+                    "turn_id": str(turn.id),
+                    "user_id": turn.user_id,
+                },
+            )
             return None
 
+        started_at = time.perf_counter()
+        logger.info(
+            "记忆召回开始",
+            extra={"session_id": turn.session_id, "turn_id": str(turn.id)},
+        )
         catalog = await self.memory_service.get_rendered_catalog(turn.workspace_id, turn.user_id)
         recent_texts = await self.repo.list_recent_user_texts(
             turn.workspace_id,
@@ -139,6 +154,16 @@ class MemoryRecallService:
                 )
             else:
                 await nested.commit()
+        logger.info(
+            "记忆召回完成",
+            extra={
+                "session_id": turn.session_id,
+                "turn_id": str(turn.id),
+                "selected_count": len(selected_revisions),
+                "selector_status": selector_status,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
         return context
 
     async def _select_memory_ids(
@@ -151,6 +176,15 @@ class MemoryRecallService:
         if not entries or not recent_texts:
             return _SelectionResult(())
 
+        # 只记候选集规模，不落任何记忆正文。
+        logger.debug(
+            "Memory选择器候选集已就绪",
+            extra={
+                "user_id": user_id,
+                "candidate_count": len(entries),
+                "recent_text_count": len(recent_texts),
+            },
+        )
         catalog_ids = {entry.id for entry in entries}
         prompt = json.dumps(
             {

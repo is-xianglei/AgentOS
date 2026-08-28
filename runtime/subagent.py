@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from copy import deepcopy
 from typing import Any
 from uuid import UUID
@@ -100,6 +101,15 @@ class SubAgentRunner:
         member_name 复用为 agent_type 值,兼容运行记录表与前端事件契约。
         """
         member_name = spec.agent_type.value
+        started_at = time.perf_counter()
+        logger.info(
+            "子代理启动",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(parent_turn_id) if parent_turn_id else None,
+                "agent_type": member_name,
+            },
+        )
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         tool_service = ToolService(self.db, tool_registry)
         # omit_inherited_memory 的 spec(如 Explore)不继承父 Turn 记忆:
@@ -125,13 +135,13 @@ class SubAgentRunner:
             run = await self.run_repo.create(session_id, member_name, prompt)
             # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt。
             actor = subagent_actor(member_name, run_id=f"run-{run.id}", task=prompt)
-            assembler = TurnEventAssembler(actor, session_id)
+            assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:
                 # 并发闸门只圈住 ReAct 循环本身(LLM + 工具),不含建记录与事件收尾,
                 # 避免持锁做无谓的 DB 往返。
                 async with _get_concurrency_gate():
-                    report = await self._run_react_loop(
+                    report, rounds = await self._run_react_loop(
                         session_id,
                         actor,
                         assembler,
@@ -152,8 +162,27 @@ class SubAgentRunner:
                 await self._emit_event(
                     StreamEvent.turn_end(actor, session_id, result.stop_reason, result.usage)
                 )
+                logger.info(
+                    "子代理运行完成",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(parent_turn_id) if parent_turn_id else None,
+                        "agent_type": member_name,
+                        "rounds": rounds,
+                        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    },
+                )
                 return report
             except Exception as exc:
+                logger.exception(
+                    "子代理运行失败",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(parent_turn_id) if parent_turn_id else None,
+                        "agent_type": member_name,
+                        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    },
+                )
                 await self.run_repo.fail(run, str(exc))
                 await self.db.commit()
                 await self._emit_event(
@@ -346,12 +375,12 @@ class SubAgentRunner:
         workspace_id: int | None,
         *,
         allowed_skill_names: frozenset[str] | None = None,
-    ) -> str:
-        """执行子代理 ReAct 循环并返回报告。系统提示、工具集与轮次上限均取自 spec。"""
+    ) -> tuple[str, int]:
+        """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示、工具集与轮次上限均取自 spec。"""
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         model = spec.resolve_model()
         last_text = ""
-        for _ in range(max(1, spec.max_rounds)):
+        for round_index in range(max(1, spec.max_rounds)):
             result = await self._stream_and_collect(
                 messages,
                 system_prompt,
@@ -367,7 +396,7 @@ class SubAgentRunner:
             last_text = result.text or last_text
 
             if not tool_uses:
-                return result.text
+                return result.text, round_index + 1
 
             await self._execute_tool_uses(
                 session_id,
@@ -393,7 +422,7 @@ class SubAgentRunner:
             extra={"session_id": session_id, "agent_type": spec.agent_type.value},
         )
         notice = f"[注意] 子代理已达 {spec.max_rounds} 轮工具调用上限,以下为截断的中间结论:"
-        return f"{notice}\n\n{last_text}" if last_text else notice
+        return (f"{notice}\n\n{last_text}" if last_text else notice), max(1, spec.max_rounds)
 
     # ============ teammate 模式(B1: 无状态短运行 + 请求内唤醒) ============
 
@@ -415,6 +444,14 @@ class SubAgentRunner:
         本方法是一个「恢复 + 单次推进」运行单元:跑完即结束,不起常驻线程。
         任何实例都能据 DB 接着唤醒,多实例正确性由 DB 保证。
         """
+        logger.info(
+            "唤醒 teammate,开始单次推进",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(parent_turn_id) if parent_turn_id else None,
+                "member_name": member_name,
+            },
+        )
         team_service = TeamService(self.db)
         member = await team_service.repo.get_member(session_id, member_name)
         if member is None:
@@ -438,7 +475,7 @@ class SubAgentRunner:
         # task=初始任务,team 携带 team_id(若已归属团队)。
         team_ref = TeamRef(id=member.team_id) if member.team_id is not None else None
         actor = teammate_actor(name, run_id=instance_id, task=member.prompt, team=team_ref)
-        assembler = TurnEventAssembler(actor, session_id)
+        assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
         try:
             # 1) 从 member.history 反序列化历史;为空则用初始 prompt 起一条 user 消息。
             messages = self._load_history(member)
@@ -492,6 +529,15 @@ class SubAgentRunner:
             )
             return report
         except Exception as exc:
+            # 失败先落日志再回滚:客户端断连时 SSE 事件送不出去,服务端日志是唯一现场。
+            logger.exception(
+                "teammate 推进失败",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(parent_turn_id) if parent_turn_id else None,
+                    "member_name": member_name,
+                },
+            )
             await self.db.rollback()
             await self._emit_event(
                 StreamEvent.error_event(

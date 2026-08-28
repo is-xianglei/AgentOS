@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "验收基准：逐条核对新增日志的级别选择、中文消息、extra 用法与敏感信息红线是否合规"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "检查是否引入禁止模式（print、f-string 日志、Optional[T] 等）"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "本次改动横跨 api/service/runtime/llm/tools/memory 六层，用它检查各层上下文字段（session_id/turn_id）传递是否一致、有无遗漏层"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "耗时测量与 KV 字段命名在多处重复出现，用它检查是否应收敛为共用写法而非各写各的"}

@@ -4,6 +4,7 @@ import signal
 import time
 
 from core.config import settings
+from core.logging import setup_logging
 from database.engine import AsyncSessionLocal
 from memory.jobs.service import MemoryJobRunner
 from memory.jobs.retention import MemoryRetentionRunner
@@ -100,5 +101,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    # 复用主进程的日志装配,保证 Worker 与 API 进程格式一致(KV Formatter + 级别配置)。
+    setup_logging()
     asyncio.run(main())

@@ -127,6 +127,16 @@ except Exception:
 | `job_id` | `str` | 异步任务 ID |
 | `user_id` | `str` | 用户 ID |
 | `agent_type` | `str` | Agent 类型 |
+| `duration_ms` | `float` | 耗时毫秒，统一 `round(x, 2)`；用 `time.perf_counter()` 测量 |
+| `ttft_ms` | `float` | 流式首 token 到达耗时，单次 consume 内只打一条，不按 delta 刷屏 |
+| `tool_name` | `str` | 工具名；**只记名字与结果，不记入参**（入参可能含敏感路径或命令） |
+| `prompt_chars` | `int` | 用户提问字符数；**正文严禁入日志** |
+| `round` / `rounds` | `int` | 当前 ReAct 轮次 / 本回合总轮数 |
+| `msg_count` | `int` | 送入 LLM 的上下文消息数 |
+| `stop_reason` | `str` | 回合终止原因 |
+| `in_tokens` / `out_tokens` | `int` | 回合 token 用量（仅日志，不落库、不改 SSE 契约） |
+| `est_tokens_before` / `est_tokens_after` | `int` | 上下文压缩前后的 token 估算 |
+| `member_name` | `str` | teammate 名称 |
 
 ### 示例
 
@@ -275,3 +285,168 @@ except Exception:
 - `/Users/xianglei/Documents/develop/code/python/AgentOS/runtime/agent.py`
 - `/Users/xianglei/Documents/develop/code/python/AgentOS/memory/jobs/service.py`
 - `/Users/xianglei/Documents/develop/code/python/AgentOS/hooks/__init__.py`
+
+---
+
+## 日志基建契约（`core/logging.py`）
+
+### 1. Scope / Trigger
+
+新增环境变量 `AGENTOS_LOG_LEVEL` 并以自定义 Formatter 接管全局输出格式，
+属于 env wiring + 跨层输出契约变更，故按 code-spec 深度记录。
+
+### 2. Signatures
+
+```python
+# core/logging.py
+def setup_logging() -> None: ...
+
+class _KeyValueFormatter(logging.Formatter):
+    def formatMessage(self, record: logging.LogRecord) -> str: ...
+
+_THIRD_PARTY_FLOOR_LOGGERS: tuple[str, ...]   # 压级名单
+_BUILTIN_FIELDS: set[str]                     # 探测法生成，非硬编码
+
+# core/config.py
+class Settings(BaseSettings):
+    log_level: str = "INFO"
+```
+
+### 3. Contracts
+
+**环境变量**
+
+| 键 | 必填 | 取值 | 默认 | 同步点 |
+|---|---|---|---|---|
+| `AGENTOS_LOG_LEVEL` | 否 | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`（大小写不敏感） | `INFO` | `core/config.py` + `.env` + `.env.example` 三处缺一不可 |
+
+**输出行格式**
+
+```
+<asctime> <levelname> <logger name> <中文消息> key=value key=value
+```
+
+- `extra` 传入的字段按插入顺序追加到**消息行尾**；
+- 无 `extra` 时行尾**不得**有多余空格；
+- `LogRecord` 内置属性（`pathname`/`lineno`/`msecs`/`taskName` 等）不得外泄。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 行为 |
+|---|---|
+| `AGENTOS_LOG_LEVEL` 未设置 | 取代码默认 `INFO` |
+| 取值合法（任意大小写） | 生效 |
+| 取值非法（如 `VERBOSE`） | 启动即抛中文 `AgentException`（"日志级别配置非法"），**不静默回落默认值** |
+| `.env` 有键但 `Settings` 无字段 | `extra="forbid"` 导致启动失败 —— 这是保护不是缺陷 |
+| 根级别降到 `DEBUG` | 第三方 SDK logger 仍压在 `INFO`（见下方安全约束） |
+| 根级别高于 `INFO`（如 `WARNING`） | 第三方同步抬高，不得比根更吵 |
+
+### 5. Good / Base / Bad Cases
+
+- **Good**：`logger.info("记忆召回完成", extra={"session_id": 42, "selected": 3})`
+  → `... 记忆召回完成 session_id=42 selected=3`
+- **Base**：无 `extra` 的普通日志 → 原样输出，行尾无空格
+- **Bad**：`logger.info(f"会话 {sid} 召回完成")` → 禁止 f-string 内插，
+  上下文必须走 `extra`，否则无法 grep 字段、也无法被聚合系统解析
+
+### 6. Tests Required
+
+`tests/test_logging_formatter.py`（基建）与 `tests/test_logging_chain.py`（链路语义）：
+
+| 断言点 | 说明 |
+|---|---|
+| `extra` 字段出现在消息行尾 | 渲染契约 |
+| 无 `extra` 时 `output == output.rstrip()` | 行尾无多余空格 |
+| 异常日志字段在 `lines[0]`、`lines[-1] == "ValueError: boom"` | **核心防回归** |
+| 内置属性不出现在输出中 | 探测法有效 |
+| 非法级别抛中文 `AgentException` | 无静默兜底 |
+| 根 `DEBUG` 时第三方 logger `level == INFO` | 防 Prompt 泄漏 |
+| 失败日志 `record.exc_info is not None` | 证明是 `exception()` 而非 `error()` |
+
+### 7. Wrong vs Correct：Formatter 必须覆盖 `formatMessage()`
+
+`logging.Formatter.format()` 的顺序是**先**生成消息行、**再**把 traceback 拼在其后。
+在 `format()` 里追加 `extra`，异常日志的字段会落到**堆栈最后一行**。
+
+#### Wrong
+
+```python
+class _KeyValueFormatter(logging.Formatter):
+    def format(self, record):
+        return f"{super().format(record)} {pairs}"   # 字段被拼到 traceback 末行
+```
+
+```
+Traceback (most recent call last):
+  ...
+ValueError: boom tool=Bash session_id=42     # ← 堆栈被污染，无法解析
+```
+
+#### Correct
+
+```python
+class _KeyValueFormatter(logging.Formatter):
+    def formatMessage(self, record):
+        message = super().formatMessage(record)
+        pairs = " ".join(
+            f"{k}={v}" for k, v in record.__dict__.items() if k not in _BUILTIN_FIELDS
+        )
+        return f"{message} {pairs}" if pairs else message
+```
+
+```
+2026-08-28 16:31:55 ERROR tools.service 工具执行失败 tool=Bash session_id=42
+Traceback (most recent call last):
+  ...
+ValueError: boom
+```
+
+> **内置属性集用探测法生成，不要硬编码清单**：
+> `set(logging.LogRecord("", logging.INFO, "", 0, "", None, None).__dict__) | {"asctime", "message"}`。
+> Python 3.14 的 `LogRecord` 已含 `taskName`，硬编码清单会随版本失效。
+
+---
+
+## Gotchas
+
+### Gotcha: DEBUG 档会经第三方 SDK 泄漏完整 Prompt
+
+> **Warning**：`openai._base_client`、`httpcore2` 等在 `DEBUG` 级别会把**完整请求体**
+> （system prompt 与对话正文）打进日志，直接违反本文档「严禁记录 Prompt 正文」的约束。
+
+引入 `AGENTOS_LOG_LEVEL=DEBUG` 就等于打开了这个泄漏面，必须由压级名单挡住：
+
+```python
+# 取根级别与 INFO 的较高者：根降到 DEBUG 时第三方停在 INFO，
+# 根高于 INFO 时同步抬高，避免第三方比根更吵。
+floor = max(logging.getLevelNamesMapping()[level_name], logging.INFO)
+for name in _THIRD_PARTY_FLOOR_LOGGERS:
+    logging.getLogger(name).setLevel(floor)
+```
+
+名单需同时覆盖 `httpx2`/`httpcore2`（本项目实际分发名，其内部 logger 名即为 `"httpx2"`）
+与 `httpx`/`httpcore`，防依赖切换后失效。
+
+**实测对照**：修复前后同一次问答，含 Prompt 正文的日志行 2 → 0，
+第三方 DEBUG 行 62 → 0，日志体积 132K → 4.0K，而本项目自己的 DEBUG 埋点 5 条不受影响。
+
+### Gotcha: 本项目 `.env` 覆盖 shell 环境变量
+
+`core/config.py` 的 `settings_customise_sources` **故意**把 `.env` 排在 shell env 之前
+（防残留环境变量劫持配置的既有设计）。因此下面这条验证命令在本项目**无效**：
+
+```bash
+# ❌ 无效：.env 的值会覆盖它
+AGENTOS_LOG_LEVEL=DEBUG uv run uvicorn main:app
+
+# ✅ 有效：改 .env
+sed -i '' 's/^AGENTOS_LOG_LEVEL=.*/AGENTOS_LOG_LEVEL=DEBUG/' .env
+```
+
+调整任何 `AGENTOS_*` 配置做临时验证时都适用，验证后记得还原。
+
+### Gotcha: 回滚时必须同步删除 `.env` 中的配置键
+
+`Settings.model_config` 为 `extra="forbid"`。`git revert` 掉代码后，
+`.env` 里残留的 `AGENTOS_LOG_LEVEL` 会因字段不存在导致**启动直接失败**。
+凡新增配置项，回滚步骤都必须包含「删除 `.env` 中对应键」。

@@ -68,7 +68,7 @@ def _ev(event_type: str, **payload: Any) -> dict[str, Any]:
 
 
 def _new_assembler() -> TurnEventAssembler:
-    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID)
+    return TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID, turn_id=None)
 
 
 async def test_text_block_roundtrip() -> None:
@@ -259,8 +259,8 @@ async def test_turn_result_without_payload_raises() -> None:
 
 async def test_concurrent_actors_have_independent_indexes() -> None:
     """多产出者并发:各持独立装配器,index 唯一性域是 (actor, turn),各自从 0 起。"""
-    main = TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID)
-    sub = TurnEventAssembler(subagent_actor("explore", run_id="run-1"), _SID)
+    main = TurnEventAssembler(ORCHESTRATOR_ACTOR, _SID, turn_id=None)
+    sub = TurnEventAssembler(subagent_actor("explore", run_id="run-1"), _SID, turn_id=None)
     seq = [
         _block_start(0),
         _text(0, "各自独立"),

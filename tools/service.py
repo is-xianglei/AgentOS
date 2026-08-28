@@ -1,3 +1,5 @@
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -5,15 +7,17 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.event_bus import StreamBus
 from core.errors import AgentException
+from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from hooks import HookContext, HookEvent, get_hook_registry
-from tools.models import ToolCallRecord, ToolRecord
-from tools.repository import ToolCatalogRepository, ToolRepository
 from tools.base import ToolContext
+from tools.models import ToolCallRecord, ToolRecord
 from tools.registry import ToolRegistry, build_tool_registry
+from tools.repository import ToolCatalogRepository, ToolRepository
 from tools.shell_policy import ShellAccess
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -227,6 +231,16 @@ class ToolService:
             await self.db.flush()
             return blocked
 
+        # 三态日志只记工具名与结果,不记入参:入参可能含敏感路径、命令或密钥。
+        logger.info(
+            "工具开始执行",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(turn_id),
+                "tool_name": tool_name,
+            },
+        )
+        started_at = time.perf_counter()
         try:
             tool = self.registry.get(tool_name)
             ctx = ToolContext(
@@ -244,6 +258,16 @@ class ToolService:
             # 开始执行工具
             output = await tool.run_with_dict(input_args, ctx)
         except Exception as exc:
+            # 失败先记日志再落库,避免后续落库或 hook 抛错吞掉现场;不改变原有 raise 时序。
+            logger.exception(
+                "工具执行失败",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(turn_id),
+                    "tool_name": tool_name,
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                },
+            )
             await self.tool_repo.fail(record, str(exc))
             await self.db.flush()
             # 让"工具失败告警" hook 能观测到;触发后原样上抛。
@@ -262,6 +286,16 @@ class ToolService:
             raise
         await self.tool_repo.succeed(record, output)
         await self.db.flush()
+        logger.info(
+            "工具执行完成",
+            extra={
+                "session_id": session_id,
+                "turn_id": str(turn_id),
+                "tool_name": tool_name,
+                "status": "success",
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            },
+        )
 
         # PostToolUse:观察副作用 / 检查输出(返回值不改写结果,只做观测与副作用)。
         await hooks.trigger(
