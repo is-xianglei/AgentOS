@@ -113,7 +113,11 @@ async def test_text_and_tool_use_sequence() -> None:
 
 
 async def test_thinking_text_interleaved_sequence() -> None:
-    """序列 c:thinking/text 交错三块;signature_delta 噪声不产出事件。"""
+    """序列 c:thinking/text 交错三块;signature_delta 噪声不产出事件。
+
+    signature 不进事件流是刻意的:它对前端毫无意义,只在回传给 Anthropic 时
+    需要,故只随终局结果带出(见 test_llm_thinking.py 的终局段用例)。
+    """
     events = await _run_call(_new_assembler(), CHUNKS_THINKING_TEXT_INTERLEAVED)
     assert events == _EXPECTED_THINKING_TEXT_INTERLEAVED
 

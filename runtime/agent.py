@@ -694,7 +694,7 @@ class AgentRuntime:
             stop_reason = result.stop_reason
             tool_uses = result.tool_uses
             # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
-            final_content = build_assistant_blocks(result.text, tool_uses)
+            final_content = build_assistant_blocks(result.text, tool_uses, result.thinking)
 
             provider, effective_model = self._llm_attribution(model_override)
             assistant_message = await self.session_service.add_message(
@@ -1733,7 +1733,9 @@ class AgentRuntime:
             await self.bus.emit(event)
 
         result = assembler.last_result
-        final_content = build_assistant_blocks(result.text, result.tool_uses)
+        final_content = build_assistant_blocks(
+            result.text, result.tool_uses, result.thinking
+        )
         provider, effective_model = self._llm_attribution(model_name)
         return await self.session_service.add_message(
             session_id,

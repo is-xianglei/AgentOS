@@ -3,8 +3,8 @@
 驱动方式对标 test_stream_baseline.py:手写裸 chunk 经适配器出中立事件,
 再经 TurnEventAssembler 出协议事件,不建真实 SDK 连接。覆盖 AC2(坏 JSON
 抛中文异常)与 AC3(usage / stop_reason / tool_uses 正确填充),另固化
-block_ref 分配规则(文本 0 / 工具 1+i)与「工具块不发 BLOCK_STOP、由装配器
-补发」的分层行为,以及与 Anthropic 侧的协议事件逐字段等价(AC1)。
+block_ref 分配规则(思考 0 / 文本 1 / 工具 2+i)与「工具块不发 BLOCK_STOP、
+由装配器补发」的分层行为,以及与 Anthropic 侧的协议事件逐字段等价(AC1)。
 """
 
 from typing import Any
@@ -149,28 +149,28 @@ async def _run_call_anthropic(
 # ---- block_ref 分配与分层行为(中立事件层) ----
 
 
-def test_block_ref_allocation_text_zero_tools_offset() -> None:
-    """block_ref 自建分配:文本块恒占 0,工具块占 1 + tool_call.index。"""
+def test_block_ref_allocation_text_and_tools_offset() -> None:
+    """block_ref 自建分配:文本块恒占 1,工具块占 2 + tool_call.index。"""
     events = _adapt_all(CHUNKS_TEXT_AND_TOOL_USE)
     starts = [e for e in events if e.kind is LLMEventKind.BLOCK_START]
     assert [(e.block_ref, e.block_type) for e in starts] == [
-        (0, BlockType.TEXT),
-        (1, BlockType.TOOL_USE),
+        (1, BlockType.TEXT),
+        (2, BlockType.TOOL_USE),
     ]
 
 
 def test_multi_tool_refs_and_payloads() -> None:
-    """序列 c:多工具并发,ref 按 1+index 分配,入参交错累积互不串块。"""
+    """序列 c:多工具并发,ref 按 2+index 分配,入参交错累积互不串块。"""
     events = _adapt_all(CHUNKS_MULTI_TOOL_USE)
     starts = [e for e in events if e.kind is LLMEventKind.BLOCK_START]
     assert [(e.block_ref, e.block_type) for e in starts] == [
-        (1, BlockType.TOOL_USE),
         (2, BlockType.TOOL_USE),
+        (3, BlockType.TOOL_USE),
     ]
     tool_events = [e for e in events if e.kind is LLMEventKind.TOOL_USE]
     assert [(e.block_ref, e.tool.id, e.tool.name, e.tool.input) for e in tool_events] == [
-        (1, "call_a", "file_read", {"path": "a.txt"}),
-        (2, "call_b", "file_write", {"path": "b.txt", "content": "x"}),
+        (2, "call_a", "file_read", {"path": "a.txt"}),
+        (3, "call_b", "file_write", {"path": "b.txt", "content": "x"}),
     ]
 
 
@@ -178,7 +178,7 @@ def test_tool_blocks_emit_no_block_stop() -> None:
     """工具块不发 BLOCK_STOP(装配器统一补发);文本块在收束点补发。"""
     events = _adapt_all(CHUNKS_TEXT_AND_TOOL_USE)
     stops = [e for e in events if e.kind is LLMEventKind.BLOCK_STOP]
-    assert [e.block_ref for e in stops] == [0]
+    assert [e.block_ref for e in stops] == [1]
     multi_tool_events = _adapt_all(CHUNKS_MULTI_TOOL_USE)
     assert not [e for e in multi_tool_events if e.kind is LLMEventKind.BLOCK_STOP]
 
@@ -195,11 +195,22 @@ def test_noise_chunks_emit_no_events() -> None:
         assert adapter.adapt(chunk) == []
 
 
-def test_no_thinking_delta_emitted() -> None:
-    """THINKING_DELTA 恒不产出:ChoiceDelta 无 reasoning 字段,属协议事实。"""
+def test_no_thinking_delta_without_reasoning_content() -> None:
+    """chunk 不带 reasoning_content 时不产出思考事件,也不开思考块。
+
+    标准 OpenAI 端点与未开思考模式的 DeepSeek 都走这条路径:
+    思考通道靠字段有无自然降级,不需要读配置分支。
+    """
     for chunks in (CHUNKS_SINGLE_TEXT, CHUNKS_TEXT_AND_TOOL_USE, CHUNKS_MULTI_TOOL_USE):
         events = _adapt_all(chunks)
         assert not [e for e in events if e.kind is LLMEventKind.THINKING_DELTA]
+        assert not [
+            e
+            for e in events
+            if e.kind is LLMEventKind.BLOCK_START and e.block_type is BlockType.THINKING
+        ]
+        result = [e for e in events if e.kind is LLMEventKind.TURN_RESULT][-1].result
+        assert result.thinking == []
 
 
 # ---- 终局:usage / stop_reason / tool_uses(AC3) ----

@@ -19,7 +19,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | ✅ 已完成 |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | ✅ 已完成 |
 | [Logging Guidelines](./logging-guidelines.md) | 结构化日志、级别配置、KV Formatter 契约、敏感信息边界与踩坑 | ✅ 已完成 |
-| [LLM Provider Guidelines](./llm-provider-guidelines.md) | LLM 工厂入口、场景模型解析、双 provider 契约、消息成本归因 | ✅ 已完成 |
+| [LLM Provider Guidelines](./llm-provider-guidelines.md) | LLM 工厂入口、场景模型解析、双 provider 契约、消息中立协议与思考块、消息成本归因 | ✅ 已完成 |
 
 ---
 

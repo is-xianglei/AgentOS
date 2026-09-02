@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, cast
 
-from anthropic import NOT_GIVEN, AsyncAnthropic
+from anthropic import NOT_GIVEN, AsyncAnthropic, NotGiven
 from anthropic.types import MessageParam, TextBlockParam, ToolChoiceToolParam, ToolParam
 from pydantic import BaseModel, ValidationError
 
@@ -13,15 +13,17 @@ from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
 from llm.types import (
+    AssistantBlock,
     LLMEventKind,
     LLMStreamEvent,
     LLMTurnResult,
     PromptBlock,
     TextBlock,
+    ThinkingBlock,
+    ThinkingSegment,
     ToolResultMessage,
     ToolSpec,
     ToolUse,
-    ToolUseBlock,
     parse_assistant_blocks,
     parse_tool_result,
     parse_user_text,
@@ -32,9 +34,38 @@ logger = logging.getLogger(__name__)
 # 承载 schema 的工具名，语义中立，避免模型将其误解为业务动作。
 _STRUCTURED_TOOL_NAME = "emit_structured_output"
 
+# Anthropic 对思考预算的硬下限,低于此值 API 直接报错。
+_MIN_THINKING_BUDGET = 1024
+
+
+def _thinking_param() -> dict[str, Any] | NotGiven:
+    """按配置产出 messages.stream() 的 thinking 参数,关闭时返回 NOT_GIVEN。
+
+    显式传 None 会被 SDK 当作有效取值下发,故沿用超时处的 NOT_GIVEN 写法。
+    预算越界当场抛中文异常而不夹取:静默夹取会让实际思考深度与配置不符,
+    成本与效果都对不上账。
+    """
+    if not settings.anthropic_thinking_enabled:
+        return NOT_GIVEN
+    budget = settings.anthropic_thinking_budget_tokens
+    if not _MIN_THINKING_BUDGET <= budget < settings.llm_default_max_tokens:
+        raise AgentException.message(
+            "思考预算配置越界",
+            {
+                "budget_tokens": budget,
+                "min": _MIN_THINKING_BUDGET,
+                "max_tokens": settings.llm_default_max_tokens,
+            },
+        )
+    return {"type": "enabled", "budget_tokens": budget}
+
+# redacted_thinking 归到 THINKING:它是被加密的思考块,对外协议语义与思考一致,
+# 只是无可读文本。漏登记会走静默兜底当成文本块,终局提取时被丢掉,
+# 回传给 Anthropic 时思考块缺失直接 400。
 _BLOCK_TYPE_MAP = {
     "text": BlockType.TEXT,
     "thinking": BlockType.THINKING,
+    "redacted_thinking": BlockType.THINKING,
     "tool_use": BlockType.TOOL_USE,
 }
 
@@ -66,6 +97,28 @@ def _extract_tool_uses(content: list[dict[str, Any]] | None) -> list[ToolUse]:
     ]
 
 
+def _extract_thinking(content: list[dict[str, Any]] | None) -> list[ThinkingSegment]:
+    """从完整消息内容中按序提取思考段(含 redacted_thinking)。
+
+    保序是硬约束:Anthropic 要求带签名的思考块原样回传,不得修改、重排或过滤,
+    同一回合的多段思考签名互不相同,合并成一段即签名失效。
+    """
+    segments: list[ThinkingSegment] = []
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "thinking":
+            segments.append(
+                ThinkingSegment(
+                    text=block.get("thinking", "") or "",
+                    signature=block.get("signature") or None,
+                )
+            )
+        elif block.get("type") == "redacted_thinking":
+            segments.append(ThinkingSegment(redacted_data=block.get("data") or None))
+    return segments
+
+
 def _text_from_content(content: list[dict[str, Any]] | None) -> str:
     """从完整消息内容中拼接文本块。"""
     return "".join(
@@ -75,8 +128,19 @@ def _text_from_content(content: list[dict[str, Any]] | None) -> str:
     )
 
 
-def _encode_assistant_block(block: TextBlock | ToolUseBlock) -> dict[str, Any]:
-    """把 assistant 中立块编成 Anthropic wire 块。"""
+def _encode_assistant_block(block: AssistantBlock) -> dict[str, Any] | None:
+    """把 assistant 中立块编成 Anthropic wire 块,不可回传的思考块返回 None。
+
+    无签名的思考块必须跳过:签名由 Anthropic 签发且不可伪造,回传缺签名的
+    思考块会被判为篡改。切换 provider 后库里会留下 OpenAI 侧产出的无签名思考,
+    此处丢弃即可——它们只用于展示,不参与 Anthropic 的思考完整性校验。
+    """
+    if isinstance(block, ThinkingBlock):
+        if block.redacted_data:
+            return {"type": "redacted_thinking", "data": block.redacted_data}
+        if not block.signature:
+            return None
+        return {"type": "thinking", "thinking": block.text, "signature": block.signature}
     if isinstance(block, TextBlock):
         return {"type": "text", "text": block.text}
     return {
@@ -157,7 +221,13 @@ class _AnthropicChunkAdapter:
         index = int(chunk.get("index", 0))
         cb = chunk.get("content_block") or {}
         raw_type = cb.get("type", "text")
-        block_type = _BLOCK_TYPE_MAP.get(raw_type, BlockType.TEXT)
+        block_type = _BLOCK_TYPE_MAP.get(raw_type)
+        if block_type is None:
+            # 无静默兜底:未知块兜成 TEXT 会让内容以错误类型流向前端,
+            # 且终局提取按 wire type 过滤时被整块丢掉,故障要在此当场暴露。
+            raise AgentException.message(
+                "未知的 Anthropic 内容块类型", {"block_type": raw_type}
+            )
         self._open[index] = _OpenBlock(
             index=index,
             block_type=block_type,
@@ -233,6 +303,7 @@ class _AnthropicChunkAdapter:
         result = LLMTurnResult(
             text=_text_from_content(content),
             tool_uses=_extract_tool_uses(content),
+            thinking=_extract_thinking(content),
             usage=usage,
             stop_reason=chunk.get("stop_reason"),
         )
@@ -315,8 +386,11 @@ class AnthropicClient(BaseLLMClient):
             if role == "user":
                 encoded.append({"role": "user", "content": parse_user_text(content)})
             elif role == "assistant":
+                # 原样遍历不重排:思考块的落库序即 Anthropic 要求的回传序。
                 blocks = [
-                    _encode_assistant_block(block) for block in parse_assistant_blocks(content)
+                    encoded_block
+                    for block in parse_assistant_blocks(content)
+                    if (encoded_block := _encode_assistant_block(block)) is not None
                 ]
                 encoded.append({"role": "assistant", "content": blocks or ""})
             elif role == "tool":
@@ -345,6 +419,8 @@ class AnthropicClient(BaseLLMClient):
         model 留空时回落构造时由工厂按场景解析的模型,供 SubAgent 按类型指定
         档位(如 Explore 走速度优先档)。别名与云厂商区域前缀原样透传,
         不做改写,避免继承时丢前缀。
+
+        扩展思考由 anthropic_thinking_enabled 控制,默认关。
         """
 
         client = AsyncAnthropic(
@@ -360,6 +436,7 @@ class AnthropicClient(BaseLLMClient):
         adapter = _AnthropicChunkAdapter()
         async with client.messages.stream(
             max_tokens=settings.llm_default_max_tokens,
+            thinking=_thinking_param(),
             model=model or self.model,
             system=self._encode_system(system_prompt),
             messages=self._encode_messages(messages),

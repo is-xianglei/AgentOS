@@ -24,6 +24,21 @@ class ToolUse:
 
 
 @dataclass(frozen=True)
+class ThinkingSegment:
+    """单次调用终局中的一段思考(流式载体)。
+
+    与 ThinkingBlock 的区别同 ToolUse 与 ToolUseBlock:本类是 provider 流式终局
+    的运行时载体,ThinkingBlock 是消息体的持久化/上下文形状。
+    signature 为 Anthropic 下发的思考块签名;redacted_data 为 redacted_thinking
+    的加密载荷,二者恒有其一为 None。OpenAI 侧两者均为 None。
+    """
+
+    text: str = ""
+    signature: str | None = None
+    redacted_data: str | None = None
+
+
+@dataclass(frozen=True)
 class ToolResultMessage:
     """tool 角色消息的内容结构。
 
@@ -64,6 +79,32 @@ class ToolResultMessage:
 # 残留的 provider 形状数据被静默误读并一路潜伏到运行时;换 kind 让它当场暴露。
 _KIND_TEXT = "text"
 _KIND_TOOL_USE = "tool_use"
+_KIND_THINKING = "thinking"
+
+
+@dataclass(frozen=True)
+class ThinkingBlock:
+    """assistant 消息的中立思考块。
+
+    signature 与 redacted_data 是 provider 下发的不透明取值,与 ToolUseBlock.id
+    同一性质:必须原样回传,但不构成 wire 形状泄漏。
+    Anthropic 要求思考块原样返回、不得修改重排或过滤,故二者必须落库;
+    OpenAI(DeepSeek)侧无签名概念,两者恒为 None。
+    redacted_data 承载 Anthropic 的 redacted_thinking 加密块,无可读文本。
+    """
+
+    text: str = ""
+    signature: str | None = None
+    redacted_data: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为落库/上下文的中立形状。"""
+        return {
+            "kind": _KIND_THINKING,
+            "text": self.text,
+            "signature": self.signature,
+            "redacted_data": self.redacted_data,
+        }
 
 
 @dataclass(frozen=True)
@@ -99,16 +140,30 @@ class ToolUseBlock:
         }
 
 
-type AssistantBlock = TextBlock | ToolUseBlock
+type AssistantBlock = ThinkingBlock | TextBlock | ToolUseBlock
 
 
-def build_assistant_blocks(text: str, tool_uses: list[ToolUse]) -> list[dict[str, Any]]:
+def build_assistant_blocks(
+    text: str,
+    tool_uses: list[ToolUse],
+    thinking: list[ThinkingSegment] | None = None,
+) -> list[dict[str, Any]]:
     """从单次调用终局组装 assistant 消息的中立块数组。
 
-    文本块在前、工具调用块在后:块间顺序不承载语义(两家 wire 都按角色而非块序
-    解释消息),故不保留 provider 下发时的交错顺序。空文本不产出空块。
+    思考块在最前且**保持 provider 下发的原序**:Anthropic 要求带签名的思考块
+    原样回传,不得修改、重排或过滤,同一回合的多段思考签名互不相同,合并即失效。
+    其后是文本块、工具调用块——这两类之间顺序不承载语义(两家 wire 都按角色而非
+    块序解释消息),故不保留其交错顺序。空文本不产出空块;空思考段同样跳过。
     """
-    blocks: list[dict[str, Any]] = []
+    blocks: list[dict[str, Any]] = [
+        ThinkingBlock(
+            text=segment.text,
+            signature=segment.signature,
+            redacted_data=segment.redacted_data,
+        ).to_dict()
+        for segment in (thinking or [])
+        if segment.text or segment.redacted_data
+    ]
     if text:
         blocks.append(TextBlock(text=text).to_dict())
     blocks.extend(
@@ -139,7 +194,15 @@ def parse_assistant_blocks(content: Any) -> list[AssistantBlock]:
                 "assistant 消息块必须是字典", {"block_type": type(raw).__name__}
             )
         kind = raw.get("kind")
-        if kind == _KIND_TEXT:
+        if kind == _KIND_THINKING:
+            blocks.append(
+                ThinkingBlock(
+                    text=raw.get("text", ""),
+                    signature=raw.get("signature"),
+                    redacted_data=raw.get("redacted_data"),
+                )
+            )
+        elif kind == _KIND_TEXT:
             blocks.append(TextBlock(text=raw.get("text", "")))
         elif kind == _KIND_TOOL_USE:
             blocks.append(
@@ -203,6 +266,7 @@ class LLMTurnResult:
 
     text: str = ""
     tool_uses: list[ToolUse] = field(default_factory=list)
+    thinking: list[ThinkingSegment] = field(default_factory=list)
     usage: Usage | None = None
     stop_reason: str | None = None
 

@@ -20,6 +20,8 @@ from llm.types import (
     LLMTurnResult,
     PromptBlock,
     TextBlock,
+    ThinkingBlock,
+    ThinkingSegment,
     ToolResultMessage,
     ToolSpec,
     ToolUse,
@@ -99,9 +101,10 @@ class _OpenAIChunkAdapter:
     """把 OpenAI 裸 chunk 适配成中立 LLMStreamEvent 序列(模块私有)。
 
     生命周期为单次 stream() 调用:流开始时创建,结束即弃。
-    OpenAI 没有块索引概念,block_ref 由本类自建:文本块恒占 0
-    (首个非空 delta.content 时开块),工具块占 1 + tool_call.index;
-    block_ref 只需单次调用内唯一,turn 级全局 index 由 TurnEventAssembler 分配。
+    OpenAI 没有块索引概念,block_ref 由本类自建:思考块恒占 0、文本块恒占 1
+    (各自首个非空增量时开块),工具块占 2 + tool_call.index;编号顺序即 DeepSeek
+    下发顺序(reasoning_content 先于 content)。block_ref 只需单次调用内唯一,
+    turn 级全局 index 由 TurnEventAssembler 分配。
 
     收束点是 finish_reason 非空的那个 chunk(OpenAI 无显式 block_stop 事件):
     文本块补 BLOCK_STOP,各工具块入参一次性解析并产出 TOOL_USE——工具块不发
@@ -109,17 +112,24 @@ class _OpenAIChunkAdapter:
     自累积,不依赖 get_final_completion():后者在 finish_reason 为 length /
     content_filter 时抛异常取代返回值,已生成内容会随之丢失。
 
-    THINKING_DELTA 恒不产出:Chat Completions 的 ChoiceDelta 没有 reasoning
-    字段,协议本身不回传思考内容——这是协议事实而非实现缺失,不要"补齐"。
+    THINKING_DELTA 来自 delta.reasoning_content:该字段是 DeepSeek 对 Chat
+    Completions 的私有扩展,不在 SDK 的 ChoiceDelta 类型内,故只能从裸 chunk
+    的 dict 里读——这也是本类不走 SDK .stream() helper 的又一处收益。
+    标准 OpenAI 端点不下发该字段,届时思考块自然不开,无需额外分支。
     """
 
-    # 文本块的固定 block_ref;不产出 BLOCK_START 就不会有空块,恒占 0 是安全的。
-    _TEXT_REF = 0
+    # 思考块与文本块的固定 block_ref;不产出 BLOCK_START 就不会有空块,占位是安全的。
+    _THINKING_REF = 0
+    _TEXT_REF = 1
+    # 工具块的 block_ref 起点,跳开上面两个占位。
+    _TOOL_REF_BASE = 2
 
     def __init__(self) -> None:
+        self._thinking_open = False
+        self._thinking_parts: list[str] = []
         self._text_open = False
         self._text_parts: list[str] = []
-        # 键为 OpenAI 的 tool_call.index(与 block_ref 差 1,见 _TEXT_REF 注释)。
+        # 键为 OpenAI 的 tool_call.index(与 block_ref 差 _TOOL_REF_BASE)。
         self._tool_calls: dict[int, _PendingToolCall] = {}
         self._usage: Usage | None = None
         self._stop_reason: str | None = None
@@ -141,6 +151,7 @@ class _OpenAIChunkAdapter:
         choice = choices[0] or {}
         delta = choice.get("delta") or {}
         events: list[LLMStreamEvent] = []
+        events.extend(self._on_thinking_delta(delta.get("reasoning_content")))
         events.extend(self._on_text_delta(delta.get("content")))
         events.extend(self._on_tool_calls(delta.get("tool_calls") or []))
         finish_reason = choice.get("finish_reason")
@@ -158,19 +169,60 @@ class _OpenAIChunkAdapter:
         """
         if not self._finished:
             return []
+        thinking_text = "".join(self._thinking_parts)
         result = LLMTurnResult(
             text="".join(self._text_parts),
             tool_uses=self._tool_uses,
+            # OpenAI 侧无签名概念,整段思考归并为单个 ThinkingSegment;
+            # 保持列表形状是为了与 Anthropic 的多段带签名思考共用中立结构。
+            thinking=[ThinkingSegment(text=thinking_text)] if thinking_text else [],
             usage=self._usage,
             stop_reason=self._stop_reason,
         )
         return [LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=result)]
 
-    def _on_text_delta(self, content: Any) -> list[LLMStreamEvent]:
-        """处理文本增量:首个非空增量开块,空串与非字符串视为噪声。"""
+    def _on_thinking_delta(self, content: Any) -> list[LLMStreamEvent]:
+        """处理思考增量:首个非空增量开块,空串与非字符串视为噪声。
+
+        DeepSeek 未开启思考模式时 reasoning_content 恒为 None/缺失,
+        走噪声分支自然不开块,故无需读配置判断是否开启。
+        """
         if not isinstance(content, str) or not content:
             return []
         events: list[LLMStreamEvent] = []
+        if not self._thinking_open:
+            self._thinking_open = True
+            events.append(
+                LLMStreamEvent(
+                    kind=LLMEventKind.BLOCK_START,
+                    block_ref=self._THINKING_REF,
+                    block_type=BlockType.THINKING,
+                )
+            )
+        self._thinking_parts.append(content)
+        events.append(
+            LLMStreamEvent(
+                kind=LLMEventKind.THINKING_DELTA, block_ref=self._THINKING_REF, text=content
+            )
+        )
+        return events
+
+    def _close_thinking(self) -> list[LLMStreamEvent]:
+        """思考块收束。思考先于正文下发,首个正文增量即可闭块,无需等到收束点。"""
+        if not self._thinking_open:
+            return []
+        self._thinking_open = False
+        return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=self._THINKING_REF)]
+
+    def _on_text_delta(self, content: Any) -> list[LLMStreamEvent]:
+        """处理文本增量:首个非空增量开块,空串与非字符串视为噪声。
+
+        开块前先关思考块:DeepSeek 先发完 reasoning_content 再发 content,
+        正文一开始就意味着思考已结束,提前闭块让前端能立刻收起思考区域。
+        """
+        if not isinstance(content, str) or not content:
+            return []
+        events: list[LLMStreamEvent] = self._close_thinking()
         if not self._text_open:
             self._text_open = True
             events.append(
@@ -207,7 +259,7 @@ class _OpenAIChunkAdapter:
                         {"tool_name": tool_name, "tool_call_id": tool_id},
                     )
                 pending = _PendingToolCall(
-                    ref=1 + raw["index"], tool_id=tool_id, tool_name=tool_name
+                    ref=self._TOOL_REF_BASE + raw["index"], tool_id=tool_id, tool_name=tool_name
                 )
                 self._tool_calls[raw["index"]] = pending
                 events.append(
@@ -230,7 +282,8 @@ class _OpenAIChunkAdapter:
         """
         self._finished = True
         self._stop_reason = finish_reason
-        events: list[LLMStreamEvent] = []
+        # 只有思考、无正文也无工具时思考块仍开着,在此兜底闭合。
+        events: list[LLMStreamEvent] = self._close_thinking()
         if self._text_open:
             self._text_open = False
             events.append(LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=self._TEXT_REF))
@@ -317,14 +370,17 @@ class OpenAIClient(BaseLLMClient):
         - user:纯文本,原样成为 user 消息;
         - assistant:文本进 content,工具调用块进 tool_calls 数组(与 Anthropic
           「工具调用是 content 里的一个块」形状不同);仅有工具调用而无文本时
-          content 置 None(OpenAI 允许 null,且不能省略该键);
+          content 置 None(OpenAI 允许 null,且不能省略该键);思考块拼成
+          reasoning_content——DeepSeek 要求:回合内发生过工具调用时,该回合的
+          reasoning_content 必须在后续请求中原样回传,否则返回 400;
         - tool:每个工具结果一条独立的 role="tool" 消息,以 tool_call_id 与调用
           配对——**不像** Anthropic 那样合并成块塞进 user 消息。
 
         多个文本块拼接成单段:OpenAI 的 assistant content 是单一字符串,
         无多块概念(build_assistant_blocks 本就最多产一个文本块)。
         ToolResultMessage 的 tool_name / input_args 是 AgentOS 自有排障字段,
-        OpenAI 协议无对应位置,不发给模型。
+        OpenAI 协议无对应位置,不发给模型。签名与 redacted_data 同理:
+        属 Anthropic 专有,OpenAI 侧无处安放,不下发。
         """
         encoded: list[dict[str, Any]] = []
         for message in messages:
@@ -338,10 +394,16 @@ class OpenAIClient(BaseLLMClient):
                 tool_calls = _encode_tool_calls(
                     [block for block in blocks if isinstance(block, ToolUseBlock)]
                 )
+                reasoning = "".join(
+                    block.text for block in blocks if isinstance(block, ThinkingBlock)
+                )
                 assistant: dict[str, Any] = {
                     "role": "assistant",
                     "content": text if text or not tool_calls else None,
                 }
+                if reasoning:
+                    # 该键不在 SDK 的 TypedDict 内,依赖末尾的 cast 收窄。
+                    assistant["reasoning_content"] = reasoning
                 if tool_calls:
                     assistant["tool_calls"] = tool_calls
                 encoded.append(assistant)
@@ -413,6 +475,8 @@ class OpenAIClient(BaseLLMClient):
 
         与 Anthropic 侧的结构差异:system 不是顶层参数,包成 messages 首条
         role="system" 消息(空串时不插入);终局由适配器自累积产出。
+
+        思考模式由 openai_thinking_enabled 控制,默认关。
         """
         client = AsyncOpenAI(
             base_url=self.base_url,
@@ -440,6 +504,12 @@ class OpenAIClient(BaseLLMClient):
         # 空 tools 不传该参数:部分兼容网关对空 tools: [] 报 400。
         if tools:
             request_kwargs["tools"] = self._encode_tools(tools)
+        # 思考模式是 DeepSeek 私有扩展,不在 SDK 参数表内,只能走 extra_body 透传;
+        # 关闭时整个键不出现,标准 OpenAI 端点的行为完全不变。
+        if settings.openai_thinking_enabled:
+            request_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            if settings.openai_reasoning_effort:
+                request_kwargs["reasoning_effort"] = settings.openai_reasoning_effort
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _OpenAIChunkAdapter()

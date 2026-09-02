@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     anthropic_memory_selector_model: str | None = None
     anthropic_memory_extractor_model: str | None = None
     anthropic_memory_dream_model: str | None = None
+    # 扩展思考。默认关:开启会改变成本与延迟,需显式选择。
+    anthropic_thinking_enabled: bool = False
+    # 思考预算,仅 anthropic_thinking_enabled=True 时生效;
+    # Anthropic 要求 >= 1024 且 < max_tokens。
+    anthropic_thinking_budget_tokens: int = 4096
 
     # --- LLM(OpenAI) ---------------------------------------------------------
     # 仅 llm_provider="openai" 时 api_key 与主模型必填;场景覆盖语义同 Anthropic 组。
@@ -60,6 +65,11 @@ class Settings(BaseSettings):
     openai_memory_selector_model: str | None = None
     openai_memory_extractor_model: str | None = None
     openai_memory_dream_model: str | None = None
+    # 思考模式。DeepSeek 私有扩展(extra_body.thinking),默认关:
+    # 发给标准 OpenAI 端点会被拒,默认关保证既有部署行为零变化。
+    openai_thinking_enabled: bool = False
+    # 思考努力档位,仅 openai_thinking_enabled=True 且非空时随请求下发。
+    openai_reasoning_effort: str | None = None
 
     # --- LLM 调用通用配置 ----------------------------------------------------
     llm_default_max_tokens: int = 131072  # 流式调用的 max_tokens

@@ -391,7 +391,12 @@ class SubAgentRunner:
             )
             tool_uses = result.tool_uses
             messages.append(
-                {"role": "assistant", "content": build_assistant_blocks(result.text, tool_uses)}
+                {
+                    "role": "assistant",
+                    "content": build_assistant_blocks(
+                        result.text, tool_uses, result.thinking
+                    ),
+                }
             )
             last_text = result.text or last_text
 
@@ -632,7 +637,12 @@ class SubAgentRunner:
             # 中立块由 to_dict() 产出,均为 JSON 原生结构,可直接随 messages 落
             # team_members.history 并由 _load_history() 原样 round-trip。
             messages.append(
-                {"role": "assistant", "content": build_assistant_blocks(result.text, tool_uses)}
+                {
+                    "role": "assistant",
+                    "content": build_assistant_blocks(
+                        result.text, tool_uses, result.thinking
+                    ),
+                }
             )
 
             if not tool_uses:

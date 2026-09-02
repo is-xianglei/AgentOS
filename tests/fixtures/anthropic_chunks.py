@@ -167,3 +167,39 @@ CHUNKS_TOOL_USE_BAD_JSON: list[dict[str, Any]] = [
         ],
     },
 ]
+
+
+# ---- 序列 e:redacted_thinking(加密思考块,无可读文本) ----
+#
+# Anthropic 在思考内容触发安全系统时下发该块类型:无 thinking_delta,
+# 内容整体加密在 data 里。它必须与普通思考块一样原样回传,否则回合校验不过。
+
+CHUNKS_REDACTED_THINKING: list[dict[str, Any]] = [
+    {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "redacted_thinking", "data": "encrypted_payload_xyz"},
+    },
+    {"type": "content_block_stop", "index": 0},
+    {"type": "content_block_start", "index": 1, "content_block": {"type": "text"}},
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "text_delta", "text": "换个说法回答"},
+    },
+    {"type": "content_block_stop", "index": 1},
+    {
+        "type": "message_final",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+        "content": [
+            {"type": "redacted_thinking", "data": "encrypted_payload_xyz"},
+            {"type": "text", "text": "换个说法回答"},
+        ],
+    },
+]

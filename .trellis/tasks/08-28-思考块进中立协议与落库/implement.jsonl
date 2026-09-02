@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "核心规范。3.6 流式协议分层界定入站适配私有/出站编码不上 ABC；3.7 消息体中立化定义 kind 判别键与「新增块类型时沿用 kind」，本任务新增 thinking 块必须遵循；3.3 timeout 语义说明 NOT_GIVEN 写法，开关关闭时的参数省略沿用同一手法"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "budget_tokens 越界、未知块 kind、无签名思考块三处都要抛中文 AgentException 且禁止静默兜底，错误消息与 details 结构按此规范"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "类型注解、frozen dataclass、命名后缀与测试组织约定；新增 ThinkingSegment/ThinkingBlock 与改写既有测试基线均受其约束"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "build_assistant_blocks 签名变更跨 llm/ 与 runtime/ 四处调用点，改动前按此清单核对跨层影响面"}

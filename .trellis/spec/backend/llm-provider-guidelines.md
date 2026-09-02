@@ -204,17 +204,32 @@ async def add_message(
 | `AGENTOS_ANTHROPIC_MAX_RETRIES` | 2 | SDK 内置重试（429/5xx/网络超时，指数退避），不自造重试框架 |
 | `AGENTOS_ANTHROPIC_TIMEOUT_SECONDS` | None | 留空 = 交给 SDK 自动计算（见 3.3） |
 | `AGENTOS_ANTHROPIC_<SCENARIO>_MODEL` | None | 七个场景覆盖，全部可选，留空回落主模型 |
+| `AGENTOS_ANTHROPIC_THINKING_ENABLED` | False | 扩展思考开关；关闭时 `thinking` 参数传 `NOT_GIVEN` |
+| `AGENTOS_ANTHROPIC_THINKING_BUDGET_TOKENS` | 4096 | 仅开关为真时生效；须 `>= 1024` 且 `< max_tokens`，越界抛错（矩阵 6） |
 
 **OpenAI 组的差异项**：`AGENTOS_OPENAI_BASE_URL` 默认 `https://api.openai.com/v1`，**必须带 `/v1`**。
+
+**思考开关两组键不对称**，不适用上面的「键名对称」规则：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `AGENTOS_OPENAI_THINKING_ENABLED` | False | DeepSeek 私有扩展，走 `extra_body`；标准 OpenAI 端点会拒，故默认关 |
+| `AGENTOS_OPENAI_REASONING_EFFORT` | None | 努力档位，仅开关为真且非空时随请求下发；OpenAI 侧无 budget_tokens 概念 |
+
+两组默认全关：开启会改变成本与延迟，必须显式选择；既有部署行为零变化。
 
 **max_tokens（provider 无关）**：
 
 | 环境变量 | 默认值 | 使用方 |
 |---|---|---|
-| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:362`、`openai_client.py:435`） |
+| `AGENTOS_LLM_DEFAULT_MAX_TOKENS` | 131072 | 流式调用（`anthropic_client.py:438`、`openai_client.py:499`） |
 | `AGENTOS_LLM_MEMORY_SELECTOR_MAX_TOKENS` | 256 | Memory 召回选择器 |
 | `AGENTOS_LLM_MEMORY_EXTRACTOR_MAX_TOKENS` | 4096 | Memory 提取 |
 | `AGENTOS_LLM_MEMORY_DREAM_MAX_TOKENS` | 8192 | Memory Dream |
+
+> **告警**：`AGENTOS_LLM_DEFAULT_MAX_TOKENS` 的代码默认值 131072 超过部分模型的输出上限
+> （实测 `claude-opus-4-6` 为 128000）。该值直接作为 `max_tokens` 下发，越限时 API 报
+> `max_tokens: 131072 > 128000`。换模型时须核对目标模型的输出上限，本仓库尚未按模型收敛该默认值。
 
 **三处同步硬约束**：`Settings` 设 `extra="forbid"`，`.env` 出现未声明的键立即报错；
 新增配置必须同时更新 `core/config.py` / `.env` / `.env.example` 三处。
@@ -233,7 +248,7 @@ async def add_message(
 
 - 配置留空（`None`）= 交给 SDK 自动计算超时
 - 但把 `None` **显式传给 SDK** 会被理解成「禁用超时」，语义完全相反
-- 统一转 `NOT_GIVEN` 规避：`openai_client.py:372/423`、`anthropic_client.py:356/436/463`；新代码沿用该写法
+- 统一转 `NOT_GIVEN` 规避：`openai_client.py:434/487`、`anthropic_client.py:432/513/540`；新代码沿用该写法
 
 ### 3.4 能力边界（当前实现）
 
@@ -242,6 +257,10 @@ async def add_message(
   （`agent` / `subagent` / `compact`）两家 provider 均可用
 - OpenAI 侧的 `stream()` 走 `create(stream=True)` 裸 chunk 路径，**不用 SDK 的 `.stream()` helper**，
   理由见 3.6 末尾的决策记录
+- **思考两家均已打通且默认关闭**：Anthropic 走原生 extended thinking（`thinking` 参数 +
+  签名回传），OpenAI 走 DeepSeek 私有的 `reasoning_content`（`extra_body` 开关）。
+  思考内容进中立协议并落库，契约见 3.7；标准 OpenAI 端点不下发 `reasoning_content`，
+  届时思考块自然不产出，无需额外分支
 - `main.py:27` 在 lifespan 中调用一次 `create_llm_client()` 做启动自检，
   让配置错误在启动时暴露而非拖到首次对话；工厂本身仍是权威关卡，
   worker、脚本等不走 lifespan 的入口同样跑不掉校验
@@ -250,7 +269,7 @@ async def add_message(
 
 | 消息来源 | `provider` 列 | `model` 列 |
 |---|---|---|
-| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:646` / `:1627`） | 客户端自报的 provider | 实际生效的模型 ID |
+| LLM 产出的 assistant 消息（写入点 `runtime/agent.py:699` / `:1739`） | 客户端自报的 provider | 实际生效的模型 ID |
 | user 消息 | NULL | NULL |
 | tool 消息 | NULL | NULL |
 | 存量历史消息 | NULL（迁移不回填） | NULL |
@@ -263,9 +282,9 @@ async def add_message(
 
 | 职责 | 归属 | 位置 |
 |---|---|---|
-| 入站流式适配（provider 原始 chunk → 中立 `LLMStreamEvent`） | 各家 Client **私有实现** | `anthropic_client.py:129` `_AnthropicChunkAdapter`、`openai_client.py:98` `_OpenAIChunkAdapter`（均为模块私有） |
-| 自有协议装配（打 actor/session_id 戳、分配 turn 内全局 block index、block_start/block_stop 配对） | runtime 侧装配器，**不是 provider 契约** | `runtime/stream_assembler.py:13` `TurnEventAssembler` |
-| 出站编码（中立 `PromptBlock` / `ToolSpec` / 消息块 → 本家 wire 形状） | 各家 Client **私有方法**，不上 ABC | `_encode_system` / `_encode_tools` / `_encode_messages`（`anthropic_client.py:262/285/297`、`openai_client.py:285/298/313`） |
+| 入站流式适配（provider 原始 chunk → 中立 `LLMStreamEvent`） | 各家 Client **私有实现** | `anthropic_client.py:193` `_AnthropicChunkAdapter`、`openai_client.py:100` `_OpenAIChunkAdapter`（均为模块私有） |
+| 自有协议装配（打 actor/session_id 戳、分配 turn 内全局 block index、block_start/block_stop 配对） | runtime 侧装配器，**不是 provider 契约** | `runtime/stream_assembler.py:15` `TurnEventAssembler` |
+| 出站编码（中立 `PromptBlock` / `ToolSpec` / 消息块 → 本家 wire 形状） | 各家 Client **私有方法**，不上 ABC | `_encode_system` / `_encode_tools` / `_encode_messages`（`anthropic_client.py:333/356/368`、`openai_client.py:338/351/366`） |
 
 - **入站**：`stream()` 只产中立 `LLMStreamEvent`（`llm/types.py`），provider 原始格式
   在实现内部消化、不外露；必须以恰好一个 `TURN_RESULT` 事件收尾且 `result` 非空，
@@ -312,29 +331,49 @@ async def add_message(
 库里（`session_messages.content`、`session_snapshots.messages`）存的也一律是中立形状，
 provider 形状只存在于各家 `stream()` 内部 `_encode_messages()` 之后。
 
-assistant 消息的 content 是块数组，两类块（定义于 `llm/types.py:70/81`，
-经 `build_assistant_blocks()`（`:105`）构造、`parse_assistant_blocks()`（`:121`）解析）：
+assistant 消息的 content 是块数组，三类块（定义于 `llm/types.py:86/111/122`，
+经 `build_assistant_blocks()`（`:146`）构造、`parse_assistant_blocks()`（`:176`）解析）：
 
 ```python
+{"kind": "thinking", "text": "...", "signature": "...", "redacted_data": None}
 {"kind": "text", "text": "..."}
 {"kind": "tool_use", "id": "...", "name": "...", "input": {...}}
 ```
 
-`tool` 消息沿用 `ToolResultMessage`（`llm/types.py:27`），形状不变——它本就是自有协议。
+`tool` 消息沿用 `ToolResultMessage`（`llm/types.py:42`），形状不变——它本就是自有协议。
 
 - **判别键用 `kind` 而非 `type`，这是刻意的**：两家 wire 的 `type` 取值恰好同名
   （都叫 `tool_use`），入参字段也都叫 `input`，若沿用 `type`，残留的 provider 形状数据
   会被静默当成中立格式读下去，错误一路潜伏到运行时。换 `kind` 让它在
   `parse_assistant_blocks()` 当场抛中文 `AgentException`。新增块类型时沿用 `kind`。
+- **思考块保序、不合并、不可伪造**：`thinking` 块排在块数组最前，且**保持 provider
+  下发的原序**——Anthropic 要求带签名的思考块原样回传，不得修改、重排或过滤，
+  同一回合的多段思考签名互不相同，合并成一段即签名失效、下一轮直接 400。
+  `signature` 与 `redacted_data` 是 provider 下发的不透明取值，性质同
+  `ToolUseBlock.id`：必须落库并原样回传，但不构成 wire 形状泄漏。
+  Anthropic 的 `redacted_thinking`（加密块、无可读文本）归入同一类块，
+  载荷存在 `redacted_data`；出站时编回 `{"type": "redacted_thinking", "data": ...}`。
+  无签名的思考块在 Anthropic 出站编码时**直接丢弃**（`_encode_assistant_block()` 返回
+  `None`）：切 provider 后库里会留下 OpenAI 侧产出的无签名思考，它们只用于展示，
+  回传缺签名的思考块会被判为篡改。
+- **OpenAI 侧的思考是 DeepSeek 私有扩展，不是标准能力**：入站读裸 chunk 的
+  `delta.reasoning_content`（不在 SDK 的 `ChoiceDelta` 类型内，这是不走 `.stream()`
+  helper 的又一处收益）；无签名概念，整段思考归并为单个 `ThinkingSegment`；
+  出站编成 assistant 消息的 `reasoning_content` 键。
+  **硬约束**：某一回合发生了工具调用，则该回合的 `reasoning_content` 必须在后续
+  所有请求中回传，否则 API 返回 400——这与 Anthropic 的签名回传要求是同一件事的两种形态，
+  也是思考块必须落库（而非只做流式展示）的根本原因。
+  开关走 `extra_body={"thinking": {"type": "enabled"}}`，关闭时整个键不出现，
+  标准 OpenAI 端点行为零变化。
 - **翻译收在 Client 内部，不在调用方**：`llm.stream()` 有 4 个调用点
-  （`agent.py:631`、`agent.py:1616`、`subagent.py:226`、`compact.py:108`），
+  （`agent.py:675`、`agent.py:1726`、`subagent.py:255`、`compact.py:140`），
   其中 `subagent.py` 自建 messages、不走 `_messages_to_context()`。翻译放调用方则每处
   都要记得翻一次，漏一处就是一个 400，新增第 5 个调用点时也无人提醒。
 - **两家的工具结果结构性不同**，这正是出站翻译必须存在的理由，不能共用一套形状糊过去：
   Anthropic 把 tool_result 作为块塞进 `role="user"` 消息并合并连续块；
   OpenAI 每个工具结果是一条独立的 `role="tool"` 消息，带 `tool_call_id`。
 - **快照同为中立形状**：`compact.py` 在中立形状上工作、落中立快照，
-  `_micro_compact()`（`compact.py:62`）直接读 `role="tool"` 的 `tool_name`，
+  `_micro_compact()`（`compact.py:94`）直接读 `role="tool"` 的 `tool_name`，
   不再从 assistant 的 tool_use 块反查，语义不随 provider 变。
   切 provider 后旧快照仍可用，无需清库。
 - **无兼容读**：不写旧格式检测分支、不做存量迁移——那个分支永远不会被测试覆盖到。
@@ -343,7 +382,8 @@ assistant 消息的 content 是块数组，两类块（定义于 `llm/types.py:7
 
 ## 4. Validation & Error Matrix
 
-所有校验集中在 `llm/factory.py`（`create_llm_client()` 与 `resolve_scenario_model()` 共用），
+配置与解析类校验集中在 `llm/factory.py`（`create_llm_client()` 与 `resolve_scenario_model()`
+共用），思考相关校验落在 `llm/anthropic_client.py`（依赖 provider 私有约束，无法上提到工厂）。
 一律抛 `AgentException.message`（简体中文），**无静默兜底**。错误消息原文如下，改代码时须同步本表：
 
 | # | 条件 | 校验位置 | 错误消息（原文） |
@@ -354,6 +394,8 @@ assistant 消息的 content 是块数组，两类块（定义于 `llm/types.py:7
 | 4 | 场景覆盖与主模型两级都为空 | `_resolve_model` | `未配置 {provider} 的模型，请设置 AGENTOS_{PROVIDER}_MODEL，或为该场景设置 AGENTOS_{PROVIDER}_<SCENARIO>_MODEL` |
 | 5a | `provider=anthropic` 且 api_key 为空 | `create_llm_client` | `LLM provider 为 anthropic，但未配置 AGENTOS_ANTHROPIC_API_KEY` |
 | 5b | `provider=openai` 且 api_key 为空 | `create_llm_client` | `LLM provider 为 openai，但未配置 AGENTOS_OPENAI_API_KEY` |
+| 6 | 思考开启且 budget 不在 `[1024, max_tokens)` | `_thinking_param`（anthropic） | `思考预算配置越界` |
+| 7 | 入站内容块 `type` 不在已登记映射内 | `_BLOCK_TYPE_MAP` 查表（anthropic） | `未知的 Anthropic 内容块类型` |
 
 说明：
 
@@ -361,6 +403,9 @@ assistant 消息的 content 是块数组，两类块（定义于 `llm/types.py:7
 - 第 4 条的 `{PROVIDER}` 为大写（源码 `provider.upper()`），如 `AGENTOS_ANTHROPIC_MODEL`
 - 场景名拼错属**编码错误**，直接抛错（第 3 条），而非静默回落主模型
 - `resolve_scenario_model()` 不建客户端，只触发第 1-4 条，不校验 api_key
+- 第 6 条**不夹取**：静默把越界预算夹到边界会让实际思考深度与配置不符，成本与效果都对不上账
+- 第 7 条覆盖 `text` / `thinking` / `redacted_thinking` / `tool_use` 四种；
+  漏登记新块类型会被兜成文本块流向前端，且终局提取时整块丢掉——回传给 Anthropic 时思考块缺失即 400
 
 ---
 
@@ -438,7 +483,8 @@ await self.session_service.add_message(
 > `tests/test_encoders.py`（两家 `_encode_system` / `_encode_tools` 编码形状 6 例）、
 > `tests/test_llm_openai_client.py`（OpenAI 适配器与 `stream()` 17 例）、
 > `tests/test_message_neutral.py`（中立块往返与双向编码 14 例）、
-> `tests/test_neutral_context.py`（中立上下文装配与 compact 6 例），共 64 passed——
+> `tests/test_neutral_context.py`（中立上下文装配与 compact 6 例）、
+> `tests/test_llm_thinking.py`（思考块跨两家的入站/落库/出站闭环 26 例），共 90 passed——
 > 即 3.6 / 3.7 两节的流式分层与消息中立化均已有覆盖。**但以下 4 个文件仍尚未编写**，
 > 属另外的欠账：工厂校验、客户端构造参数（timeout 归一、max_tokens 来源）、
 > 注入点回落与归因链路均无测试。后续补齐时必须覆盖以下用例与断言点；
@@ -462,14 +508,16 @@ await self.session_service.add_message(
 
 - 事件序列：纯文本 / 文本+工具 / 多工具，断言产出的 `LLMStreamEvent` 序列与收尾的
   单个 `TURN_RESULT`；与 Anthropic 侧同输入的协议等价性对照
-- block_ref 分配：文本占 0、工具为 `1 + tool_call.index`；tool_use 块不发 `BLOCK_STOP`
-  （由 `TurnEventAssembler` 补发，见 3.6）
+- block_ref 分配：思考占 0、文本占 1、工具为 `2 + tool_call.index`；tool_use 块不发 `BLOCK_STOP`
+  （由 `TurnEventAssembler` 补发，见 3.6）。思考与文本是固定占位，不产出
+  `BLOCK_START` 就不会有空块
 - 终局信息：usage 与 stop_reason 映射；缺 usage 时为 `None`；
   `finish_reason="length"` 保留已生成文本并翻成 `max_tokens`；`content_filter` 透传
 - 错误分支（均须为中文 `AgentException`，见第 4 段矩阵）：工具入参坏 JSON、
   tool call 缺 id 或 name、流未给 `finish_reason` 即耗尽
 - 分层边界：适配器只产中立事件，不含 `actor` / `session_id` / 全局 index；
-  恒不产出 `THINKING_DELTA`（`ChoiceDelta` 无 reasoning 字段）；噪声 chunk 不产事件
+  chunk 无 `reasoning_content` 时不产出 `THINKING_DELTA` 且终局 `thinking == []`；
+  噪声 chunk 不产事件
 
 以下非流式用例仍未覆盖，属欠账：
 
@@ -477,6 +525,25 @@ await self.session_service.add_message(
   与 `max_completion_tokens`（而非 `max_tokens`）
 - 拒答处理：`message.parsed = None` 时断言抛 `ValueError` 且消息含 `finish_reason`
 - timeout 归一：构造 `timeout=None`，断言 SDK 构造参数收到 `NOT_GIVEN` 而非 `None`
+
+### 6.6 `tests/test_llm_thinking.py`（已编写，26 例）
+
+跨两家的思考闭环，改动思考通道时须维持这些断言点：
+
+- Anthropic 入站：多段思考按原序提取且签名互不相同（`sig_abc` / `sig_def` 不得合并）；
+  `redacted_thinking` 提取到 `redacted_data` 且以 `BlockType.THINKING` announce；
+  未登记的块类型抛中文 `AgentException`（矩阵 7）
+- 中立协议：`build_assistant_blocks()` 保序、空思考段跳过、往返 `parse_assistant_blocks()` 等价；
+  残留 wire 形状（带 `type` 无 `kind`）抛错
+- Anthropic 出站：块序与落库序一致；**无签名思考块被跳过**，带签名与 redacted 正常编码
+- OpenAI：`reasoning_content` 编进 assistant 消息、无思考时该键不出现；
+  `THINKING_DELTA` 事件产出、首个正文 delta 处关块、纯思考响应在 finish 处兜底关块、
+  终局归并为单段
+- 配置：`_thinking_param()` 关闭返 `NOT_GIVEN`、开启返 budget；
+  越界参数化用例 `[1023, 0, -1, 131072, 999_999]` 逐条断言抛错（矩阵 6，**不夹取**）；
+  两家开关的**代码默认值**均为关（断言 `Settings.model_fields[...].default`，不读实例，
+  避免受本地 `.env` 影响）
+- 请求参数：Mock `AsyncOpenAI`，断言开启时 `extra_body` 含 `thinking`、关闭时整个键不出现
 
 ### 6.3 `tests/test_llm_anthropic_client.py`（待编写）
 
@@ -559,7 +626,31 @@ client = AsyncOpenAI(
 )
 ```
 
-现有实现参照：`openai_client.py:372/423`、`anthropic_client.py:356/436/463`。
+现有实现参照：`openai_client.py:434/487`、`anthropic_client.py:432/513/540`。
+
+### 第四对：思考段的合并与丢弃
+
+```python
+# ❌ Wrong：把多段思考拼成一段落库 —— 每段签名不同，拼完签名对不上，
+#    下一轮回传即 400；「只留最后一段」「过滤掉空文本的 redacted 段」同样致命
+thinking_text = "".join(seg.text for seg in result.thinking)
+blocks = [{"kind": "thinking", "text": thinking_text}]
+
+# ✅ Correct：逐段落库，原序、带签名，redacted 段用 redacted_data 承载
+blocks = build_assistant_blocks(result.text, result.tool_uses, result.thinking)
+```
+
+```python
+# ❌ Wrong：出站时把中立思考块无脑编成 Anthropic 思考块 ——
+#    切过 provider 的历史里有 OpenAI 侧产出的无签名思考，回传会被判篡改
+return {"type": "thinking", "thinking": block.text, "signature": block.signature}
+
+# ✅ Correct：无签名的思考块直接丢弃（返回 None 由调用方过滤），
+#    它们只用于展示，不参与 Anthropic 的思考完整性校验
+if not block.signature:
+    return None
+```
+
 
 ---
 
@@ -567,7 +658,7 @@ client = AsyncOpenAI(
 
 - 工厂与全部校验：`llm/factory.py`
 - 接口定义：`llm/base.py`
-- 中立类型：`llm/types.py`
+- 中立类型：`llm/types.py`（含 `ThinkingBlock` / `ThinkingSegment`）
 - 中立消息构造与解析：`llm/types.py`（`build_assistant_blocks()` / `parse_assistant_blocks()`）、
   产出方 `session/service.py`（`_messages_to_context()`）、消费方 `runtime/compact.py`、
   `tools/subagents/trigger.py`、`memory/jobs/extraction.py`
