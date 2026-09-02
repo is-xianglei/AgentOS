@@ -484,7 +484,7 @@ await self.session_service.add_message(
 > `tests/test_llm_openai_client.py`（OpenAI 适配器与 `stream()` 17 例）、
 > `tests/test_message_neutral.py`（中立块往返与双向编码 14 例）、
 > `tests/test_neutral_context.py`（中立上下文装配与 compact 6 例）、
-> `tests/test_llm_thinking.py`（思考块跨两家的入站/落库/出站闭环 26 例），共 90 passed——
+> `tests/test_llm_thinking.py`（思考块跨两家的入站/落库/出站闭环 30 例），共 94 passed——
 > 即 3.6 / 3.7 两节的流式分层与消息中立化均已有覆盖。**但以下 4 个文件仍尚未编写**，
 > 属另外的欠账：工厂校验、客户端构造参数（timeout 归一、max_tokens 来源）、
 > 注入点回落与归因链路均无测试。后续补齐时必须覆盖以下用例与断言点；
@@ -526,7 +526,7 @@ await self.session_service.add_message(
 - 拒答处理：`message.parsed = None` 时断言抛 `ValueError` 且消息含 `finish_reason`
 - timeout 归一：构造 `timeout=None`，断言 SDK 构造参数收到 `NOT_GIVEN` 而非 `None`
 
-### 6.6 `tests/test_llm_thinking.py`（已编写，26 例）
+### 6.6 `tests/test_llm_thinking.py`（已编写，30 例）
 
 跨两家的思考闭环，改动思考通道时须维持这些断言点：
 
@@ -544,6 +544,13 @@ await self.session_service.add_message(
   两家开关的**代码默认值**均为关（断言 `Settings.model_fields[...].default`，不读实例，
   避免受本地 `.env` 影响）
 - 请求参数：Mock `AsyncOpenAI`，断言开启时 `extra_body` 含 `thinking`、关闭时整个键不出现
+- **思考块与 `tool_use` 同现**：F1 的回传约束只在「该回合发生过工具调用」时触发，
+  故这是唯一会触发校验的形状，只测思考块覆盖不到。四条断言——
+  `build_assistant_blocks()` 在工具块存在时思考仍排最前；Anthropic 出站
+  `thinking → text → tool_use` 三块顺序与落库一致；OpenAI 出站同一条 assistant 消息
+  **同时**带 `reasoning_content` 与 `tool_calls`；跳过无签名思考块时 `tool_use` 编码不变。
+  已用变异验证：把 OpenAI 编码改成 `if reasoning and not tool_calls` 后，
+  **仅**「同时带」这一条转红，其余 29 例全绿——证明该形状此前确无回归保护
 
 ### 6.3 `tests/test_llm_anthropic_client.py`（待编写）
 

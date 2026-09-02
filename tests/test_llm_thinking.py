@@ -22,6 +22,7 @@ from llm.types import (
     LLMEventKind,
     LLMTurnResult,
     ThinkingSegment,
+    ToolUse,
     build_assistant_blocks,
     parse_assistant_blocks,
 )
@@ -203,6 +204,76 @@ def test_openai_omits_reasoning_key_without_thinking() -> None:
     encoded = _encode_assistant(_OPENAI, build_assistant_blocks("结论", [], None))
 
     assert "reasoning_content" not in encoded
+
+
+# ---- 思考块与工具调用同现(AC2、AC4、AC7、AC10) ----
+#
+# F1 的回传约束只在「该回合发生过工具调用」时触发,故 thinking 与 tool_use 同现
+# 才是唯一会触发校验的形状——只测思考块覆盖不到它。
+
+_TOOL_USES = [ToolUse(id="call_1", name="get_weather", input={"city": "上海"})]
+_TOOL_WIRE_ANTHROPIC = {
+    "type": "tool_use",
+    "id": "call_1",
+    "name": "get_weather",
+    "input": {"city": "上海"},
+}
+
+
+def _thinking_text_tool_blocks(signature: str | None = "sig_1") -> list[dict[str, Any]]:
+    """构造 thinking + text + tool_use 三块齐全的中立 assistant 消息。"""
+    return build_assistant_blocks(
+        "上海今天晴",
+        _TOOL_USES,
+        [ThinkingSegment(text="先查天气", signature=signature)],
+    )
+
+
+def test_build_blocks_orders_thinking_before_text_and_tool() -> None:
+    """AC2:工具块存在时思考块仍排在最前,且两段签名不串位。"""
+    blocks = build_assistant_blocks(
+        "结论",
+        _TOOL_USES,
+        [
+            ThinkingSegment(text="先分析", signature="sig_abc"),
+            ThinkingSegment(text="再核对", signature="sig_def"),
+        ],
+    )
+
+    assert [b["kind"] for b in blocks] == ["thinking", "thinking", "text", "tool_use"]
+    assert [b.get("signature") for b in blocks[:2]] == ["sig_abc", "sig_def"]
+
+
+def test_anthropic_encodes_thinking_text_and_tool_use_in_order() -> None:
+    """AC7:三类块齐全时,出站顺序与落库顺序完全一致,不重排。"""
+    assert _encode_assistant(_ANTHROPIC, _thinking_text_tool_blocks())["content"] == [
+        {"type": "thinking", "thinking": "先查天气", "signature": "sig_1"},
+        {"type": "text", "text": "上海今天晴"},
+        _TOOL_WIRE_ANTHROPIC,
+    ]
+
+
+def test_openai_encodes_reasoning_content_with_tool_calls() -> None:
+    """AC4:同一条 assistant 消息同时带 reasoning_content 与 tool_calls。
+
+    这正是 F1 要求回传的形状:回合内发生过工具调用,该回合思考须随之回传,否则 400。
+    """
+    encoded = _encode_assistant(_OPENAI, _thinking_text_tool_blocks())
+
+    assert encoded["reasoning_content"] == "先查天气"
+    assert encoded["content"] == "上海今天晴"
+    assert [call["id"] for call in encoded["tool_calls"]] == ["call_1"]
+    assert encoded["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_anthropic_skips_unsigned_thinking_but_keeps_tool_use() -> None:
+    """AC10:跳过无签名思考块时,text 与 tool_use 块的编码不受影响。"""
+    encoded = _encode_assistant(_ANTHROPIC, _thinking_text_tool_blocks(signature=None))
+
+    assert encoded["content"] == [
+        {"type": "text", "text": "上海今天晴"},
+        _TOOL_WIRE_ANTHROPIC,
+    ]
 
 
 # ---- OpenAI 入站:reasoning_content 通道 ----
