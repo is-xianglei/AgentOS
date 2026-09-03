@@ -50,10 +50,11 @@ def resolve_scenario_model(scenario: str | None = None) -> str:  # factory.py:79
 ```python
 _SUPPORTED_PROVIDERS = ("anthropic", "openai")
 
-# 七个已注册场景，与 Settings 的 {provider}_{scenario}_model 字段一一对应
+# 八个已注册场景，与 Settings 的 {provider}_{scenario}_model 字段一一对应
 _KNOWN_SCENARIOS = frozenset({
     "agent", "subagent", "subagent_fast", "compact",
     "memory_selector", "memory_extractor", "memory_dream",
+    "workflow",  # Workflow 编排的并行汇总 / 智能路由调用，见 workflow-orchestration.md §3.5
 })
 
 def _blank_to_none(value: str | None) -> str | None:
@@ -147,6 +148,7 @@ def __init__(self, ..., llm: BaseLLMClient | None = None):
 | `memory/jobs/service.py:182`（构造器接受注入并透传；入队冻结模型见 `:90` / `:167` 的 `resolve_scenario_model()`） | `memory_extractor` / `memory_dream` |
 | `memory/jobs/extraction.py:214` / `:317` | `memory_extractor` |
 | `memory/jobs/dream.py:222` / `:284` | `memory_dream` |
+| `runtime/workflow.py` `ParallelOrchestrator.__init__` / `LlmRoutingOrchestrator.__init__`（`SequentialOrchestrator` 不建客户端） | `workflow` |
 
 ### 2.5 DB 签名（成本归因列）
 
@@ -203,7 +205,7 @@ async def add_message(
 | `AGENTOS_ANTHROPIC_MODEL` | None | 主模型，所有场景的回落终点 |
 | `AGENTOS_ANTHROPIC_MAX_RETRIES` | 2 | SDK 内置重试（429/5xx/网络超时，指数退避），不自造重试框架 |
 | `AGENTOS_ANTHROPIC_TIMEOUT_SECONDS` | None | 留空 = 交给 SDK 自动计算（见 3.3） |
-| `AGENTOS_ANTHROPIC_<SCENARIO>_MODEL` | None | 七个场景覆盖，全部可选，留空回落主模型 |
+| `AGENTOS_ANTHROPIC_<SCENARIO>_MODEL` | None | 八个场景覆盖（含 `WORKFLOW`），全部可选，留空回落主模型 |
 | `AGENTOS_ANTHROPIC_THINKING_ENABLED` | False | 扩展思考开关；关闭时 `thinking` 参数传 `NOT_GIVEN` |
 | `AGENTOS_ANTHROPIC_THINKING_BUDGET_TOKENS` | 4096 | 仅开关为真时生效；须 `>= 1024` 且 `< max_tokens`，越界抛错（矩阵 6） |
 
@@ -390,7 +392,7 @@ assistant 消息的 content 是块数组，三类块（定义于 `llm/types.py:8
 |---|---|---|---|
 | 1 | `llm_provider` 未配置（None / 空串 / 纯空白） | `_require_provider` | `未配置 LLM provider，请在 .env 中设置 AGENTOS_LLM_PROVIDER（可选值：anthropic / openai）` |
 | 2 | `llm_provider` 取值不在支持列表 | `_require_provider` | `不支持的 LLM provider：{provider}，可选值：anthropic / openai` |
-| 3 | scenario 非 None 且不在七个已注册场景 | `_resolve_model` | `未知的 LLM 场景：{scenario}，可选值：agent、compact、memory_dream、memory_extractor、memory_selector、subagent、subagent_fast` |
+| 3 | scenario 非 None 且不在八个已注册场景 | `_resolve_model` | `未知的 LLM 场景：{scenario}，可选值：agent、compact、memory_dream、memory_extractor、memory_selector、subagent、subagent_fast、workflow` |
 | 4 | 场景覆盖与主模型两级都为空 | `_resolve_model` | `未配置 {provider} 的模型，请设置 AGENTOS_{PROVIDER}_MODEL，或为该场景设置 AGENTOS_{PROVIDER}_<SCENARIO>_MODEL` |
 | 5a | `provider=anthropic` 且 api_key 为空 | `create_llm_client` | `LLM provider 为 anthropic，但未配置 AGENTOS_ANTHROPIC_API_KEY` |
 | 5b | `provider=openai` 且 api_key 为空 | `create_llm_client` | `LLM provider 为 openai，但未配置 AGENTOS_OPENAI_API_KEY` |

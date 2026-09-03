@@ -34,4 +34,5 @@ from team.models import (  # noqa: F401
 )
 from tools.models import ToolCallRecord, ToolRecord  # noqa: F401
 from user.models import UserRecord  # noqa: F401
+from workflow.models import WorkflowAgentRecord, WorkflowRecord  # noqa: F401
 from workspace.models import WorkspaceMemberRecord, WorkspaceRecord  # noqa: F401

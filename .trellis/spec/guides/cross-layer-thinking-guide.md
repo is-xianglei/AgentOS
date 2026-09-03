@@ -110,6 +110,9 @@ Before implementation:
 - [ ] Identified all layer boundaries
 - [ ] Defined format at each boundary
 - [ ] Decided where validation happens
+- [ ] When reusing an existing entry point to dispatch to a new path, the dispatch
+      key includes state already locked on the session/resource, not just this
+      request's body (see `backend/workflow-orchestration.md` §3.1 / §7)
 
 After implementation:
 

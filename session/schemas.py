@@ -11,6 +11,10 @@ class SessionSendMessageRequest(BaseModel):
         default=None,
         description="新会话使用的Agent ID，空表示使用默认Agent",
     )
+    workflow_id: int | None = Field(
+        default=None,
+        description="使用的Workflow ID，与agent_id互斥",
+    )
     content: str = Field(description="用户消息")
 
 
@@ -35,6 +39,10 @@ class SessionResponse(BaseModel):
     user_id: int | None = Field(default=None, description="创建用户ID")
     workspace_id: int | None = Field(default=None, description="所属工作区ID")
     agent_id: int | None = Field(default=None, description="绑定的Agent ID")
+    workflow_id: int | None = Field(
+        default=None,
+        description="锁定的Workflow ID，空表示普通Agent会话",
+    )
     visibility: str = Field(description="可见性")
     shared_with: list[int] = Field(default_factory=list, description="共享用户ID列表")
     shared_with_departments: list[int] = Field(

@@ -24,6 +24,7 @@ _KNOWN_SCENARIOS = frozenset(
         "memory_selector",
         "memory_extractor",
         "memory_dream",
+        "workflow",
     }
 )
 

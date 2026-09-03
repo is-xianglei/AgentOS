@@ -80,6 +80,16 @@ class SubAgentSpec:
     omit_inherited_memory: bool = False
     # 核心约束的二次注入,拼在 system_prompt 末尾,抵抗长上下文中的约束遗忘。
     critical_reminder: str = ""
+    # 动态构造的 spec(如 workflow 成员)的运行标识;内置 spec 留空,回落枚举值。
+    # agent_type 对这类 spec 只表示能力档位,不再充当标识,避免权限规则与事件串名。
+    display_name: str = ""
+
+    @property
+    def runtime_name(self) -> str:
+        """运行标识:落运行记录、发事件、判权限、打日志都用它。
+        内置 SubAgent 留空即回落枚举值,行为与改造前完全一致。
+        """
+        return self.display_name or self.agent_type.value
 
     def effective_denied_tools(self) -> tuple[str, ...]:
         """合并全局禁用规则与自身黑名单。"""
@@ -126,4 +136,4 @@ class SubAgentSpec:
         """TMP_WRITABLE 档位的可写临时目录;其余档位无可写目录。"""
         if self.shell_access is not ShellAccess.TMP_WRITABLE:
             return None
-        return Path(tempfile.gettempdir()) / f"agentos-{self.agent_type.value}"
+        return Path(tempfile.gettempdir()) / f"agentos-{self.runtime_name}"

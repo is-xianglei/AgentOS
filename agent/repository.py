@@ -87,6 +87,15 @@ class AgentRepository:
             stmt = stmt.where(AgentRecord.id != exclude_agent_id)
         return (await self.db.scalars(stmt)).first()
 
+    async def list_by_ids(self, workspace_id: int, agent_ids: list[int]) -> list[AgentRecord]:
+        if not agent_ids:
+            return []
+        stmt = select(AgentRecord).where(
+            AgentRecord.workspace_id == workspace_id,
+            AgentRecord.id.in_(agent_ids),
+        )
+        return list(await self.db.scalars(stmt))
+
     async def list_and_count(
         self,
         workspace_id: int,

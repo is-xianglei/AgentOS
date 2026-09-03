@@ -25,6 +25,7 @@ from database.base import Base, json_type
 if TYPE_CHECKING:
     from agent.models import AgentRecord
     from user.models import UserRecord
+    from workflow.models import WorkflowRecord
     from workspace.models import WorkspaceRecord
 
 
@@ -83,6 +84,12 @@ class SessionRecord(Base):
         index=True,
         comment="会话绑定的Agent ID，空表示使用默认Agent",
     )
+    workflow_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workflows.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="会话锁定的Workflow ID，空表示普通Agent会话",
+    )
 
     # 共享与权限（新增字段）
     visibility: Mapped[str] = mapped_column(
@@ -130,6 +137,10 @@ class SessionRecord(Base):
     agent: Mapped[AgentRecord | None] = relationship(
         "AgentRecord",
         foreign_keys=[agent_id],
+    )
+    workflow: Mapped[WorkflowRecord | None] = relationship(
+        "WorkflowRecord",
+        foreign_keys=[workflow_id],
     )
 
 

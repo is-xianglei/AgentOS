@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核对新代码无禁用写法、类型注解齐全、行宽与格式符合 ruff 配置"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "核对 registry 登记、迁移可双向执行、外键 ondelete 与中文 comment 齐全，且未手写 is_deleted 过滤"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 D5 三种失败语义均抛中文 AgentException，无静默兜底、无裸 HTTPException"}
+{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "核对 workflow 场景四处同步、未直接实例化具体 Client、未硬编码模型名与 max_tokens"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "核对日志为简体中文、含定位上下文，且未输出密钥或完整异常详情到响应"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核对是否复用 AgentService.get_runtime_config / require_runnable 与 SubAgentRunner，而非另写一套解析"}

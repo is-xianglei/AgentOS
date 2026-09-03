@@ -136,8 +136,8 @@ API、错误与日志：
 2. 每个 provider 一组连接配置：`{provider}_base_url`、`{provider}_api_key`、
    `{provider}_model`（主模型，所有场景的回落终点）、`{provider}_max_retries`
    和 `{provider}_timeout_seconds`；重试与超时直接使用 SDK 内置机制，不要自造重试框架。
-3. 场景覆盖配置为 `{provider}_{scenario}_model`，scenario 共七个：agent、subagent、
-   subagent_fast、compact、memory_selector、memory_extractor、memory_dream；
+3. 场景覆盖配置为 `{provider}_{scenario}_model`，scenario 共八个：agent、subagent、
+   subagent_fast、compact、memory_selector、memory_extractor、memory_dream、workflow；
    场景覆盖未配置时回落到 `{provider}_model` 主模型。新增或调整这些配置项时，
    同样遵守上文「配置同步规则」。
 4. token 上限读取 `llm_default_max_tokens`（流式调用）和

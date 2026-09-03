@@ -36,6 +36,9 @@ class AgentRuntimeConfig:
     tool_runtime_names: tuple[str, ...]
     skill_ids: tuple[int, ...]
     skill_names: tuple[str, ...]
+    # 供 workflow 编排复用:name 作成员运行标识,description 作 LLM 路由的判断依据。
+    name: str
+    description: str | None
 
 
 class AgentService:
@@ -206,11 +209,31 @@ class AgentService:
             tool_runtime_names=tool_names,
             skill_ids=tuple(skill_ids),
             skill_names=skill_names,
+            name=agent.name,
+            description=agent.description,
         )
 
     async def remove_skill_bindings(self, workspace_id: int, skill_id: int) -> None:
         """供Skill域删除资产时清理本域绑定。"""
         await self.repo.soft_delete_skill_bindings(workspace_id, skill_id)
+
+    async def require_bindable_agent_ids(
+        self,
+        workspace_id: int,
+        agent_ids: list[int],
+    ) -> list[int]:
+        """校验Agent均存在且属于当前工作区，返回去重后的ID；供Workflow域绑定成员时复用。"""
+        normalized = list(dict.fromkeys(agent_ids))
+        records = await self.repo.list_by_ids(workspace_id, normalized)
+        existing_ids = {record.id for record in records}
+        missing = [agent_id for agent_id in normalized if agent_id not in existing_ids]
+        if missing:
+            raise AgentException.message(
+                "绑定的Agent不存在",
+                {"agent_ids": missing},
+                status_code=404,
+            )
+        return normalized
 
     async def _get_required(self, workspace_id: int, agent_id: int) -> AgentRecord:
         agent = await self.repo.get(workspace_id, agent_id)

@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     anthropic_memory_selector_model: str | None = None
     anthropic_memory_extractor_model: str | None = None
     anthropic_memory_dream_model: str | None = None
+    anthropic_workflow_model: str | None = None  # Workflow 编排的汇总/路由 LLM 调用
     # 扩展思考。默认关:开启会改变成本与延迟,需显式选择。
     anthropic_thinking_enabled: bool = False
     # 思考预算,仅 anthropic_thinking_enabled=True 时生效;
@@ -65,6 +66,7 @@ class Settings(BaseSettings):
     openai_memory_selector_model: str | None = None
     openai_memory_extractor_model: str | None = None
     openai_memory_dream_model: str | None = None
+    openai_workflow_model: str | None = None
     # 思考模式。DeepSeek 私有扩展(extra_body.thinking),默认关:
     # 发给标准 OpenAI 端点会被拒,默认关保证既有部署行为零变化。
     openai_thinking_enabled: bool = False

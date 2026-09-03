@@ -98,9 +98,9 @@ class SubAgentRunner:
         """无状态执行一次子代理:按 spec 配置跑 ReAct 并返回报告。
 
         不依赖团队成员或收件箱,prompt 由调用方(Agent 工具)直接给出。
-        member_name 复用为 agent_type 值,兼容运行记录表与前端事件契约。
+        member_name 复用为 spec 的运行标识(内置即 agent_type 值),兼容运行记录表与前端事件契约。
         """
-        member_name = spec.agent_type.value
+        member_name = spec.runtime_name
         started_at = time.perf_counter()
         logger.info(
             "子代理启动",
@@ -300,7 +300,7 @@ class SubAgentRunner:
         因此 ask 在此坍缩为拒绝,并把原因作为 tool_result 回给模型,让它自行改道;
         不能沿用"未裁决直接执行"的旧行为,否则子代理成为绕过审批的提权路径。
         """
-        agent_type = spec.agent_type.value
+        agent_type = spec.runtime_name
         for tool_use in tool_uses:
             behavior = await self.permission_service.evaluate(
                 session_id,
@@ -393,9 +393,7 @@ class SubAgentRunner:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": build_assistant_blocks(
-                        result.text, tool_uses, result.thinking
-                    ),
+                    "content": build_assistant_blocks(result.text, tool_uses, result.thinking),
                 }
             )
             last_text = result.text or last_text
@@ -422,9 +420,9 @@ class SubAgentRunner:
         logger.warning(
             "子代理轮次耗尽,返回截断报告,会话 ID=%s 类型=%s 上限=%s",
             session_id,
-            spec.agent_type.value,
+            spec.runtime_name,
             spec.max_rounds,
-            extra={"session_id": session_id, "agent_type": spec.agent_type.value},
+            extra={"session_id": session_id, "agent_type": spec.runtime_name},
         )
         notice = f"[注意] 子代理已达 {spec.max_rounds} 轮工具调用上限,以下为截断的中间结论:"
         return (f"{notice}\n\n{last_text}" if last_text else notice), max(1, spec.max_rounds)
@@ -499,9 +497,7 @@ class SubAgentRunner:
                 )
 
             # teammate 人格头:在 spec.system_prompt 之上拼接 name/role/team 身份。
-            system_prompt = compose_teammate_prompt(
-                spec.system_prompt, session_id, name, role
-            )
+            system_prompt = compose_teammate_prompt(spec.system_prompt, session_id, name, role)
             system_prompt = compose_subagent_prompt(system_prompt, rendered_memories)
 
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
@@ -639,9 +635,7 @@ class SubAgentRunner:
             messages.append(
                 {
                     "role": "assistant",
-                    "content": build_assistant_blocks(
-                        result.text, tool_uses, result.thinking
-                    ),
+                    "content": build_assistant_blocks(result.text, tool_uses, result.thinking),
                 }
             )
 

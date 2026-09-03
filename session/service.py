@@ -44,6 +44,7 @@ class SessionService:
         user_id: int | None = None,
         workspace_id: int | None = None,
         agent_id: int | None = None,
+        workflow_id: int | None = None,
     ) -> SessionRecord:
         """根据首条用户消息创建会话。"""
         title = self._summarize_title(content)
@@ -55,6 +56,7 @@ class SessionService:
             user_id=user_id,
             workspace_id=workspace_id,
             agent_id=agent_id,
+            workflow_id=workflow_id,
         )
 
     async def list(self) -> list[SessionRecord]:
@@ -329,29 +331,61 @@ class SessionService:
         user_id: int,
         workspace_id: int,
         agent_id: int | None = None,
+        workflow_id: int | None = None,
     ) -> SessionRecord:
-        """获取或创建本次消息所属会话，并标记为运行中。"""
+        """获取或创建本次消息所属会话，并标记为运行中。
+
+        workflow_id 与 agent_id 语义互斥；会话一旦锁定 Workflow，后续每轮都复检其可运行性，
+        且不允许切换（与 Agent 的锁定规则同构）。不涉及 Workflow 的请求不进入任何新分支。
+        """
+        if agent_id is not None and workflow_id is not None:
+            raise AgentException.message("同一次请求不能同时指定Agent和Workflow")
         if session_id is None:
             if agent_id is not None:
                 from agent.service import AgentService
 
                 await AgentService(self.db).require_runnable(agent_id, workspace_id)
+            if workflow_id is not None:
+                from workflow.service import WorkflowService
+
+                await WorkflowService(self.db).require_runnable(workflow_id, workspace_id)
             session: SessionRecord = await self.create_from_first_message(
                 content,
                 user_id,
                 workspace_id,
                 agent_id,
+                workflow_id,
             )
             await self.repo.update_status(session, "running")
             return session
         session = await self.get_required(session_id)
         if agent_id is not None and agent_id != session.agent_id:
             raise AgentException.message("已有会话不能切换Agent", status_code=409)
+        if workflow_id is not None and workflow_id != session.workflow_id:
+            raise AgentException.message("已有会话不能切换Workflow", status_code=409)
         if session.agent_id is not None:
             from agent.service import AgentService
 
             await AgentService(self.db).require_runnable(session.agent_id, workspace_id)
+        if session.workflow_id is not None:
+            from workflow.service import WorkflowService
+
+            await WorkflowService(self.db).require_runnable(session.workflow_id, workspace_id)
         return await self.mark_running(session_id)
+
+    @staticmethod
+    def resolve_effective_workflow_id(
+        requested_workflow_id: int | None,
+        session: SessionRecord | None,
+    ) -> int | None:
+        """本次消息实际生效的 Workflow：请求体的 workflow_id 或会话已锁定的 workflow_id。
+
+        会话锁定 Workflow 后前端不再带 workflow_id，只看请求体会让第二轮静默退回普通 Agent
+        路径且不报错；发消息入口必须以本方法的结果作为分发判据。
+        """
+        if requested_workflow_id is not None:
+            return requested_workflow_id
+        return session.workflow_id if session is not None else None
 
     async def start_turn(
         self,

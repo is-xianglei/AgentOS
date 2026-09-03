@@ -14,6 +14,7 @@ from task import api as task_api
 from team import api as team_api
 from tools import api as tools_api
 from user import api as user_api
+from workflow import api as workflow_api
 from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
@@ -35,4 +36,5 @@ api_router.include_router(team_api.router, prefix="/teams", tags=["teams"])
 api_router.include_router(permission_api.router, prefix="/permissions", tags=["permissions"])
 api_router.include_router(skill_api.router, prefix="/skills", tags=["skills"])
 api_router.include_router(user_api.router, prefix="/users", tags=["users"])
+api_router.include_router(workflow_api.router, prefix="/workflows", tags=["workflows"])
 api_router.include_router(workspace_api.router, prefix="/workspaces", tags=["workspaces"])

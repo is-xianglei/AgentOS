@@ -9,6 +9,7 @@ from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from runtime.agent import AgentRuntime, format_sse
+from runtime.workflow import WorkflowRuntime
 from session.schemas import (
     SessionBatchDeleteRequest,
     SessionDeleteResult,
@@ -21,6 +22,7 @@ from session.schemas import (
 )
 from session.service import SessionService
 from user.models import UserRecord
+from workflow.service import WorkflowService
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,14 @@ async def send_message(
         extra={
             "session_id": payload.session_id,
             "agent_id": payload.agent_id,
+            "workflow_id": payload.workflow_id,
             "prompt_chars": len(payload.content),
         },
     )
+    if payload.agent_id is not None and payload.workflow_id is not None:
+        raise AgentException.message("同一次请求不能同时指定Agent和Workflow")
     # 如果提供了 session_id，需要验证权限
+    session = None
     if payload.session_id:
         session = await SessionService(db).require_write_access(
             payload.session_id,
@@ -67,16 +73,40 @@ async def send_message(
         )
         if payload.agent_id is not None and payload.agent_id != session.agent_id:
             raise AgentException.message("已有会话不能切换Agent", status_code=409)
+        # 与 Agent 的规则同构；会话已锁定 Agent 时再带 workflow_id 同样视为切换。
+        if payload.workflow_id is not None and payload.workflow_id != session.workflow_id:
+            raise AgentException.message("已有会话不能切换Workflow", status_code=409)
+    elif payload.workflow_id is not None:
+        # 新建会话时前置校验 Workflow 可运行：让 404/409 走普通 JSON 错误响应，而不是进入
+        # 流式生产者后只留日志、返回一条空 SSE 流。Service 内的复检会再读一次，属有意重复。
+        await WorkflowService(db).require_runnable(payload.workflow_id, workspace_id)
 
-    # 传递用户信息和工作区信息到 runtime
-    runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
+    # 分发判据是「请求体的 workflow_id 或会话已锁定的 workflow_id」：会话锁定后前端不再带
+    # workflow_id，只看请求体会让第二轮静默退回普通 Agent 路径且不报错。
+    effective_workflow_id = SessionService.resolve_effective_workflow_id(
+        payload.workflow_id,
+        session,
+    )
 
-    async def event_stream():
-        async for event in runtime.run(
+    # 运行时在进入流式响应前构造：LLM 客户端配置缺失等错误仍走普通 JSON 错误响应。
+    if effective_workflow_id is not None:
+        workflow_runtime = WorkflowRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
+        events = workflow_runtime.run(
+            payload.session_id,
+            payload.content,
+            workflow_id=effective_workflow_id,
+        )
+    else:
+        # 传递用户信息和工作区信息到 runtime
+        runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
+        events = runtime.run(
             payload.session_id,
             payload.content,
             agent_id=payload.agent_id,
-        ):
+        )
+
+    async def event_stream():
+        async for event in events:
             yield format_sse(event)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
