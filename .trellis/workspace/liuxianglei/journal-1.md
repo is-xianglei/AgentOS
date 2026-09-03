@@ -54,3 +54,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Workflow 编排引擎：顺序/并行/智能路由三模式落地
+
+**Date**: 2026-09-03
+**Task**: Workflow 编排引擎：顺序/并行/智能路由三模式落地
+**Branch**: `feature/unify-llm-client`
+
+### Summary
+
+新增 workflow 域与迁移 0022、runtime/workflow.py 三种编排器、发消息接口 workflow_id 分发（含会话锁定防降级）、SubAgentSpec display_name/runtime_name 桥接、workflow LLM 场景四处同步；独立审查修复 Parallel 配置期失败静默跳过（AC7）等 6 项；146 个测试通过；沉淀 code-spec workflow-orchestration.md
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `77a4e77` | (see git log) |
+
+### Status
+
+[OK] **Completed**
