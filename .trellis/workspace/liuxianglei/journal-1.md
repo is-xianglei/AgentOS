@@ -75,3 +75,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Workflow 进度事件：节点状态与编排阶段 SSE 事件
+
+**Date**: 2026-09-04
+**Task**: Workflow 进度事件：节点状态与编排阶段 SSE 事件
+**Branch**: `feature/unify-llm-client`
+
+### Summary
+
+新增 workflow_progress StreamEvent 类型（member/routing/merging × running/done/failed）、Actor.agent_id 双形态输出、subagent_runs.agent_id 列与迁移 0023；三编排器统一 _emit_progress；审查修复取消路径测试缺口与 WorkflowProgressInfo 构造期校验；173 个测试通过；code-spec 与 README 同步
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9b86ac0` | (see git log) |
+
+### Status
+
+[OK] **Completed**
