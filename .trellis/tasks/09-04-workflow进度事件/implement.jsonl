@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/workflow-orchestration.md", "reason": "本任务推翻其 :172/:221/:265 三处「不新增事件类型」的取舍，需在改动编排器时同步改写该规范并补 workflow_progress 契约"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "subagent_runs 新增 agent_id 列与迁移 0023，需遵守 ORM 写法、中文 comment、显式 ondelete、索引与 Alembic 双向迁移约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "新增 frozen dataclass、枚举与关键字参数须符合类型注解、行宽与禁用旧写法的质量红线"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "成员失败发 failed 进度事件后仍要按既有语义抛中文 AgentException，取消不发 failed，不得静默兜底"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Parallel 失败分支在 logger.exception 之后补发进度事件，日志字段与中文文案需保持既有写法"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "agent_id 从 AgentRuntimeConfig 贯穿 SubAgentSpec、SubAgentRunner、Actor、运行记录表与 SSE，属典型跨层改动"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "进度事件对象应复用 BlockInfo/ToolInfo 的 frozen dataclass + to_dict 模式，编排器复用统一 _emit_progress helper 而非各处手写"}

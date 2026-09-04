@@ -1,7 +1,7 @@
 # Workflow Orchestration Guidelines
 
 > AgentOS Workflow 编排引擎规范：数据模型、运行入口分发判据、三种模式的失败语义、
-> SubAgentSpec 桥接与新增 `workflow` LLM 场景
+> SubAgentSpec 桥接、`workflow_progress` 进度事件契约与新增 `workflow` LLM 场景
 
 ---
 
@@ -12,7 +12,8 @@
 - 新增或修改 `workflow/` 包（`models.py` / `schemas.py` / `repository.py` / `service.py` / `api.py`）
 - 修改 `runtime/workflow.py`（`WorkflowRuntime`、三个编排器、成员标识与提示词模板）
 - 修改 `POST /api/sessions/messages` 的分发逻辑或 `SessionService.prepare_for_message`
-- 修改 `SubAgentSpec.display_name` / `runtime_name`，或 `AgentRuntimeConfig` 的 `name` / `description`
+- 修改 `SubAgentSpec.display_name` / `agent_id` / `runtime_name`，或 `AgentRuntimeConfig` 的 `name` / `description`
+- 修改 `core/events.py` 的 `Actor.agent_id`、`WorkflowProgressInfo` 或 `EventType.WORKFLOW_PROGRESS`（前端工作流图契约）
 - 新增编排模式、调整 `workflow` LLM 场景配置
 
 **强制触发条件**（本次全部命中）：`/api/workflows` 六个路由与 `send_message` 新增
@@ -25,14 +26,20 @@ API → SessionService → WorkflowRuntime → SubAgentRunner 的跨层契约。
 - `workflow/service.py` — 配置态入口；`require_runnable()` / `get_run_members()` 供 session 与 runtime 复用
 - `workflow/api.py` — `/api/workflows` 路由（`/modes` 必须先于 `/{workflow_id}` 声明）
 - `runtime/workflow.py` — 执行态：`WorkflowRuntime`、`SequentialOrchestrator` /
-  `ParallelOrchestrator` / `LlmRoutingOrchestrator`、`build_member_display_name()`、提示词模板
+  `ParallelOrchestrator` / `LlmRoutingOrchestrator`、`build_member_display_name()`、提示词模板、
+  `_emit_progress()` / `_run_member_with_progress()` 进度事件 helper
+- `core/events.py` — `EventType.WORKFLOW_PROGRESS`、`WorkflowPhase` / `WorkflowProgressStatus` /
+  `WorkflowProgressInfo`、`Actor.agent_id`、`subagent_actor(agent_id=)`
 - `session/api.py` `send_message`；`session/service.py` `prepare_for_message()` /
   `resolve_effective_workflow_id()`；`session/schemas.py` `SessionSendMessageRequest`
-- `tools/subagents/definition.py` — `SubAgentSpec.display_name` / `runtime_name`
+- `tools/subagents/definition.py` — `SubAgentSpec.display_name` / `agent_id` / `runtime_name`
+- `runtime/subagent.py` — `SubAgentRunner.run()` 把 `spec.agent_id` 透传到运行记录与 actor
+- `team/models.py` `SubAgentRunRecord.agent_id`；`team/subagent_run_repository.py` `create(agent_id=)`
 - `agent/service.py` — `AgentRuntimeConfig.name` / `.description`、`require_bindable_agent_ids()`
-- `alembic/versions/0022_create_workflows.py`
+- `alembic/versions/0022_create_workflows.py`、`alembic/versions/0023_subagent_run_agent_id.py`
 - 设计背景：`.trellis/tasks/09-02-工作流编排引擎/design.md`（§3 桥接、§4 执行流、§5 入口、
-  §9 取舍）与 `prd.md`（D1–D5）
+  §9 取舍）与 `prd.md`（D1–D5）；进度事件与 `agent_id`：
+  `.trellis/tasks/09-04-workflow进度事件/design.md`（§1 契约、§4 发事件点、§8 取舍）与 `prd.md`（D1–D5）
 
 ---
 
@@ -76,6 +83,15 @@ class WorkflowRuntime:
 class BaseOrchestrator:
     def __init__(self, *, db, bus, user_id, workspace_id, session_id, turn_id, workflow_id, members)
     async def run(self, user_content: str) -> OrchestrationResult   # 子类实现
+    async def run_member(self, db, agent_id: int, prompt: str, *,
+                         ordinal: int | None = None, total: int | None = None) -> tuple[AgentRuntimeConfig, str]
+    async def _emit_progress(self, phase: WorkflowPhase, status: WorkflowProgressStatus, *,
+                             config: AgentRuntimeConfig | None = None,
+                             ordinal: int | None = None, total: int | None = None) -> None
+    """以 ORCHESTRATOR_ACTOR 发 workflow_progress;member 阶段从 config 取 agent_id 与 Agent 原名。"""
+    async def _run_member_with_progress(self, db, config, prompt: str, *,
+                                        ordinal: int | None = None, total: int | None = None) -> str
+    """running → _execute_member → done / failed;CancelledError 不发 failed。三个编排器统一走它,不各自手写。"""
 
 # Parallel / LlmRouting 额外接受 llm: BaseLLMClient | None，未注入回落 create_llm_client(scenario="workflow")
 ORCHESTRATOR_CLASSES: dict[WorkflowMode, type[BaseOrchestrator]]   # 新模式必须在此登记
@@ -88,27 +104,57 @@ def build_member_display_name(agent_name: str) -> str   # f"wf-{name}"[:120]
 `OrchestrationResult(text, provider=None, model=None)`：只有编排层自己调 LLM 的产出
 （并行汇总）才带归因；Sequential / Routing 的最终文本来自成员，`provider` / `model` 为空。
 
-### 2.3 桥接签名（`tools/subagents/definition.py`、`agent/service.py`）
+### 2.3 桥接签名（`tools/subagents/definition.py`、`agent/service.py`、`core/events.py`、`team/`）
 
 ```python
 @dataclass(frozen=True)
 class SubAgentSpec:
     agent_type: AgentType            # workflow 成员固定 GENERAL_PURPOSE：只是能力档位，不是标识
     display_name: str = ""           # 动态 spec 的运行标识；内置 spec 留空
+    agent_id: int | None = None      # 数据库 Agent 主键；workflow 成员传 config.agent_id，内置 spec 留空
     @property
     def runtime_name(self) -> str:   # display_name or agent_type.value
         """落运行记录、发事件、判权限、打日志、TMP 目录名统一用它。"""
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
-    ...; name: str; description: str | None   # name → display_name；description → 路由依据
+    ...; agent_id: int; name: str; description: str | None   # name → display_name；description → 路由依据
+
+# core/events.py
+@dataclass(frozen=True)
+class Actor:
+    ...; agent_id: int | None = None   # to_dict_full 与 to_dict_compact 都在非 None 时输出该键
+def subagent_actor(agent_type: str, run_id: str, task: str | None = None, *,
+                   agent_id: int | None = None) -> Actor
+
+class WorkflowPhase(str, Enum): MEMBER / ROUTING / MERGING
+class WorkflowProgressStatus(str, Enum): RUNNING / DONE / FAILED
+@dataclass(frozen=True)
+class WorkflowProgressInfo:
+    phase: WorkflowPhase; status: WorkflowProgressStatus
+    agent_id: int | None = None; member_name: str | None = None
+    ordinal: int | None = None; total: int | None = None
+    def to_dict(self) -> dict[str, Any]   # phase/status 必出，其余非 None 才出
+StreamEvent.workflow_progress(actor, session_id, progress: WorkflowProgressInfo) -> StreamEvent
+StreamEvent.progress: WorkflowProgressInfo | None   # to_dict() 输出为 "progress" 键
+
+# team/subagent_run_repository.py
+class SubAgentRunRepository:
+    async def create(self, session_id, member_name, prompt, *, agent_id: int | None = None) -> SubAgentRunRecord
 ```
 
-### 2.4 DB（`alembic/versions/0022_create_workflows.py`）
+`SubAgentRunner.run()`（`runtime/subagent.py`）把 `spec.agent_id` 同时透传给
+`run_repo.create(agent_id=)` 与 `subagent_actor(agent_id=)`，因此 workflow 成员的全部事件
+（`turn_start` / `block_*` / `text_delta` / `tool_*` / `error` / `turn_end`）的 `actor` 都带 `agent_id`。
+
+### 2.4 DB（`alembic/versions/0022_create_workflows.py`、`0023_subagent_run_agent_id.py`）
 
 ```python
 revision = "0022_create_workflows"
 down_revision = "0021_message_llm_attribution"
+
+revision = "0023_subagent_run_agent_id"
+down_revision = "0022_create_workflows"
 ```
 
 | 表 / 列 | 约束 | 说明 |
@@ -123,8 +169,9 @@ down_revision = "0021_message_llm_attribution"
 | `workflow_agents.sort_order` | `Integer` 默认 0 | 执行/展示序；**无 role 列**（D3：角色差异全在编排器） |
 | `workflow_agents` | `UniqueConstraint(workflow_id, agent_id)` `uq_workflow_agents_workflow_agent` | `replace_members()` 复活软删行而非新插 |
 | `sessions.workflow_id` | FK `workflows.id` **SET NULL**，nullable，index | 会话锁定的 Workflow；workflow 会话的 `agent_id` 留空 |
+| `subagent_runs.agent_id`（0023） | FK `agents.id` **SET NULL** `fk_subagent_runs_agent_id_agents`，nullable，索引 `ix_subagent_runs_agent_id` | 仅 workflow 成员填成员 Agent 主键；内置子代理与 team 路径 NULL；存量行不回填 |
 
-两张新表均继承 `Base` 审计 / 软删字段，并已登记 `database/registry.py`。
+两张新表均继承 `Base` 审计 / 软删字段，并已登记 `database/registry.py`；0023 只加列不加实体，registry 不改。
 
 ---
 
@@ -168,10 +215,12 @@ class SessionSendMessageRequest(BaseModel):
 | `llm_routing` | 2（运行期） | 被选中成员收原始提问 | 是：`complete_structured(_RoutingChoice)` | 决策失败、选出 `agent_id` 不在成员表 → 整体失败，**不回落第一个成员** |
 
 - 成员执行统一经 `SubAgentRunner.run(...)`，成员的工具 / Skill / 模型来自 `AgentRuntimeConfig`；
-  成员过程事件由 `SubAgentRunner` 自发，编排者（`ORCHESTRATOR_ACTOR`）只发 `turn_start` /
-  `turn_end` 与承载最终回答的**一个**文本块（index 0），不新增事件类型。
+  成员过程事件由 `SubAgentRunner` 自发（`actor` 带 `agent_id`），编排者（`ORCHESTRATOR_ACTOR`）发
+  `turn_start` / `turn_end`、承载最终回答的**一个**文本块（index 0），以及 `workflow_progress`
+  进度事件（节点 running / done / failed 与 routing / merging 阶段，契约见 3.8）。
 - `SubAgentRunner` 抛出的任何异常被包成「Workflow成员执行失败」，details 只含
   `workflow_id` / `member_name`，堆栈只进 `logger.exception`，不透出到响应或汇总提示词。
+  进度事件不改变任何失败语义：`failed` 发出后仍按上表抛错。
 
 ### 3.3 Parallel 的 Session 隔离（硬约束）
 
@@ -216,14 +265,56 @@ class SessionSendMessageRequest(BaseModel):
 最后 emit `error`（code `WORKFLOW_RUN_FAILED`，非 `AgentException` 统一文案「Workflow执行失败。」）。
 分步 commit 的原因是流式执行跨越请求依赖的 yield 生命周期，与 `AgentRuntime` 相同。
 
-### 3.7 已接受取舍（design.md §9）
+### 3.7 已接受取舍（09-02 design.md §9、09-04 design.md §8）
 
-- 编排阶段**不额外发事件类型**，也不为「正在路由 / 正在汇总」另发说明文本。
+- 编排阶段以 `workflow_progress` 事件上报节点状态（09-04 推翻 09-02 的「不新增事件类型」），
+  但**不发路由理由**（`_RoutingChoice` 只有 `agent_id`）、**不带成员输出正文**、**进度事件不落库**
+  （不进 `session_messages` / `session_snapshots`，历史回放范围外）。
+- **配置期失败不发 `member/failed`**：`failed` 只与已发出的 `running` 配对；成员停用 / 软删 /
+  不存在发生在 `running` 之前，整体失败由 `WorkflowRuntime._produce` 的 `error` 事件承担。
+- **Parallel 全败不发 merging 事件**：没有进入汇总阶段就不上报该阶段。
+- **`asyncio.CancelledError` 不发任何 `failed`**：取消不是节点失败，直接重抛保持既有取消语义。
+- `Actor.agent_id` 在 `to_dict_full` 与 `to_dict_compact` **都**输出：前端靠增量事件归节点。
+  内置子代理 / teammate / 主循环的 `agent_id` 恒 None，序列化不出键，事件形状逐字节不变。
 - `WorkflowRuntime` **不接** prompt hooks、任务快照（`TaskService.emit_snapshot`）、记忆入队 / 提取。
 - D2 每轮重跑**成员不接收历史消息**，只收本轮 `user_content`（顺序模式外加上一步输出）。
 - Sequential / Routing 落库的 assistant 消息 `provider` / `model` 为空（文本来自成员，
   成员归因在其自身运行记录）；仅 Parallel 汇总带归因。
 - 编排器放 `runtime/` 而非 `workflow/service.py`：编排是执行态，`workflow/service.py` 只管配置态。
+
+### 3.8 `workflow_progress` 进度事件契约（前端工作流图）
+
+`type = "workflow_progress"`，归 `StreamEvent`，actor 固定为编排者精简形态
+`{"role": "orchestrator", "name": "orchestrator"}`，payload 键 `progress`：
+
+| phase | 含义 | 允许的 status | 必带字段 | 可选字段 |
+|---|---|---|---|---|
+| `member` | 单个成员节点 | running / done / failed | `agent_id`、`member_name`（Agent 原名，非 `wf-` 标识） | `ordinal`、`total`（仅 Sequential，1 起算） |
+| `routing` | LlmRouting 决策 | running / done / failed | — | done 时带选中的 `agent_id`、`member_name` |
+| `merging` | Parallel 汇总 | running / done / failed | — | — |
+
+每个 (phase, agent_id) 一轮内 `running` 恰一次、终态至多一次。三种模式的事件序（一次成功运行）：
+
+- Sequential：`member/running(1/N)` → 成员 1 自发事件 → `member/done(1/N)` → … → `member/done(N/N)`
+  → 编排者文本块。成员失败：`member/failed(k/N)` 后抛「顺序编排已中止」，后续成员零事件。
+- Parallel：派发前 `member/running × N`（前端一次性点亮全部节点）→ 各成员自发事件交错 →
+  `member/done` / `member/failed` 交错（各协程自发，彼此顺序不定）→ `merging/running` →
+  编排者汇总文本块 → `merging/done`。汇总 LLM 无文本：`merging/failed` 后抛错。
+- LlmRouting：`routing/running` → `routing/done(agent_id=X, member_name)` → `member/running(X)` →
+  成员 X 自发事件 → `member/done(X)` → 编排者文本块。决策失败 / 选出成员不在列表：`routing/failed`，零条 member。
+
+示例：
+
+```json
+{"type": "workflow_progress", "session_id": 42, "sequence": 17,
+ "actor": {"role": "orchestrator", "name": "orchestrator"},
+ "progress": {"phase": "member", "status": "running",
+              "agent_id": 2, "member_name": "审稿人", "ordinal": 2, "total": 3}}
+```
+
+语义分层：成员自发的 `error` 是成员自述，`member/failed` 是编排者视角的节点状态，两者可同时出现。
+`StreamBus` 单队列 FIFO，成员 `done` 必然排在该成员 `turn_end` 之后。`format_sse` 无 type 白名单，
+新事件直接透传；本仓库无前端，前端需对未知 `type` 容错。
 
 ---
 
@@ -262,7 +353,8 @@ class SessionSendMessageRequest(BaseModel):
 请求 `{"content": "...", "workflow_id": 7}` → API 前置 `require_runnable(7)` → 分发
 `WorkflowRuntime.run(None, content, workflow_id=7)` → `prepare_for_message` 建会话并写
 `sessions.workflow_id = 7`、`agent_id = NULL` → SSE：`session_ready` → `turn_start` →
-成员 subagent 事件 → 编排者文本块 → `turn_end`。
+（Sequential）`workflow_progress member/running(1/N)` → 成员 subagent 事件（`actor.agent_id` 可归节点）→
+`workflow_progress member/done(1/N)` → … → 编排者文本块 → `turn_end`。
 
 ### Good：第二轮只带 `session_id`
 
@@ -272,8 +364,9 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 
 ### Good：Parallel 部分失败
 
-三成员中一个 `SubAgentRunner` 抛错 → 该成员 `logger.exception` 后被 `gather(return_exceptions=True)`
-收集并跳过 → 汇总提示词只含两个成功成员输出 → 正常返回。
+三成员中一个 `SubAgentRunner` 抛错 → 该成员 `logger.exception` 后发 `member/failed`，被
+`gather(return_exceptions=True)` 收集并跳过 → 其余两成员 `member/done` → `merging/running` →
+汇总提示词只含两个成功成员输出 → `merging/done` → 正常返回。
 
 ### Bad（详见第 7 段，此处只列症状）
 
@@ -293,7 +386,7 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 
 | 用例 | 断言点 |
 |---|---|
-| `test_sequential_passes_original_question_and_previous_output` | 第 1 个 prompt 恰为原始提问；第 3 个含第 2 个输出、**不含**第 1 个；成员名序 `wf-分析师 / wf-审稿人 / wf-总结者`；bus 事件恰为 `BLOCK_START, TEXT_DELTA, BLOCK_STOP` |
+| `test_sequential_passes_original_question_and_previous_output` | 第 1 个 prompt 恰为原始提问；第 3 个含第 2 个输出、**不含**第 1 个；成员名序 `wf-分析师 / wf-审稿人 / wf-总结者`；过滤 `WORKFLOW_PROGRESS` 后 bus 事件恰为 `BLOCK_START, TEXT_DELTA, BLOCK_STOP` |
 | `test_sequential_aborts_remaining_members_on_failure` | 第 2 个失败后第 3 个未执行；消息以「顺序编排已中止」开头；details 含 `member_name` / `workflow_id`；异常细节不出现在消息与 details |
 | `test_sequential_aborts_when_member_agent_disabled` | `status_code == 409`、含「Agent已停用」、`details["agent_id"] == 2`、停用成员及后续未执行 |
 | `test_parallel_runs_all_members_in_isolated_sessions_and_merges` | 三成员 `db` 实例 `id` 互不相同且均来自 `AsyncSessionLocal`；汇总 LLM 入参含全部成员输出 |
@@ -308,6 +401,21 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 | `test_send_message_plain_agent_request_dispatches_agent_runtime` / `..._rejects_workflow_switch_and_mixing` | 纯 Agent 走 `AgentRuntime`；API 层 409 与互斥时两个 Runtime 均未构造 |
 | `test_runtime_run_commits_user_message_then_final_state` | `commits >= 2`、`rollbacks == 0`；assistant 落 `[{"kind": "text", ...}]`；事件序 `session_ready, turn_start, turn_end`；bus 已关闭 |
 | `test_runtime_run_marks_failed_and_emits_error_on_orchestrator_exception` | `_mark_abnormal_end(..., "failed")` 恰一次、`rollbacks == 1`、恰一个 `error` 事件 |
+| `test_sequential_emits_member_progress_with_ordinal` / `..._emits_failed_before_abort` / `..._config_failure_emits_no_progress_for_that_member` | 09-04 AC1：三成员各 running/done，`ordinal` 1/2/3、`total` 3；running 先于执行器调用（`bus_len_at_call` 为 1/3/5）；失败成员 failed 无 done、后续零条；配置期失败零条 |
+| `test_parallel_emits_running_for_all_before_dispatch` / `..._emits_failed_for_single_member_and_merging` / `..._all_failed_skips_merging` / `..._merge_failure_emits_merging_failed` | 09-04 AC2：前 3 条进度全为 running 且早于任何执行器调用；失败成员 failed、其余 done；`merging/running` 在全部终态后、汇总 LLM 前，`merging/done` 为最后一条；全败零条 merging；汇总无文本 `merging/failed` |
+| `test_routing_emits_routing_then_only_selected_member` / `..._decision_failure_emits_routing_failed` / `..._choice_outside_members_emits_routing_failed` | 09-04 AC3：`routing/running` 是首条事件且早于 `complete_structured`；`routing/done` 带选中 `agent_id`/`member_name`；只有选中成员有 member 进度；决策失败 / 选出成员不在列表均 `routing/failed`、零条 member |
+| `test_member_spec_carries_agent_id` / `test_progress_events_serialize_with_orchestrator_compact_actor` | 09-04 AC4/AC5：交给 `SubAgentRunner` 的 `spec.agent_id == config.agent_id`；进度事件 `to_dict()` 的 actor 为编排者精简形态、`progress` 只含非 None 字段 |
+
+### 6.1b `tests/test_events_actor.py`（09-04 AC4 / AC5）
+
+- `test_builtin_subagent_actor_has_no_agent_id_key` / `test_orchestrator_and_teammate_actor_shape_unchanged`：
+  内置 / 主循环 / teammate actor 两种形态均无 `agent_id` 键（事件形状零变化）
+- `test_workflow_member_actor_carries_agent_id_in_both_shapes` / `test_agent_id_flows_into_increment_event_actor`：
+  `subagent_actor(agent_id=7)` 的 full 与 compact 都含 `"agent_id": 7`，`text_delta` 事件 actor 同样带
+- `test_workflow_progress_event_serialization` / `test_workflow_progress_info_omits_none_fields`：payload 形状与 3.8 示例一致
+- `test_runner_passes_spec_agent_id_to_run_record_and_actor` / `test_runner_keeps_builtin_spec_record_and_actor_unchanged`：
+  跑真实 `SubAgentRunner.run`（ReAct 打桩），`run_repo.create` 收到 `agent_id=spec.agent_id`，
+  `turn_start` / `turn_end` actor 带 `agent_id`；内置 spec 的运行记录 `agent_id=None`、actor 无该键
 
 ### 6.2 `tests/test_workflow_service.py`
 
@@ -321,12 +429,15 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 ### 6.3 `tests/test_subagent_spec.py`
 
 - `test_builtin_spec_runtime_name_falls_back_to_enum_value`（参数化四个内置类型）、
-  `test_explore_spec_runtime_name_is_explore`：内置 spec 零行为变更
+  `test_explore_spec_runtime_name_is_explore`：内置 spec 零行为变更，且 `agent_id is None`
 - `test_display_name_overrides_runtime_name`：传 `display_name` 时 `runtime_name` 取其值
+- `test_spec_agent_id_is_readable_when_provided`：传 `agent_id=7` 可读回
 
 ### 6.4 欠账（需真实 PostgreSQL，尚未编写）
 
 - 迁移往返：`alembic upgrade` 到 `0022_create_workflows` 后两表、`sessions.workflow_id` 与部分唯一索引存在；`downgrade -1` 后全部消失
+- 迁移 `0023_subagent_run_agent_id` 往返：`subagent_runs.agent_id` 列、`fk_subagent_runs_agent_id_agents`、`ix_subagent_runs_agent_id` 出现 / 消失（09-04 实施时已用命令验证，未沉淀为自动化用例）
+- workflow 成员运行记录 `agent_id` 真实落库为成员主键，内置子代理与 team 路径为 NULL
 - `replace_members` 复活软删绑定不触发 `uq_workflow_agents_workflow_agent`
 - 删除被 workflow 绑定的 Agent 时 RESTRICT 只拦物理删除、软删仍成功
 ---

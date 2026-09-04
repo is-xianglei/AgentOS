@@ -83,6 +83,9 @@ class SubAgentSpec:
     # 动态构造的 spec(如 workflow 成员)的运行标识;内置 spec 留空,回落枚举值。
     # agent_type 对这类 spec 只表示能力档位,不再充当标识,避免权限规则与事件串名。
     display_name: str = ""
+    # 数据库 Agent 主键;动态 spec(workflow 成员)传入,供事件与运行记录归到具体 Agent。
+    # 内置 spec 留空,事件形状与运行记录保持原样。
+    agent_id: int | None = None
 
     @property
     def runtime_name(self) -> str:

@@ -60,6 +60,9 @@ SSE 使用单层 JSON 数据，事件类型放在 `type` 字段：
 data: {"id":12,"type":"task_created","session_id":1,"data":{"subject":"写文档"}}
 ```
 
+Workflow 会话（首轮带 `workflow_id`，或会话已锁定 workflow）额外产出 `workflow_progress` 事件：`progress.phase`（member / routing / merging）
+与 `progress.status`（running / done / failed）为受控取值，成员事件的 `actor.agent_id` 可把事件归到工作流图节点。
+
 触发示例工具：
 
 ```bash

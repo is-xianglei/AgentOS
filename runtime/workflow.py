@@ -1,7 +1,8 @@
 """Workflow 编排运行时:把数据库定义的 Workflow 按模式编排成一次流式会话轮次。
 
 与 AgentRuntime 同构(生产者-消费者 + StreamBus),成员执行复用 SubAgentRunner,
-编排层只负责成员顺序、输入拼装、并发隔离与汇总/路由,不新增事件类型。
+编排层负责成员顺序、输入拼装、并发隔离与汇总/路由,并以 workflow_progress 事件
+上报节点状态(成员 running/done/failed 与路由、汇总阶段),供前端实时渲染工作流图。
 
 会话语义(D2):会话一旦锁定 workflow,后续每一轮追问都会重跑整个编排,
 成本高于普通 Agent 会话,这是既定取舍。
@@ -22,7 +23,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.service import AgentRuntimeConfig, AgentService
 from core.errors import AgentException
 from core.event_bus import StreamBus
-from core.events import ORCHESTRATOR_ACTOR, BlockType, ErrorInfo, RuntimeEvent, StreamEvent
+from core.events import (
+    ORCHESTRATOR_ACTOR,
+    BlockType,
+    ErrorInfo,
+    RuntimeEvent,
+    StreamEvent,
+    WorkflowPhase,
+    WorkflowProgressInfo,
+    WorkflowProgressStatus,
+)
 from database.engine import AsyncSessionLocal
 from llm import BaseLLMClient, create_llm_client
 from llm.types import build_assistant_blocks
@@ -65,6 +75,14 @@ LLM_ROUTING_CANDIDATE_TEMPLATE = "- agent_id={agent_id} 名称:{name} 描述:{de
 
 # 编排者最终文本块的 index:编排者一个回合只发一个文本块,成员事件由各自 actor 独立编号。
 _FINAL_TEXT_BLOCK_INDEX = 0
+
+# 进度事件枚举的短别名,只为缩短编排器里的调用行,不另造字符串常量。
+_MEMBER = WorkflowPhase.MEMBER
+_ROUTING = WorkflowPhase.ROUTING
+_MERGING = WorkflowPhase.MERGING
+_RUNNING = WorkflowProgressStatus.RUNNING
+_DONE = WorkflowProgressStatus.DONE
+_FAILED = WorkflowProgressStatus.FAILED
 
 # 成员运行标识前缀与长度上限:display_name 会落 subagent_runs.member_name(String(120)),
 # 而 agents.name 允许 128 字符,拼上前缀后必须截断,否则运行记录写入失败。
@@ -162,6 +180,7 @@ class BaseOrchestrator:
         spec = SubAgentSpec(
             agent_type=AgentType.GENERAL_PURPOSE,
             display_name=build_member_display_name(config.name),
+            agent_id=config.agent_id,
             system_prompt=config.system_prompt,
             allowed_tools=config.tool_runtime_names,
             model=config.model_name,
@@ -189,11 +208,69 @@ class BaseOrchestrator:
         db: AsyncSession,
         agent_id: int,
         prompt: str,
+        *,
+        ordinal: int | None = None,
+        total: int | None = None,
     ) -> tuple[AgentRuntimeConfig, str]:
-        """成员执行的公共步骤:取配置 → 执行,返回 (配置, 输出) 供调用方取成员名。"""
+        """成员执行的公共步骤:取配置 → 带进度执行,返回 (配置, 输出) 供调用方取成员名。
+
+        配置期失败(成员停用/软删/不存在)发生在 running 之前,不发 failed 进度事件,
+        整体失败由 WorkflowRuntime._produce 的 error 事件承担。
+        """
         config = await self._load_member_config(db, agent_id)
-        output = await self._execute_member(db, config, prompt)
+        output = await self._run_member_with_progress(
+            db, config, prompt, ordinal=ordinal, total=total
+        )
         return config, output
+
+    async def _emit_progress(
+        self,
+        phase: WorkflowPhase,
+        status: WorkflowProgressStatus,
+        *,
+        config: AgentRuntimeConfig | None = None,
+        ordinal: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        """以编排者身份推送进度事件;member 阶段从 config 取 agent_id 与 Agent 原名。"""
+        await self.bus.emit(
+            StreamEvent.workflow_progress(
+                ORCHESTRATOR_ACTOR,
+                self.session_id,
+                WorkflowProgressInfo(
+                    phase=phase,
+                    status=status,
+                    agent_id=config.agent_id if config else None,
+                    member_name=config.name if config else None,
+                    ordinal=ordinal,
+                    total=total,
+                ),
+            )
+        )
+
+    async def _run_member_with_progress(
+        self,
+        db: AsyncSession,
+        config: AgentRuntimeConfig,
+        prompt: str,
+        *,
+        ordinal: int | None = None,
+        total: int | None = None,
+    ) -> str:
+        """成员执行外包一层 running/done/failed 进度;取消不发 failed,保持既有取消语义。
+
+        failed 只与已发出的 running 配对,避免前端出现「从未 running 的节点直接 failed」。
+        """
+        await self._emit_progress(_MEMBER, _RUNNING, config=config, ordinal=ordinal, total=total)
+        try:
+            output = await self._execute_member(db, config, prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._emit_progress(_MEMBER, _FAILED, config=config, ordinal=ordinal, total=total)
+            raise
+        await self._emit_progress(_MEMBER, _DONE, config=config, ordinal=ordinal, total=total)
+        return output
 
     async def _emit_final_text(self, text: str) -> None:
         """把最终文本作为编排者的一个文本块推给前端;成员过程事件已由 SubAgentRunner 自发。"""
@@ -227,7 +304,8 @@ class SequentialOrchestrator(BaseOrchestrator):
     async def run(self, user_content: str) -> OrchestrationResult:
         previous_member: str | None = None
         previous_output: str | None = None
-        for member in self.members:
+        total = len(self.members)
+        for ordinal, member in enumerate(self.members, start=1):
             prompt = (
                 user_content
                 if previous_output is None
@@ -238,7 +316,9 @@ class SequentialOrchestrator(BaseOrchestrator):
                 )
             )
             try:
-                config, previous_output = await self.run_member(self.db, member.agent_id, prompt)
+                config, previous_output = await self.run_member(
+                    self.db, member.agent_id, prompt, ordinal=ordinal, total=total
+                )
             except AgentException as exc:
                 # 下游拿不到输入,继续执行无意义;抛错即中止,后续成员不再执行。
                 raise AgentException.message(
@@ -275,6 +355,9 @@ class ParallelOrchestrator(BaseOrchestrator):
         configs = [
             await self._load_member_config(self.db, member.agent_id) for member in self.members
         ]
+        # 派发前对全部成员发 running:前端一次性点亮所有节点,而不是随各协程调度顺序零散出现。
+        for config in configs:
+            await self._emit_progress(_MEMBER, _RUNNING, config=config)
         results = await asyncio.gather(
             *(self._run_member_isolated(config, user_content) for config in configs),
             return_exceptions=True,
@@ -284,15 +367,25 @@ class ParallelOrchestrator(BaseOrchestrator):
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
             if isinstance(outcome, BaseException):
-                # 失败成员已在 _run_member_isolated 记录服务端日志,这里只统计不再上抛。
+                # 失败成员已在 _run_member_isolated 记录服务端日志并发 failed 进度,这里只统计不再上抛。
                 continue
             succeeded.append(outcome)
         if not succeeded:
+            # 全败不进入汇总阶段,也不发 merging 事件,与实际执行路径一致。
             raise AgentException.message(
                 "并行编排的全部成员均执行失败",
                 {"workflow_id": self.workflow_id, "member_count": len(self.members)},
             )
-        return await self._merge(user_content, succeeded)
+        await self._emit_progress(_MERGING, _RUNNING)
+        try:
+            result = await self._merge(user_content, succeeded)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._emit_progress(_MERGING, _FAILED)
+            raise
+        await self._emit_progress(_MERGING, _DONE)
+        return result
 
     async def _run_member_isolated(
         self,
@@ -303,6 +396,7 @@ class ParallelOrchestrator(BaseOrchestrator):
 
         AsyncSession 非并发安全,而 SubAgentRunner 持有 db,故每个并发成员必须用
         AsyncSessionLocal 开独立 Session;只共享 self.bus,让各成员增量流到同一条 SSE。
+        running 进度已由 run() 在派发前统一发出,这里只负责终态 done / failed。
         """
         async with AsyncSessionLocal() as sub_db:
             try:
@@ -321,7 +415,9 @@ class ParallelOrchestrator(BaseOrchestrator):
                         "member_name": config.name,
                     },
                 )
+                await self._emit_progress(_MEMBER, _FAILED, config=config)
                 raise
+            await self._emit_progress(_MEMBER, _DONE, config=config)
             return config.name, output
 
     async def _merge(
@@ -373,8 +469,17 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
         configs = [
             await self._load_member_config(self.db, member.agent_id) for member in self.members
         ]
-        chosen = await self._route(user_content, configs)
-        output = await self._execute_member(self.db, chosen, user_content)
+        await self._emit_progress(_ROUTING, _RUNNING)
+        try:
+            chosen = await self._route(user_content, configs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # _route 内部已把 LLM 异常与「不在成员列表」都转成 AgentException,这里只补节点状态。
+            await self._emit_progress(_ROUTING, _FAILED)
+            raise
+        await self._emit_progress(_ROUTING, _DONE, config=chosen)
+        output = await self._run_member_with_progress(self.db, chosen, user_content)
         await self._emit_final_text(output)
         return OrchestrationResult(text=output)
 

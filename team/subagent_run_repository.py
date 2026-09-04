@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,10 +10,19 @@ class SubAgentRunRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def create(self, session_id: int, member_name: str, prompt: str) -> SubAgentRunRecord:
+    async def create(
+        self,
+        session_id: int,
+        member_name: str,
+        prompt: str,
+        *,
+        agent_id: int | None = None,
+    ) -> SubAgentRunRecord:
+        """建运行记录;agent_id 仅 workflow 成员传入,内置子代理与团队成员留空。"""
         run = SubAgentRunRecord(
             session_id=session_id,
             member_name=member_name,
+            agent_id=agent_id,
             status="running",
             prompt=prompt,
         )
@@ -25,7 +34,7 @@ class SubAgentRunRepository:
     async def succeed(self, run: SubAgentRunRecord, report: str) -> SubAgentRunRecord:
         run.status = "succeeded"
         run.report = report
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         await self.db.flush()
         await self.db.refresh(run)
         return run
@@ -33,7 +42,7 @@ class SubAgentRunRepository:
     async def fail(self, run: SubAgentRunRecord, error_message: str) -> SubAgentRunRecord:
         run.status = "failed"
         run.error_message = error_message
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         await self.db.flush()
         await self.db.refresh(run)
         return run

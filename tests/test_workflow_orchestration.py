@@ -18,7 +18,13 @@ from pydantic import BaseModel
 
 from agent.service import AgentRuntimeConfig
 from core.errors import AgentException
-from core.events import BlockType, EventType
+from core.events import (
+    BlockType,
+    EventType,
+    WorkflowPhase,
+    WorkflowProgressInfo,
+    WorkflowProgressStatus,
+)
 from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from runtime.workflow import (
     MEMBER_DISPLAY_NAME_MAX_LENGTH,
@@ -40,6 +46,13 @@ _WORKFLOW_ID = 9
 _USER_ID = 1
 _WORKSPACE_ID = 1
 _QUESTION = "帮我评估这个方案"
+
+_MEMBER = WorkflowPhase.MEMBER
+_ROUTING = WorkflowPhase.ROUTING
+_MERGING = WorkflowPhase.MERGING
+_RUNNING = WorkflowProgressStatus.RUNNING
+_DONE = WorkflowProgressStatus.DONE
+_FAILED = WorkflowProgressStatus.FAILED
 
 
 # ---------- 替身 ----------
@@ -69,6 +82,18 @@ class _RecordingBus:
         return {}
 
 
+def _progress(bus: _RecordingBus) -> list[WorkflowProgressInfo]:
+    """按顺序取出 bus 上全部进度事件的 payload。"""
+    return [e.progress for e in bus.events if e.type is EventType.WORKFLOW_PROGRESS]
+
+
+def _progress_of(
+    bus: _RecordingBus, phase: WorkflowPhase, agent_id: int | None = None
+) -> list[WorkflowProgressStatus]:
+    """某个 (phase, agent_id) 节点在 bus 上的状态序列。"""
+    return [p.status for p in _progress(bus) if p.phase is phase and p.agent_id == agent_id]
+
+
 class _FakeSessionScope:
     """替身 AsyncSessionLocal:进出上下文都不建立数据库连接,每次实例唯一以便断言隔离。"""
 
@@ -84,6 +109,9 @@ class _MemberCall:
     display_name: str
     prompt: str
     db: Any
+    # 执行器被调用时 bus 上已有的事件数与 spec 携带的 agent_id,供进度事件顺序 / 透传断言。
+    bus_len_at_call: int = 0
+    agent_id: int | None = None
 
 
 class _Harness:
@@ -96,10 +124,14 @@ class _Harness:
         *,
         outputs: dict[str, str] | None = None,
         failing: set[str] = frozenset(),
+        cancelling: set[str] = frozenset(),
         disabled_ids: set[int] = frozenset(),
         rendezvous: int | None = None,
     ) -> None:
-        """rendezvous 非空时,执行器替身进入后要等齐该数量的成员才返回:串行实现会在此死等。"""
+        """rendezvous 非空时,执行器替身进入后要等齐该数量的成员才返回:串行实现会在此死等。
+
+        cancelling 中的成员在执行器里抛 CancelledError,模拟客户端断开导致的任务取消。
+        """
         self.calls: list[_MemberCall] = []
         self.config_requests: list[int] = []
         self.timeouts = 0
@@ -123,10 +155,19 @@ class _Harness:
         class _FakeSubAgentRunner:
             def __init__(self, db: object, bus: object | None = None) -> None:
                 self.db = db
+                self.bus = bus
 
             async def run(self, session_id: int, prompt: str, spec: Any, **kwargs: Any) -> str:
                 nonlocal arrived
-                harness.calls.append(_MemberCall(spec.display_name, prompt, self.db))
+                harness.calls.append(
+                    _MemberCall(
+                        spec.display_name,
+                        prompt,
+                        self.db,
+                        bus_len_at_call=len(getattr(self.bus, "events", ())),
+                        agent_id=spec.agent_id,
+                    )
+                )
                 if rendezvous is not None:
                     arrived += 1
                     if arrived >= rendezvous:
@@ -139,6 +180,8 @@ class _Harness:
                         raise
                 if spec.display_name in failing:
                     raise RuntimeError("成员内部故障：含敏感堆栈细节")
+                if spec.display_name in cancelling:
+                    raise asyncio.CancelledError()
                 return outputs.get(spec.display_name, f"{spec.display_name}的结论")
 
         monkeypatch.setattr("runtime.workflow.AgentService", _FakeAgentService)
@@ -158,6 +201,16 @@ class _FakeLLM:
         self.stream_prompts: list[str] = []
         self.structured_prompts: list[str] = []
         self.fail_structured = False
+        # 置 True 时对应调用抛 CancelledError,模拟 LLM 调用中途被取消。
+        self.cancel_stream = False
+        self.cancel_structured = False
+        # 绑定 bus 后,记录每次 LLM 调用时 bus 上已有的事件数,供进度事件顺序断言。
+        self.bus: _RecordingBus | None = None
+        self.stream_bus_len: list[int] = []
+        self.structured_bus_len: list[int] = []
+
+    def _bus_len(self) -> int:
+        return len(self.bus.events) if self.bus is not None else 0
 
     async def stream(
         self,
@@ -167,6 +220,9 @@ class _FakeLLM:
         model: str | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
         self.stream_prompts.append(messages[-1]["content"])
+        self.stream_bus_len.append(self._bus_len())
+        if self.cancel_stream:
+            raise asyncio.CancelledError()
         yield LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)
         yield LLMStreamEvent(LLMEventKind.TEXT_DELTA, block_ref=0, text=self.merged_text)
         yield LLMStreamEvent(LLMEventKind.BLOCK_STOP, block_ref=0)
@@ -186,6 +242,9 @@ class _FakeLLM:
         timeout: float | None = None,
     ) -> T:
         self.structured_prompts.append(messages[-1]["content"])
+        self.structured_bus_len.append(self._bus_len())
+        if self.cancel_structured:
+            raise asyncio.CancelledError()
         if self.fail_structured:
             raise RuntimeError("路由模型不可用")
         return output_format(agent_id=self.choice)
@@ -239,8 +298,12 @@ async def test_sequential_passes_original_question_and_previous_output(
     assert "wf-审稿人的结论" in third.prompt
     assert "wf-分析师的结论" not in third.prompt
     assert result.text == "wf-总结者的结论"
-    # 最终文本以编排者文本块推送。
-    types = [event.type for event in orchestrator.bus.events]
+    # 最终文本以编排者文本块推送;进度事件另有专门用例覆盖,这里过滤掉。
+    types = [
+        event.type
+        for event in orchestrator.bus.events
+        if event.type is not EventType.WORKFLOW_PROGRESS
+    ]
     assert types == [EventType.BLOCK_START, EventType.TEXT_DELTA, EventType.BLOCK_STOP]
 
 
@@ -466,6 +529,322 @@ async def test_routing_requires_at_least_two_members(monkeypatch: pytest.MonkeyP
 
     assert "至少需要2个成员" in exc_info.value.message
     assert llm.structured_prompts == []
+
+
+# ---------- 进度事件(09-04 AC1–AC5) ----------
+
+
+async def test_sequential_emits_member_progress_with_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1:三成员各一条 running/done,ordinal 1/2/3、total 恒 3,running 早于执行器、done 晚于返回。"""
+    harness = _Harness(monkeypatch, _CONFIGS)
+    bus = _RecordingBus()
+    orchestrator = SequentialOrchestrator(**_deps(_members(1, 2, 3), bus))
+
+    await orchestrator.run(_QUESTION)
+
+    progress = _progress(bus)
+    assert [
+        (p.phase, p.status, p.agent_id, p.member_name, p.ordinal, p.total) for p in progress
+    ] == [
+        (_MEMBER, _RUNNING, 1, "分析师", 1, 3),
+        (_MEMBER, _DONE, 1, "分析师", 1, 3),
+        (_MEMBER, _RUNNING, 2, "审稿人", 2, 3),
+        (_MEMBER, _DONE, 2, "审稿人", 2, 3),
+        (_MEMBER, _RUNNING, 3, "总结者", 3, 3),
+        (_MEMBER, _DONE, 3, "总结者", 3, 3),
+    ]
+    # 执行器被调用时,该成员的 running 已在 bus 上(第 N 个成员调用时已有 2N-1 条事件),
+    # 而 done 只能在返回后出现,故调用时刻 bus 长度恰为 running 的条数。
+    assert [call.bus_len_at_call for call in harness.calls] == [1, 3, 5]
+
+
+async def test_sequential_emits_failed_before_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC1:失败成员有 failed、无 done;后续成员零条进度;整体仍按既有语义抛错。"""
+    _Harness(monkeypatch, _CONFIGS, failing={"wf-审稿人"})
+    bus = _RecordingBus()
+    orchestrator = SequentialOrchestrator(**_deps(_members(1, 2, 3), bus))
+
+    with pytest.raises(AgentException, match="顺序编排已中止"):
+        await orchestrator.run(_QUESTION)
+
+    assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MEMBER, 2) == [_RUNNING, _FAILED]
+    assert _progress_of(bus, _MEMBER, 3) == []
+    failed = [p for p in _progress(bus) if p.status is _FAILED]
+    assert failed[0].ordinal == 2 and failed[0].total == 3
+
+
+async def test_sequential_config_failure_emits_no_progress_for_that_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配置期失败(成员停用)发生在 running 之前,不发 failed:failed 只与已发 running 配对。"""
+    _Harness(monkeypatch, _CONFIGS, disabled_ids={2})
+    bus = _RecordingBus()
+    orchestrator = SequentialOrchestrator(**_deps(_members(1, 2, 3), bus))
+
+    with pytest.raises(AgentException):
+        await orchestrator.run(_QUESTION)
+
+    assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MEMBER, 2) == []
+    assert _progress_of(bus, _MEMBER, 3) == []
+
+
+async def test_parallel_emits_running_for_all_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2:派发前三条 member/running 均已发出,任何执行器调用时 bus 上都已有这三条。"""
+    harness = _Harness(monkeypatch, _CONFIGS)
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=_FakeLLM(), **_deps(_members(1, 2, 3), bus))
+
+    await orchestrator.run(_QUESTION)
+
+    first_three = _progress(bus)[:3]
+    assert [(p.phase, p.status) for p in first_three] == [(_MEMBER, _RUNNING)] * 3
+    assert sorted(p.agent_id for p in first_three) == [1, 2, 3]
+    assert all(p.ordinal is None and p.total is None for p in first_three)
+    assert len(harness.calls) == 3
+    assert all(call.bus_len_at_call >= 3 for call in harness.calls)
+
+
+async def test_parallel_emits_failed_for_single_member_and_merging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2:失败成员 failed、其余 done;merging/running 在全部终态之后、汇总 LLM 之前;merging/done 最后。"""
+    _Harness(monkeypatch, _CONFIGS, failing={"wf-审稿人"})
+    llm = _FakeLLM()
+    bus = _RecordingBus()
+    llm.bus = bus
+    orchestrator = ParallelOrchestrator(llm=llm, **_deps(_members(1, 2, 3), bus))
+
+    result = await orchestrator.run(_QUESTION)
+
+    assert result.text == "汇总结论"
+    assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MEMBER, 2) == [_RUNNING, _FAILED]
+    assert _progress_of(bus, _MEMBER, 3) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MERGING) == [_RUNNING, _DONE]
+    progress_events = [e for e in bus.events if e.type is EventType.WORKFLOW_PROGRESS]
+    member_terminal_idx = max(
+        bus.events.index(e)
+        for e in progress_events
+        if e.progress.phase is _MEMBER and e.progress.status is not _RUNNING
+    )
+    merging_running_idx = bus.events.index(
+        next(
+            e
+            for e in progress_events
+            if e.progress.phase is _MERGING and e.progress.status is _RUNNING
+        )
+    )
+    assert member_terminal_idx < merging_running_idx < llm.stream_bus_len[0]
+    # merging/done 是最后一条事件,晚于汇总文本块。
+    last = bus.events[-1]
+    assert last.type is EventType.WORKFLOW_PROGRESS
+    assert (last.progress.phase, last.progress.status) == (_MERGING, _DONE)
+    text_idx = max(i for i, e in enumerate(bus.events) if e.type is EventType.TEXT_DELTA)
+    assert text_idx < len(bus.events) - 1
+
+
+async def test_parallel_all_failed_skips_merging(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC2:全部成员失败时各有一条 failed,零条 merging 事件。"""
+    _Harness(monkeypatch, _CONFIGS, failing={"wf-分析师", "wf-审稿人"})
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=_FakeLLM(), **_deps(_members(1, 2), bus))
+
+    with pytest.raises(AgentException, match="全部成员均执行失败"):
+        await orchestrator.run(_QUESTION)
+
+    assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _FAILED]
+    assert _progress_of(bus, _MEMBER, 2) == [_RUNNING, _FAILED]
+    assert [p for p in _progress(bus) if p.phase is _MERGING] == []
+
+
+async def test_parallel_merge_failure_emits_merging_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """汇总 LLM 未产出文本时发 merging/failed 再抛错,不发 merging/done。"""
+    _Harness(monkeypatch, _CONFIGS)
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=_FakeLLM(merged_text=""), **_deps(_members(1, 2), bus))
+
+    with pytest.raises(AgentException, match="并行编排汇总失败"):
+        await orchestrator.run(_QUESTION)
+
+    assert _progress_of(bus, _MERGING) == [_RUNNING, _FAILED]
+
+
+async def test_routing_emits_routing_then_only_selected_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3:routing/running 早于决策调用;routing/done 带选中成员;只有选中成员有 member 进度。"""
+    _Harness(monkeypatch, _CONFIGS)
+    llm = _FakeLLM(choice=3)
+    bus = _RecordingBus()
+    llm.bus = bus
+    orchestrator = LlmRoutingOrchestrator(llm=llm, **_deps(_members(1, 2, 3), bus))
+
+    await orchestrator.run(_QUESTION)
+
+    progress = _progress(bus)
+    assert [(p.phase, p.status, p.agent_id, p.member_name) for p in progress] == [
+        (_ROUTING, _RUNNING, None, None),
+        (_ROUTING, _DONE, 3, "总结者"),
+        (_MEMBER, _RUNNING, 3, "总结者"),
+        (_MEMBER, _DONE, 3, "总结者"),
+    ]
+    assert all(p.ordinal is None and p.total is None for p in progress)
+    # routing/running 是 bus 上第一条事件,决策调用时它已在 bus 上。
+    assert llm.structured_bus_len == [1]
+    assert _progress_of(bus, _MEMBER, 1) == []
+    assert _progress_of(bus, _MEMBER, 2) == []
+
+
+async def test_routing_decision_failure_emits_routing_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3:决策失败发 routing/failed,零条 member 进度。"""
+    _Harness(monkeypatch, _CONFIGS)
+    llm = _FakeLLM(choice=1)
+    llm.fail_structured = True
+    bus = _RecordingBus()
+    orchestrator = LlmRoutingOrchestrator(llm=llm, **_deps(_members(1, 2), bus))
+
+    with pytest.raises(AgentException, match="智能路由决策失败"):
+        await orchestrator.run(_QUESTION)
+
+    assert [(p.phase, p.status) for p in _progress(bus)] == [
+        (_ROUTING, _RUNNING),
+        (_ROUTING, _FAILED),
+    ]
+
+
+async def test_routing_choice_outside_members_emits_routing_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3:选出的 agent_id 不在成员表同样是 routing/failed,不回落成员、零条 member 进度。"""
+    _Harness(monkeypatch, _CONFIGS)
+    bus = _RecordingBus()
+    orchestrator = LlmRoutingOrchestrator(llm=_FakeLLM(choice=99), **_deps(_members(1, 2), bus))
+
+    with pytest.raises(AgentException, match="不在Workflow成员列表中"):
+        await orchestrator.run(_QUESTION)
+
+    assert [(p.phase, p.status) for p in _progress(bus)] == [
+        (_ROUTING, _RUNNING),
+        (_ROUTING, _FAILED),
+    ]
+
+
+async def test_member_spec_carries_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4/AC5:交给 SubAgentRunner 的 spec 携带成员 Agent 主键,与配置一一对应。"""
+    harness = _Harness(monkeypatch, _CONFIGS)
+    orchestrator = SequentialOrchestrator(**_deps(_members(1, 2, 3)))
+
+    await orchestrator.run(_QUESTION)
+
+    assert [(call.display_name, call.agent_id) for call in harness.calls] == [
+        ("wf-分析师", 1),
+        ("wf-审稿人", 2),
+        ("wf-总结者", 3),
+    ]
+
+
+async def test_progress_events_serialize_with_orchestrator_compact_actor() -> None:
+    """进度事件序列化:actor 恒为编排者精简形态,progress 只输出非 None 字段。"""
+    bus = _RecordingBus()
+    orchestrator = SequentialOrchestrator(**_deps(_members(1), bus))
+
+    await orchestrator._emit_progress(_MEMBER, _RUNNING, config=_CONFIGS[2], ordinal=2, total=3)
+    await orchestrator._emit_progress(_MERGING, _RUNNING)
+
+    member_event, merging_event = (e.to_dict() for e in bus.events)
+    assert member_event == {
+        "type": "workflow_progress",
+        "session_id": _SESSION_ID,
+        "actor": {"role": "orchestrator", "name": "orchestrator"},
+        "progress": {
+            "phase": "member",
+            "status": "running",
+            "agent_id": 2,
+            "member_name": "审稿人",
+            "ordinal": 2,
+            "total": 3,
+        },
+    }
+    assert merging_event["progress"] == {"phase": "merging", "status": "running"}
+
+
+# ---------- 取消路径:CancelledError 一律不发 failed(09-04 R3) ----------
+
+
+def _failed_progress(bus: _RecordingBus) -> list[WorkflowProgressInfo]:
+    return [p for p in _progress(bus) if p.status is _FAILED]
+
+
+async def test_sequential_member_cancel_emits_no_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sequential 成员执行被取消:重抛 CancelledError,进度中只有该成员的 running,没有 failed。"""
+    _Harness(monkeypatch, _CONFIGS, cancelling={"wf-分析师"})
+    bus = _RecordingBus()
+    orchestrator = SequentialOrchestrator(**_deps(_members(1, 2), bus))
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run(_QUESTION)
+
+    assert _failed_progress(bus) == []
+    assert [(p.phase, p.status, p.agent_id) for p in _progress(bus)] == [(_MEMBER, _RUNNING, 1)]
+
+
+async def test_parallel_member_cancel_emits_no_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parallel 某成员被取消:gather 收集后重抛 CancelledError,零条 failed、零条 merging。"""
+    _Harness(monkeypatch, _CONFIGS, cancelling={"wf-审稿人"})
+    llm = _FakeLLM()
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=llm, **_deps(_members(1, 2), bus))
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run(_QUESTION)
+
+    assert _failed_progress(bus) == []
+    assert _progress_of(bus, _MEMBER, 2) == [_RUNNING]
+    assert _progress_of(bus, _MERGING) == []
+    assert llm.stream_prompts == []
+
+
+async def test_parallel_merge_cancel_emits_no_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parallel 汇总 LLM 调用被取消:重抛 CancelledError,merging 只有 running,没有 failed / done。"""
+    _Harness(monkeypatch, _CONFIGS)
+    llm = _FakeLLM()
+    llm.cancel_stream = True
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=llm, **_deps(_members(1, 2), bus))
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run(_QUESTION)
+
+    assert _failed_progress(bus) == []
+    assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MEMBER, 2) == [_RUNNING, _DONE]
+    assert _progress_of(bus, _MERGING) == [_RUNNING]
+
+
+async def test_routing_decision_cancel_emits_no_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Routing 决策 LLM 调用被取消:重抛 CancelledError,routing 只有 running,零条 member。"""
+    harness = _Harness(monkeypatch, _CONFIGS)
+    llm = _FakeLLM(choice=1)
+    llm.cancel_structured = True
+    bus = _RecordingBus()
+    orchestrator = LlmRoutingOrchestrator(llm=llm, **_deps(_members(1, 2), bus))
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator.run(_QUESTION)
+
+    assert _failed_progress(bus) == []
+    assert [(p.phase, p.status) for p in _progress(bus)] == [(_ROUTING, _RUNNING)]
+    assert harness.calls == []
 
 
 # ---------- 发消息入口(AC8 / AC9) ----------

@@ -5,7 +5,7 @@
 sequence 由 StreamBus 在入队时注入,不在对象构造期填充。
 
 两类信封:
-1. StreamEvent —— actor 产出的生命周期、内容、工具、交互和错误事件。
+1. StreamEvent —— actor 产出的生命周期、内容、工具、交互、错误和编排进度事件。
 2. RuntimeEvent —— 会话级控制事件(如 session_ready),不属于某个 actor 的产出,
    仅用于前端建立连接 / 拿 session 元信息。
 """
@@ -26,7 +26,9 @@ class ActorRole(str, Enum):
 
 
 class EventType(str, Enum):
-    """协议事件类型(9 种,所有 actor 通用)。"""
+    """协议事件类型。除 workflow_progress 仅由 Workflow 编排者(orchestrator)产出外,
+    其余所有 actor 通用。
+    """
 
     TURN_START = "turn_start"
     TURN_END = "turn_end"
@@ -38,6 +40,7 @@ class EventType(str, Enum):
     TOOL_RESULT = "tool_result"
     INTERACTION_REQUEST = "interaction_request"
     ERROR = "error"
+    WORKFLOW_PROGRESS = "workflow_progress"
 
 
 class BlockType(str, Enum):
@@ -66,6 +69,7 @@ class Actor:
     role 是绝对种类;name 是显示名(orchestrator 固定 'orchestrator',
     subagent 用 agent_type,teammate 用成员名)。run_id 用于区分同名并发运行
     (subagent 的唯一键);task/team 是只在开场事件携带的元信息。
+    agent_id 供前端把事件稳定归到工作流图节点:name 可能重名或被截断,主键不会。
     """
 
     role: ActorRole
@@ -73,6 +77,8 @@ class Actor:
     run_id: str | None = None
     task: str | None = None
     team: TeamRef | None = None
+    # 数据库 Agent 主键;仅 workflow 成员携带,内置子代理 / teammate / 主循环为 None。
+    agent_id: int | None = None
 
     def to_dict_full(self) -> dict[str, Any]:
         """完整形态:供开场事件(turn_start)使用,带 task / team。"""
@@ -83,13 +89,20 @@ class Actor:
             data["task"] = self.task
         if self.team is not None:
             data["team"] = self.team.to_dict()
+        if self.agent_id is not None:
+            data["agent_id"] = self.agent_id
         return data
 
     def to_dict_compact(self) -> dict[str, Any]:
-        """精简形态:供高频增量事件使用,只带定位键。"""
+        """精简形态:供高频增量事件使用,只带定位键。
+
+        agent_id 也在此输出:前端靠增量事件归节点,只在 turn_start 带等于没加。
+        """
         data: dict[str, Any] = {"role": self.role.value, "name": self.name}
         if self.run_id is not None:
             data["run_id"] = self.run_id
+        if self.agent_id is not None:
+            data["agent_id"] = self.agent_id
         return data
 
 
@@ -97,9 +110,17 @@ class Actor:
 ORCHESTRATOR_ACTOR = Actor(role=ActorRole.ORCHESTRATOR, name="orchestrator")
 
 
-def subagent_actor(agent_type: str, run_id: str, task: str | None = None) -> Actor:
-    """构造一次性子代理来源(唯一键是 run_id)。"""
-    return Actor(role=ActorRole.SUBAGENT, name=agent_type, run_id=run_id, task=task)
+def subagent_actor(
+    agent_type: str,
+    run_id: str,
+    task: str | None = None,
+    *,
+    agent_id: int | None = None,
+) -> Actor:
+    """构造一次性子代理来源(唯一键是 run_id);agent_id 仅 workflow 成员传入。"""
+    return Actor(
+        role=ActorRole.SUBAGENT, name=agent_type, run_id=run_id, task=task, agent_id=agent_id
+    )
 
 
 def teammate_actor(
@@ -208,6 +229,58 @@ class ErrorInfo:
         }
 
 
+class WorkflowPhase(str, Enum):
+    """编排进度所处阶段。member 是成员节点,其余是编排者自身的阶段。"""
+
+    MEMBER = "member"
+    ROUTING = "routing"
+    MERGING = "merging"
+
+
+class WorkflowProgressStatus(str, Enum):
+    """进度节点状态:running 已开始,done 正常完成,failed 异常终止(不含取消)。"""
+
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class WorkflowProgressInfo:
+    """Workflow 编排进度:phase/status 受控,其余按非 None 输出。
+
+    member 阶段必带 agent_id 与 member_name;routing/done 带被选中的 agent_id;
+    ordinal/total 仅 Sequential 的 member 阶段携带(1 起算)。不带成员输出正文与路由理由。
+    """
+
+    phase: WorkflowPhase
+    status: WorkflowProgressStatus
+    agent_id: int | None = None
+    member_name: str | None = None
+    ordinal: int | None = None
+    total: int | None = None
+
+    def __post_init__(self) -> None:
+        """构造期拦下非法字段组合,让契约在类型层而非前端状态机里暴露。"""
+        if self.phase is WorkflowPhase.MEMBER:
+            if self.agent_id is None or self.member_name is None:
+                raise ValueError("member 阶段的进度事件必须携带 agent_id 与 member_name")
+        elif self.ordinal is not None or self.total is not None:
+            raise ValueError(f"{self.phase.value} 阶段的进度事件不得携带 ordinal / total")
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"phase": self.phase.value, "status": self.status.value}
+        if self.agent_id is not None:
+            data["agent_id"] = self.agent_id
+        if self.member_name is not None:
+            data["member_name"] = self.member_name
+        if self.ordinal is not None:
+            data["ordinal"] = self.ordinal
+        if self.total is not None:
+            data["total"] = self.total
+        return data
+
+
 @dataclass
 class StreamEvent:
     """Actor 级流式协议事件的统一载体。
@@ -226,18 +299,19 @@ class StreamEvent:
     error: ErrorInfo | None = None
     text: str | None = None
     stop_reason: str | None = None
+    progress: WorkflowProgressInfo | None = None
     sequence: int | None = None
 
     # ---- 工厂方法:生命周期 ----
 
     @classmethod
-    def turn_start(cls, actor: Actor, session_id: int) -> "StreamEvent":
+    def turn_start(cls, actor: Actor, session_id: int) -> StreamEvent:
         return cls(type=EventType.TURN_START, actor=actor, session_id=session_id)
 
     @classmethod
     def turn_end(
         cls, actor: Actor, session_id: int, stop_reason: str | None, usage: Usage | None
-    ) -> "StreamEvent":
+    ) -> StreamEvent:
         return cls(
             type=EventType.TURN_END,
             actor=actor,
@@ -251,7 +325,7 @@ class StreamEvent:
     @classmethod
     def block_start(
         cls, actor: Actor, session_id: int, index: int, block_type: BlockType
-    ) -> "StreamEvent":
+    ) -> StreamEvent:
         return cls(
             type=EventType.BLOCK_START,
             actor=actor,
@@ -260,7 +334,7 @@ class StreamEvent:
         )
 
     @classmethod
-    def block_stop(cls, actor: Actor, session_id: int, index: int) -> "StreamEvent":
+    def block_stop(cls, actor: Actor, session_id: int, index: int) -> StreamEvent:
         return cls(
             type=EventType.BLOCK_STOP,
             actor=actor,
@@ -271,9 +345,7 @@ class StreamEvent:
     # ---- 工厂方法:内容增量 ----
 
     @classmethod
-    def thinking_delta(
-        cls, actor: Actor, session_id: int, index: int, text: str
-    ) -> "StreamEvent":
+    def thinking_delta(cls, actor: Actor, session_id: int, index: int, text: str) -> StreamEvent:
         return cls(
             type=EventType.THINKING_DELTA,
             actor=actor,
@@ -283,9 +355,7 @@ class StreamEvent:
         )
 
     @classmethod
-    def text_delta(
-        cls, actor: Actor, session_id: int, index: int, text: str
-    ) -> "StreamEvent":
+    def text_delta(cls, actor: Actor, session_id: int, index: int, text: str) -> StreamEvent:
         return cls(
             type=EventType.TEXT_DELTA,
             actor=actor,
@@ -297,9 +367,7 @@ class StreamEvent:
     # ---- 工厂方法:工具 ----
 
     @classmethod
-    def tool_use(
-        cls, actor: Actor, session_id: int, index: int, tool: ToolInfo
-    ) -> "StreamEvent":
+    def tool_use(cls, actor: Actor, session_id: int, index: int, tool: ToolInfo) -> StreamEvent:
         return cls(
             type=EventType.TOOL_USE,
             actor=actor,
@@ -309,10 +377,8 @@ class StreamEvent:
         )
 
     @classmethod
-    def tool_result(cls, actor: Actor, session_id: int, tool: ToolInfo) -> "StreamEvent":
-        return cls(
-            type=EventType.TOOL_RESULT, actor=actor, session_id=session_id, tool=tool
-        )
+    def tool_result(cls, actor: Actor, session_id: int, tool: ToolInfo) -> StreamEvent:
+        return cls(type=EventType.TOOL_RESULT, actor=actor, session_id=session_id, tool=tool)
 
     @classmethod
     def interaction_request(
@@ -320,7 +386,7 @@ class StreamEvent:
         actor: Actor,
         session_id: int,
         interaction: InteractionInfo,
-    ) -> "StreamEvent":
+    ) -> StreamEvent:
         return cls(
             type=EventType.INTERACTION_REQUEST,
             actor=actor,
@@ -331,8 +397,21 @@ class StreamEvent:
     # ---- 工厂方法:错误 ----
 
     @classmethod
-    def error_event(cls, actor: Actor, session_id: int, error: ErrorInfo) -> "StreamEvent":
+    def error_event(cls, actor: Actor, session_id: int, error: ErrorInfo) -> StreamEvent:
         return cls(type=EventType.ERROR, actor=actor, session_id=session_id, error=error)
+
+    # ---- 工厂方法:Workflow 编排进度 ----
+
+    @classmethod
+    def workflow_progress(
+        cls, actor: Actor, session_id: int, progress: WorkflowProgressInfo
+    ) -> StreamEvent:
+        return cls(
+            type=EventType.WORKFLOW_PROGRESS,
+            actor=actor,
+            session_id=session_id,
+            progress=progress,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 SSE 帧。turn_start 用完整 actor(带 task/team),其余用精简 actor。"""
@@ -344,7 +423,7 @@ class StreamEvent:
         data: dict[str, Any] = {
             "type": self.type.value,
             "session_id": self.session_id,
-            "actor": actor_dict
+            "actor": actor_dict,
         }
         if self.sequence is not None:
             data["sequence"] = self.sequence
@@ -358,6 +437,8 @@ class StreamEvent:
             data["usage"] = self.usage.to_dict()
         if self.error is not None:
             data["error"] = self.error.to_dict()
+        if self.progress is not None:
+            data["progress"] = self.progress.to_dict()
         if self.text is not None:
             data["text"] = self.text
         if self.stop_reason is not None:
@@ -378,7 +459,7 @@ class RuntimeEvent:
     sequence: int | None = None
 
     @classmethod
-    def session_ready(cls, session_id: int, title: str, status: str) -> "RuntimeEvent":
+    def session_ready(cls, session_id: int, title: str, status: str) -> RuntimeEvent:
         """会话就绪事件:前端据此拿 session 元信息建立 UI。
 
         首轮流式运行与审批恢复复用同一份 payload,字段名收在此处避免调用点各写一遍。
@@ -392,7 +473,7 @@ class RuntimeEvent:
     @classmethod
     def task_snapshot(
         cls, session_id: int, tasks: list[dict[str, Any]], reason: str | None = None
-    ) -> "RuntimeEvent":
+    ) -> RuntimeEvent:
         """会话级任务全量快照:前端收到后整体替换本地任务树(不做增量 merge)。
 
         tasks 为该 session 下全量任务的序列化列表(含 id/subject/status/owner/
@@ -409,4 +490,3 @@ class RuntimeEvent:
         if self.sequence is not None:
             result["sequence"] = self.sequence
         return result
-

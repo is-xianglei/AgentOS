@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import ClassVar
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
@@ -8,7 +9,7 @@ from database.base import Base
 
 class TeamRecord(Base):
     __tablename__ = "teams"
-    __table_args__ = {"comment": "会话团队"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话团队"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="团队ID")
     session_id: Mapped[int] = mapped_column(
@@ -31,7 +32,7 @@ class TeamRecord(Base):
 
 class TeamMemberRecord(Base):
     __tablename__ = "team_members"
-    __table_args__ = {"comment": "会话团队成员"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话团队成员"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="成员ID")
     session_id: Mapped[int] = mapped_column(
@@ -63,7 +64,7 @@ class TeamMemberRecord(Base):
 
 class TeamMessageRecord(Base):
     __tablename__ = "team_messages"
-    __table_args__ = {"comment": "会话团队消息"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话团队消息"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="消息ID")
     session_id: Mapped[int] = mapped_column(
@@ -90,7 +91,7 @@ class TeamMessageRecord(Base):
 
 class SubAgentRunRecord(Base):
     __tablename__ = "subagent_runs"
-    __table_args__ = {"comment": "子代理运行记录"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "子代理运行记录"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="运行ID")
     session_id: Mapped[int] = mapped_column(
@@ -99,7 +100,15 @@ class SubAgentRunRecord(Base):
         comment="所属会话ID",
     )
     member_name: Mapped[str] = mapped_column(String(120), index=True, comment="成员名称")
-    status: Mapped[str] = mapped_column(String(32), default="running", index=True, comment="运行状态")
+    agent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="成员对应的Agent ID，仅Workflow成员填写，内置子代理与团队成员为空",
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default="running", index=True, comment="运行状态"
+    )
     prompt: Mapped[str] = mapped_column(Text, comment="任务提示")
     report: Mapped[str | None] = mapped_column(Text, nullable=True, comment="运行报告")
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True, comment="错误信息")

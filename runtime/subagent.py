@@ -132,9 +132,14 @@ class SubAgentRunner:
         # 为本次 run 设置独立隔离 id(供运行期内派生消息的隔离与调试归属)。
         token = set_team_task_instance_id(new_team_task_instance_id())
         try:
-            run = await self.run_repo.create(session_id, member_name, prompt)
-            # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt。
-            actor = subagent_actor(member_name, run_id=f"run-{run.id}", task=prompt)
+            run = await self.run_repo.create(
+                session_id, member_name, prompt, agent_id=spec.agent_id
+            )
+            # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt;
+            # workflow 成员额外带 agent_id,供前端把事件归到工作流图节点。
+            actor = subagent_actor(
+                member_name, run_id=f"run-{run.id}", task=prompt, agent_id=spec.agent_id
+            )
             assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:

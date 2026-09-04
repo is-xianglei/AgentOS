@@ -16,6 +16,8 @@ def test_builtin_spec_runtime_name_falls_back_to_enum_value(agent_type: AgentTyp
     spec = get_subagent_spec(agent_type)
     assert spec.display_name == ""
     assert spec.runtime_name == agent_type.value
+    # 内置 spec 不携带数据库 Agent 主键,事件与运行记录形状保持原样。
+    assert spec.agent_id is None
 
 
 def test_explore_spec_runtime_name_is_explore() -> None:
@@ -31,3 +33,13 @@ def test_display_name_overrides_runtime_name() -> None:
     assert spec.runtime_name == "wf-测试"
     # agent_type 只表示能力档位,不受 display_name 影响。
     assert spec.agent_type is AgentType.GENERAL_PURPOSE
+
+
+def test_spec_agent_id_is_readable_when_provided() -> None:
+    spec = SubAgentSpec(
+        agent_type=AgentType.GENERAL_PURPOSE,
+        system_prompt="测试用人格",
+        display_name="wf-测试",
+        agent_id=7,
+    )
+    assert spec.agent_id == 7
