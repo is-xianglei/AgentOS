@@ -303,6 +303,7 @@ class WorkspaceService:
         if member.role == "admin" and operator.role != "owner":
             raise AgentException.message("只有工作区 owner 可以移除管理员", status_code=403)
         # 群组成员关系属于 group 域，由该域负责同步软删除。
+        # 局部导入：真实双向 Service 依赖，改顶层仍成环 group.service -> workspace.service，待依赖倒置任务处理。
         from group.service import GroupService
 
         await GroupService(self.db).remove_user_from_workspace_groups(workspace_id, user_id)

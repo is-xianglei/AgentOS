@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "解法必须守住 :22-25 跨域只允许 Service 调 Service、Repository 不跨域的分层约定；:155 包导出条目与 tools/__init__.py 留空冲突，需在该 spec 补基础设施包例外说明"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": ":50-56 架构边界红线与 :120 导入分组规则约束顶层导入的摆放位置；:399-420 测试要求决定新增 tests/test_import_isolation.py 的组织方式与如实报告义务"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "回归测试的断言信息要带模块名与 stderr 末行，不吞异常；删除包再导出后外部误用应显式 ImportError，符合无静默兜底原则"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "循环导入横跨 ORM / Repository / Service / tools / runtime 多层，需先画数据流与边界再动刀，避免只在一处打补丁"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "提升局部导入时复用已有顶层导入（auth/service.py:12 已导入 WorkspaceService），不重复声明；保留项统一注释格式"}

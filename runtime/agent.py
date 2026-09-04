@@ -25,6 +25,7 @@ from core.events import (
     ToolInfo,
     teammate_actor,
 )
+from database.engine import AsyncSessionLocal
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
@@ -45,10 +46,12 @@ from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
 from runtime.compact import CompactService
 from runtime.stream_assembler import TurnEventAssembler
+from runtime.subagent import SubAgentRunner
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from skill.service import SkillService
 from task.service import TaskService
+from team.service import TeamService
 from tools.models import ToolCallRecord
 from tools.registry import ToolRegistry, build_tool_registry
 from tools.service import ToolService
@@ -1802,10 +1805,6 @@ class AgentRuntime:
         每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
-        from database.engine import AsyncSessionLocal
-        from runtime.subagent import SubAgentRunner
-        from team.service import TeamService
-
         members = await TeamService(self.db).list_members(session_id)
         working = [m for m in members if m.status == "working"]
         for member in working:

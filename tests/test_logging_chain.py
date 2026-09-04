@@ -104,9 +104,9 @@ def _install_wake_fakes(
                 raise RuntimeError("唤醒链路故障注入")
             return "推进完成"
 
-    monkeypatch.setattr("team.service.TeamService", _FakeTeamService)
-    monkeypatch.setattr("database.engine.AsyncSessionLocal", _FakeSessionScope)
-    monkeypatch.setattr("runtime.subagent.SubAgentRunner", _FakeSubAgentRunner)
+    monkeypatch.setattr("runtime.agent.TeamService", _FakeTeamService)
+    monkeypatch.setattr("runtime.agent.AsyncSessionLocal", _FakeSessionScope)
+    monkeypatch.setattr("runtime.agent.SubAgentRunner", _FakeSubAgentRunner)
     return calls
 
 

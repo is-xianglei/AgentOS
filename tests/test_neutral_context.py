@@ -12,11 +12,6 @@ from typing import Any
 
 import pytest
 
-# 先完整初始化 tools 包再触碰 session 域:仓库存在既有环形导入
-# (session.repository -> tools.models -> tools/__init__ -> task.service ->
-# session.service -> session.repository),从 session 侧进入会失败,
-# 从 tools 侧进入可正常收敛(main.py 即此顺序)。属既有问题,非本阶段引入。
-import tools  # noqa: F401
 from llm.types import (
     LLMEventKind,
     LLMStreamEvent,

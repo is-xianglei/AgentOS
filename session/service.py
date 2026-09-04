@@ -5,6 +5,8 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
+from department.service import DepartmentService
+from group.service import GroupService
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from session.repository import SessionRepository
 from workspace.service import WorkspaceService
@@ -86,9 +88,6 @@ class SessionService:
             user_id,
         )
 
-        from department.service import DepartmentService
-        from group.service import GroupService
-
         department_scope_ids = await DepartmentService(self.db).get_department_scope_ids(
             workspace_id,
             membership.department_id,
@@ -142,27 +141,22 @@ class SessionService:
         if session.visibility == "workspace":
             return True
 
-        if session.shared_with_departments:
-            from department.service import DepartmentService
+        if session.shared_with_departments and await DepartmentService(
+            self.db
+        ).is_department_in_shared_departments(
+            workspace_id,
+            membership.department_id,
+            session.shared_with_departments,
+        ):
+            return True
 
-            if await DepartmentService(self.db).is_department_in_shared_departments(
-                workspace_id,
-                membership.department_id,
-                session.shared_with_departments,
-            ):
-                return True
-
-        if session.shared_with_groups:
-            from group.service import GroupService
-
-            if await GroupService(self.db).is_user_in_groups(
-                workspace_id,
-                user_id,
-                session.shared_with_groups,
-            ):
-                return True
-
-        return False
+        if not session.shared_with_groups:
+            return False
+        return await GroupService(self.db).is_user_in_groups(
+            workspace_id,
+            user_id,
+            session.shared_with_groups,
+        )
 
     async def check_write_access(
         self,
@@ -219,9 +213,6 @@ class SessionService:
         departments = list(dict.fromkeys(department_ids))
         groups = list(dict.fromkeys(group_ids))
         await WorkspaceService(self.db).require_active_user_ids(workspace_id, users)
-
-        from department.service import DepartmentService
-        from group.service import GroupService
 
         await DepartmentService(self.db).require_department_ids(
             workspace_id,
@@ -342,10 +333,14 @@ class SessionService:
             raise AgentException.message("同一次请求不能同时指定Agent和Workflow")
         if session_id is None:
             if agent_id is not None:
+                # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> tools.service
+                # -> tools.registry -> tools.builtin.task -> task.service -> session.service，待依赖倒置任务处理。
                 from agent.service import AgentService
 
                 await AgentService(self.db).require_runnable(agent_id, workspace_id)
             if workflow_id is not None:
+                # 局部导入：真实双向 Service 依赖，改顶层仍成环 workflow.service -> agent.service
+                # -> ... -> task.service -> session.service，待依赖倒置任务处理。
                 from workflow.service import WorkflowService
 
                 await WorkflowService(self.db).require_runnable(workflow_id, workspace_id)
@@ -364,10 +359,14 @@ class SessionService:
         if workflow_id is not None and workflow_id != session.workflow_id:
             raise AgentException.message("已有会话不能切换Workflow", status_code=409)
         if session.agent_id is not None:
+            # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> tools.service
+            # -> tools.registry -> tools.builtin.task -> task.service -> session.service，待依赖倒置任务处理。
             from agent.service import AgentService
 
             await AgentService(self.db).require_runnable(session.agent_id, workspace_id)
         if session.workflow_id is not None:
+            # 局部导入：真实双向 Service 依赖，改顶层仍成环 workflow.service -> agent.service
+            # -> ... -> task.service -> session.service，待依赖倒置任务处理。
             from workflow.service import WorkflowService
 
             await WorkflowService(self.db).require_runnable(session.workflow_id, workspace_id)

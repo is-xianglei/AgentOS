@@ -152,7 +152,10 @@ team/
 - **文件名**：使用 `snake_case`（如 `user_service.py`、`task_repository.py`）
 - **目录名**：使用 `snake_case`（如 `memory/`, `user/`）
 - **标准文件名**：`models.py`、`schemas.py`、`repository.py`、`service.py`、`api.py`
-- **包导出**：`__init__.py` 导出该域的 Service 和主要 Schema
+- **包导出**：`__init__.py` 导出该域的 Service 和主要 Schema。
+  例外：基础设施包（`tools/`、`database/`、`core/`）的 `__init__.py` 不做重量级再导出，
+  否则 `database/registry.py` 导入 `tools.models` 时会连带触发上层 Service 加载，形成加载期循环导入；
+  任意一方模块都必须能作为进程首个导入被干净地 `import`（由 `tests/test_import_isolation.py` 守护）
 
 ### 类
 
@@ -327,6 +330,7 @@ database/
 
 ```
 tools/
+├── __init__.py          # 刻意留空，见文件 docstring；消费者一律 from tools.registry import
 ├── base.py              # BaseTool 抽象基类、ToolContext
 ├── registry.py          # ToolRegistry 工具注册表
 └── builtin/             # 内置工具实现

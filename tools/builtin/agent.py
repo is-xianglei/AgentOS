@@ -125,6 +125,8 @@ class AgentTool(BaseTool):
         allowed_skill_names: frozenset[str] | None,
     ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
+        # 局部导入：工具反向依赖运行时，改顶层仍成环 runtime.subagent -> tools.registry
+        # -> tools.builtin.agent，待依赖倒置任务处理。
         from database.engine import AsyncSessionLocal
         from runtime.subagent import SubAgentRunner
 

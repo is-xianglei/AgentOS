@@ -52,6 +52,17 @@
 - ❌ **禁止** 跨域直接使用别域的 Repository 或自行拼写别域表的 SQL
 - ❌ **禁止** API 层包含业务校验与跨模块编排逻辑
 - ❌ **禁止** 新建按层划分的目录（`models/`、`services/`、`repositories/`、`schemas/`）
+- ❌ **禁止** 在基础设施包（`tools/`、`database/`、`core/`）的 `__init__.py` 做重量级再导出；
+  任意一方模块必须可作为进程首个导入，跨模块加载期环数必须为 0（`tests/test_import_isolation.py`）
+
+```python
+# ❌ 错误：tools/__init__.py 再导出 registry，导入 tools.models 会连带拉起整套工具及其 Service，
+# 形成 session.repository -> tools -> tools.builtin.task -> task.service -> session.service 的环
+from tools.registry import ToolRegistry, build_tool_registry
+
+# ✅ 正确：包入口留空（仅 docstring 说明原因），消费者直接导入子模块
+from tools.registry import ToolRegistry, build_tool_registry  # 写在消费方模块顶部
+```
 
 ---
 

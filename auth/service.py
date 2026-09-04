@@ -55,8 +55,6 @@ class AuthService:
         # 若工作区创建失败则 user 一并回滚,避免孤儿用户。
 
         # 自动创建个人工作区
-        from workspace.service import WorkspaceService
-
         workspace_service = WorkspaceService(self.db)
         workspace: WorkspaceRecord = await workspace_service.create_workspace(
             creator_user_id=user.id,
@@ -99,8 +97,6 @@ class AuthService:
         user.last_login_at = datetime.now(UTC)
 
         # 获取用户的第一个工作区（优先个人工作区）
-        from workspace.service import WorkspaceService
-
         workspace_service = WorkspaceService(self.db)
         user_workspaces = await workspace_service.list_user_workspaces(user.id)
 

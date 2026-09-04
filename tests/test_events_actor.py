@@ -21,6 +21,7 @@ from core.events import (
     teammate_actor,
 )
 from llm.types import LLMTurnResult
+from runtime.subagent import SubAgentRunner
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import get_subagent_spec
 
@@ -194,13 +195,7 @@ class _FakeAssembler:
 def _stub_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Any, _RecordingRunRepo, _RecordingBus]:
-    """构造跳过 LLM / 工具 / 记忆 / 权限依赖的运行器,只保留建记录与发事件两步。
-
-    runtime.subagent 作为首个被导入的模块会触发存量循环导入(team.service → session.service
-    → tools → task.service → session.service),故在 tools 包已加载后再局部导入。
-    """
-    from runtime.subagent import SubAgentRunner
-
+    """构造跳过 LLM / 工具 / 记忆 / 权限依赖的运行器,只保留建记录与发事件两步。"""
     runner = SubAgentRunner(_FakeDb(), bus=_RecordingBus(), llm=object())  # type: ignore[arg-type]
     repo = _RecordingRunRepo()
     runner.run_repo = repo  # type: ignore[assignment]
