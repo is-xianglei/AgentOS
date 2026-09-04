@@ -249,7 +249,8 @@ class WorkflowProgressStatus(str, Enum):
 class WorkflowProgressInfo:
     """Workflow 编排进度:phase/status 受控,其余按非 None 输出。
 
-    member 阶段必带 agent_id 与 member_name;routing/done 带被选中的 agent_id;
+    member 阶段必带 agent_id;member_name 通常同时携带,但配置期失败(成员停用/软删/不存在)
+    时拿不到 Agent 名,允许为 None。routing/done 带被选中的 agent_id;
     ordinal/total 仅 Sequential 的 member 阶段携带(1 起算)。不带成员输出正文与路由理由。
     """
 
@@ -263,8 +264,9 @@ class WorkflowProgressInfo:
     def __post_init__(self) -> None:
         """构造期拦下非法字段组合,让契约在类型层而非前端状态机里暴露。"""
         if self.phase is WorkflowPhase.MEMBER:
-            if self.agent_id is None or self.member_name is None:
-                raise ValueError("member 阶段的进度事件必须携带 agent_id 与 member_name")
+            # 只强制 agent_id:前端靠它归节点;member_name 在配置期失败时无从获取,不作强制。
+            if self.agent_id is None:
+                raise ValueError("member 阶段的进度事件必须携带 agent_id")
         elif self.ordinal is not None or self.total is not None:
             raise ValueError(f"{self.phase.value} 阶段的进度事件不得携带 ordinal / total")
 

@@ -111,14 +111,24 @@ def test_workflow_progress_info_omits_none_fields() -> None:
     assert merging.to_dict() == {"phase": "merging", "status": "failed"}
 
 
-def test_member_progress_requires_agent_id_and_member_name() -> None:
-    """member 阶段缺 agent_id 或 member_name 在构造期即被拦下,不会流到前端状态机。"""
+def test_member_progress_requires_agent_id() -> None:
+    """member 阶段缺 agent_id 在构造期即被拦下,不会流到前端状态机;有 member_name 也救不回。"""
     with pytest.raises(ValueError, match="member 阶段"):
         WorkflowProgressInfo(phase=WorkflowPhase.MEMBER, status=WorkflowProgressStatus.RUNNING)
     with pytest.raises(ValueError, match="member 阶段"):
         WorkflowProgressInfo(
-            phase=WorkflowPhase.MEMBER, status=WorkflowProgressStatus.DONE, agent_id=2
+            phase=WorkflowPhase.MEMBER,
+            status=WorkflowProgressStatus.FAILED,
+            member_name="审稿人",
         )
+
+
+def test_member_failed_progress_allows_missing_member_name() -> None:
+    """配置期失败(成员停用/软删/不存在)拿不到 Agent 名:只带 agent_id 合法,序列化不出 member_name 键。"""
+    failed = WorkflowProgressInfo(
+        phase=WorkflowPhase.MEMBER, status=WorkflowProgressStatus.FAILED, agent_id=2
+    )
+    assert failed.to_dict() == {"phase": "member", "status": "failed", "agent_id": 2}
 
 
 def test_non_member_progress_rejects_ordinal_and_total() -> None:

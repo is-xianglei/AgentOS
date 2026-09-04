@@ -85,10 +85,13 @@ class BaseOrchestrator:
     async def run(self, user_content: str) -> OrchestrationResult   # 子类实现
     async def run_member(self, db, agent_id: int, prompt: str, *,
                          ordinal: int | None = None, total: int | None = None) -> tuple[AgentRuntimeConfig, str]
+    async def _load_member_config(self, db, agent_id: int) -> AgentRuntimeConfig
+    """经 AgentService.get_runtime_config 取配置;非取消异常先发 member/failed(只带 agent_id)再重抛。三个编排器统一走它。"""
     async def _emit_progress(self, phase: WorkflowPhase, status: WorkflowProgressStatus, *,
-                             config: AgentRuntimeConfig | None = None,
+                             config: AgentRuntimeConfig | None = None, agent_id: int | None = None,
                              ordinal: int | None = None, total: int | None = None) -> None
-    """以 ORCHESTRATOR_ACTOR 发 workflow_progress;member 阶段从 config 取 agent_id 与 Agent 原名。"""
+    """以 ORCHESTRATOR_ACTOR 发 workflow_progress;member 阶段优先从 config 取 agent_id 与 Agent 原名,
+    无 config(配置期失败)时用显式 agent_id、member_name 留空。"""
     async def _run_member_with_progress(self, db, config, prompt: str, *,
                                         ordinal: int | None = None, total: int | None = None) -> str
     """running → _execute_member → done / failed;CancelledError 不发 failed。三个编排器统一走它,不各自手写。"""
@@ -211,7 +214,7 @@ class SessionSendMessageRequest(BaseModel):
 | 模式 | 最小成员 | 成员输入 | 是否调 LLM | 失败语义 |
 |---|---|---|---|---|
 | `sequential` | 1（保存期） | 第 1 个只收原始提问；第 N≥2 个收 `SEQUENTIAL_HANDOFF_PROMPT_TEMPLATE`（原始提问 + **仅上一步**输出，不累积） | 否，不建客户端 | **任一成员失败即中止**，后续不执行；错误前缀「顺序编排已中止：」 |
-| `parallel` | 2（运行期） | 全部成员收同一原始提问 | 是：汇总走 `llm.stream()` + `TurnEventAssembler` 逐字推送 | **配置期**（成员停用 / 软删 / 不存在）任一失败即整体失败、此时零成员派发；**运行期**部分容忍，只汇总成功者；**全部失败**抛「并行编排的全部成员均执行失败」 |
+| `parallel` | 2（运行期） | 全部成员收同一原始提问 | 是：汇总走 `llm.stream()` + `TurnEventAssembler` 逐字推送 | **配置期**（成员停用 / 软删 / 不存在）任一失败即整体失败、此时零成员派发，只有该成员一条 `member/failed`；**运行期**部分容忍，只汇总成功者；**全部失败**抛「并行编排的全部成员均执行失败」 |
 | `llm_routing` | 2（运行期） | 被选中成员收原始提问 | 是：`complete_structured(_RoutingChoice)` | 决策失败、选出 `agent_id` 不在成员表 → 整体失败，**不回落第一个成员** |
 
 - 成员执行统一经 `SubAgentRunner.run(...)`，成员的工具 / Skill / 模型来自 `AgentRuntimeConfig`；
@@ -226,7 +229,7 @@ class SessionSendMessageRequest(BaseModel):
 
 `AsyncSession` 非并发安全，而 `SubAgentRunner` 持有 `db`。`ParallelOrchestrator` 中：
 
-- 配置期用主 `db` **串行**加载全部成员配置（不可运行者在派发前抛错）；
+- 配置期用主 `db` **串行**加载全部成员配置（不可运行者在派发前发 `member/failed` 并抛错）；
 - 每个成员协程 `async with AsyncSessionLocal() as sub_db` 开**独立 Session**；
 - 成员之间**只共享 `self.bus`**，让各成员增量流到同一条 SSE。
 
@@ -270,8 +273,10 @@ class SessionSendMessageRequest(BaseModel):
 - 编排阶段以 `workflow_progress` 事件上报节点状态（09-04 推翻 09-02 的「不新增事件类型」），
   但**不发路由理由**（`_RoutingChoice` 只有 `agent_id`）、**不带成员输出正文**、**进度事件不落库**
   （不进 `session_messages` / `session_snapshots`，历史回放范围外）。
-- **配置期失败不发 `member/failed`**：`failed` 只与已发出的 `running` 配对；成员停用 / 软删 /
-  不存在发生在 `running` 之前，整体失败由 `WorkflowRuntime._produce` 的 `error` 事件承担。
+- **配置期失败也发 `member/failed`**：成员停用 / 软删 / 不存在发生在 `running` 之前，该节点
+  没有 `running` 配对，事件只带 `agent_id`（拿不到 Agent 名，`member_name` 缺省；Sequential
+  也不带 `ordinal` / `total`），统一由 `BaseOrchestrator._load_member_config` 发出，三种模式
+  共用；整体失败仍由 `WorkflowRuntime._produce` 的 `error` 事件承担。
 - **Parallel 全败不发 merging 事件**：没有进入汇总阶段就不上报该阶段。
 - **`asyncio.CancelledError` 不发任何 `failed`**：取消不是节点失败，直接重抛保持既有取消语义。
 - `Actor.agent_id` 在 `to_dict_full` 与 `to_dict_compact` **都**输出：前端靠增量事件归节点。
@@ -289,19 +294,22 @@ class SessionSendMessageRequest(BaseModel):
 
 | phase | 含义 | 允许的 status | 必带字段 | 可选字段 |
 |---|---|---|---|---|
-| `member` | 单个成员节点 | running / done / failed | `agent_id`、`member_name`（Agent 原名，非 `wf-` 标识） | `ordinal`、`total`（仅 Sequential，1 起算） |
+| `member` | 单个成员节点 | running / done / failed | `agent_id` | `member_name`（Agent 原名，非 `wf-` 标识；仅配置期 failed 缺省）、`ordinal`、`total`（仅 Sequential 的 running / done / 运行期 failed，1 起算） |
 | `routing` | LlmRouting 决策 | running / done / failed | — | done 时带选中的 `agent_id`、`member_name` |
 | `merging` | Parallel 汇总 | running / done / failed | — | — |
 
-每个 (phase, agent_id) 一轮内 `running` 恰一次、终态至多一次。三种模式的事件序（一次成功运行）：
+每个 (phase, agent_id) 一轮内 `running` 至多一次、终态至多一次；`running` 与终态成对出现，
+唯一例外是配置期 `failed`（无 `running`）。三种模式的事件序（一次成功运行）：
 
 - Sequential：`member/running(1/N)` → 成员 1 自发事件 → `member/done(1/N)` → … → `member/done(N/N)`
-  → 编排者文本块。成员失败：`member/failed(k/N)` 后抛「顺序编排已中止」，后续成员零事件。
+  → 编排者文本块。成员失败：`member/failed(k/N)` 后抛「顺序编排已中止」，后续成员零事件；
+  配置期失败：`member/failed(agent_id)`（无序号、无成员名）后抛错，同样后续零事件。
 - Parallel：派发前 `member/running × N`（前端一次性点亮全部节点）→ 各成员自发事件交错 →
   `member/done` / `member/failed` 交错（各协程自发，彼此顺序不定）→ `merging/running` →
   编排者汇总文本块 → `merging/done`。汇总 LLM 无文本：`merging/failed` 后抛错。
 - LlmRouting：`routing/running` → `routing/done(agent_id=X, member_name)` → `member/running(X)` →
-  成员 X 自发事件 → `member/done(X)` → 编排者文本块。决策失败 / 选出成员不在列表：`routing/failed`，零条 member。
+  成员 X 自发事件 → `member/done(X)` → 编排者文本块。决策失败 / 选出成员不在列表：`routing/failed`，零条 member；
+  配置期失败发生在 `routing/running` 之前：只有该成员一条 `member/failed`，零条 routing。
 
 示例：
 
@@ -401,7 +409,8 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 | `test_send_message_plain_agent_request_dispatches_agent_runtime` / `..._rejects_workflow_switch_and_mixing` | 纯 Agent 走 `AgentRuntime`；API 层 409 与互斥时两个 Runtime 均未构造 |
 | `test_runtime_run_commits_user_message_then_final_state` | `commits >= 2`、`rollbacks == 0`；assistant 落 `[{"kind": "text", ...}]`；事件序 `session_ready, turn_start, turn_end`；bus 已关闭 |
 | `test_runtime_run_marks_failed_and_emits_error_on_orchestrator_exception` | `_mark_abnormal_end(..., "failed")` 恰一次、`rollbacks == 1`、恰一个 `error` 事件 |
-| `test_sequential_emits_member_progress_with_ordinal` / `..._emits_failed_before_abort` / `..._config_failure_emits_no_progress_for_that_member` | 09-04 AC1：三成员各 running/done，`ordinal` 1/2/3、`total` 3；running 先于执行器调用（`bus_len_at_call` 为 1/3/5）；失败成员 failed 无 done、后续零条；配置期失败零条 |
+| `test_sequential_emits_member_progress_with_ordinal` / `..._emits_failed_before_abort` / `..._config_failure_emits_failed_without_running` | 09-04 AC1：三成员各 running/done，`ordinal` 1/2/3、`total` 3；running 先于执行器调用（`bus_len_at_call` 为 1/3/5）；失败成员 failed 无 done、后续零条；配置期失败恰一条 failed（无 running、无 `member_name` / `ordinal` / `total`）、后续零条 |
+| `test_parallel_config_failure_emits_failed_and_dispatches_nothing` / `test_routing_config_failure_emits_failed_before_routing` | 配置期失败三模式统一：该成员恰一条 `member/failed`（只带 `agent_id`），其余成员零条；Parallel 零派发、零条 merging；Routing 零条 routing、不调决策 LLM |
 | `test_parallel_emits_running_for_all_before_dispatch` / `..._emits_failed_for_single_member_and_merging` / `..._all_failed_skips_merging` / `..._merge_failure_emits_merging_failed` | 09-04 AC2：前 3 条进度全为 running 且早于任何执行器调用；失败成员 failed、其余 done；`merging/running` 在全部终态后、汇总 LLM 前，`merging/done` 为最后一条；全败零条 merging；汇总无文本 `merging/failed` |
 | `test_routing_emits_routing_then_only_selected_member` / `..._decision_failure_emits_routing_failed` / `..._choice_outside_members_emits_routing_failed` | 09-04 AC3：`routing/running` 是首条事件且早于 `complete_structured`；`routing/done` 带选中 `agent_id`/`member_name`；只有选中成员有 member 进度；决策失败 / 选出成员不在列表均 `routing/failed`、零条 member |
 | `test_member_spec_carries_agent_id` / `test_progress_events_serialize_with_orchestrator_compact_actor` | 09-04 AC4/AC5：交给 `SubAgentRunner` 的 `spec.agent_id == config.agent_id`；进度事件 `to_dict()` 的 actor 为编排者精简形态、`progress` 只含非 None 字段 |
@@ -413,6 +422,8 @@ API 层不再前置复检，`prepare_for_message` 内复检 `require_runnable(7)
 - `test_workflow_member_actor_carries_agent_id_in_both_shapes` / `test_agent_id_flows_into_increment_event_actor`：
   `subagent_actor(agent_id=7)` 的 full 与 compact 都含 `"agent_id": 7`，`text_delta` 事件 actor 同样带
 - `test_workflow_progress_event_serialization` / `test_workflow_progress_info_omits_none_fields`：payload 形状与 3.8 示例一致
+- `test_member_progress_requires_agent_id` / `test_member_failed_progress_allows_missing_member_name`：
+  member 阶段缺 `agent_id` 构造期抛 `ValueError`（带 `member_name` 也不行）；只带 `agent_id` 的 failed 合法，序列化无 `member_name` 键
 - `test_runner_passes_spec_agent_id_to_run_record_and_actor` / `test_runner_keeps_builtin_spec_record_and_actor_unchanged`：
   跑真实 `SubAgentRunner.run`（ReAct 打桩），`run_repo.create` 收到 `agent_id=spec.agent_id`，
   `turn_start` / `turn_end` actor 带 `agent_id`；内置 spec 的运行记录 `agent_id=None`、actor 无该键

@@ -154,16 +154,27 @@ class BaseOrchestrator:
             )
 
     async def _load_member_config(self, db: AsyncSession, agent_id: int) -> AgentRuntimeConfig:
-        """经 agent 域取成员运行配置;内部已 require_runnable,停用/软删成员在此抛错(AC7)。"""
+        """经 agent 域取成员运行配置;内部已 require_runnable,停用/软删成员在此抛错(AC7)。
+
+        三个编排器都经此加载配置,故配置期失败的 member/failed 统一在这里发:此时没有
+        running 配对、拿不到 Agent 名(软删/不存在根本没有记录),事件只带 agent_id;
+        Sequential 的 ordinal/total 也不带——失败节点无需序号,前端按 agent_id 归节点即可。
+        取消不是节点失败,不发 failed。
+        """
         try:
             return await AgentService(db).get_runtime_config(self.workspace_id, agent_id)
-        except AgentException as exc:
-            # 补上是哪个成员,agent 域的原始消息本身不带 Workflow 上下文。
-            raise AgentException.message(
-                f"Workflow成员不可运行：{exc.message}",
-                {"workflow_id": self.workflow_id, "agent_id": agent_id},
-                status_code=exc.status_code,
-            ) from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_progress(_MEMBER, _FAILED, agent_id=agent_id)
+            if isinstance(exc, AgentException):
+                # 补上是哪个成员,agent 域的原始消息本身不带 Workflow 上下文。
+                raise AgentException.message(
+                    f"Workflow成员不可运行：{exc.message}",
+                    {"workflow_id": self.workflow_id, "agent_id": agent_id},
+                    status_code=exc.status_code,
+                ) from exc
+            raise
 
     async def _execute_member(
         self,
@@ -214,8 +225,8 @@ class BaseOrchestrator:
     ) -> tuple[AgentRuntimeConfig, str]:
         """成员执行的公共步骤:取配置 → 带进度执行,返回 (配置, 输出) 供调用方取成员名。
 
-        配置期失败(成员停用/软删/不存在)发生在 running 之前,不发 failed 进度事件,
-        整体失败由 WorkflowRuntime._produce 的 error 事件承担。
+        配置期失败(成员停用/软删/不存在)由 _load_member_config 发 member/failed,
+        整体失败仍由 WorkflowRuntime._produce 的 error 事件承担。
         """
         config = await self._load_member_config(db, agent_id)
         output = await self._run_member_with_progress(
@@ -229,10 +240,15 @@ class BaseOrchestrator:
         status: WorkflowProgressStatus,
         *,
         config: AgentRuntimeConfig | None = None,
+        agent_id: int | None = None,
         ordinal: int | None = None,
         total: int | None = None,
     ) -> None:
-        """以编排者身份推送进度事件;member 阶段从 config 取 agent_id 与 Agent 原名。"""
+        """以编排者身份推送进度事件。
+
+        member 阶段优先从 config 取 agent_id 与 Agent 原名;配置期失败没有 config,
+        改用显式 agent_id,member_name 留空。
+        """
         await self.bus.emit(
             StreamEvent.workflow_progress(
                 ORCHESTRATOR_ACTOR,
@@ -240,7 +256,7 @@ class BaseOrchestrator:
                 WorkflowProgressInfo(
                     phase=phase,
                     status=status,
-                    agent_id=config.agent_id if config else None,
+                    agent_id=config.agent_id if config else agent_id,
                     member_name=config.name if config else None,
                     ordinal=ordinal,
                     total=total,
@@ -259,7 +275,7 @@ class BaseOrchestrator:
     ) -> str:
         """成员执行外包一层 running/done/failed 进度;取消不发 failed,保持既有取消语义。
 
-        failed 只与已发出的 running 配对,避免前端出现「从未 running 的节点直接 failed」。
+        运行期 failed 与已发出的 running 配对;配置期 failed 由 _load_member_config 单独发出。
         """
         await self._emit_progress(_MEMBER, _RUNNING, config=config, ordinal=ordinal, total=total)
         try:
@@ -341,7 +357,8 @@ class ParallelOrchestrator(BaseOrchestrator):
     """并行编排:全部成员并发执行同一提问,成功结果由 LLM 汇总。
 
     失败语义(D5)分两段:配置期(成员停用/软删/不存在)任一失败即整体失败(AC7),
-    此时尚未派发任何成员;运行期(SubAgentRunner 执行失败)部分容忍,只对成功结果汇总。
+    此时尚未派发任何成员,只有该成员一条 member/failed;运行期(SubAgentRunner 执行失败)
+    部分容忍,只对成功结果汇总。
     """
 
     def __init__(self, *, llm: BaseLLMClient | None = None, **kwargs: Any) -> None:

@@ -576,20 +576,70 @@ async def test_sequential_emits_failed_before_abort(monkeypatch: pytest.MonkeyPa
     assert failed[0].ordinal == 2 and failed[0].total == 3
 
 
-async def test_sequential_config_failure_emits_no_progress_for_that_member(
+def _config_failed_events(bus: _RecordingBus, agent_id: int) -> list[WorkflowProgressInfo]:
+    """取出某成员的 member 进度,并断言配置期失败的形状:恰一条 failed、无 running、不带成员名与序号。"""
+    events = [p for p in _progress(bus) if p.phase is _MEMBER and p.agent_id == agent_id]
+    assert [p.status for p in events] == [_FAILED]
+    failed = events[0]
+    assert failed.member_name is None
+    assert failed.ordinal is None and failed.total is None
+    assert "member_name" not in failed.to_dict()
+    return events
+
+
+async def test_sequential_config_failure_emits_failed_without_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """配置期失败(成员停用)发生在 running 之前,不发 failed:failed 只与已发 running 配对。"""
-    _Harness(monkeypatch, _CONFIGS, disabled_ids={2})
+    """配置期失败(成员停用)发 member/failed 且无 running 配对;失败节点只带 agent_id,后续成员零条。"""
+    harness = _Harness(monkeypatch, _CONFIGS, disabled_ids={2})
     bus = _RecordingBus()
     orchestrator = SequentialOrchestrator(**_deps(_members(1, 2, 3), bus))
 
-    with pytest.raises(AgentException):
+    with pytest.raises(AgentException, match="顺序编排已中止"):
         await orchestrator.run(_QUESTION)
 
     assert _progress_of(bus, _MEMBER, 1) == [_RUNNING, _DONE]
-    assert _progress_of(bus, _MEMBER, 2) == []
+    _config_failed_events(bus, 2)
     assert _progress_of(bus, _MEMBER, 3) == []
+    assert harness.names() == ["wf-分析师"]
+
+
+async def test_parallel_config_failure_emits_failed_and_dispatches_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel 配置期失败:该成员恰一条 failed,其余成员零条进度,零成员派发、零条 merging。"""
+    harness = _Harness(monkeypatch, _CONFIGS, disabled_ids={2})
+    llm = _FakeLLM()
+    bus = _RecordingBus()
+    orchestrator = ParallelOrchestrator(llm=llm, **_deps(_members(1, 2, 3), bus))
+
+    with pytest.raises(AgentException, match="Agent已停用"):
+        await orchestrator.run(_QUESTION)
+
+    assert _progress_of(bus, _MEMBER, 1) == []
+    _config_failed_events(bus, 2)
+    assert _progress_of(bus, _MEMBER, 3) == []
+    assert _progress_of(bus, _MERGING) == []
+    assert harness.calls == []
+    assert llm.stream_prompts == []
+
+
+async def test_routing_config_failure_emits_failed_before_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing 配置期失败:该成员恰一条 failed,尚未进入决策,零条 routing 进度、不调决策 LLM。"""
+    harness = _Harness(monkeypatch, _CONFIGS, disabled_ids={2})
+    llm = _FakeLLM(choice=1)
+    bus = _RecordingBus()
+    orchestrator = LlmRoutingOrchestrator(llm=llm, **_deps(_members(1, 2, 3), bus))
+
+    with pytest.raises(AgentException, match="Agent已停用"):
+        await orchestrator.run(_QUESTION)
+
+    assert [(p.phase, p.status, p.agent_id) for p in _progress(bus)] == [(_MEMBER, _FAILED, 2)]
+    _config_failed_events(bus, 2)
+    assert harness.calls == []
+    assert llm.structured_prompts == []
 
 
 async def test_parallel_emits_running_for_all_before_dispatch(
