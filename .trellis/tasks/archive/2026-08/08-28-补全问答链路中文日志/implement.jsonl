@@ -1,4 +1,0 @@
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "本任务的核心依据：级别语义、extra 结构化字段、中文消息、%s 格式化参数、logger.exception 优先，以及敏感信息红线（不记完整 Prompt/模型输出/工具入参/凭证）。每条新增日志都要对照它"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "禁止模式清单，确认新增代码不引入 print、f-string 日志内插等历史遗留写法"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "步骤 2 的非法日志级别要抛中文 AgentException，需按既有错误约定实现，不新增裸 HTTPException"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "确认日志基建归 core/、各节点埋点就地落在所属 feature 包，不新建跨域日志封装层"}

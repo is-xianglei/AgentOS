@@ -1,4 +1,0 @@
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "核对改动没有新增跨域调 Repository 或按层目录；tools/__init__.py 留空的例外说明已回写到 :155 与 tools 段"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核对提升后的顶层导入分组顺序、SIM102 折叠后语义不变、ruff 全绿，测试报告含真实通过/失败数"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对回归测试失败信息包含模块名与 stderr 末行，未用 try/except 吞掉子进程错误"}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "核对静态 SCC 用例把 llm/plan/prompt 包内自环正确排除，且 database.engine -> registry -> tools.models 路径解环后不再触发工具加载"}

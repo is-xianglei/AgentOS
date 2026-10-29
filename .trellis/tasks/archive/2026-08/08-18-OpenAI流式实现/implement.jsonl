@@ -1,5 +1,0 @@
-{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "本任务的最强约束：§3.6 流式分层（入站适配私有于 Client、装配归 TurnEventAssembler、出站编码不上 ABC）、明令禁止 StreamTranslator ABC 与 create_translator() 工厂、§4 错误矩阵、§7 三对 Wrong vs Correct（用 self.llm.provider 而非 isinstance、base_url 的 /v1 规则两家相反、timeout 的 None→NOT_GIVEN）"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "所有新增错误分支必须走统一的中文 AgentException，无静默兜底；坏 JSON、缺 tool id、旧格式会话三处都要遵此规范"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "新增测试的组织方式与命名，以及改动后的验证要求"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "适配器与翻译层的日志规范：中文、结构化 extra、不输出密钥"}
-{"file": ".trellis/tasks/08-18-OpenAI流式实现/research/provider-architecture.html", "reason": "方案 B 全链路架构图，含改造前后落库形态对比与 5 处核心改动点标注"}

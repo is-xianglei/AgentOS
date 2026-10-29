@@ -1,4 +1,0 @@
-{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "验收关键项：出站编码是否仍为 Client 私有（未提升到 BaseLLMClient 三个抽象成员）、库中是否只存中立形状、判别键是否用 kind 而非 type；3.7 节需在 Phase 3 由「两类块」更新为「三类块」"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "核验四类异常路径未被静默兜底：未知 kind、budget 越界、无签名思考块跨 provider、reasoning JSON 缺失"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核验测试覆盖成功/失败/副作用三类路径，且被推翻的既有用例是逐条改写而非整体删除"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "思考正文属模型输出，日志只可记长度不得记正文；核验新增日志未泄漏思考内容与 signature"}

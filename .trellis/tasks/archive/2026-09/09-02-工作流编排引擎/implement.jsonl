@@ -1,7 +1,0 @@
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新建 workflow feature 包，需按 models/schemas/repository/service/api 的既有分层与目录约定落位"}
-{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增 workflows / workflow_agents 两张表与 sessions.workflow_id 列，需遵守 ORM 写法、中文 comment、软删除与 Alembic 迁移约定"}
-{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "Parallel 汇总与 Routing 决策必须走 create_llm_client(scenario=\"workflow\") 工厂，新增场景要四处同步"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "三种模式的失败语义（D5）一律 AgentException.message 中文异常，异常详情不得透出 API"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "编排过程的中文日志与 extra 结构化字段写法，异常用 logger.exception"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "禁用 Optional[T]、裸 dict、datetime.utcnow()、print 等历史写法，新代码需符合质量红线"}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "workflow_id 从请求体贯穿 Session -> 编排 Service -> SubAgentRunner -> SSE 事件，属典型跨层改动"}

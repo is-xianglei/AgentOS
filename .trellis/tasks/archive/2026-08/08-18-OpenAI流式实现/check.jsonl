@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "验收核心：核对是否引入了被禁止的第二个 provider 抽象、runtime/ tools/ prompt/ 是否仍对 anthropic 零引用、错误分支是否符合 §4 矩阵；同时本任务后 §3.4 能力边界与 §6.2 测试要求需同步更新"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对新增错误是否均为中文 AgentException 且带定位所需 details，有无静默兜底"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核对测试覆盖是否达标：本次改造的核心路径原本零覆盖，新增测试是首次覆盖而非补充"}

@@ -1,6 +1,0 @@
-{"file": ".trellis/spec/backend/workflow-orchestration.md", "reason": "核对三处「不新增事件类型」记述已改写、workflow_progress 受控取值表与新增用例已登记，且三种模式的失败语义未被进度事件改变"}
-{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "核对 subagent_runs.agent_id 的 ORM 列、迁移 0023 的 FK/索引命名与 downgrade 逆序，registry 无需改动且 alembic 单 head"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "核对新增 dataclass/枚举/工厂方法类型注解齐全、无 Optional[T] 等旧写法、ruff 通过"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "核对 failed 只与已发 running 配对、CancelledError 不发 failed、配置期失败仍由 error 事件承担"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "核对新增日志为简体中文、extra 含 workflow_id/agent_id 等定位字段，未输出敏感信息"}
-{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "核对三个编排器统一走 _emit_progress / _run_member_with_progress，没有各自复制发事件代码"}

@@ -79,7 +79,12 @@
       "Bash(echo \"exit=$?\")",
       "Skill(claude-api)",
       "Bash(/Users/xianglei/Documents/develop/code/python/AgentOS/.venv/bin/python -c \"import anthropic; print\\('anthropic', anthropic.__version__\\)\")",
-      "Bash(/Users/xianglei/Documents/develop/code/python/AgentOS/.venv/bin/python -c \"import openai; print\\('openai', openai.__version__\\)\")"
+      "Bash(/Users/xianglei/Documents/develop/code/python/AgentOS/.venv/bin/python -c \"import openai; print\\('openai', openai.__version__\\)\")",
+      "Read(//Users/xianglei/Desktop/**)",
+      "Bash(echo \"---\")",
+      "Bash(which ffprobe *)",
+      "Bash(echo \"无 ffmpeg/ffprobe\")",
+      "Bash(afinfo /Users/xianglei/Desktop/0e8d172f1a8e83021b709ffa7198f0db824e78a0267d579a65fc224e9b4ec932.ogg)"
     ]
   }
 }

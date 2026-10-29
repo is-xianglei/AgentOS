@@ -1,3 +1,0 @@
-{"file": ".trellis/spec/backend/llm-provider-guidelines.md", "reason": "多 provider 抽象、无静默兜底与 provider 判定的既有约定"}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "llm/ 与 runtime/ 分层归属，新类型该落在哪个包"}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层收口改造，避免把翻译职责留在 runtime"}
