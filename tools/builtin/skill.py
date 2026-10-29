@@ -1,11 +1,12 @@
 """Skill 工具层(PRD §14):三个工具经 Anthropic 原生 tool-calling 暴露。
 
-- SkillTool(Skill):加载指定 skill 的正文 + 资源清单(排除 SKILL.md)。
+- SkillTool(Skill):加载指定 skill 的正文 + 附属文件清单。
 - SkillResourceTool(SkillResource):读取单个资源文件(文本内联,二进制只给描述)。
 - SkillRunTool(SkillRun):执行 scripts/ 下脚本,返回退出码 + 截断后的 stdout/stderr。
 
 均继承 tools.base.BaseTool,run async 返回 str;经 ctx.db 构造 SkillService(ctx.db);
 领域错误在 run 内捕获转可读中文文本,不抛给框架(风格同 tools/builtin/task.py)。
+禁用的 skill 由 SkillService 拒绝访问,与不存在报同一条错误。
 """
 
 from pydantic import BaseModel, Field
@@ -14,26 +15,9 @@ from core.errors import AgentException
 from skill.service import SkillService
 from tools.base import BaseTool, ToolContext
 
-# 文本类 mime:命中则把资源内容内联返回,否则只给描述(避免把二进制/base64 塞进上下文)。
-_TEXT_MIME_PREFIXES = ("text/",)
-_TEXT_MIME_EXACT = {
-    "application/json",
-    "application/xml",
-    "application/x-yaml",
-    "application/yaml",
-    "application/x-python",
-    "application/javascript",
-    "application/x-sh",
-    "application/x-shellscript",
-    "application/toml",
-}
 
-
-def _is_text_mime(mime: str) -> bool:
-    """判定 mime 是否按文本内联。"""
-    if any(mime.startswith(p) for p in _TEXT_MIME_PREFIXES):
-        return True
-    return mime in _TEXT_MIME_EXACT
+def _unknown_skill(name: str) -> str:
+    return f"错误:skill '{name}' 不存在或已禁用。"
 
 
 def _human_size(n: int) -> str:
@@ -69,19 +53,17 @@ class SkillTool(BaseTool):
 
     async def run(self, args: SkillInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.name, ctx):
-            return f"错误:未知 skill '{args.name}'。"
+            return _unknown_skill(args.name)
         service = SkillService(ctx.db)
         try:
             body = await service.load_body(ctx.workspace_id, args.name)
             resources = await service.list_resources(ctx.workspace_id, args.name)
-        except AgentException:
-            # skill 不存在等领域错误统一转可读文本(不抛)。
-            return f"错误:未知 skill '{args.name}'。"
+        except AgentException as exc:
+            # skill 不存在、已禁用等领域错误统一转可读文本(不抛)。
+            return f"错误:{exc.message}"
 
-        # 资源清单排除 SKILL.md(正文已单独返回)。
-        listed = [r for r in resources if r.relative_path != "SKILL.md"]
         lines = [
-            f"- {r.relative_path} ({r.mime}, {_human_size(r.size)})" for r in listed
+            f"- {r.relative_path} ({r.mime}, {_human_size(r.size)})" for r in resources
         ]
         resource_block = "\n".join(lines) if lines else "(无附属资源)"
         return (
@@ -113,21 +95,22 @@ class SkillResourceTool(BaseTool):
 
     async def run(self, args: SkillResourceInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):
-            return f"错误:未知 skill '{args.skill_name}'。"
+            return _unknown_skill(args.skill_name)
         service = SkillService(ctx.db)
         try:
-            data, mime = await service.read_resource(
+            resource = await service.read_resource(
                 ctx.workspace_id,
                 args.skill_name,
                 args.relative_path,
             )
         except AgentException as exc:
             return f"错误:{exc.message}"
-        if _is_text_mime(mime):
-            return data.decode("utf-8", errors="replace")
+        if resource.text is not None:
+            return resource.text
         # 二进制类不内联,只返回描述(不塞 base64 进上下文)。
         return (
-            f"[二进制资源 {args.relative_path},{mime},{len(data)} 字节,暂不支持内联展示]"
+            f"[二进制资源 {resource.relative_path},{resource.mime},"
+            f"{resource.size} 字节,暂不支持内联展示]"
         )
 
 
@@ -151,7 +134,7 @@ class SkillRunTool(BaseTool):
 
     async def run(self, args: SkillRunInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):
-            return f"错误:未知 skill '{args.skill_name}'。"
+            return _unknown_skill(args.skill_name)
         service = SkillService(ctx.db)
         try:
             result = await service.run_script(

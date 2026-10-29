@@ -196,7 +196,8 @@ class AgentService:
         tool_ids = sorted(binding.tool_id for binding in agent.tool_bindings)
         skill_ids = sorted(binding.skill_id for binding in agent.skill_bindings)
         tool_names = await self.tool_catalog_service.get_runtime_names(tool_ids)
-        skill_names = await self.skill_service.get_names_by_ids(workspace_id, skill_ids)
+        # skill_ids 保留全部绑定(含禁用),skill_names 只含已启用的,作为运行时可调用白名单。
+        skill_names = await self.skill_service.get_enabled_names_by_ids(workspace_id, skill_ids)
         if skill_names:
             skill_tool_names = await self.tool_catalog_service.require_runtime_names(
                 ["Skill", "SkillResource", "SkillRun"]

@@ -1,12 +1,18 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
-from skill.schemas import SkillDetailResponse, SkillResponse, SkillValidateResult
+from skill.schemas import (
+    SkillDetailResponse,
+    SkillEnabledRequest,
+    SkillResponse,
+    SkillUpsertRequest,
+    SkillValidateResult,
+)
 from skill.service import SkillService
 from user.models import UserRecord
 
@@ -20,9 +26,12 @@ _MAX_BUNDLE_BYTES = 8 * 1024 * 1024
 
 
 def _read_and_guard(data: bytes) -> bytes:
-    """校验上传体大小上限;超限抛 SKILL_BUNDLE_INVALID。"""
+    """校验上传体大小上限。"""
     if len(data) > _MAX_BUNDLE_BYTES:
-        raise AgentException.message(f"bundle 体积超过上限 {_MAX_BUNDLE_BYTES} 字节({len(data)})")
+        raise AgentException.message(
+            f"bundle 体积超过上限 {_MAX_BUNDLE_BYTES} 字节({len(data)})",
+            status_code=400,
+        )
     return data
 
 
@@ -46,7 +55,7 @@ async def upload_skill(
 
 @router.post(
     "/validate",
-    summary="预检 skill bundle(不落库、不写存储)",
+    summary="预检 skill bundle(不落库)",
     response_model=ApiResponse[SkillValidateResult],
 )
 async def validate_skill(
@@ -64,7 +73,7 @@ async def validate_skill(
 
 @router.get(
     "",
-    summary="列出全部 skill(精简元数据)",
+    summary="列出全部 skill(精简元数据,含禁用)",
     response_model=ApiResponse[list[SkillResponse]],
 )
 async def list_skills(
@@ -80,7 +89,7 @@ async def list_skills(
 
 @router.get(
     "/{name}",
-    summary="查询 skill 详情(含 frontmatter、资源清单、正文)",
+    summary="查询 skill 详情(含 frontmatter、附属文件清单、正文)",
     response_model=ApiResponse[SkillDetailResponse],
 )
 async def get_skill(
@@ -95,9 +104,76 @@ async def get_skill(
     return ok(detail, request)
 
 
+@router.put(
+    "/{name}",
+    summary="JSON 创建或更新 skill(服务端拼 SKILL.md,保留已有附属文件)",
+    response_model=ApiResponse[SkillResponse],
+)
+async def upsert_skill(
+    name: str,
+    payload: SkillUpsertRequest,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    service = SkillService(db)
+    record = await service.upsert_from_fields(
+        workspace_id,
+        current_user.id,
+        name,
+        description=payload.description,
+        body=payload.body,
+        version=payload.version,
+        compatibility=payload.compatibility,
+        metadata=payload.metadata,
+    )
+    return ok(SkillResponse.model_validate(record), request)
+
+
+@router.patch(
+    "/{name}/enabled",
+    summary="启用或禁用 skill(agent 绑定保留)",
+    response_model=ApiResponse[SkillResponse],
+)
+async def set_skill_enabled(
+    name: str,
+    payload: SkillEnabledRequest,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    service = SkillService(db)
+    record = await service.set_enabled(workspace_id, name, current_user.id, payload.enabled)
+    return ok(SkillResponse.model_validate(record), request)
+
+
+@router.get(
+    "/{name}/export",
+    summary="导出 skill 为 zip(可直接重新上传)",
+    response_class=Response,
+    responses={200: {"content": {"application/zip": {}}}},
+)
+async def export_skill(
+    name: str,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+) -> Response:
+    service = SkillService(db)
+    data = await service.export_bundle(workspace_id, name)
+    # 与 SSE 一样属于统一响应外壳的例外:二进制下载无法套 {data, error, request_id}。
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+    )
+
+
 @router.delete(
     "/{name}",
-    summary="软删除 skill",
+    summary="软删除 skill(同时清理 agent 绑定)",
     response_model=ApiResponse[dict],
 )
 async def delete_skill(

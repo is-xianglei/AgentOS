@@ -103,13 +103,6 @@ class Settings(BaseSettings):
     instance_id: str | None = None
     create_tables: bool = False  # 启动时自动建表(仅开发用)
 
-    # --- 对象存储 ---------------------------------------------------
-    minio_endpoint: str | None = None  # 形如 "localhost:9000"(不含 scheme)
-    minio_access_key: str | None = None
-    minio_secret_key: str | None = None
-    minio_bucket: str = "skills"
-    minio_secure: bool = False  # 是否走 https,默认 false(本地 MinIO 多为 http)
-
     # --- skill 脚本执行 -----------------------
     skill_exec_enabled: bool = True
     skill_exec_timeout: int = 30  # 单次执行超时(秒)
