@@ -7,10 +7,11 @@ from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from skill.schemas import (
+    SkillCreateRequest,
     SkillDetailResponse,
     SkillEnabledRequest,
     SkillResponse,
-    SkillUpsertRequest,
+    SkillUpdateRequest,
     SkillValidateResult,
 )
 from skill.service import SkillService
@@ -36,8 +37,8 @@ def _read_and_guard(data: bytes) -> bytes:
 
 
 @router.post(
-    "",
-    summary="上传或覆盖更新 skill(zip bundle)",
+    "/upload",
+    summary="上传 zip 新建 skill(同名有效 skill 返回 409)",
     response_model=ApiResponse[SkillResponse],
 )
 async def upload_skill(
@@ -49,7 +50,7 @@ async def upload_skill(
 ):
     data = _read_and_guard(await file.read())
     service = SkillService(db)
-    record = await service.upload_bundle(data, workspace_id, current_user.id)
+    record = await service.create_from_bundle(workspace_id, current_user.id, data)
     return ok(SkillResponse.model_validate(record), request)
 
 
@@ -71,6 +72,27 @@ async def validate_skill(
     return ok(result, request)
 
 
+@router.post(
+    "",
+    summary="JSON 新建 skill(服务端拼 SKILL.md,同名有效 skill 返回 409)",
+    response_model=ApiResponse[SkillResponse],
+)
+async def create_skill(
+    payload: SkillCreateRequest,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    service = SkillService(db)
+    record = await service.create_from_fields(
+        workspace_id,
+        current_user.id,
+        **payload.model_dump(),
+    )
+    return ok(SkillResponse.model_validate(record), request)
+
+
 @router.get(
     "",
     summary="列出全部 skill(精简元数据,含禁用)",
@@ -88,56 +110,71 @@ async def list_skills(
 
 
 @router.get(
-    "/{name}",
+    "/{skill_id}",
     summary="查询 skill 详情(含 frontmatter、附属文件清单、正文)",
     response_model=ApiResponse[SkillDetailResponse],
 )
 async def get_skill(
-    name: str,
+    skill_id: int,
     request: Request,
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
     service = SkillService(db)
-    detail = await service.get_detail(workspace_id, name)
+    detail = await service.get_detail(workspace_id, skill_id)
     return ok(detail, request)
 
 
 @router.put(
-    "/{name}",
-    summary="JSON 创建或更新 skill(服务端拼 SKILL.md,保留已有附属文件)",
+    "/{skill_id}",
+    summary="JSON 更新 skill(name 不可改,可选字段缺省保留原值,保留附属文件)",
     response_model=ApiResponse[SkillResponse],
 )
-async def upsert_skill(
-    name: str,
-    payload: SkillUpsertRequest,
+async def update_skill(
+    skill_id: int,
+    payload: SkillUpdateRequest,
     request: Request,
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
     service = SkillService(db)
-    record = await service.upsert_from_fields(
+    record = await service.update_from_fields(
         workspace_id,
+        skill_id,
         current_user.id,
-        name,
-        description=payload.description,
-        body=payload.body,
-        version=payload.version,
-        compatibility=payload.compatibility,
-        metadata=payload.metadata,
+        **payload.model_dump(),
     )
     return ok(SkillResponse.model_validate(record), request)
 
 
+@router.put(
+    "/{skill_id}/bundle",
+    summary="用 zip 覆盖指定 skill(SKILL.md 的 name 须与记录一致)",
+    response_model=ApiResponse[SkillResponse],
+)
+async def replace_skill_bundle(
+    skill_id: int,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+    file: UploadFile = File(description="skill 的 zip 打包文件"),
+):
+    data = _read_and_guard(await file.read())
+    service = SkillService(db)
+    record = await service.replace_bundle(workspace_id, skill_id, current_user.id, data)
+    return ok(SkillResponse.model_validate(record), request)
+
+
 @router.patch(
-    "/{name}/enabled",
+    "/{skill_id}/enabled",
     summary="启用或禁用 skill(agent 绑定保留)",
     response_model=ApiResponse[SkillResponse],
 )
 async def set_skill_enabled(
-    name: str,
+    skill_id: int,
     payload: SkillEnabledRequest,
     request: Request,
     db: DatabaseSession,
@@ -145,45 +182,45 @@ async def set_skill_enabled(
     workspace_id: CurrentWorkspaceId,
 ):
     service = SkillService(db)
-    record = await service.set_enabled(workspace_id, name, current_user.id, payload.enabled)
+    record = await service.set_enabled(workspace_id, skill_id, current_user.id, payload.enabled)
     return ok(SkillResponse.model_validate(record), request)
 
 
 @router.get(
-    "/{name}/export",
+    "/{skill_id}/export",
     summary="导出 skill 为 zip(可直接重新上传)",
     response_class=Response,
     responses={200: {"content": {"application/zip": {}}}},
 )
 async def export_skill(
-    name: str,
+    skill_id: int,
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ) -> Response:
     service = SkillService(db)
-    data = await service.export_bundle(workspace_id, name)
+    archive = await service.export_bundle(workspace_id, skill_id)
     # 与 SSE 一样属于统一响应外壳的例外:二进制下载无法套 {data, error, request_id}。
     return Response(
-        content=data,
+        content=archive.data,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{archive.name}.zip"'},
     )
 
 
 @router.delete(
-    "/{name}",
+    "/{skill_id}",
     summary="软删除 skill(同时清理 agent 绑定)",
     response_model=ApiResponse[dict],
 )
 async def delete_skill(
-    name: str,
+    skill_id: int,
     request: Request,
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
     service = SkillService(db)
-    deleted = await service.delete_skill(workspace_id, name, current_user.id)
+    deleted = await service.delete_skill(workspace_id, skill_id, current_user.id)
     # 提交交给请求边界（get_db）统一处理
     return ok({"deleted": deleted}, request)

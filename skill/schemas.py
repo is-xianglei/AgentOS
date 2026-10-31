@@ -48,8 +48,8 @@ class SkillValidateResult(BaseModel):
     errors: list[str] = Field(default_factory=list, description="校验错误信息列表")
 
 
-class SkillUpsertRequest(BaseModel):
-    """JSON 创建或更新 skill,由服务端拼成 SKILL.md;name 取自路径参数。"""
+class _SkillContentFields(BaseModel):
+    """JSON 写入的公共字段,由服务端拼成 SKILL.md。"""
 
     description: str = Field(
         min_length=1,
@@ -71,6 +71,22 @@ class SkillUpsertRequest(BaseModel):
         if not value.strip():
             raise ValueError("不能为空白")
         return value
+
+
+class SkillCreateRequest(_SkillContentFields):
+    """JSON 新建 skill;工作区内已有同名有效 skill 时返回 409。"""
+
+    # 名称规则由 parser.validate_frontmatter 统一校验,与 zip 上传报同样的 400。
+    name: str = Field(description="skill 名称(kebab-case),创建后不可修改")
+
+
+class SkillUpdateRequest(_SkillContentFields):
+    """JSON 更新指定 skill;version、compatibility、metadata 不传或为 null 时保留原值。"""
+
+    name: str | None = Field(
+        default=None,
+        description="可选,须与记录的 name 一致,不一致返回 400;name 创建后不可修改",
+    )
 
 
 class SkillEnabledRequest(BaseModel):

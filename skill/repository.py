@@ -21,22 +21,36 @@ class SkillRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def get_by_name(
-        self,
-        workspace_id: int,
-        name: str,
-        *,
-        include_deleted: bool = False,
-    ) -> SkillRecord | None:
-        """按 name 取整行(含正文与附属文件)。include_deleted=True 时可读已软删记录。"""
+    async def get_by_id(self, workspace_id: int, skill_id: int) -> SkillRecord | None:
+        """按 ID 取未软删整行;带工作区条件,别的工作区的 ID 与不存在同样返回 None。"""
+        stmt = select(SkillRecord).where(
+            SkillRecord.workspace_id == workspace_id,
+            SkillRecord.id == skill_id,
+        )
+        return (await self.db.scalars(stmt)).first()
+
+    async def get_by_name(self, workspace_id: int, name: str) -> SkillRecord | None:
+        """按 name 取未软删整行(含正文与附属文件),供运行时按名访问。"""
         stmt = select(SkillRecord).where(
             SkillRecord.workspace_id == workspace_id,
             SkillRecord.name == name,
         )
-        if include_deleted:
+        return (await self.db.scalars(stmt)).first()
+
+    async def lock_by_name(self, workspace_id: int, name: str) -> SkillRecord | None:
+        """按 name 加行锁读取,含已软删行;供新建前判重与复活。
+
+        行锁让并发复活同一软删行串行化,后到者读到已复活的行而判为冲突;
+        populate_existing 保证锁内读到的是库中最新状态而非 identity map 里的旧值。
+        """
+        stmt = (
+            select(SkillRecord)
+            .where(SkillRecord.workspace_id == workspace_id, SkillRecord.name == name)
+            .with_for_update()
             # 全局软删过滤(database/engine.py 的 do_orm_execute)默认会追加 is_deleted=false,
             # 复活需读到已软删行,故显式关闭本次过滤。
-            stmt = stmt.execution_options(include_deleted=True)
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
         return (await self.db.scalars(stmt)).first()
 
     async def list_enabled(
@@ -76,8 +90,9 @@ class SkillRepository:
         )
         return list(await self.db.scalars(stmt))
 
-    async def upsert(
+    async def save(
         self,
+        record: SkillRecord | None,
         *,
         workspace_id: int,
         name: str,
@@ -89,12 +104,13 @@ class SkillRepository:
         extra_files: dict[str, dict[str, str]],
         actor_user_id: int,
     ) -> SkillRecord:
-        """覆盖更新 + 软删复活;只 flush/refresh,commit 交给请求边界。
+        """写入 skill 内容;只 flush/refresh,commit 交给请求边界。
 
-        启用状态:新建与软删复活为启用;更新有效记录时保持原值,重新上传不会自动启用。
+        record 为 None 时新建;为软删行时原地复活,沿用原 ID;为有效行时覆盖内容。
+        workspace_id 与 name 只在新建时使用,其余情况由调用方保证与 record 一致。
+        启用状态:新建与复活为启用;覆盖有效记录时保持原值,重新上传不会自动启用。
         """
-        existing = await self.get_by_name(workspace_id, name, include_deleted=True)
-        if existing is None:
+        if record is None:
             record = SkillRecord(
                 workspace_id=workspace_id,
                 name=name,
@@ -102,14 +118,12 @@ class SkillRepository:
                 created_by_user_id=actor_user_id,
             )
             self.db.add(record)
-        else:
-            record = existing
-            if record.is_deleted:
-                # 复活等同重新创建,创建者与启用状态随之重置。
-                record.is_deleted = False
-                record.deleted_at = None
-                record.is_enabled = True
-                record.created_by_user_id = actor_user_id
+        elif record.is_deleted:
+            # 复活等同重新创建,创建者与启用状态随之重置。
+            record.is_deleted = False
+            record.deleted_at = None
+            record.is_enabled = True
+            record.created_by_user_id = actor_user_id
         record.description = description
         record.frontmatter = frontmatter
         record.version = version

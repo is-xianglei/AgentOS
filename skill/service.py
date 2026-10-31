@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import SKILL_EXEC_INTERPRETERS, settings
@@ -28,8 +29,6 @@ from skill.repository import SkillRepository
 from skill.schemas import SkillDetailResponse, SkillResourceItem, SkillValidateResult
 from workspace.service import WorkspaceService
 
-# JSON 写入时由请求体全量覆盖的 frontmatter 键;其余键(如 license、allowed-tools)更新时保留。
-_MANAGED_FRONTMATTER_KEYS = ("name", "description", "version", "compatibility", "metadata")
 _WRITE_ROLES = {"owner", "admin"}
 
 
@@ -41,6 +40,14 @@ class SkillResource:
     mime: str
     size: int
     text: str | None
+
+
+@dataclass(frozen=True)
+class SkillArchive:
+    """导出结果:name 用作下载文件名,data 为 zip 字节。"""
+
+    name: str
+    data: bytes
 
 
 class SkillService:
@@ -57,74 +64,124 @@ class SkillService:
             self._executor = get_executor()
         return self._executor
 
-    async def upload_bundle(
+    async def create_from_bundle(
         self,
+        workspace_id: int,
+        actor_user_id: int,
         file_bytes: bytes,
-        workspace_id: int,
-        actor_user_id: int,
     ) -> SkillRecord:
-        """上传 zip 创建或覆盖更新 skill;同名且内容哈希一致时直接返回已有记录。"""
+        """上传 zip 新建 skill;同名有效记录返回 409,同名软删记录原地复活。"""
         await self._require_write_access(workspace_id, actor_user_id)
-        bundle = parse_skill_zip(file_bytes)
-        existing = await self.repo.get_by_name(workspace_id, bundle.name)
-        return await self._save_bundle(workspace_id, actor_user_id, bundle, existing)
+        return await self._create(workspace_id, actor_user_id, parse_skill_zip(file_bytes))
 
-    async def upsert_from_fields(
+    async def create_from_fields(
         self,
         workspace_id: int,
         actor_user_id: int,
-        name: str,
         *,
+        name: str,
         description: str,
         body: str,
         version: str | None,
         compatibility: str | None,
         metadata: dict[str, Any] | None,
     ) -> SkillRecord:
-        """JSON 创建或更新:服务端拼 SKILL.md;更新时保留已有附属文件和非托管 frontmatter 键。"""
+        """JSON 新建:服务端拼 SKILL.md;同名冲突规则与 zip 上传一致。"""
         await self._require_write_access(workspace_id, actor_user_id)
-        existing = await self.repo.get_by_name(workspace_id, name)
-        frontmatter: dict[str, Any] = {}
-        if existing is not None:
-            frontmatter.update(
-                (key, value)
-                for key, value in existing.frontmatter.items()
-                if key not in _MANAGED_FRONTMATTER_KEYS
+        frontmatter: dict[str, Any] = {"name": name, "description": description}
+        _merge_optional_fields(frontmatter, version, compatibility, metadata)
+        bundle = SkillBundle.from_content(build_skill_md(frontmatter, body))
+        return await self._create(workspace_id, actor_user_id, bundle)
+
+    async def update_from_fields(
+        self,
+        workspace_id: int,
+        skill_id: int,
+        actor_user_id: int,
+        *,
+        name: str | None,
+        description: str,
+        body: str,
+        version: str | None,
+        compatibility: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> SkillRecord:
+        """JSON 更新:name 不可改;可选字段为 None 时保留原值,非托管 frontmatter 键与附属文件保留。"""
+        await self._require_write_access(workspace_id, actor_user_id)
+        record = await self._require_skill(workspace_id, skill_id)
+        if name is not None and name != record.name:
+            raise AgentException.message(
+                f"skill 名称创建后不可修改: 当前为 {record.name},请求为 {name}",
+                {"name": record.name, "requested_name": name},
+                status_code=400,
             )
-        frontmatter.update(
-            (key, value)
-            for key, value in {
-                "name": name,
-                "description": description,
-                "version": version,
-                "compatibility": compatibility,
-                "metadata": metadata,
-            }.items()
-            if value is not None
-        )
-        content = build_skill_md(frontmatter, body)
-        extra_files = dict(existing.extra_files) if existing is not None else {}
-        bundle = SkillBundle.from_content(content, extra_files)
-        return await self._save_bundle(workspace_id, actor_user_id, bundle, existing)
+        frontmatter = dict(record.frontmatter)
+        frontmatter.update(name=record.name, description=description)
+        _merge_optional_fields(frontmatter, version, compatibility, metadata)
+        bundle = SkillBundle.from_content(build_skill_md(frontmatter, body), record.extra_files)
+        return await self._update(workspace_id, actor_user_id, record, bundle)
+
+    async def replace_bundle(
+        self,
+        workspace_id: int,
+        skill_id: int,
+        actor_user_id: int,
+        file_bytes: bytes,
+    ) -> SkillRecord:
+        """用 zip 覆盖指定 skill;SKILL.md 的 name 必须与记录一致,内容哈希不变时直接返回。"""
+        await self._require_write_access(workspace_id, actor_user_id)
+        record = await self._require_skill(workspace_id, skill_id)
+        bundle = parse_skill_zip(file_bytes)
+        if bundle.name != record.name:
+            raise AgentException.message(
+                f"bundle 的 name 与目标 skill 不一致: 目标为 {record.name},bundle 为 {bundle.name}",
+                {"name": record.name, "bundle_name": bundle.name},
+                status_code=400,
+            )
+        return await self._update(workspace_id, actor_user_id, record, bundle)
+
+    async def _create(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        bundle: SkillBundle,
+    ) -> SkillRecord:
+        existing = await self.repo.lock_by_name(workspace_id, bundle.name)
+        if existing is not None and not existing.is_deleted:
+            raise _name_conflict(bundle.name)
+        try:
+            return await self._save_bundle(workspace_id, actor_user_id, bundle, existing)
+        except IntegrityError as exc:
+            # 并发新建同名:行锁锁不住尚不存在的行,后到者在唯一约束上失败。
+            raise _name_conflict(bundle.name) from exc
+
+    async def _update(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        record: SkillRecord,
+        bundle: SkillBundle,
+    ) -> SkillRecord:
+        if record.skill_hash == bundle.skill_hash:
+            return record
+        return await self._save_bundle(workspace_id, actor_user_id, bundle, record)
 
     async def _save_bundle(
         self,
         workspace_id: int,
         actor_user_id: int,
         bundle: SkillBundle,
-        existing: SkillRecord | None,
+        record: SkillRecord | None,
     ) -> SkillRecord:
-        skill_hash = bundle.skill_hash
-        if existing is not None and existing.skill_hash == skill_hash:
-            return existing
         # 提交交给请求边界（get_db）统一处理
-        return await self.repo.upsert(
+        return await self.repo.save(
+            record,
             workspace_id=workspace_id,
             name=bundle.name,
             description=bundle.description,
             frontmatter=bundle.parsed.frontmatter,
             version=bundle.version,
-            skill_hash=skill_hash,
+            skill_hash=bundle.skill_hash,
             content=bundle.content,
             extra_files=bundle.extra_files,
             actor_user_id=actor_user_id,
@@ -141,13 +198,13 @@ class SkillService:
     async def set_enabled(
         self,
         workspace_id: int,
-        name: str,
+        skill_id: int,
         actor_user_id: int,
         enabled: bool,
     ) -> SkillRecord:
         """启用或禁用;agent 绑定保留,禁用期间由运行时过滤,重新启用后原绑定直接生效。"""
         await self._require_write_access(workspace_id, actor_user_id)
-        record = await self._require_skill(workspace_id, name)
+        record = await self._require_skill(workspace_id, skill_id)
         if record.is_enabled == enabled:
             return record
         return await self.repo.set_enabled(record, enabled)
@@ -167,9 +224,9 @@ class SkillService:
         """列表接口:全部未软删 skill(含禁用),按创建时间倒序。"""
         return await self.repo.list_all(workspace_id)
 
-    async def get_detail(self, workspace_id: int, name: str) -> SkillDetailResponse:
+    async def get_detail(self, workspace_id: int, skill_id: int) -> SkillDetailResponse:
         """详情:元数据 + frontmatter + 附属文件清单 + 正文;禁用的 skill 同样可查看。"""
-        record = await self._require_skill(workspace_id, name)
+        record = await self._require_skill(workspace_id, skill_id)
         return SkillDetailResponse(
             id=record.id,
             workspace_id=record.workspace_id,
@@ -185,11 +242,11 @@ class SkillService:
             body=parse_skill_md(record.content).body,
         )
 
-    async def export_bundle(self, workspace_id: int, name: str) -> bytes:
-        """导出 zip,结构与上传一致,可直接重新上传。"""
-        record = await self._require_skill(workspace_id, name)
+    async def export_bundle(self, workspace_id: int, skill_id: int) -> SkillArchive:
+        """导出 zip,结构与上传一致,可直接用于 zip 覆盖或删除后重新上传。"""
+        record = await self._require_skill(workspace_id, skill_id)
         bundle = SkillBundle.from_content(record.content, record.extra_files)
-        return build_skill_zip(bundle)
+        return SkillArchive(name=record.name, data=build_skill_zip(bundle))
 
     async def load_body(self, workspace_id: int, name: str) -> str:
         """取 SKILL.md 正文,剥离 frontmatter(避免把 YAML 头喂给模型)。"""
@@ -292,12 +349,12 @@ class SkillService:
     async def delete_skill(
         self,
         workspace_id: int,
-        name: str,
+        skill_id: int,
         actor_user_id: int,
     ) -> bool:
-        """软删除并清理 agent 绑定;记录不存在时返回 False。"""
+        """软删除并清理 agent 绑定;记录不存在或属于别的工作区时返回 False。"""
         await self._require_write_access(workspace_id, actor_user_id)
-        record = await self.repo.get_by_name(workspace_id, name)
+        record = await self.repo.get_by_id(workspace_id, skill_id)
         if record is None:
             return False
         await self.repo.soft_delete(record)
@@ -323,10 +380,11 @@ class SkillService:
             )
         return records
 
-    async def _require_skill(self, workspace_id: int, name: str) -> SkillRecord:
-        record = await self.repo.get_by_name(workspace_id, name)
+    async def _require_skill(self, workspace_id: int, skill_id: int) -> SkillRecord:
+        """HTTP 管理入口:别的工作区的 ID 与不存在报同一条 404,不泄露存在性。"""
+        record = await self.repo.get_by_id(workspace_id, skill_id)
         if record is None:
-            raise AgentException.message(f"skill 不存在: {name}", status_code=404)
+            raise AgentException.message(f"skill 不存在: {skill_id}", status_code=404)
         return record
 
     async def _require_enabled_skill(self, workspace_id: int, name: str) -> SkillRecord:
@@ -342,6 +400,25 @@ class SkillService:
             actor_user_id,
             _WRITE_ROLES,
         )
+
+
+def _merge_optional_fields(
+    frontmatter: dict[str, Any],
+    version: str | None,
+    compatibility: str | None,
+    metadata: dict[str, Any] | None,
+) -> None:
+    """只写入非 None 的可选字段:新建时即不出现该键,更新时即保留原值。"""
+    optional = {"version": version, "compatibility": compatibility, "metadata": metadata}
+    frontmatter.update((key, value) for key, value in optional.items() if value is not None)
+
+
+def _name_conflict(name: str) -> AgentException:
+    return AgentException.message(
+        f"skill 名称已存在: {name}",
+        {"name": name},
+        status_code=409,
+    )
 
 
 def _resource_items(extra_files: dict[str, dict[str, str]]) -> list[SkillResourceItem]:
