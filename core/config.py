@@ -96,7 +96,17 @@ class Settings(BaseSettings):
     # --- Redis ---------------------------------------------------------------
     redis_url: str | None = None
     redis_password: str | None = None
-    disable_redis_events: bool = False
+    disable_redis_events: bool = False  # true 时 run 事件流改用进程内本地后端(仅单进程)
+
+    # --- Run 事件流与执行租约 ------------------------------------------------
+    # 执行结束后 events/projection 两个 key 的保留时长;等待交互期间过期属可接受边界。
+    run_stream_ttl_seconds: int = Field(default=9000, ge=1)
+    # 单条 Stream 近似裁剪上限(XADD MAXLEN ~);被裁剪的历史靠 projection 快照兜底。
+    run_stream_maxlen: int = Field(default=5000, ge=128)
+    # 执行租约时长;心跳间隔为其 1/3,过期未续约的执行由回收任务收尾。
+    run_lease_seconds: int = Field(default=90, ge=15)
+    # 孤儿回收扫描间隔(启动时另执行一次)。
+    run_reaper_interval_seconds: float = Field(default=15, gt=0)
 
     # --- 调试 / 多实例隔离 ---------------------------------------------------
     team_task_debug_isolation: bool = False

@@ -103,3 +103,18 @@ class SessionMessageResponse(BaseModel):
 class SendMessageAccepted(BaseModel):
     session_id: int = Field(description="会话ID")
     stream: bool = Field(description="是否返回流")
+
+
+class ActiveTurnResponse(BaseModel):
+    """会话最新一轮的状态;executing 为 true 时可调用订阅接口续播。"""
+
+    turn_id: UUID = Field(description="最新交互轮次ID")
+    status: str = Field(description="轮次业务状态")
+    executing: bool = Field(description="是否有执行中的任务(执行租约有效)")
+    last_event_offset: int = Field(description="已分配的最大事件offset")
+
+
+class TurnCancelResponse(BaseModel):
+    turn_id: UUID = Field(description="交互轮次ID")
+    status: str = Field(description="取消后的轮次状态")
+    session_status: str = Field(description="取消后的会话状态")

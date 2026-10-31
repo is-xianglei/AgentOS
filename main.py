@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,10 +15,13 @@ from core.errors import (
     validation_error_handler,
 )
 from core.logging import request_context_middleware, setup_logging
+from core.run_events import check_run_event_store, close_run_event_store
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
 from hooks.builtin import register_builtin_hooks
 from llm import create_llm_client
+from runtime.execution import shutdown_executions
+from runtime.recovery import reap_orphan_turns, run_reaper_loop
 from tools.service import ToolCatalogService
 
 
@@ -35,7 +40,20 @@ async def lifespan(app: FastAPI):
         except Exception:
             await db.rollback()
             raise
-    yield
+    # run 事件流自检:Redis 缺配置或不可达时启动即失败,不静默降级到本地后端。
+    await check_run_event_store()
+    # 启动时回收一次:含已过期租约,以及迁移前遗留的 running 且无租约的轮次。
+    await reap_orphan_turns(include_unleased_running=True)
+    reaper = asyncio.create_task(run_reaper_loop())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+        # 取消本进程执行,让它们走取消路径收尾并清除租约,再关闭连接池。
+        await shutdown_executions()
+        await close_run_event_store()
 
 
 def create_app() -> FastAPI:

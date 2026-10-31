@@ -14,7 +14,6 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from core.event_bus import StreamBus
 from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from runtime.agent import AgentRuntime
 from runtime.compact import CompactService
@@ -53,6 +52,16 @@ class _FakeRegistry:
     names: frozenset[str] = frozenset()
 
 
+class _RecordingBus:
+    """替身事件总线:按序记录 emit 的事件对象。"""
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def emit(self, event: Any) -> None:
+        self.events.append(event)
+
+
 class _FakeSessionScope:
     """替身 AsyncSessionLocal:进出上下文都不建立数据库连接。"""
 
@@ -67,7 +76,7 @@ def _make_runtime() -> AgentRuntime:
     """绕过 __init__ 组装 _wake_team_members 所需的最小运行时,避免建真实 LLM 客户端。"""
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = object()
-    runtime.bus = StreamBus()
+    runtime.bus = _RecordingBus()
     runtime.tool_registry = _FakeRegistry()
     runtime.allowed_skill_names = None
     return runtime
@@ -134,8 +143,7 @@ async def test_wake_failure_logs_exception_with_context(
     assert record.exc_info is not None
 
     # 隔离分支走完全程:error 事件也已发往总线。
-    await runtime.bus.close()
-    events = [event async for event in runtime.bus.stream()]
+    events = [event.to_dict() for event in runtime.bus.events]
     assert [event["type"] for event in events] == ["error"]
 
 

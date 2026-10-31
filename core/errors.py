@@ -34,6 +34,15 @@ class AgentException(Exception):
         return cls(message, details, status_code)
 
 
+class LeaseLostError(AgentException):
+    """执行租约已不属于当前持有者(被用户取消、被回收或续约失败)。
+
+    持有者据此停止写入并静默收尾:终态与 run_end 由清除租约的一方负责。
+    """
+
+    status_code = 409
+
+
 def error_payload(request: Request, message: str, details: dict[str, Any] | None = None):
     return {
         "data": None,

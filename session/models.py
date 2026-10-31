@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.ext.mutable import MutableDict, MutableList
@@ -201,6 +202,12 @@ class SessionTurnRecord(Base):
             "AND completed_at IS NULL)",
             name="ck_session_turns_completion",
         ),
+        # 孤儿回收只扫持有租约的行,部分索引让扫描不随历史轮次增长。
+        Index(
+            "ix_session_turns_lease_expires_at",
+            "lease_expires_at",
+            postgresql_where=text("lease_owner IS NOT NULL"),
+        ),
         {"comment": "Agent交互轮次记录"},
     )
 
@@ -267,6 +274,23 @@ class SessionTurnRecord(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="轮次成功完成时间",
+    )
+    # 执行租约:lease_owner 非空且未过期即表示有执行中的任务;status 只表示业务结果。
+    lease_owner: Mapped[str | None] = mapped_column(
+        String(160),
+        nullable=True,
+        comment="执行租约持有者(进程实例ID加执行ID),为空表示没有执行中的任务",
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="执行租约到期时间,心跳续约,过期后可被回收或重新认领",
+    )
+    last_event_offset: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default=text("0"),
+        comment="已分配的最大事件offset,跨多次执行连续递增、不复用",
     )
 
     session: Mapped[SessionRecord] = relationship(back_populates="turns")

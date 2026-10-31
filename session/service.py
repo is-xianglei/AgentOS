@@ -1,15 +1,51 @@
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.errors import AgentException
+from core.errors import AgentException, LeaseLostError
 from department.service import DepartmentService
 from group.service import GroupService
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from session.repository import SessionRepository
 from workspace.service import WorkspaceService
+
+
+@dataclass(frozen=True)
+class TurnExecutionState:
+    """轮次的业务状态与执行状态;executing 表示租约有效、有执行中的任务。"""
+
+    turn_id: UUID
+    session_id: int
+    status: str
+    executing: bool
+    last_event_offset: int
+
+
+@dataclass(frozen=True)
+class TurnTermination:
+    """清除租约后的收尾结果;offset 是为 run_end 分配的 offset。"""
+
+    turn_id: UUID
+    session_id: int
+    status: str
+    session_status: str
+    offset: int
+
+
+@dataclass(frozen=True)
+class MessageDraft:
+    """取消收尾时补写的一条中立形状消息(assistant 中立块数组或 tool 结果 dict)。"""
+
+    role: str
+    content: Any
+
+
+# 取消方在锁内按需读取未落库内容:只有轮次仍是 running 时才调用。
+type PartialLoader = Callable[[], Awaitable[list[MessageDraft]]]
 
 
 class SessionService:
@@ -286,7 +322,12 @@ class SessionService:
         """校验会话当前是否允许继续执行。"""
         session = await self.lock_required(session_id)
         if session.status not in {"idle", "created", "failed"}:
-            raise AgentException.message("会话当前不可执行")
+            # 准入在推流前完成,冲突需以 HTTP 409 返回给客户端。
+            raise AgentException.message(
+                "会话当前不可执行",
+                {"status": session.status},
+                status_code=409,
+            )
         return session
 
     async def lock_required(self, session_id: int) -> SessionRecord:
@@ -549,3 +590,205 @@ class SessionService:
         if len(normalized) <= 24:
             return normalized
         return f"{normalized[:24].rstrip()}..."
+
+    # ---- 执行租约(run 即 turn):事务由调用方提交,本层只做校验与写入 ----
+
+    async def claim_turn_lease(self, turn_id: UUID, owner: str, lease_seconds: float) -> int:
+        """认领执行租约,返回认领时的 last_event_offset;已有执行中的任务时拒绝。"""
+        offset = await self.repo.claim_turn_lease(turn_id, owner, lease_seconds)
+        if offset is None:
+            raise AgentException.message(
+                "该轮次已有执行中的任务",
+                {"turn_id": str(turn_id)},
+                status_code=409,
+            )
+        return offset
+
+    async def renew_turn_lease(self, turn_id: UUID, owner: str, lease_seconds: float) -> bool:
+        """心跳续约;返回 False 表示租约已不属于 owner。"""
+        return await self.repo.renew_turn_lease(turn_id, owner, lease_seconds)
+
+    async def reserve_turn_offsets(self, turn_id: UUID, owner: str, count: int) -> int:
+        """在租约内预留连续 offset,返回首个;租约丢失时抛 LeaseLostError。"""
+        first = await self.repo.reserve_turn_offsets(turn_id, owner, count)
+        if first is None:
+            raise LeaseLostError("执行租约已失效", {"turn_id": str(turn_id)})
+        return first
+
+    async def verify_turn_lease(self, turn_id: UUID, owner: str) -> None:
+        """只读校验租约归属,供高频的取消可见性检查使用。"""
+        if await self.repo.get_turn_lease_owner(turn_id) != owner:
+            raise LeaseLostError("执行租约已失效", {"turn_id": str(turn_id)})
+
+    async def lock_owned_turn(
+        self,
+        session_id: int,
+        turn_id: UUID,
+        owner: str,
+    ) -> tuple[SessionRecord, SessionTurnRecord]:
+        """按「会话 → 轮次」顺序加锁并确认租约仍属于 owner,供执行方提交终态前隔离。
+
+        与取消接口、回收任务的加锁顺序一致,避免互相等待成死锁。
+        """
+        session = await self.lock_required(session_id)
+        turn = await self.repo.get_turn_for_update(turn_id)
+        if turn is None or turn.lease_owner != owner:
+            raise LeaseLostError("执行租约已失效", {"turn_id": str(turn_id)})
+        return session, turn
+
+    async def finish_turn_execution(
+        self,
+        session_id: int,
+        turn_id: UUID,
+        owner: str,
+        *,
+        partial: list[MessageDraft] | None = None,
+        interrupted_session_status: str = "failed",
+    ) -> TurnTermination:
+        """持有者收尾:为 run_end 分配 offset;仍是 running 时按中断收尾。
+
+        仍是 running 说明执行被取消或失联:同一事务里先补写 partial(执行事务回滚掉的
+        半截回答),再改 turn=interrupted、会话=interrupted_session_status(用户取消为 idle,
+        其余为 failed),保证半截回答排在下一条用户消息之前。
+        租约在 run_end 写入 Stream 之后才由 release_turn_lease 清除,
+        保证下一次执行的事件一定排在本次 run_end 之后。
+        """
+        session, turn = await self.lock_owned_turn(session_id, turn_id, owner)
+        if turn.status == "running":
+            await self._save_partial(turn, partial or [])
+            await self.repo.update_turn_status(turn, "interrupted")
+            if session.status == "running":
+                await self.repo.update_status(session, interrupted_session_status)
+        offset = await self.reserve_turn_offsets(turn_id, owner, 1)
+        return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
+
+    async def _save_partial(self, turn: SessionTurnRecord, drafts: list[MessageDraft]) -> None:
+        """按顺序落库取消时补写的消息;provider/model 未知,成本归因留空。"""
+        for draft in drafts:
+            await self.add_message(turn.session_id, draft.role, draft.content, turn_id=turn.id)
+
+    async def release_turn_lease(self, turn_id: UUID, owner: str) -> None:
+        """清除 owner 自己的租约;已被他人清除时为空操作。"""
+        await self.repo.clear_turn_lease(turn_id, owner=owner)
+
+    async def cancel_turn_execution(
+        self,
+        session_id: int,
+        turn_id: UUID,
+        *,
+        partial_loader: PartialLoader | None = None,
+    ) -> TurnTermination:
+        """用户取消执行中的轮次:清除租约并为 run_end 分配 offset。
+
+        running → 补写 partial_loader 给出的半截回答、turn=interrupted、会话=idle,同一事务;
+        已 completed 但仍在唤醒队友等情况只停止执行,不改业务状态;
+        awaiting_interaction 须走交互取消接口。partial_loader 在锁内调用,
+        持有者此后提交终态时会在 lock_owned_turn 处被隔离,不会重复写入。
+        """
+        session = await self.lock_required(session_id)
+        found = await self.repo.get_turn_lease_state(turn_id, for_update=True)
+        if found is None or found[0].session_id != session_id:
+            raise AgentException.message("交互轮次不存在", status_code=404)
+        turn, executing = found
+        if not executing:
+            raise AgentException.message("该轮次没有执行中的任务", status_code=409)
+        if turn.status == "awaiting_interaction":
+            raise AgentException.message(
+                "轮次正在等待人工交互,请使用交互取消接口",
+                {"turn_id": str(turn_id)},
+                status_code=409,
+            )
+        if turn.status == "running" and partial_loader is not None:
+            await self._save_partial(turn, await partial_loader())
+        offset = await self.repo.clear_turn_lease(turn_id, reserve_offset=True)
+        if offset is None:
+            raise AgentException.message("交互轮次不存在", status_code=404)
+        if turn.status == "running":
+            await self.repo.update_turn_status(turn, "interrupted")
+            await self.repo.update_status(session, "idle")
+        return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
+
+    async def release_turn_for_detached_end(
+        self,
+        session: SessionRecord,
+        turn: SessionTurnRecord,
+    ) -> TurnTermination:
+        """执行之外改了轮次终态(如交互取消)时,清除残留租约并为补写的 run_end 分配 offset。
+
+        调用方须已按「会话 → 轮次」顺序持锁并写好终态。offset 由与租约预留同一行的原子
+        UPDATE 分配,不与任何写入者重复;残留的持有者(挂起后正在收尾或刚认领的恢复执行)
+        随后在 offset 校验或 lock_owned_turn 处被隔离,不再写入。
+        """
+        offset = await self.repo.clear_turn_lease(turn.id, reserve_offset=True)
+        if offset is None:
+            raise AgentException.message("交互轮次不存在", status_code=404)
+        return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
+
+    async def list_reapable_turn_ids(self, *, include_unleased_running: bool) -> list[UUID]:
+        return await self.repo.list_reapable_turn_ids(
+            include_unleased_running=include_unleased_running,
+        )
+
+    async def reap_turn(
+        self,
+        turn_id: UUID,
+        *,
+        include_unleased_running: bool,
+    ) -> TurnTermination | None:
+        """回收一个孤儿轮次;加锁后复核条件,已被续约或认领时返回 None。
+
+        running 改 interrupted,会话仍为 running 时改 failed(与 _mark_abnormal_end 一致,
+        failed 可再次执行);不重跑。
+        """
+        turn = await self.repo.get_turn(turn_id)
+        if turn is None:
+            return None
+        session = await self.lock_required(turn.session_id)
+        found = await self.repo.get_turn_lease_state(turn_id, for_update=True)
+        if found is None:
+            return None
+        turn, executing = found
+        expired = turn.lease_owner is not None and not executing
+        unleased = (
+            include_unleased_running and turn.lease_owner is None and turn.status == "running"
+        )
+        if not (expired or unleased):
+            return None
+        offset = await self.repo.clear_turn_lease(turn_id, reserve_offset=True)
+        if offset is None:
+            return None
+        if turn.status == "running":
+            await self.repo.update_turn_status(turn, "interrupted")
+            if session.status == "running":
+                await self.repo.update_status(session, "failed")
+        return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
+
+    async def get_turn_execution(self, turn_id: UUID) -> TurnExecutionState | None:
+        found = await self.repo.get_turn_lease_state(turn_id)
+        return None if found is None else self._execution_state(*found)
+
+    async def get_session_turn_execution(
+        self,
+        session_id: int,
+        turn_id: UUID,
+    ) -> TurnExecutionState:
+        """读取属于指定会话的轮次执行状态,不属于时按不存在处理。"""
+        state = await self.get_turn_execution(turn_id)
+        if state is None or state.session_id != session_id:
+            raise AgentException.message("交互轮次不存在", status_code=404)
+        return state
+
+    async def get_active_turn(self, session_id: int) -> TurnExecutionState | None:
+        """会话最新一轮的状态与是否有执行中的任务;尚无轮次时返回 None。"""
+        found = await self.repo.get_latest_turn_lease_state(session_id)
+        return None if found is None else self._execution_state(*found)
+
+    @staticmethod
+    def _execution_state(turn: SessionTurnRecord, executing: bool) -> TurnExecutionState:
+        return TurnExecutionState(
+            turn_id=turn.id,
+            session_id=turn.session_id,
+            status=turn.status,
+            executing=executing,
+            last_event_offset=turn.last_event_offset,
+        )

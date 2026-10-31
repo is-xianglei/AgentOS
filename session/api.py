@@ -1,16 +1,20 @@
 import logging
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
-from runtime.agent import AgentRuntime, format_sse
+from core.sse import sse_response
+from runtime.agent import AgentRuntime
+from runtime.execution import cancel_turn
+from runtime.turn_follow import follow_execution, subscribe_turn
 from runtime.workflow import WorkflowRuntime
 from session.schemas import (
+    ActiveTurnResponse,
     SessionBatchDeleteRequest,
     SessionDeleteResult,
     SessionMessageResponse,
@@ -19,6 +23,7 @@ from session.schemas import (
     SessionSendMessageRequest,
     SessionShareRequest,
     SessionShareResponse,
+    TurnCancelResponse,
 )
 from session.service import SessionService
 from user.models import UserRecord
@@ -88,28 +93,92 @@ async def send_message(
         session,
     )
 
-    # 运行时在进入流式响应前构造：LLM 客户端配置缺失等错误仍走普通 JSON 错误响应。
+    # 准入(建轮次、认领租约、提交)在返回 SSE 前完成:冲突与配置错误走普通 JSON 错误响应,
+    # 后台执行与本次连接解耦,客户端断开只停止跟随,不取消执行。
     if effective_workflow_id is not None:
         workflow_runtime = WorkflowRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
-        events = workflow_runtime.run(
+        handle = await workflow_runtime.start(
             payload.session_id,
             payload.content,
             workflow_id=effective_workflow_id,
         )
     else:
-        # 传递用户信息和工作区信息到 runtime
         runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
-        events = runtime.run(
+        handle = await runtime.start(
             payload.session_id,
             payload.content,
             agent_id=payload.agent_id,
         )
+    return sse_response(follow_execution(handle))
 
-    async def event_stream():
-        async for event in events:
-            yield format_sse(event)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
+@router.get(
+    "/{session_id}/active-turn",
+    summary="查询会话最新轮次及其执行状态",
+    response_model=ApiResponse[ActiveTurnResponse | None],
+)
+async def get_active_turn(
+    session_id: int,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    service = SessionService(db)
+    await service.require_read_access(session_id, current_user.id, workspace_id)
+    state = await service.get_active_turn(session_id)
+    data = (
+        None
+        if state is None
+        else ActiveTurnResponse(
+            turn_id=state.turn_id,
+            status=state.status,
+            executing=state.executing,
+            last_event_offset=state.last_event_offset,
+        )
+    )
+    return ok(data, request)
+
+
+@router.get("/{session_id}/turns/{turn_id}/subscription", summary="订阅轮次事件流(快照续播)")
+async def subscribe_turn_events(
+    session_id: int,
+    turn_id: UUID,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    service = SessionService(db)
+    await service.require_read_access(session_id, current_user.id, workspace_id)
+    await service.get_session_turn_execution(session_id, turn_id)
+    # 显式提交:鉴权只读事务到此结束,请求作用域的连接不随长时间 SSE 挂着事务。
+    await db.commit()
+    return sse_response(subscribe_turn(turn_id))
+
+
+@router.post(
+    "/{session_id}/turns/{turn_id}/cancel",
+    summary="取消执行中的轮次",
+    response_model=ApiResponse[TurnCancelResponse],
+)
+async def cancel_turn_execution(
+    session_id: int,
+    turn_id: UUID,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    await SessionService(db).require_write_access(session_id, current_user.id, workspace_id)
+    termination = await cancel_turn(db, session_id, turn_id)
+    return ok(
+        TurnCancelResponse(
+            turn_id=termination.turn_id,
+            status=termination.status,
+            session_status=termination.session_status,
+        ),
+        request,
+    )
 
 
 @router.post(

@@ -1064,7 +1064,7 @@ async def test_prepare_rejects_switching_workflow_on_existing_session(
 
 
 class _FakeRuntimeFactory:
-    """替身 AgentRuntime / WorkflowRuntime:记录构造与 run 入参,产出一条事件。"""
+    """替身 AgentRuntime / WorkflowRuntime:记录构造与 start 入参,返回执行句柄。"""
 
     def __init__(self) -> None:
         self.constructed = 0
@@ -1075,9 +1075,9 @@ class _FakeRuntimeFactory:
             def __init__(self, db: object, user_id: int, workspace_id: int) -> None:
                 factory.constructed += 1
 
-            async def run(self, session_id: int | None, content: str, **kwargs: Any):
+            async def start(self, session_id: int | None, content: str, **kwargs: Any):
                 factory.run_kwargs.append(kwargs)
-                yield {"type": "turn_end"}
+                return SimpleNamespace(turn_id=uuid4(), session_id=_SESSION_ID)
 
         self.cls = _Runtime
 
@@ -1108,6 +1108,10 @@ def _install_api_fakes(
             workflow_checks.append(workflow_id)
             return SimpleNamespace(id=workflow_id)
 
+    async def _fake_follow(handle: Any):
+        yield {"type": "run_started", "turn_id": str(handle.turn_id)}
+
+    monkeypatch.setattr(session_api, "follow_execution", _fake_follow)
     monkeypatch.setattr(session_api, "WorkflowRuntime", workflow_rt.cls)
     monkeypatch.setattr(session_api, "AgentRuntime", agent_rt.cls)
     monkeypatch.setattr(session_api, "SessionService", _FakeSessionService)
@@ -1196,16 +1200,18 @@ async def test_send_message_rejects_workflow_switch_and_mixing(
     assert workflow_rt.constructed == 0 and agent_rt.constructed == 0
 
 
-# ---------- WorkflowRuntime._produce(生命周期与失败终态) ----------
+# ---------- WorkflowRuntime.start / _produce(准入、生命周期与失败终态) ----------
 
 
 @dataclass
 class _FakeDb:
     commits: int = 0
     rollbacks: int = 0
+    log: list[str] = field(default_factory=list)
 
     async def commit(self) -> None:
         self.commits += 1
+        self.log.append("commit")
 
     async def rollback(self) -> None:
         self.rollbacks += 1
@@ -1246,6 +1252,16 @@ class _FakeRuntimeSessionService:
         self.prepare_kwargs = kwargs
         return SimpleNamespace(id=_SESSION_ID, title="标题", status="running")
 
+    async def claim_turn_lease(self, turn_id, owner, lease_seconds):
+        self.claimed = (turn_id, owner)
+        return 0
+
+    async def get_required(self, session_id):
+        return SimpleNamespace(id=_SESSION_ID, title="标题", status="running")
+
+    async def get_turn_required(self, turn_id):
+        return self.turn
+
     async def start_turn(self, session, user_id, workspace_id, content):
         self.messages.append(("user", content))
         return self.turn, SimpleNamespace(id=1)
@@ -1269,6 +1285,7 @@ def _make_runtime(
     runtime = WorkflowRuntime(db, user_id=_USER_ID, workspace_id=_WORKSPACE_ID)
     session_service = _FakeRuntimeSessionService()
     runtime.session_service = session_service
+    runtime.bus = _RecordingBus()
 
     async def _build(session_id: int, turn_id: Any, workflow_id: int) -> Any:
         return SimpleNamespace(run=orchestrator_run)
@@ -1277,10 +1294,34 @@ def _make_runtime(
     return runtime, db, session_service
 
 
-async def test_runtime_run_commits_user_message_then_final_state(
+async def test_runtime_start_commits_admission_before_launching_background_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """成功路径:首次 commit 落 user 消息,末次 commit 完成 turn;assistant 落中立块;bus 关闭。"""
+    """准入:落 user 消息 → 建 Turn → 认领租约 → 提交,之后才启动后台执行。"""
+    runtime, db, session_service = _make_runtime(monkeypatch, None)
+    launched: list[dict[str, Any]] = []
+
+    async def _fake_launch(**kwargs: Any) -> Any:
+        db.log.append("launch")
+        launched.append(kwargs)
+        return SimpleNamespace(turn_id=kwargs["turn_id"])
+
+    monkeypatch.setattr("runtime.workflow.launch_turn_execution", _fake_launch)
+
+    handle = await runtime.start(None, _QUESTION, workflow_id=_WORKFLOW_ID)
+
+    assert session_service.prepare_kwargs == {"workflow_id": _WORKFLOW_ID}
+    assert session_service.messages == [("user", _QUESTION)]
+    assert session_service.claimed[0] == session_service.turn.id
+    assert db.log == ["commit", "launch"]
+    assert launched[0]["owner"] == session_service.claimed[1]
+    assert handle.turn_id == session_service.turn.id
+
+
+async def test_runtime_produce_commits_final_state_and_emits_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """后台执行成功路径:assistant 落中立块,turn completed、session idle,事件同形。"""
 
     async def _run(user_content: str):
         from runtime.workflow import OrchestrationResult
@@ -1289,16 +1330,14 @@ async def test_runtime_run_commits_user_message_then_final_state(
 
     runtime, db, session_service = _make_runtime(monkeypatch, _run)
 
-    events = [event async for event in runtime.run(None, _QUESTION, workflow_id=_WORKFLOW_ID)]
+    await runtime._produce(_SESSION_ID, session_service.turn.id, _QUESTION, _WORKFLOW_ID)
 
-    assert db.commits >= 2 and db.rollbacks == 0
-    assert session_service.prepare_kwargs == {"workflow_id": _WORKFLOW_ID}
-    assert session_service.messages[0] == ("user", _QUESTION)
+    assert db.commits == 1 and db.rollbacks == 0
     assert session_service.messages[-1] == ("assistant", [{"kind": "text", "text": "最终回答"}])
     assert session_service.turn_statuses == ["completed"]
     assert session_service.session_statuses == ["idle"]
+    events = [event.to_dict() for event in runtime.bus.events]
     assert [event["type"] for event in events] == ["session_ready", "turn_start", "turn_end"]
-    assert runtime.bus._closed is True
 
 
 async def test_runtime_run_marks_failed_and_emits_error_on_orchestrator_exception(
@@ -1319,14 +1358,15 @@ async def test_runtime_run_marks_failed_and_emits_error_on_orchestrator_exceptio
 
     monkeypatch.setattr(runtime, "_mark_abnormal_end", _spy)
 
-    events = [event async for event in runtime.run(None, _QUESTION, workflow_id=_WORKFLOW_ID)]
+    await runtime._produce(_SESSION_ID, session_service.turn.id, _QUESTION, _WORKFLOW_ID)
 
     assert marked == [(_SESSION_ID, session_service.turn.id, "failed")]
     assert db.rollbacks == 1
     assert session_service.turn_statuses == ["failed"]
     assert session_service.session_statuses == ["failed"]
+    events = [event.to_dict() for event in runtime.bus.events]
     error_events = [event for event in events if event["type"] == "error"]
     assert len(error_events) == 1
     assert error_events[0]["error"]["message"] == "并行编排的全部成员均执行失败"
     assert error_events[0]["error"]["code"] == "WORKFLOW_RUN_FAILED"
-    assert runtime.bus._closed is True
+    assert events[-1]["type"] == "error"

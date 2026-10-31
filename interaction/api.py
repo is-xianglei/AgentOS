@@ -3,19 +3,20 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
+from core.sse import sse_response
 from interaction.schemas import (
     InteractionResolutionRequest,
     PendingInteractionResponse,
     RuntimeSuspensionResponse,
 )
 from interaction.service import InteractionService
-from runtime.agent import AgentRuntime, format_sse
+from runtime.agent import AgentRuntime
+from runtime.turn_follow import follow_execution
 from session.service import SessionService
 from user.models import UserRecord
 
@@ -107,26 +108,15 @@ async def resolve_interaction(
         mode="json",
         by_alias=True,
     )
-    # 在返回 StreamingResponse 前完成校验与响应落库，使 409 等业务错误保持
-    # 普通 HTTP 语义；提交后即使 SSE 未建立，也可用相同响应继续恢复。
-    await runtime.prepare_interaction_response(
+    # 在返回 SSE 前完成校验、响应落库与租约认领，使 409 等业务错误保持普通 HTTP 语义；
+    # 响应提交后即使 SSE 未建立，也可用相同响应继续恢复。客户端断开不取消恢复执行。
+    handle = await runtime.start_resume(
         session_id,
         request_id,
         payload.kind,
         response_payload,
     )
-
-    async def event_stream():
-        async for event in runtime.resume(
-            session_id,
-            request_id,
-            payload.kind,
-            response_payload,
-            response_prepared=True,
-        ):
-            yield format_sse(event)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
+    return sse_response(follow_execution(handle))
 
 
 @router.post(

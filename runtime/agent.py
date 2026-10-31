@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
@@ -13,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.service import AgentService
 from core.config import settings
-from core.errors import AgentException
-from core.event_bus import StreamBus
+from core.errors import AgentException, LeaseLostError
+from core.event_bus import NullStreamBus, RunStreamBus, StreamBus
 from core.events import (
     ORCHESTRATOR_ACTOR,
     Actor,
@@ -45,6 +44,13 @@ from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
 from runtime.compact import CompactService
+from runtime.execution import (
+    ExecutionHandle,
+    launch_turn_execution,
+    lease_seconds,
+    new_lease_owner,
+    write_detached_run_end,
+)
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
@@ -127,68 +133,89 @@ class AgentRuntime:
         self.active_model_name: str | None = None
         self.active_skill_ids: tuple[int, ...] | None = None
         self.allowed_skill_names: frozenset[str] | None = None
-        self.bus = StreamBus()
+        # 执行之外(准入、交互取消)没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
+        self.bus: StreamBus = NullStreamBus()
+        # 当前执行的租约持有者;提交终态前据此隔离已被取消或回收的执行。
+        self.lease_owner: str | None = None
 
-    async def run(
+    def bind_execution(self, bus: RunStreamBus, lease_owner: str) -> None:
+        """把运行时绑定到一次后台执行的事件流与租约。"""
+        self.bus = bus
+        self.lease_owner = lease_owner
+
+    async def start(
         self,
         session_id: int | None,
         user_content: str,
         *,
         agent_id: int | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """执行一次会话消息处理并产出流式事件。
+    ) -> ExecutionHandle:
+        """请求阶段准入:锁会话 → 校验可执行 → 按需建会话 → 写用户消息 → 建 Turn → 认领租约。
 
-        采用生产者-消费者模式:后台任务跑 ReAct 主流程并把所有事件(含 lead 增量、
-        工具事件、子代理增量)emit 到会话级事件总线;本协程从总线抽干并 yield 给 SSE。
+        准入失败直接以 HTTP 错误返回;成功后在推流前提交,再启动后台执行。
         """
-        producer = asyncio.create_task(self._produce(session_id, user_content, agent_id))
-        try:
-            async for event in self.bus.stream():
-                yield event
-        finally:
-            # 确保后台任务结束(正常 close 后 producer 已完成;异常/取消时显式收尾)。
-            if not producer.done():
-                # 正常完成时 producer 已结束，走到这里说明事件流被消费方提前中断。
-                logger.warning(
-                    "事件流提前中断，取消会话处理任务，客户端可能已断开连接",
-                    extra={"session_id": session_id},
-                )
-                producer.cancel()
-            try:
-                await producer
-            except asyncio.CancelledError:
-                pass
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+        session = await self.session_service.prepare_for_message(
+            session_id,
+            user_content,
+            self.user_id,
+            self.workspace_id,
+            agent_id,
+        )
+        turn, _ = await self.session_service.start_turn(
+            session,
+            self.user_id,
+            self.workspace_id,
+            user_content,
+        )
+        owner = new_lease_owner()
+        start_offset = await self.session_service.claim_turn_lease(
+            turn.id, owner, lease_seconds()
+        )
+        # 显式提交:请求作用域的 db 只用于准入;轮次与租约须在后台任务读取前可见,
+        # 且 get_db 要等整个 SSE 发完才收尾,不能让连接在推流期间一直挂着事务。
+        await self.db.commit()
+        target_session_id, turn_id = session.id, turn.id
+        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
+
+        async def body(bus: RunStreamBus) -> None:
+            # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
+            async with AsyncSessionLocal() as db:
+                runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime.bind_execution(bus, owner)
+                await runtime._produce(target_session_id, turn_id, user_content)
+
+        return await launch_turn_execution(
+            turn_id=turn_id,
+            session_id=target_session_id,
+            owner=owner,
+            start_offset=start_offset,
+            body=body,
+        )
+
+    async def _fence_lease(self, session_id: int, turn_id: UUID) -> None:
+        """提交终态前按「会话 → 轮次」加锁并确认租约仍属于本次执行。
+
+        已被用户取消或被回收时抛 LeaseLostError,避免覆盖清除方写下的终态。
+        lease_owner 为空表示运行时未绑定执行(单元测试直接驱动),不做隔离。
+        """
+        if self.lease_owner is not None:
+            await self.session_service.lock_owned_turn(session_id, turn_id, self.lease_owner)
 
     async def _produce(
         self,
-        session_id: int | None,
+        session_id: int,
+        turn_id: UUID,
         user_content: str,
-        agent_id: int | None = None,
     ) -> None:
-        """后台生产者:跑完整流程,所有事件 emit 到 bus,最终 close。"""
-        session: SessionRecord | None = None
+        """后台执行体:准入已提交,跑完整流程并把事件 emit 到 bus;收尾由执行包装层负责。"""
         turn: SessionTurnRecord | None = None
         suspension_committed = False
         try:
-            if self.user_id is None or self.workspace_id is None:
-                raise AgentException.message("缺少可信用户或工作区上下文")
-            session: SessionRecord = await self.session_service.prepare_for_message(
-                session_id,
-                user_content,
-                self.user_id,
-                self.workspace_id,
-                agent_id,
-            )
+            session = await self.session_service.get_required(session_id)
+            turn = await self.session_service.get_turn_required(turn_id)
             await self._configure_agent(session)
-            session_id = session.id
-            turn, _ = await self.session_service.start_turn(
-                session,
-                self.user_id,
-                self.workspace_id,
-                user_content,
-            )
-            # 流式执行跨越请求依赖的 yield 生命周期，原始输入与 Turn 必须先可靠提交。
-            await self.db.commit()
 
             # Hook 只生成本次模型请求的临时上下文，绝不改写已保存的原始用户消息。
             additional_context = await self._apply_user_prompt_hooks(
@@ -215,6 +242,7 @@ class AgentRuntime:
             )
             if loop_result.suspended:
                 # 暂停点、请求、Session/Turn 状态先提交，再向客户端发布交互事件。
+                await self._fence_lease(session_id, turn.id)
                 await self.db.commit()
                 suspension_committed = True
                 if loop_result.interaction is not None:
@@ -228,61 +256,73 @@ class AgentRuntime:
             await self._run_inline_memory_job(memory_job_id)
             # 完成状态已提交，独立数据库会话中的队友才能读取到本轮最终回复。
             await self._wake_team_members(session_id, turn)
+        except LeaseLostError:
+            # 已被用户取消或被回收:终态由清除租约的一方写入,这里只放弃未提交的修改。
+            await self.db.rollback()
+            logger.info(
+                "执行租约已失效，放弃本次执行的未提交修改",
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
+            )
         except asyncio.CancelledError:
             logger.warning(
-                "会话处理被取消，客户端可能已断开连接",
-                extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
+                "会话处理被取消",
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
             )
-            if suspension_committed:
+            if suspension_committed or self.lease_owner is not None:
+                # 绑定执行时只回滚:执行包装层的收尾在同一事务里补写半截回答并写终态,
+                # 被隔离时则什么都不写;这里先写 failed 会抢在半截回答之前提交。
                 await self.db.rollback()
             else:
-                await self._mark_abnormal_end(
-                    session_id,
-                    turn.id if turn else None,
-                    "interrupted",
-                )
+                await self._mark_abnormal_end(session_id, turn_id, "interrupted")
             raise
         except Exception:
             logger.exception(
                 "处理会话消息失败",
-                extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
             )
             if suspension_committed:
                 await self.db.rollback()
             else:
-                await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
-        finally:
-            await self.bus.close()
+                await self._mark_abnormal_end(session_id, turn_id, "failed")
 
-    async def resume(
+    async def start_resume(
         self,
         session_id: int,
         request_id: UUID,
         kind: str,
         response_payload: dict[str, Any],
-        *,
-        response_prepared: bool = False,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """持久化人工响应并从通用暂停点恢复执行。"""
-        producer = asyncio.create_task(
-            self._produce_resume(
-                session_id,
-                request_id,
-                kind,
-                response_payload,
-                response_prepared=response_prepared,
-            )
+    ) -> ExecutionHandle:
+        """保存人工响应、对原轮次认领租约,再启动后台恢复执行。
+
+        响应先单独提交:即使随后认领冲突或 SSE 未建立,相同响应仍可重放恢复。
+        """
+        turn_id = await self.prepare_interaction_response(
+            session_id,
+            request_id,
+            kind,
+            response_payload,
         )
-        try:
-            async for event in self.bus.stream():
-                yield event
-        finally:
-            if not producer.done():
-                producer.cancel()
-            try:
-                await producer
-            except asyncio.CancelledError:
-                pass
+        owner = new_lease_owner()
+        start_offset = await self.session_service.claim_turn_lease(
+            turn_id, owner, lease_seconds()
+        )
+        # 显式提交:租约须在后台任务读取前可见,请求作用域的 db 不随 SSE 挂着事务。
+        await self.db.commit()
+        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
+
+        async def body(bus: RunStreamBus) -> None:
+            async with AsyncSessionLocal() as db:
+                runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime.bind_execution(bus, owner)
+                await runtime._produce_resume(session_id, request_id)
+
+        return await launch_turn_execution(
+            turn_id=turn_id,
+            session_id=session_id,
+            owner=owner,
+            start_offset=start_offset,
+            body=body,
+        )
 
     async def prepare_interaction_response(
         self,
@@ -290,8 +330,11 @@ class AgentRuntime:
         request_id: UUID,
         kind: str,
         response_payload: dict[str, Any],
-    ) -> None:
-        """校验并提交用户响应，使格式错误和冲突能在 SSE 建立前返回 HTTP 错误。"""
+    ) -> UUID:
+        """校验并提交用户响应，使格式错误和冲突能在 SSE 建立前返回 HTTP 错误。
+
+        返回暂停点所属轮次 ID,恢复执行沿用同一个轮次。
+        """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
 
@@ -330,13 +373,18 @@ class AgentRuntime:
 
         # 流建立或客户端连接随后失败时，响应仍可从 resuming 暂停点重放。
         await self.db.commit()
+        return turn.id
 
     async def cancel_interaction(
         self,
         session_id: int,
         suspension_id: UUID,
     ) -> RuntimeSuspensionRecord:
-        """取消当前暂停点，并原子收尾关联的 Turn 与工具调用。"""
+        """取消当前暂停点，原子收尾关联的 Turn 与工具调用，提交后补写 run_end。
+
+        补写的 run_end(interrupted, cancelled=true)让快照离开 awaiting_interaction、
+        不再显示待处理交互;取消之后才订阅的客户端同样拿到该终态。
+        """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
 
@@ -362,6 +410,11 @@ class AgentRuntime:
             requests,
             "用户取消了运行暂停点。",
         )
+        termination = await self.session_service.release_turn_for_detached_end(session, turn)
+        # 显式提交:数据库是事实来源,补写 run_end 必须在终态提交之后;
+        # 与轮次取消接口一致,写事件流失败只记日志,不影响已提交的取消。
+        await self.db.commit()
+        await write_detached_run_end(termination, cancelled=True)
         logger.info(
             "人工交互已取消",
             extra={
@@ -373,32 +426,14 @@ class AgentRuntime:
         )
         return suspension
 
-    async def _produce_resume(
-        self,
-        session_id: int,
-        request_id: UUID,
-        kind: str,
-        response_payload: dict[str, Any],
-        *,
-        response_prepared: bool = False,
-    ) -> None:
-        """后台生产者：先可靠保存响应，再应用 continuation 并续跑主循环。"""
+    async def _produce_resume(self, session_id: int, request_id: UUID) -> None:
+        """后台恢复执行体:响应已由请求阶段提交,应用 continuation 并续跑主循环。"""
         session: SessionRecord | None = None
         turn: SessionTurnRecord | None = None
-        response_committed = response_prepared
         continuation_applied = False
         idempotent_replay = False
         terminal_committed = False
         try:
-            if not response_prepared:
-                await self.prepare_interaction_response(
-                    session_id,
-                    request_id,
-                    kind,
-                    response_payload,
-                )
-                response_committed = True
-
             # 所有恢复者都按 Session -> Suspension 的顺序重新加锁。竞争者会在首个
             # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
             session = await self.session_service.lock_required(session_id)
@@ -470,6 +505,7 @@ class AgentRuntime:
                     requests,
                     "用户取消了问题交互。",
                 )
+                await self._fence_lease(session_id, turn.id)
                 await self.db.commit()
                 continuation_applied = True
                 terminal_committed = True
@@ -503,6 +539,7 @@ class AgentRuntime:
                 suspension,
             )
             if interaction is not None:
+                await self._fence_lease(session_id, turn.id)
                 await self.db.commit()
                 await self._emit_interaction(interaction)
                 return
@@ -510,6 +547,7 @@ class AgentRuntime:
             await self.interaction_service.mark_suspension_resolved(suspension.id)
             await self.session_service.repo.update_status(session, "running")
             await self.session_service.mark_turn_status(turn, "running")
+            await self._fence_lease(session_id, turn.id)
             await self.db.commit()
             continuation_applied = True
             await self.bus.emit(
@@ -523,6 +561,7 @@ class AgentRuntime:
                 suspension.continuation_payload.get("additional_context"),
             )
             if loop_result.suspended:
+                await self._fence_lease(session_id, turn.id)
                 await self.db.commit()
                 if loop_result.interaction is not None:
                     await self._emit_interaction(loop_result.interaction)
@@ -534,8 +573,15 @@ class AgentRuntime:
             )
             await self._run_inline_memory_job(memory_job_id)
             await self._wake_team_members(session_id, turn)
+        except LeaseLostError:
+            await self.db.rollback()
+            logger.info(
+                "执行租约已失效，放弃本次恢复执行的未提交修改",
+                extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
+            )
         except asyncio.CancelledError:
-            if terminal_committed or (response_committed and not continuation_applied):
+            if terminal_committed or not continuation_applied or self.lease_owner is not None:
+                # 绑定执行的中断终态与半截回答由执行包装层收尾,原因同 _produce。
                 await self.db.rollback()
             else:
                 await self._mark_abnormal_end(
@@ -544,28 +590,12 @@ class AgentRuntime:
                     "interrupted",
                 )
             raise
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "恢复人工交互轮次失败",
                 extra={"session_id": session_id, "turn_id": str(turn.id if turn else "")},
             )
-            if not response_committed:
-                # 请求格式、请求归属或并发状态错误都不能破坏仍可响应的原暂停点。
-                await self.db.rollback()
-                message = exc.message if isinstance(exc, AgentException) else "人工交互响应处理失败。"
-                await self.bus.emit(
-                    StreamEvent.error_event(
-                        ORCHESTRATOR_ACTOR,
-                        session_id,
-                        ErrorInfo(
-                            code="INTERACTION_RESPONSE_INVALID",
-                            message=message,
-                            retriable=True,
-                            fatal=True,
-                        ),
-                    )
-                )
-            elif terminal_committed or idempotent_replay or not continuation_applied:
+            if terminal_committed or idempotent_replay or not continuation_applied:
                 # 保持 session=awaiting_interaction / suspension=resuming，允许相同响应重放。
                 await self.db.rollback()
                 await self.bus.emit(
@@ -582,8 +612,6 @@ class AgentRuntime:
                 )
             else:
                 await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
-        finally:
-            await self.bus.close()
 
     async def _run_llm_loop(
         self,
@@ -785,6 +813,8 @@ class AgentRuntime:
         completed_message_id: int | None,
     ) -> UUID | None:
         """原子完成 Turn、恢复 Session，并按开关幂等创建提取 Job。"""
+        # 先按「会话 → 轮次」加锁隔离,与取消接口的加锁顺序一致。
+        await self._fence_lease(session.id, turn.id)
         await self.session_service.mark_turn_status(
             turn,
             "completed",
@@ -855,18 +885,34 @@ class AgentRuntime:
         turn_id: UUID | None,
         turn_status: str,
     ) -> None:
-        """回滚当前失败事务，再尽力持久化 Turn 和 Session 的异常终态。"""
+        """回滚当前失败事务，再尽力持久化 Turn 和 Session 的异常终态。
+
+        绑定执行时先确认租约仍属于本次执行:用户取消已写下 interrupted+idle,
+        回收已写下终态,都不能被这里覆盖成 failed。
+        """
         await self.db.rollback()
         if session_id is None or turn_id is None:
             return
         try:
-            session = await self.session_service.repo.get(session_id)
-            turn = await self.session_service.repo.get_turn(turn_id)
+            if self.lease_owner is not None:
+                session, turn = await self.session_service.lock_owned_turn(
+                    session_id, turn_id, self.lease_owner
+                )
+            else:
+                session = await self.session_service.repo.get(session_id)
+                turn = await self.session_service.repo.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
+                await self.db.rollback()
                 return
             await self.session_service.mark_turn_status(turn, turn_status)
             await self.session_service.repo.update_status(session, "failed")
             await self.db.commit()
+        except LeaseLostError:
+            await self.db.rollback()
+            logger.info(
+                "执行租约已失效，异常终态由清除租约的一方负责",
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
+            )
         except Exception:
             await self.db.rollback()
             logger.exception(
@@ -1845,8 +1891,3 @@ class AgentRuntime:
                         ),
                     )
                 )
-
-
-def format_sse(event: dict[str, Any]) -> str:
-    """把事件字典序列化为 SSE 数据帧。"""
-    return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"

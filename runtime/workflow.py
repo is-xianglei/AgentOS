@@ -1,6 +1,6 @@
 """Workflow 编排运行时:把数据库定义的 Workflow 按模式编排成一次流式会话轮次。
 
-与 AgentRuntime 同构(生产者-消费者 + StreamBus),成员执行复用 SubAgentRunner,
+与 AgentRuntime 同构(请求阶段准入 + 后台执行写事件流),成员执行复用 SubAgentRunner,
 编排层负责成员顺序、输入拼装、并发隔离与汇总/路由,并以 workflow_progress 事件
 上报节点状态(成员 running/done/failed 与路由、汇总阶段),供前端实时渲染工作流图。
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -21,8 +21,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.service import AgentRuntimeConfig, AgentService
-from core.errors import AgentException
-from core.event_bus import StreamBus
+from core.errors import AgentException, LeaseLostError
+from core.event_bus import NullStreamBus, RunStreamBus, StreamBus
 from core.events import (
     ORCHESTRATOR_ACTOR,
     BlockType,
@@ -36,6 +36,12 @@ from core.events import (
 from database.engine import AsyncSessionLocal
 from llm import BaseLLMClient, create_llm_client
 from llm.types import build_assistant_blocks
+from runtime.execution import (
+    ExecutionHandle,
+    launch_turn_execution,
+    lease_seconds,
+    new_lease_owner,
+)
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from session.models import SessionRecord, SessionTurnRecord
@@ -575,69 +581,82 @@ class WorkflowRuntime:
         self.workspace_id = workspace_id
         self.llm = llm
         self.session_service = SessionService(db)
-        self.bus = StreamBus()
+        # 执行之外没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
+        self.bus: StreamBus = NullStreamBus()
+        self.lease_owner: str | None = None
 
-    async def run(
+    def bind_execution(self, bus: RunStreamBus, lease_owner: str) -> None:
+        """把运行时绑定到一次后台执行的事件流与租约。"""
+        self.bus = bus
+        self.lease_owner = lease_owner
+
+    async def start(
         self,
         session_id: int | None,
         user_content: str,
         *,
         workflow_id: int,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """执行一次 Workflow 会话消息并产出流式事件。
+    ) -> ExecutionHandle:
+        """请求阶段准入:取/建会话 → 落用户消息 → 建 Turn → 认领租约,提交后启动后台编排。"""
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+        session: SessionRecord = await self.session_service.prepare_for_message(
+            session_id,
+            user_content,
+            self.user_id,
+            self.workspace_id,
+            workflow_id=workflow_id,
+        )
+        turn, _ = await self.session_service.start_turn(
+            session,
+            self.user_id,
+            self.workspace_id,
+            user_content,
+        )
+        owner = new_lease_owner()
+        start_offset = await self.session_service.claim_turn_lease(
+            turn.id, owner, lease_seconds()
+        )
+        # 显式提交:请求作用域的 db 只用于准入,轮次与租约须在后台任务读取前可见。
+        await self.db.commit()
+        target_session_id, turn_id = session.id, turn.id
+        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
 
-        与 AgentRuntime.run 同构:后台任务跑编排并把事件 emit 到 bus,本协程抽干后 yield 给 SSE。
-        """
-        producer = asyncio.create_task(self._produce(session_id, user_content, workflow_id))
-        try:
-            async for event in self.bus.stream():
-                yield event
-        finally:
-            if not producer.done():
-                # 正常完成时 producer 已结束,走到这里说明事件流被消费方提前中断。
-                logger.warning(
-                    "Workflow事件流提前中断，取消编排任务，客户端可能已断开连接",
-                    extra={"session_id": session_id, "workflow_id": workflow_id},
-                )
-                producer.cancel()
-            try:
-                await producer
-            except asyncio.CancelledError:
-                pass
+        async def body(bus: RunStreamBus) -> None:
+            # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
+            async with AsyncSessionLocal() as db:
+                runtime = WorkflowRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime.bind_execution(bus, owner)
+                await runtime._produce(target_session_id, turn_id, user_content, workflow_id)
+
+        return await launch_turn_execution(
+            turn_id=turn_id,
+            session_id=target_session_id,
+            owner=owner,
+            start_offset=start_offset,
+            body=body,
+        )
+
+    async def _fence_lease(self, session_id: int, turn_id: UUID) -> None:
+        """提交终态前确认租约仍属于本次执行;未绑定执行(单元测试)时不做隔离。"""
+        if self.lease_owner is not None:
+            await self.session_service.lock_owned_turn(session_id, turn_id, self.lease_owner)
 
     async def _produce(
         self,
-        session_id: int | None,
+        session_id: int,
+        turn_id: UUID,
         user_content: str,
         workflow_id: int,
     ) -> None:
-        """后台生产者:取/建会话 → 落用户消息 → 编排 → 落最终回复,所有事件 emit 到 bus。"""
-        turn: SessionTurnRecord | None = None
+        """后台执行体:编排 → 落最终回复,所有事件 emit 到 bus;收尾由执行包装层负责。"""
         try:
-            if self.user_id is None or self.workspace_id is None:
-                raise AgentException.message("缺少可信用户或工作区上下文")
-            session: SessionRecord = await self.session_service.prepare_for_message(
-                session_id,
-                user_content,
-                self.user_id,
-                self.workspace_id,
-                workflow_id=workflow_id,
-            )
-            session_id = session.id
-            turn, _ = await self.session_service.start_turn(
-                session,
-                self.user_id,
-                self.workspace_id,
-                user_content,
-            )
-            # 流式执行跨越请求依赖的 yield 生命周期,原始输入与 Turn 必须先可靠提交。
-            await self.db.commit()
-
+            session = await self.session_service.get_required(session_id)
             # 会话级控制事件:前端据此拿 session 元信息建立 UI。
             await self.bus.emit(
                 RuntimeEvent.session_ready(session.id, session.title, session.status)
             )
-
+            turn = await self.session_service.get_turn_required(turn_id)
             orchestrator = await self._build_orchestrator(session.id, turn.id, workflow_id)
             await self.bus.emit(StreamEvent.turn_start(ORCHESTRATOR_ACTOR, session.id))
             result = await orchestrator.run(user_content)
@@ -655,16 +674,26 @@ class WorkflowRuntime:
                 model=result.model,
             )
             await self._complete_turn(session, turn, assistant_message.id)
+        except LeaseLostError:
+            await self.db.rollback()
+            logger.info(
+                "执行租约已失效，放弃Workflow本次执行的未提交修改",
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
+            )
         except asyncio.CancelledError:
             logger.warning(
-                "Workflow会话处理被取消，客户端可能已断开连接",
+                "Workflow会话处理被取消",
                 extra={
                     "session_id": session_id,
-                    "turn_id": str(turn.id if turn else ""),
+                    "turn_id": str(turn_id),
                     "workflow_id": workflow_id,
                 },
             )
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "interrupted")
+            if self.lease_owner is not None:
+                # 绑定执行只回滚:汇总/最终文本等编排层半截输出由执行包装层收尾时补写。
+                await self.db.rollback()
+            else:
+                await self._mark_abnormal_end(session_id, turn_id, "interrupted")
             raise
         except Exception as exc:
             # 异常详情只进服务端日志;推给客户端的只有业务消息,内部错误一律用统一文案。
@@ -672,22 +701,19 @@ class WorkflowRuntime:
                 "处理Workflow会话消息失败",
                 extra={
                     "session_id": session_id,
-                    "turn_id": str(turn.id if turn else ""),
+                    "turn_id": str(turn_id),
                     "workflow_id": workflow_id,
                 },
             )
-            await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
-            if session_id is not None:
-                message = exc.message if isinstance(exc, AgentException) else "Workflow执行失败。"
-                await self.bus.emit(
-                    StreamEvent.error_event(
-                        ORCHESTRATOR_ACTOR,
-                        session_id,
-                        ErrorInfo(code="WORKFLOW_RUN_FAILED", message=message, fatal=True),
-                    )
+            await self._mark_abnormal_end(session_id, turn_id, "failed")
+            message = exc.message if isinstance(exc, AgentException) else "Workflow执行失败。"
+            await self.bus.emit(
+                StreamEvent.error_event(
+                    ORCHESTRATOR_ACTOR,
+                    session_id,
+                    ErrorInfo(code="WORKFLOW_RUN_FAILED", message=message, fatal=True),
                 )
-        finally:
-            await self.bus.close()
+            )
 
     async def _build_orchestrator(
         self,
@@ -735,6 +761,7 @@ class WorkflowRuntime:
         completed_message_id: int,
     ) -> None:
         """原子完成 Turn 并恢复 Session。"""
+        await self._fence_lease(session.id, turn.id)
         await self.session_service.mark_turn_status(
             turn,
             "completed",
@@ -754,18 +781,30 @@ class WorkflowRuntime:
         turn_id: UUID | None,
         turn_status: str,
     ) -> None:
-        """回滚当前失败事务,再尽力持久化 Turn 和 Session 的异常终态。"""
+        """回滚当前失败事务,再尽力持久化 Turn 和 Session 的异常终态;租约已失效时不覆盖。"""
         await self.db.rollback()
         if session_id is None or turn_id is None:
             return
         try:
-            session = await self.session_service.repo.get(session_id)
-            turn = await self.session_service.repo.get_turn(turn_id)
+            if self.lease_owner is not None:
+                session, turn = await self.session_service.lock_owned_turn(
+                    session_id, turn_id, self.lease_owner
+                )
+            else:
+                session = await self.session_service.repo.get(session_id)
+                turn = await self.session_service.repo.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
+                await self.db.rollback()
                 return
             await self.session_service.mark_turn_status(turn, turn_status)
             await self.session_service.repo.update_status(session, "failed")
             await self.db.commit()
+        except LeaseLostError:
+            await self.db.rollback()
+            logger.info(
+                "执行租约已失效，Workflow异常终态由清除租约的一方负责",
+                extra={"session_id": session_id, "turn_id": str(turn_id)},
+            )
         except Exception:
             await self.db.rollback()
             logger.exception(

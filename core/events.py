@@ -4,10 +4,12 @@
 产出者的事件构造。所有事件封装为对象,不裸传 dict,通过 to_dict() 序列化为 SSE 帧;
 sequence 由 StreamBus 在入队时注入,不在对象构造期填充。
 
-两类信封:
+三类信封:
 1. StreamEvent —— actor 产出的生命周期、内容、工具、交互、错误和编排进度事件。
 2. RuntimeEvent —— 会话级控制事件(如 session_ready),不属于某个 actor 的产出,
    仅用于前端建立连接 / 拿 session 元信息。
+3. RunEvent —— 一次执行的边界事件(run_started / run_end),由执行包装层写入,
+   业务代码不直接构造。
 """
 
 from __future__ import annotations
@@ -492,3 +494,65 @@ class RuntimeEvent:
         if self.sequence is not None:
             result["sequence"] = self.sequence
         return result
+
+
+# 执行结束事件允许的状态:取消记为 interrupted 并带 cancelled=true。
+RUN_END_STATUSES = frozenset({"completed", "awaiting_interaction", "failed", "interrupted"})
+
+
+@dataclass
+class RunEvent:
+    """一次执行的边界事件,扁平序列化,turn_id 是订阅方定位执行的唯一键。
+
+    run_started 是每次执行写入 Stream 的第一帧;run_end 在本次执行全部事件
+    (含唤醒队友产生的事件)之后写入,订阅方读到即结束本次 SSE。
+    """
+
+    type: str
+    turn_id: str
+    session_id: int | None = None
+    status: str | None = None
+    cancelled: bool = False
+    expired: bool = False
+    sequence: int | None = None
+
+    @classmethod
+    def run_started(cls, turn_id: str, session_id: int) -> RunEvent:
+        return cls(type="run_started", turn_id=turn_id, session_id=session_id)
+
+    @classmethod
+    def run_end(
+        cls,
+        turn_id: str,
+        status: str,
+        *,
+        cancelled: bool = False,
+        expired: bool = False,
+    ) -> RunEvent:
+        if status not in RUN_END_STATUSES:
+            raise ValueError(f"run_end 状态无效: {status}")
+        return cls(
+            type="run_end",
+            turn_id=turn_id,
+            status=status,
+            cancelled=cancelled,
+            expired=expired,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"type": self.type, "turn_id": self.turn_id}
+        if self.session_id is not None:
+            data["session_id"] = self.session_id
+        if self.status is not None:
+            data["status"] = self.status
+        if self.cancelled:
+            data["cancelled"] = True
+        if self.expired:
+            data["expired"] = True
+        if self.sequence is not None:
+            data["sequence"] = self.sequence
+        return data
+
+
+# 事件总线接受的全部事件对象。
+type BusEvent = StreamEvent | RuntimeEvent | RunEvent

@@ -1,8 +1,8 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import desc, or_, select, update
+from sqlalchemy import ColumnElement, DateTime, and_, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
@@ -36,6 +36,19 @@ _SESSION_CHILD_MODELS = (
     InteractionRequestRecord,
     SessionPlanRecord,
 )
+
+
+def _db_clock() -> ColumnElement[datetime]:
+    """数据库墙钟:用 clock_timestamp() 而非 now(),后者是事务开始时间,长事务里会停滞。"""
+    return func.clock_timestamp(type_=DateTime(timezone=True))
+
+
+def _lease_active() -> ColumnElement[bool]:
+    """租约有效:持有者非空且未过期,由数据库时钟判断,避免各进程时钟漂移。"""
+    return and_(
+        SessionTurnRecord.lease_owner.is_not(None),
+        SessionTurnRecord.lease_expires_at > _db_clock(),
+    )
 
 
 class SessionRepository:
@@ -377,3 +390,140 @@ class SessionRepository:
             .limit(1)
         )
         return (await self.db.scalars(stmt)).first()
+
+    # ---- 执行租约(run 即 turn) ----
+    # 批量 UPDATE 不同步 identity map:调用方需要新值时用 populate_existing 重新读取。
+
+    async def claim_turn_lease(
+        self,
+        turn_id: UUID,
+        owner: str,
+        lease_seconds: float,
+    ) -> int | None:
+        """无人持有或已过期时认领租约,返回 last_event_offset;未认领到返回 None。"""
+        now = _db_clock()
+        stmt = (
+            update(SessionTurnRecord)
+            .where(
+                SessionTurnRecord.id == turn_id,
+                or_(
+                    SessionTurnRecord.lease_owner.is_(None),
+                    SessionTurnRecord.lease_expires_at < now,
+                ),
+            )
+            .values(lease_owner=owner, lease_expires_at=now + timedelta(seconds=lease_seconds))
+            .returning(SessionTurnRecord.last_event_offset)
+            .execution_options(synchronize_session=False)
+        )
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def renew_turn_lease(self, turn_id: UUID, owner: str, lease_seconds: float) -> bool:
+        """仅当租约仍由 owner 持有时续约。"""
+        stmt = (
+            update(SessionTurnRecord)
+            .where(SessionTurnRecord.id == turn_id, SessionTurnRecord.lease_owner == owner)
+            .values(lease_expires_at=_db_clock() + timedelta(seconds=lease_seconds))
+            .execution_options(synchronize_session=False)
+        )
+        return ((await self.db.execute(stmt)).rowcount or 0) > 0
+
+    async def reserve_turn_offsets(self, turn_id: UUID, owner: str, count: int) -> int | None:
+        """在租约内预留 count 个连续 offset,返回首个;租约不属于 owner 时返回 None。"""
+        stmt = (
+            update(SessionTurnRecord)
+            .where(SessionTurnRecord.id == turn_id, SessionTurnRecord.lease_owner == owner)
+            .values(last_event_offset=SessionTurnRecord.last_event_offset + count)
+            .returning(SessionTurnRecord.last_event_offset)
+            .execution_options(synchronize_session=False)
+        )
+        last = (await self.db.execute(stmt)).scalar_one_or_none()
+        return None if last is None else last - count + 1
+
+    async def get_turn_lease_owner(self, turn_id: UUID) -> str | None:
+        stmt = select(SessionTurnRecord.lease_owner).where(SessionTurnRecord.id == turn_id)
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def get_turn_for_update(self, turn_id: UUID) -> SessionTurnRecord | None:
+        stmt = (
+            select(SessionTurnRecord)
+            .where(SessionTurnRecord.id == turn_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return (await self.db.scalars(stmt)).first()
+
+    async def get_turn_lease_state(
+        self,
+        turn_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> tuple[SessionTurnRecord, bool] | None:
+        """返回轮次及其租约是否有效;for_update 时锁定轮次行。"""
+        stmt = (
+            select(SessionTurnRecord, _lease_active())
+            .where(SessionTurnRecord.id == turn_id)
+            .execution_options(populate_existing=True)
+        )
+        if for_update:
+            stmt = stmt.with_for_update(of=SessionTurnRecord)
+        row = (await self.db.execute(stmt)).first()
+        return None if row is None else (row[0], bool(row[1]))
+
+    async def clear_turn_lease(
+        self,
+        turn_id: UUID,
+        *,
+        owner: str | None = None,
+        reserve_offset: bool = False,
+    ) -> int | None:
+        """清除租约;reserve_offset 时同语句为 run_end 分配一个 offset。
+
+        owner 非空时仅清除该持有者的租约。返回清除后的 last_event_offset,未命中返回 None。
+        """
+        conditions = [SessionTurnRecord.id == turn_id]
+        if owner is not None:
+            conditions.append(SessionTurnRecord.lease_owner == owner)
+        values: dict[str, Any] = {"lease_owner": None, "lease_expires_at": None}
+        if reserve_offset:
+            values["last_event_offset"] = SessionTurnRecord.last_event_offset + 1
+        stmt = (
+            update(SessionTurnRecord)
+            .where(*conditions)
+            .values(**values)
+            .returning(SessionTurnRecord.last_event_offset)
+            .execution_options(synchronize_session=False)
+        )
+        return (await self.db.execute(stmt)).scalar_one_or_none()
+
+    async def list_reapable_turn_ids(self, *, include_unleased_running: bool) -> list[UUID]:
+        """租约已过期的轮次;启动时另含 running 且无租约的迁移前遗留轮次。"""
+        expired = and_(
+            SessionTurnRecord.lease_owner.is_not(None),
+            SessionTurnRecord.lease_expires_at <= _db_clock(),
+        )
+        condition = expired
+        if include_unleased_running:
+            condition = or_(
+                expired,
+                and_(
+                    SessionTurnRecord.lease_owner.is_(None),
+                    SessionTurnRecord.status == "running",
+                ),
+            )
+        stmt = select(SessionTurnRecord.id).where(condition)
+        return list((await self.db.execute(stmt)).scalars())
+
+    async def get_latest_turn_lease_state(
+        self,
+        session_id: int,
+    ) -> tuple[SessionTurnRecord, bool] | None:
+        """会话最新一轮及其租约是否有效;按起始消息 ID 排序,同一事务内也有确定顺序。"""
+        stmt = (
+            select(SessionTurnRecord, _lease_active())
+            .where(SessionTurnRecord.session_id == session_id)
+            .order_by(desc(SessionTurnRecord.started_message_id))
+            .limit(1)
+            .execution_options(populate_existing=True)
+        )
+        row = (await self.db.execute(stmt)).first()
+        return None if row is None else (row[0], bool(row[1]))
