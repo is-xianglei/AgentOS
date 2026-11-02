@@ -58,6 +58,7 @@ async def test_agent_cancel_defers_terminal_state_when_bound(
     runtime.session_service = _Service()
     runtime.bus = NullStreamBus()
     runtime.lease_owner = owner
+    runtime.mode_slug = "standard"
     marked: list[str] = []
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)

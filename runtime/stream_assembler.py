@@ -72,10 +72,10 @@ class TurnEventAssembler:
         first_delta_logged = False
 
         async for event in stream:
-            if not first_delta_logged and event.kind in (
+            if not first_delta_logged and event.kind in {
                 LLMEventKind.TEXT_DELTA,
                 LLMEventKind.THINKING_DELTA,
-            ):
+            }:
                 first_delta_logged = True
                 # 只记首个增量的 TTFT;delta 为高频事件,后续不再计时、不打日志。
                 logger.info(
@@ -86,28 +86,36 @@ class TurnEventAssembler:
                         "ttft_ms": round((time.perf_counter() - stream_started_at) * 1000, 2),
                     },
                 )
+
             if event.kind is LLMEventKind.BLOCK_START:
-                index = self._next_index
-                self._next_index += 1
                 if event.block_ref is None or event.block_type is None:
                     raise AgentException.message(
                         "LLM 流的 BLOCK_START 事件缺少 block_ref 或 block_type",
                         {"provider_block_ref": event.block_ref},
                     )
+
+                index = self._next_index
+                self._next_index += 1
                 self._ref_to_index[event.block_ref] = index
                 self._open.add(index)
                 yield StreamEvent.block_start(
                     self._actor, self._session_id, index, event.block_type
                 )
-            elif event.kind is LLMEventKind.TEXT_DELTA:
+                continue
+
+            if event.kind is LLMEventKind.TEXT_DELTA:
                 yield StreamEvent.text_delta(
                     self._actor, self._session_id, self._require_index(event), event.text
                 )
-            elif event.kind is LLMEventKind.THINKING_DELTA:
+                continue
+
+            if event.kind is LLMEventKind.THINKING_DELTA:
                 yield StreamEvent.thinking_delta(
                     self._actor, self._session_id, self._require_index(event), event.text
                 )
-            elif event.kind is LLMEventKind.TOOL_USE:
+                continue
+
+            if event.kind is LLMEventKind.TOOL_USE:
                 index = self._require_index(event)
                 if event.tool is None:
                     raise AgentException.message(
@@ -118,12 +126,13 @@ class TurnEventAssembler:
                 # R4.2 方案 A:tool_use 块同样成对,紧随其后补发 block_stop。
                 self._open.discard(index)
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
-            elif event.kind is LLMEventKind.BLOCK_STOP:
-                index = (
-                    self._ref_to_index.get(event.block_ref)
-                    if (event.block_ref is not None)
-                    else None
-                )
+                continue
+
+            if event.kind is LLMEventKind.BLOCK_STOP:
+                index = None
+                if event.block_ref is not None:
+                    index = self._ref_to_index.get(event.block_ref)
+
                 if index is None:
                     # 关一个从没开过的块不损失信息,不值得炸掉整个 turn;
                     # 但照发会让前端收到 index 对不上的孤儿 stop,故丢弃并留日志。
@@ -134,16 +143,19 @@ class TurnEventAssembler:
                     continue
                 self._open.discard(index)
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
-            elif event.kind is LLMEventKind.TURN_RESULT:
+                continue
+
+            if event.kind is LLMEventKind.TURN_RESULT:
                 if event.result is None:
                     raise AgentException.message("LLM 流的 TURN_RESULT 事件缺少终局结果")
                 self._last_result = event.result
-            else:
-                # 无静默兜底:未知事件种类说明 provider 实现有错,必须立刻暴露。
-                raise AgentException.message(
-                    "未知的 LLM 流事件种类",
-                    {"kind": str(event.kind)},
-                )
+                continue
+
+            # 无静默兜底:未知事件种类说明 provider 实现有错,必须立刻暴露。
+            raise AgentException.message(
+                "未知的 LLM 流事件种类",
+                {"kind": str(event.kind)},
+            )
 
         if self._last_result is None:
             raise AgentException.message("LLM 流未产出终局结果")
@@ -160,7 +172,10 @@ class TurnEventAssembler:
 
     def _require_index(self, event: LLMStreamEvent) -> int:
         """查 block_ref 的全局 index 映射;无映射时抛错(丢弃等于静默丢内容)。"""
-        index = self._ref_to_index.get(event.block_ref) if event.block_ref is not None else None
+        index = None
+        if event.block_ref is not None:
+            index = self._ref_to_index.get(event.block_ref)
+
         if index is None:
             raise AgentException.message(
                 "LLM 流事件的 block_ref 无对应的已开启内容块",

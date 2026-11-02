@@ -25,6 +25,8 @@ from llm.types import LLMTurnResult, ToolResultMessage, build_assistant_blocks
 from memory.recall.repository import MemoryRecallRepository
 from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
+from runtime.budget import ToolCallBudget
+from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
 from team.isolation import (
     new_team_task_instance_id,
@@ -34,7 +36,10 @@ from team.isolation import (
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
 from tools.registry import ToolRegistry, build_tool_registry
-from tools.service import ToolService
+from tools.policy import ToolCapabilityResolver, ToolProfile
+from tools.gateway import ToolGateway
+from tools.policy_engine import PolicyEngine
+from tools.service import ToolService  # 兼容旧测试/扩展点；实际执行统一经 ToolGateway
 from tools.subagents.definition import SubAgentSpec
 
 logger = logging.getLogger(__name__)
@@ -68,20 +73,48 @@ class SubAgentRunner:
         self.bus = bus
         # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
         # 在每次调用时以 model 参数覆盖,见 _run_react_loop / _run_teammate_loop。
-        self.llm = llm or create_llm_client(scenario="subagent")
+        self.llm = llm
+        self._llm_injected = llm is not None
         self.run_repo = SubAgentRunRepository(db)
-        self.permission_service = PermissionService(db)
+        self.policy_engine = PolicyEngine(db)
+        self.permission_service = self.policy_engine.permission_service
 
     @staticmethod
     def _resolve_tools(
         spec: SubAgentSpec,
         parent_allowed_tool_names: frozenset[str] | None,
+        profile: ToolProfile = "subagent",
     ) -> ToolRegistry:
         """先继承父 Agent 工具边界，再叠加子代理自身规则。"""
         registry = build_tool_registry()
         if parent_allowed_tool_names is not None:
             registry = registry.only(*parent_allowed_tool_names)
-        return spec.resolve_tools(registry)
+        registry = spec.resolve_tools(registry)
+        names = ToolCapabilityResolver().resolve_names(registry.names, profile)
+        return registry.only(*names)
+
+    async def _configure_model(self, session_id: int, spec: SubAgentSpec, workspace_id: int | None, user_id: int | None) -> str | None:
+        if self._llm_injected:
+            return spec.resolve_model()
+        from runtime.model_selection import resolve_runtime_client
+        from session.service import SessionService
+
+        provider_id = None
+        effort = None
+        if workspace_id is not None:
+            session = await SessionService(self.db).runtime_model_options(session_id)
+            if session.workspace_id != workspace_id or session.user_id != user_id:
+                raise AgentException.message("子智能体会话归属无效")
+            if getattr(session, "mode_slug", "standard") == "turbo":
+                raise AgentException.message("极速模式不能启动子智能体")
+            if (session.extra or {}).get("model_provider_override"):
+                provider_id = session.model_provider_id
+            effort = getattr(session, "thinking_effort", "fast")
+        self.llm, provider = await resolve_runtime_client(
+            self.db, workspace_id, user_id, spec.model_scenario or "subagent",
+            provider_id=provider_id, effort=effort,
+        )
+        return None if provider is not None else spec.resolve_model()
 
     async def run(
         self,
@@ -110,8 +143,16 @@ class SubAgentRunner:
                 "agent_type": member_name,
             },
         )
+        # 保持旧的二参数调用形态，便于上层替换/测试 _resolve_tools；工作流节点
+        # 在默认子代理边界基础上再做一次 workflow_node 能力解析。
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
-        tool_service = ToolService(self.db, tool_registry)
+        if spec.agent_id is not None and hasattr(tool_registry, "names"):
+            workflow_names = ToolCapabilityResolver().resolve_names(
+                tool_registry.names,
+                "workflow_node",
+            )
+            tool_registry = tool_registry.only(*workflow_names)
+        profile: ToolProfile = "workflow_node" if spec.agent_id is not None else "subagent"
         # omit_inherited_memory 的 spec(如 Explore)不继承父 Turn 记忆:
         # 它只做代码检索,注入用户偏好等长期记忆既无用又占满上下文预算。
         rendered_memories = (
@@ -140,6 +181,16 @@ class SubAgentRunner:
             actor = subagent_actor(
                 member_name, run_id=f"run-{run.id}", task=prompt, agent_id=spec.agent_id
             )
+            tool_gateway = ToolGateway.from_registry(
+                self.db,
+                tool_registry,
+                profile,
+                principal_name=actor.name,
+                agent_id=spec.agent_id,
+                allowed_skill_names=allowed_skill_names,
+                shell_access=spec.shell_access,
+                shell_tmp_root=spec.shell_tmp_root(),
+            )
             assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:
@@ -154,7 +205,7 @@ class SubAgentRunner:
                         system_prompt,
                         rendered_memories,
                         tool_registry,
-                        tool_service,
+                        tool_gateway,
                         spec,
                         parent_turn_id,
                         user_id,
@@ -256,16 +307,16 @@ class SubAgentRunner:
     ) -> LLMTurnResult:
         """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。"""
         request_messages = self._with_memory_context(messages, rendered_memories)
-        async for event in assembler.consume(
-            self.llm.stream(
-                request_messages,
-                system_prompt,
-                tools=tool_registry.to_specs(),
+        step = AgentStep(self.llm, assembler, self._emit_event)
+        result = await step.run(
+            StepRequest(
+                messages=request_messages,
+                system_prompt=system_prompt,
+                tool_registry=tool_registry,
                 model=model,
             )
-        ):
-            await self._emit_event(event)
-        return assembler.last_result
+        )
+        return result.llm_result
 
     async def _emit_tool_result(
         self,
@@ -291,13 +342,14 @@ class SubAgentRunner:
         actor: Actor,
         tool_uses: list[Any],
         messages: list[dict[str, Any]],
-        tool_service: ToolService,
+        tool_gateway: ToolGateway,
         spec: SubAgentSpec,
         parent_turn_id: UUID | None,
         user_id: int | None,
         workspace_id: int | None,
         *,
         allowed_skill_names: frozenset[str] | None = None,
+        budget: ToolCallBudget | None = None,
     ) -> None:
         """裁决并执行一轮 tool_use,把结果追加回 messages。
 
@@ -306,15 +358,42 @@ class SubAgentRunner:
         不能沿用"未裁决直接执行"的旧行为,否则子代理成为绕过审批的提权路径。
         """
         agent_type = spec.runtime_name
+        budget = budget or ToolCallBudget(
+            total_limit=max(1, spec.max_rounds * 4),
+            per_tool_limit=max(1, spec.max_rounds * 2),
+        )
         for tool_use in tool_uses:
-            behavior = await self.permission_service.evaluate(
+            allowed, budget_error = budget.try_consume(tool_use.name)
+            if not allowed:
+                output = budget_error or "error: 工具调用预算不足。"
+                await self._emit_tool_result(
+                    actor, session_id, tool_use, output, is_error=True
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": ToolResultMessage(
+                            tool_use_id=tool_use.id,
+                            tool_name=tool_use.name,
+                            input_args=tool_use.input,
+                            output=output,
+                            is_error=True,
+                        ).to_content_dict(),
+                    }
+                )
+                continue
+            decision = await self.policy_engine.authorize(
                 session_id,
                 tool_use.name,
-                tool_use.input,
+                tool_gateway.context.profile,
+                input_args=tool_use.input,
+                allowed_skill_names=tool_gateway.context.allowed_skill_names,
                 agent_type=agent_type,
+                workspace_id=workspace_id,
             )
+            behavior = decision.behavior
             if behavior == "allow":
-                output = await tool_service.run(
+                output = await tool_gateway.run(
                     session_id,
                     tool_use.name,
                     tool_use.input,
@@ -323,8 +402,6 @@ class SubAgentRunner:
                     user_id=user_id,
                     workspace_id=workspace_id,
                     allowed_skill_names=allowed_skill_names,
-                    shell_access=spec.shell_access,
-                    shell_tmp_root=spec.shell_tmp_root(),
                 )
                 is_error = False
             else:
@@ -373,7 +450,7 @@ class SubAgentRunner:
         system_prompt: str,
         rendered_memories: str | None,
         tool_registry: ToolRegistry,
-        tool_service: ToolService,
+        tool_gateway: ToolGateway,
         spec: SubAgentSpec,
         parent_turn_id: UUID | None,
         user_id: int | None,
@@ -383,7 +460,11 @@ class SubAgentRunner:
     ) -> tuple[str, int]:
         """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示、工具集与轮次上限均取自 spec。"""
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        model = spec.resolve_model()
+        model = await self._configure_model(session_id, spec, workspace_id, user_id)
+        budget = ToolCallBudget(
+            total_limit=max(1, spec.max_rounds * 4),
+            per_tool_limit=max(1, spec.max_rounds * 2),
+        )
         last_text = ""
         for round_index in range(max(1, spec.max_rounds)):
             result = await self._stream_and_collect(
@@ -411,12 +492,13 @@ class SubAgentRunner:
                 actor,
                 tool_uses,
                 messages,
-                tool_service,
+                tool_gateway,
                 spec,
                 parent_turn_id,
                 user_id,
                 workspace_id,
                 allowed_skill_names=allowed_skill_names,
+                budget=budget,
             )
             await self.db.flush()
 
@@ -461,7 +543,7 @@ class SubAgentRunner:
             },
         )
         team_service = TeamService(self.db)
-        member = await team_service.repo.get_member(session_id, member_name)
+        member = await team_service.get_member(session_id, member_name)
         if member is None:
             raise AgentException.message("要唤醒的团队成员不存在")
         name = member.name
@@ -473,8 +555,17 @@ class SubAgentRunner:
             workspace_id,
         )
         # 先继承父 Agent 的硬白名单，再叠加 teammate 规格；通信工具同样不得越过父边界。
-        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
-        tool_service = ToolService(self.db, tool_registry)
+        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names, "teammate")
+        tool_gateway = ToolGateway.from_registry(
+            self.db,
+            tool_registry,
+            "teammate",
+            principal_name=name,
+            agent_id=spec.agent_id,
+            allowed_skill_names=allowed_skill_names,
+            shell_access=spec.shell_access,
+            shell_tmp_root=spec.shell_tmp_root(),
+        )
 
         # 为本次推进设置独立隔离 id(收件箱消费按该 id 隔离;任务认领不隔离)。
         instance_id = new_team_task_instance_id()
@@ -515,7 +606,7 @@ class SubAgentRunner:
                 system_prompt,
                 rendered_memories,
                 tool_registry,
-                tool_service,
+                tool_gateway,
                 spec,
                 parent_turn_id,
                 user_id,
@@ -524,8 +615,10 @@ class SubAgentRunner:
             )
 
             # 5) 写回历史 + 据剩余待办决定 idle / working。
-            await team_service.repo.update_member_history(
-                member, json.dumps(messages, ensure_ascii=False)
+            await team_service.save_member_history(
+                session_id,
+                name,
+                json.dumps(messages, ensure_ascii=False),
             )
             await self._settle_member_status(session_id, name, member, team_service)
             await self.db.commit()
@@ -600,7 +693,7 @@ class SubAgentRunner:
         pending_inbox = await team_service.peek_inbox(session_id, name)
         claimable = await team_service.list_claimable_tasks(session_id)
         status = "working" if (pending_inbox or claimable) else "idle"
-        await team_service.repo.update_member_runtime(member, status=status)
+        await team_service.update_member_runtime(session_id, name, status=status)
 
     async def _run_teammate_loop(
         self,
@@ -611,7 +704,7 @@ class SubAgentRunner:
         system_prompt: str,
         rendered_memories: str | None,
         tool_registry: ToolRegistry,
-        tool_service: ToolService,
+        tool_gateway: ToolGateway,
         spec: SubAgentSpec,
         parent_turn_id: UUID | None,
         user_id: int | None,
@@ -621,7 +714,11 @@ class SubAgentRunner:
     ) -> str:
         """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环。"""
         name = actor.name
-        model = spec.resolve_model()
+        model = await self._configure_model(session_id, spec, workspace_id, user_id)
+        budget = ToolCallBudget(
+            total_limit=max(1, TEAMMATE_MAX_ROUNDS * 4),
+            per_tool_limit=max(1, TEAMMATE_MAX_ROUNDS * 2),
+        )
         for _ in range(TEAMMATE_MAX_ROUNDS):
             # 轮首尝试认领可处理任务(只按 session_id,不加实例隔离)。
             await self._try_claim_tasks(session_id, name, messages)
@@ -652,12 +749,13 @@ class SubAgentRunner:
                 actor,
                 tool_uses,
                 messages,
-                tool_service,
+                tool_gateway,
                 spec,
                 parent_turn_id,
                 user_id,
                 workspace_id,
                 allowed_skill_names=allowed_skill_names,
+                budget=budget,
             )
             await self.db.flush()
 

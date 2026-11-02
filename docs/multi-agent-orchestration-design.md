@@ -56,7 +56,8 @@ tools, model)` 是散参数,编排层需要"把一次调用的全部参数当成
 **模型调用本身就是链上最后一个节点。** `ChatModelCallAdvisor` / `ChatModelStreamAdvisor`
 以 `LOWEST_PRECEDENCE` 注册在链尾,链里没有"链尾特判"。直接收益:测试时替换链尾即得 fake
 model,不必 mock SDK。AgentOS 当前 `_run_llm_loop` 里 LLM 调用是硬编码的 `self.llm.stream(...)`,
-这是零测试状态下最难验证的一段。
+这是测试覆盖不足时最难验证的一段。当前 `tests/` 已有运行时、流式、工作流、权限、工具身份
+和统一 `AgentStep` 契约等回归测试;后续重构仍需继续补齐并行分支恢复与节点级持久化测试。
 
 **不可变载荷 + 可变共享 context。** `ChatClientRequest(prompt, context)` 与
 `ChatClientResponse(chatResponse, context)` 都是 record,`context` 是贯穿整链的可变 map,
@@ -185,15 +186,15 @@ team 唤醒全耦合在 `_produce` / `_run_llm_loop` / `_execute_tool_uses` 三�
 (runtime/subagent.py:253)。**这个约束是对的,不要放开**;正确做法是让编排器持有派发权,
 而不是让子层 agent 获得派发权。
 
-**障碍五:零测试。** `tests/` 目录已从磁盘删除(33 个测试文件全部 `D`)。主循环依赖精细的
-分步 commit 语义(挂起先提交再发事件、子代理独立 session),编排插入新提交点极易破坏恢复语义,
-而当前无任何回归网。
+**障碍五:测试覆盖仍不完整。** 当前仓库已有 `tests/` 回归目录,覆盖事件、流式、运行状态、技能、
+工作流、数据库租约/取消以及工具身份与工具策略等场景。主循环依赖精细的分步 commit 语义
+(挂起先提交再发事件、子代理独立 session),编排插入新提交点仍可能破坏恢复语义,因此需要在现有
+测试网基础上补充统一 `AgentStep`、并行分支恢复、预算耗尽和工具执行边界测试。
 
-**顺手发现的 bug:** `AgentType.GENERAL_PURPOSE = "general-purpose"`(连字符),而
-`TeamSpawnInput.agent_type` 默认 `"general_purpose"`(下划线,tools/builtin/team.py:70)、
-`team/service.py:201` 同为下划线;`runtime/agent.py:1681` 唤醒时 `AgentType(member.agent_type
-or "general_purpose")` 对默认值抛 `ValueError`,被 try/except 吞成 `TEAMMATE_WAKE_FAILED`。
-**默认 agent_type 的队友可能一次都唤不醒。** 应在阶段一顺手修掉。
+**历史命名问题已修复:** 内置 `AgentType.GENERAL_PURPOSE`、`TeamSpawnInput.agent_type`、
+`team/service.py` 的默认值以及 `runtime/agent.py` 的唤醒路径目前统一使用
+`"general-purpose"`(连字符)。如果数据库中仍存在历史值 `"general_purpose"`(下划线),应在
+读取或迁移边界归一化,不要在 `AgentType` 中新增第二个枚举值。
 
 ## 4. 目标架构
 
@@ -424,7 +425,7 @@ class StateKey:
 约定——前缀约定是隐式契约,容易写错且无法静态检查。
 
 `WORKSPACE` 作用域的状态**不新建表**:它就是 `memory/` 域的记忆项,应通过 `MemoryService`
-的公开方法读写(遵循 CLAUDE.md 第 9 条:跨域读写在数据所属域的 Service 上补方法)。
+的公开方法读写(遵循 AGENTS.md 第 9 条:跨域读写在数据所属域的 Service 上补方法)。
 `RUN` 与 `SESSION` 作用域落编排自己的表(见第 9 节)。
 
 ### 6.2 输出键与占位符注入
@@ -574,13 +575,15 @@ class NodeSpec(BaseModel):
 
 顺序有强依赖,不建议调换。每阶段结束应可独立验证。
 
-**阶段零:补回归网(前置,不可跳)**
-`tests/` 已空。至少恢复主循环、挂起恢复、权限裁决、子代理并发、压缩这五组测试。
-JSONB / 锁 / 事务隔离按 CLAUDE.md 第 2 条走真实 PostgreSQL 集成测试。
-顺手修 `agent_type` 连字符与下划线不一致的 bug。
+**阶段零:补齐回归网(前置,不可跳)**
+当前 `tests/` 目录已存在,先在现有测试基础上补齐主循环、挂起恢复、权限裁决、子代理并发、
+压缩和工具身份注入这几组关键场景。JSONB / 锁 / 事务隔离按 AGENTS.md 第 2 条使用真实
+PostgreSQL 集成测试。`agent_type` 的默认值已经统一为 `"general-purpose"`;若需要兼容历史
+数据库值,在读取或迁移边界增加归一化测试。
 
-**阶段一:提取 `AgentStep`(核心重构)**
+**阶段一:提取 `AgentStep`(核心重构,第一版已完成)**
 从 `_run_llm_loop` / `_run_react_loop` / `_run_teammate_loop` 提取唯一一份单步实现,
+当前实现位于 `runtime/step.py`,主 Agent、SubAgent 和 Workflow 节点已开始复用。
 三处改为调用它。行为必须完全等价——这是纯重构,靠阶段零的测试保证。
 产出:`runtime/step.py`,`AgentRuntime` 应显著瘦身。
 

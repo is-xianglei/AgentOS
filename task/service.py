@@ -39,6 +39,15 @@ class TaskService:
         await self.session_service.get_required(session_id)
         return await self.repo.list_by_session(session_id)
 
+    async def get(self, session_id: int, task_id: int) -> TaskRecord | None:
+        """按会话读取单个任务。
+
+        任务工具和其他跨域调用统一通过本 Service 访问任务表，避免绕过会话校验
+        直接触碰 ``TaskRepository``。
+        """
+        await self.session_service.get_required(session_id)
+        return await self.repo.get(session_id, task_id)
+
     async def list_by_session_for_user(
         self,
         session_id: int,

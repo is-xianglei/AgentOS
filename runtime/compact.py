@@ -29,7 +29,7 @@ class CompactService:
     ):
         """初始化上下文压缩服务依赖。"""
         self.session_repo = session_repo
-        self.llm = llm or create_llm_client(scenario="compact")
+        self.llm = llm
         self.threshold = threshold
 
     async def maybe_compact(
@@ -137,7 +137,8 @@ class CompactService:
 
         # 压缩只要一段摘要文本,不往 bus 发事件,故不建装配器、直接消费中立流。
         result: LLMTurnResult | None = None
-        async for event in self.llm.stream(messages=[{"role": "user", "content": compact_prompt}]):
+        client = self.llm or create_llm_client(scenario="compact")
+        async for event in client.stream(messages=[{"role": "user", "content": compact_prompt}]):
             if event.kind is LLMEventKind.TURN_RESULT:
                 result = event.result
         if result is None:

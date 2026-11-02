@@ -2,10 +2,16 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class SessionSendMessageRequest(BaseModel):
+class _StrictRequest(BaseModel):
+    """会话写接口的严格请求基类，避免客户端字段被静默丢弃。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionSendMessageRequest(_StrictRequest):
     session_id: int | None = Field(default=None, description="会话ID，不传则自动创建新会话")
     agent_id: int | None = Field(
         default=None,
@@ -16,13 +22,38 @@ class SessionSendMessageRequest(BaseModel):
         description="使用的Workflow ID，与agent_id互斥",
     )
     content: str = Field(description="用户消息")
+    model_provider_id: str | None = Field(default=None, description="指定模型供应商；新会话可显式传 null 使用默认")
+    mode_slug: Literal["standard", "turbo"] = "standard"
+    thinking_effort: Literal["fast", "low", "medium", "high", "xhigh", "max"] = "fast"
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unsupported_orchestration_plan(cls, data: object) -> object:
+        """明确拒绝尚未提供资源实现的旧编排方案字段。"""
+        if isinstance(data, dict) and "orchestration_plan_id" in data:
+            raise ValueError(
+                "当前不支持 orchestration_plan_id，请使用已存在的 workflow_id"
+            )
+        return data
 
 
-class SessionRenameRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=200, description="会话新标题")
+class SessionRenameRequest(_StrictRequest):
+    title: str | None = Field(default=None, min_length=1, max_length=200, description="会话新标题")
+    model_provider_id: str | None = None
+    mode_slug: Literal["standard", "turbo"] | None = None
+    thinking_effort: Literal["fast", "low", "medium", "high", "xhigh", "max"] | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> SessionRenameRequest:
+        if not self.model_fields_set or any(
+            name in self.model_fields_set and getattr(self, name) is None
+            for name in ("title", "mode_slug", "thinking_effort")
+        ):
+            raise ValueError("请提供有效的会话标题或模型选项")
+        return self
 
 
-class SessionBatchDeleteRequest(BaseModel):
+class SessionBatchDeleteRequest(_StrictRequest):
     ids: list[int] = Field(min_length=1, description="待删除的会话ID列表")
 
 
@@ -35,6 +66,9 @@ class SessionResponse(BaseModel):
     title: str = Field(description="会话标题")
     status: str = Field(description="会话状态")
     model_name: str | None = Field(default=None, description="模型名称")
+    model_provider_id: str | None = None
+    mode_slug: Literal["standard", "turbo"] = "standard"
+    thinking_effort: Literal["fast", "low", "medium", "high", "xhigh", "max"] = "fast"
     system_prompt: str | None = Field(default=None, description="系统提示词")
     user_id: int | None = Field(default=None, description="创建用户ID")
     workspace_id: int | None = Field(default=None, description="所属工作区ID")
@@ -67,13 +101,13 @@ class SessionResponse(BaseModel):
     model_config = {"from_attributes": True, "populate_by_name": True}
 
 
-class SessionShareTargetsRequest(BaseModel):
+class SessionShareTargetsRequest(_StrictRequest):
     users: list[int] = Field(default_factory=list, description="共享用户ID列表")
     departments: list[int] = Field(default_factory=list, description="共享部门ID列表")
     groups: list[int] = Field(default_factory=list, description="共享群组ID列表")
 
 
-class SessionShareRequest(BaseModel):
+class SessionShareRequest(_StrictRequest):
     """覆盖会话当前的完整共享范围。"""
 
     visibility: Literal["private", "workspace", "public"] = Field(description="可见性")

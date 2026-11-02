@@ -62,7 +62,10 @@ async def agent_error_handler(request: Request, exc: AgentException) -> JSONResp
 
 
 async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-    safe_errors = json.loads(json.dumps(exc.errors(), default=str))
+    # 模型服务等请求携带密钥；校验失败不应把原始字段或整个请求体回显给客户端。
+    errors = [{key: value for key, value in error.items() if key != "input"}
+              for error in exc.errors()]
+    safe_errors = json.loads(json.dumps(errors, default=str))
     return JSONResponse(
         status_code=422,
         content=error_payload(

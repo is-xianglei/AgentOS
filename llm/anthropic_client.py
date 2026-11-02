@@ -318,12 +318,57 @@ class AnthropicClient(BaseLLMClient):
         base_url: str | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
+        thinking_enabled: bool | None = None,
+        reasoning_effort: str | int | None = None,
+        thinking_budget_tokens: int | None = None,
     ):
         self.model = model
         self.api_key = api_key or settings.anthropic_api_key
         self.base_url = base_url or settings.anthropic_base_url
         self.max_retries = max_retries
         self.timeout = timeout
+        self.thinking_enabled = thinking_enabled
+        self.reasoning_effort = reasoning_effort
+        self.thinking_budget_tokens = thinking_budget_tokens
+
+    def _thinking_kwargs(self, max_tokens: int) -> dict[str, Any]:
+        """统一流式与结构化思考配置，严格验证预算和输出上限。"""
+        if self.thinking_enabled is None:
+            thinking = _thinking_param()
+            if isinstance(thinking, dict) and thinking["budget_tokens"] >= max_tokens:
+                raise AgentException.message("Anthropic 思考预算须小于本次最大输出长度")
+            return {"thinking": thinking}
+        if not self.thinking_enabled:
+            return {"thinking": {"type": "disabled"}}
+        if isinstance(self.reasoning_effort, str):
+            return {
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": self.reasoning_effort},
+            }
+        budget = (
+            self.reasoning_effort or self.thinking_budget_tokens
+            or settings.anthropic_thinking_budget_tokens
+        )
+        if not _MIN_THINKING_BUDGET <= budget < max_tokens:
+            raise AgentException.message(
+                "Anthropic 思考预算须不小于1024且小于最大输出长度"
+            )
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
+    def _structured_max_tokens(self, requested: int) -> int:
+        """结构化输出在思考预算之外保留请求的结果空间。"""
+        enabled = (
+            settings.anthropic_thinking_enabled if self.thinking_enabled is None
+            else self.thinking_enabled
+        )
+        if not enabled:
+            return requested
+        budget = (
+            (self.reasoning_effort if isinstance(self.reasoning_effort, int) else None)
+            or self.thinking_budget_tokens
+            or settings.anthropic_thinking_budget_tokens
+        )
+        return min(requested + budget, settings.llm_default_max_tokens)
 
     @property
     def provider(self) -> str:
@@ -434,13 +479,14 @@ class AnthropicClient(BaseLLMClient):
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _AnthropicChunkAdapter()
+        max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
         async with client.messages.stream(
-            max_tokens=settings.llm_default_max_tokens,
-            thinking=_thinking_param(),
+            max_tokens=max_tokens,
             model=model or self.model,
             system=self._encode_system(system_prompt),
             messages=self._encode_messages(messages),
             tools=self._encode_tools(tools),
+            **self._thinking_kwargs(max_tokens),
         ) as stream:
             async for event in stream:
                 chunk = (
@@ -522,23 +568,42 @@ class AnthropicClient(BaseLLMClient):
             "strict": True,
         }
         conversation = list(messages)
+        effective_max_tokens = self._structured_max_tokens(max_tokens)
+        thinking_kwargs = self._thinking_kwargs(effective_max_tokens)
+        thinking = thinking_kwargs["thinking"]
+        thinking_on = isinstance(thinking, dict) and thinking["type"] != "disabled"
+        # 开启思考时API只允许auto工具选择，不能强制tool或temperature=0。
+        request_options: dict[str, Any] = (
+            {"tool_choice": {"type": "auto"}} if thinking_on else {
+                "tool_choice": ToolChoiceToolParam(type="tool", name=_STRUCTURED_TOOL_NAME),
+                "temperature": 0,
+            }
+        )
+        structured_system = (system_prompt or "") + (
+            "\n请完成必要思考后，必须调用emit_structured_output工具提交结果。"
+            "不要用普通文本替代结构化结果。"
+        )
         last_error: ValidationError | None = None
 
         # 首轮 + 一次回灌重试：把 ValidationError 原文交回模型，让它自行修正字段。
         for attempt in range(2):
-            response = await client.messages.create(
-                max_tokens=max_tokens,
-                model=model or self.model,
-                system=system_prompt or "",
-                messages=cast("list[MessageParam]", conversation),
-                tools=[tool],
-                # 指定工具名即强制调用，模型无法改调其他工具或只返回文本。
-                tool_choice=ToolChoiceToolParam(type="tool", name=_STRUCTURED_TOOL_NAME),
-                temperature=0,
-                # 显式 None 会被 SDK 视为"已给定"从而禁用超时，
-                # 此处转成 NOT_GIVEN 以保留非流式超时的自动计算。
-                timeout=timeout if timeout is not None else NOT_GIVEN,
-            )
+            request: dict[str, Any] = {
+                "max_tokens": effective_max_tokens,
+                "model": model or self.model,
+                "system": structured_system,
+                "messages": cast("list[MessageParam]", conversation),
+                "tools": [tool],
+                **request_options,
+                **thinking_kwargs,
+                # 显式None会禁用SDK超时，未指定时保留客户端默认值。
+                "timeout": timeout if timeout is not None else NOT_GIVEN,
+            }
+            if thinking_on:
+                # 大思考预算须流式传输；SDK聚合完整块，保留签名和用量供重试。
+                async with client.messages.stream(**request) as stream:
+                    response = await stream.get_final_message()
+            else:
+                response = await client.messages.create(**request)
             tool_block = next(
                 (
                     block
@@ -570,7 +635,11 @@ class AnthropicClient(BaseLLMClient):
                     *conversation,
                     {
                         "role": "assistant",
-                        "content": [tool_block.model_dump(mode="json", warnings=False)],
+                        # 必须保留带签名的思考块，单独回放tool_use会破坏连续性。
+                        "content": [
+                            block.model_dump(mode="json", warnings=False)
+                            for block in response.content
+                        ],
                     },
                     {
                         "role": "user",

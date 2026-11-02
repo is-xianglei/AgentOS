@@ -181,18 +181,23 @@ def parse_assistant_blocks(content: Any) -> list[AssistantBlock]:
     残留的 provider wire 形状(带 type 而非 kind)在此当场暴露。
     """
     if isinstance(content, str):
-        return [TextBlock(text=content)] if content else []
+        if not content:
+            return []
+        return [TextBlock(text=content)]
+
     if not isinstance(content, list):
         raise AgentException.message(
             "assistant 消息 content 必须是中立块数组或字符串",
             {"content_type": type(content).__name__},
         )
+
     blocks: list[AssistantBlock] = []
     for raw in content:
         if not isinstance(raw, dict):
             raise AgentException.message(
                 "assistant 消息块必须是字典", {"block_type": type(raw).__name__}
             )
+
         kind = raw.get("kind")
         if kind == _KIND_THINKING:
             blocks.append(
@@ -202,9 +207,13 @@ def parse_assistant_blocks(content: Any) -> list[AssistantBlock]:
                     redacted_data=raw.get("redacted_data"),
                 )
             )
-        elif kind == _KIND_TEXT:
+            continue
+
+        if kind == _KIND_TEXT:
             blocks.append(TextBlock(text=raw.get("text", "")))
-        elif kind == _KIND_TOOL_USE:
+            continue
+
+        if kind == _KIND_TOOL_USE:
             blocks.append(
                 ToolUseBlock(
                     id=raw["id"],
@@ -212,11 +221,13 @@ def parse_assistant_blocks(content: Any) -> list[AssistantBlock]:
                     input=raw.get("input") or {},
                 )
             )
-        else:
-            raise AgentException.message(
-                "assistant 消息块的 kind 未知或缺失",
-                {"kind": kind, "keys": sorted(raw.keys())},
-            )
+            continue
+
+        raise AgentException.message(
+            "assistant 消息块的 kind 未知或缺失",
+            {"kind": kind, "keys": sorted(raw.keys())},
+        )
+
     return blocks
 
 

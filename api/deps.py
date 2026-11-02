@@ -79,4 +79,24 @@ async def get_current_workspace_id(
     return workspace_id
 
 
-__all__ = ["get_current_active_user", "get_current_user", "get_current_workspace_id", "get_db"]
+async def get_current_admin_user(
+    current_user: Annotated[UserRecord, Depends(get_current_active_user)],
+    workspace_id: Annotated[int, Depends(get_current_workspace_id)],
+    db: DatabaseSession,
+) -> UserRecord:
+    """校验当前用户是当前工作区的 owner 或 admin。"""
+    await WorkspaceService(db).require_workspace_role(
+        workspace_id,
+        current_user.id,
+        {"owner", "admin"},
+    )
+    return current_user
+
+
+__all__ = [
+    "get_current_active_user",
+    "get_current_admin_user",
+    "get_current_user",
+    "get_current_workspace_id",
+    "get_db",
+]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -145,6 +145,7 @@ class PreparedDream:
     prompt_version: str
     base_catalog_version: int
     entries: tuple[MemoryDreamEntry, ...]
+    client: BaseLLMClient | None = field(default=None, repr=False, compare=False)
 
     @property
     def revision_ids(self) -> tuple[int, ...]:
@@ -221,7 +222,7 @@ class MemoryDreamService:
 
     def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None) -> None:
         self.db = db
-        self.llm = llm or create_llm_client(scenario="memory_dream")
+        self.llm = llm
         self.job_repo = MemoryJobRepository(db)
         self.memory_repo = MemoryRepository(db)
 
@@ -250,7 +251,19 @@ class MemoryDreamService:
             )
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_dream 场景解析,
         # 不再继承 Extractor 的模型配置(2 层回落:场景覆盖 > provider 主模型)。
-        model = job.model
+        from runtime.model_selection import frozen_job_client
+        client = self.llm
+        if client is None:
+            try:
+                client = await frozen_job_client(
+                    self.db, space.workspace_id, space.user_id, "memory_dream",
+                    model=job.model, provider_id=(job.payload or {}).get("model_provider_id"),
+                )
+            except AgentException as exc:
+                raise MemoryDreamFailure(
+                    "model_missing", exc.message, retryable=False
+                ) from exc
+        model = job.model or getattr(client, "model", None)
         if not model:
             try:
                 model = resolve_scenario_model("memory_dream")
@@ -271,6 +284,7 @@ class MemoryDreamService:
             prompt_version=job.prompt_version or settings.memory_dream_prompt_version,
             base_catalog_version=space.catalog_version,
             entries=entries,
+            client=client,
         )
 
     async def dream(self, prepared: PreparedDream) -> MemoryDreamResult:
@@ -284,7 +298,7 @@ class MemoryDreamService:
         llm: BaseLLMClient | None = None,
     ) -> MemoryDreamResult:
         """调用结构化输出并执行严格校验。"""
-        client = llm or create_llm_client(scenario="memory_dream")
+        client = llm or prepared.client or create_llm_client(scenario="memory_dream")
         try:
             return await client.complete_structured(
                 [

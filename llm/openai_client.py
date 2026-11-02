@@ -323,12 +323,48 @@ class OpenAIClient(BaseLLMClient):
         base_url: str | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
+        thinking_enabled: bool | None = None,
+        reasoning_effort: str | int | None = None,
+        thinking_protocol: str = "deepseek",
+        fast_reasoning_effort: str | None = None,
     ):
         self.model = model
         self.api_key = api_key or settings.openai_api_key
         self.base_url = base_url or settings.openai_base_url
         self.max_retries = max_retries
         self.timeout = timeout
+        self.thinking_enabled = thinking_enabled
+        self.reasoning_effort = reasoning_effort
+        self.thinking_protocol = thinking_protocol
+        self.fast_reasoning_effort = fast_reasoning_effort
+
+    def _thinking_kwargs(self) -> dict[str, Any]:
+        """让流式与结构化请求共享实例级思考策略。"""
+        if self.thinking_enabled is None:
+            if not settings.openai_thinking_enabled:
+                return {}
+            result: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
+            if settings.openai_reasoning_effort:
+                result["reasoning_effort"] = settings.openai_reasoning_effort
+            return result
+        result = {}
+        if self.thinking_protocol == "deepseek":
+            result["extra_body"] = {
+                "thinking": {"type": "enabled" if self.thinking_enabled else "disabled"}
+            }
+        elif self.thinking_protocol == "chat_template":
+            template: dict[str, Any] = {"enable_thinking": self.thinking_enabled}
+            if self.thinking_enabled and self.reasoning_effort is not None:
+                template = {"thinking": True, "reasoning_effort": self.reasoning_effort}
+            result["extra_body"] = {"chat_template_kwargs": template}
+        if self.thinking_enabled and self.reasoning_effort is not None:
+            if self.thinking_protocol in {"openai", "deepseek"}:
+                result["reasoning_effort"] = self.reasoning_effort
+        elif not self.thinking_enabled and self.thinking_protocol == "openai":
+            # 原生协议必须由管理员确认支持 none，不能按模型名猜测禁用能力。
+            if self.fast_reasoning_effort is not None:
+                result["reasoning_effort"] = self.fast_reasoning_effort
+        return result
 
     @property
     def provider(self) -> str:
@@ -440,14 +476,17 @@ class OpenAIClient(BaseLLMClient):
             openai_messages.append({"role": "system", "content": system_prompt})
         openai_messages.extend(messages)
 
-        # 调用 parse() 方法（Structured Outputs）
+        thinking_kwargs = self._thinking_kwargs()
+        # 推理模型经常不接受 temperature=0；由上游默认温度决定采样。
+        sampling = {} if self.thinking_enabled or thinking_kwargs.get("reasoning_effort") else {"temperature": 0}
         response = await client.chat.completions.parse(
             model=model or self.model,
             # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
             messages=cast("list[ChatCompletionMessageParam]", openai_messages),
             response_format=output_format,
             max_completion_tokens=max_tokens,
-            temperature=0,
+            **sampling,
+            **thinking_kwargs,
         )
 
         parsed = response.choices[0].message.parsed
@@ -496,7 +535,7 @@ class OpenAIClient(BaseLLMClient):
         request_kwargs: dict[str, Any] = {
             "model": model or self.model,
             "messages": openai_messages,
-            "max_completion_tokens": settings.llm_default_max_tokens,
+            "max_completion_tokens": getattr(self, "max_tokens", settings.llm_default_max_tokens),
             "stream": True,
             # 不显式开启则 usage 恒为 None(SDK 不会自动注入该选项)。
             "stream_options": {"include_usage": True},
@@ -504,12 +543,7 @@ class OpenAIClient(BaseLLMClient):
         # 空 tools 不传该参数:部分兼容网关对空 tools: [] 报 400。
         if tools:
             request_kwargs["tools"] = self._encode_tools(tools)
-        # 思考模式是 DeepSeek 私有扩展,不在 SDK 参数表内,只能走 extra_body 透传;
-        # 关闭时整个键不出现,标准 OpenAI 端点的行为完全不变。
-        if settings.openai_thinking_enabled:
-            request_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            if settings.openai_reasoning_effort:
-                request_kwargs["reasoning_effort"] = settings.openai_reasoning_effort
+        request_kwargs.update(self._thinking_kwargs())
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _OpenAIChunkAdapter()

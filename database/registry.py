@@ -16,7 +16,9 @@ from memory.models import (  # noqa: F401
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
+from model_service.models import ModelProviderRecord, ModelRoleRecord  # noqa: F401
 from permission.models import PermissionRuleRecord  # noqa: F401
+from runtime.models import OrchestrationCheckpointRecord  # noqa: F401
 from plan.models import SessionPlanRecord  # noqa: F401
 from session.models import (  # noqa: F401
     SessionMessage,

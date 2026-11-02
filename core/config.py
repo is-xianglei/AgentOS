@@ -26,8 +26,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # --- LLM Provider 全局开关 -----------------------------------------------
-    # 必填,无默认值:未配置、取值不支持、api_key 缺失、模型解析不出时,
-    # create_llm_client() 与启动自检一律抛中文 AgentException,不做静默回落。
+    # 工作区数据库没有可用模型时才使用环境配置；启动不要求声明环境模型。
+    # 回退时Provider、密钥或模型无效，create_llm_client()抛中文AgentException。
     llm_provider: str | None = None  # "anthropic" | "openai"
 
     # --- LLM(Anthropic) -----------------------------------------------------
@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     anthropic_thinking_budget_tokens: int = 4096
 
     # --- LLM(OpenAI) ---------------------------------------------------------
-    # 仅 llm_provider="openai" 时 api_key 与主模型必填;场景覆盖语义同 Anthropic 组。
+    # 回退环境且llm_provider="openai"时密钥与主模型必填；场景覆盖语义同Anthropic。
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str | None = None  # provider 主模型,所有场景的回落终点

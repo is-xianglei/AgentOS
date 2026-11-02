@@ -11,13 +11,39 @@ from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from hooks import HookContext, HookEvent, get_hook_registry
+from tools.context import ToolExecutionContext
 from tools.base import ToolContext
 from tools.models import ToolCallRecord, ToolRecord
+from tools.policy import (
+    ToolProfile,
+    can_bind_tool,
+    can_call_tool,
+    get_tool_policy,
+    requires_skill_allowlist,
+)
 from tools.registry import ToolRegistry, build_tool_registry
 from tools.repository import ToolCatalogRepository, ToolRepository
 from tools.shell_policy import ShellAccess
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_from_actor(actor: Actor) -> ToolProfile:
+    """兼容旧调用点的 actor -> profile 映射。
+
+    新运行时应显式传入 profile；这里仅为直接使用 ToolService 的旧代码保留
+    安全默认值。显示名称永远不参与能力判定。
+    """
+    role = actor.role.value
+    if role == "subagent":
+        return "subagent"
+    if role == "teammate":
+        return "teammate"
+    return "lead"
+
+
+def _principal_from_actor(actor: Actor) -> str:
+    return "lead" if actor.role.value == "orchestrator" else actor.name
 
 
 @dataclass(frozen=True)
@@ -70,7 +96,17 @@ class ToolCatalogService:
             raise AgentException.message("工具不存在", status_code=404)
         return record
 
-    async def require_bindable_tool_ids(self, tool_ids: list[int]) -> list[int]:
+    async def require_bindable_tool_ids(
+        self,
+        tool_ids: list[int],
+        *,
+        profile: ToolProfile | None = None,
+    ) -> list[int]:
+        """校验工具存在、可运行，并按执行档位过滤可绑定工具。
+
+        profile 为空时保留旧行为，供系统内部目录同步与兼容调用使用；用户 Agent
+        创建和更新必须显式传入 ``user_agent``，避免把控制平面工具绑定到普通 Agent。
+        """
         normalized = list(dict.fromkeys(tool_ids))
         records = await self.repo.list_by_ids(normalized)
         records_by_id = {record.id: record for record in records}
@@ -98,10 +134,31 @@ class ToolCatalogService:
                 {"tool_ids": missing_runtime},
                 status_code=409,
             )
+        if profile is not None:
+            forbidden = [
+                record
+                for record in records
+                if not can_bind_tool(record.runtime_name, profile)
+            ]
+            if forbidden:
+                raise AgentException.message(
+                    "当前Agent类型不允许绑定这些工具",
+                    {
+                        "profile": profile,
+                        "tool_ids": [record.id for record in forbidden],
+                        "tool_names": [record.runtime_name for record in forbidden],
+                    },
+                    status_code=403,
+                )
         return normalized
 
-    async def get_runtime_names(self, tool_ids: list[int]) -> tuple[str, ...]:
-        normalized = await self.require_bindable_tool_ids(tool_ids)
+    async def get_runtime_names(
+        self,
+        tool_ids: list[int],
+        *,
+        profile: ToolProfile | None = None,
+    ) -> tuple[str, ...]:
+        normalized = await self.require_bindable_tool_ids(tool_ids, profile=profile)
         records = await self.repo.list_by_ids(normalized)
         names_by_id = {record.id: record.runtime_name for record in records}
         return tuple(names_by_id[tool_id] for tool_id in normalized)
@@ -182,6 +239,9 @@ class ToolService:
         shell_tmp_root: Path | None = None,
         agent_id: int | None = None,
         allowed_skill_names: frozenset[str] | None = None,
+        profile: ToolProfile | None = None,
+        principal_name: str | None = None,
+        execution_context: ToolExecutionContext | None = None,
     ) -> str:
         """执行工具并记录调用状态。
 
@@ -193,7 +253,74 @@ class ToolService:
         否则新建一条 running 记录。
         """
         actor = actor or ORCHESTRATOR_ACTOR
+        if execution_context is not None:
+            # 网关创建时冻结的上下文优先级高于兼容参数，避免调用方借助一次
+            # ``run`` 临时替换 profile、主体或资源白名单。
+            resolved_profile = execution_context.profile
+            resolved_principal = execution_context.principal_name
+            agent_id = execution_context.agent_id
+            allowed_skill_names = execution_context.allowed_skill_names
+            shell_access = execution_context.shell_access
+            shell_tmp_root = execution_context.shell_tmp_root
+        else:
+            resolved_profile = profile or _profile_from_actor(actor)
+            resolved_principal = principal_name or _principal_from_actor(actor)
         hooks = get_hook_registry()
+
+        # 注册表裁剪只影响模型可见 schema，不能作为最终安全边界。任何旧
+        # 配置、直接调用或恢复路径都必须在网关再次经过能力策略。
+        policy = get_tool_policy(tool_name)
+        # 未声明策略的自定义工具保留旧的直接 ToolService 兼容路径；一旦
+        # 运行时显式携带 profile，则未知工具也必须先登记策略才能调用。
+        denied: str | None = None
+        if (profile is not None or policy.category != "unknown") and not can_call_tool(
+            tool_name, resolved_profile
+        ):
+            denied = f"工具能力策略拒绝执行: tool={tool_name}, profile={resolved_profile}"
+        elif policy.requires_bound_skill and requires_skill_allowlist(resolved_profile):
+            # Skill 的参数名是 ``name``，SkillResource / SkillRun 使用
+            # ``skill_name``。统一在执行网关做资产边界校验，不能只依赖
+            # 工具自身的错误文本或模型可见 schema。lead 使用工作区级目录，
+            # 其他运行身份必须由父运行时显式下发白名单。
+            skill_arg = "name" if tool_name == "Skill" else "skill_name"
+            requested_skill = input_args.get(skill_arg)
+            if (
+                allowed_skill_names is None
+                or not isinstance(requested_skill, str)
+                or requested_skill not in allowed_skill_names
+            ):
+                denied = (
+                    "工具能力策略拒绝执行: 当前运行身份只能访问已绑定的 skill"
+                    f" (skill={requested_skill!r})"
+                )
+        if denied is not None:
+            if record is None:
+                record = await self.start_call(
+                    session_id,
+                    tool_name,
+                    input_args,
+                    message_id=message_id,
+                    agent_id=agent_id,
+                )
+            else:
+                record.input_args = input_args
+                record.status = "running"
+                await self.db.flush()
+            await self.tool_repo.fail(record, denied)
+            await self.db.flush()
+            await hooks.trigger(
+                HookContext(
+                    event=HookEvent.POST_TOOL_USE,
+                    session_id=session_id,
+                    actor=actor,
+                    turn_id=turn_id,
+                    tool_name=tool_name,
+                    tool_input=input_args,
+                    tool_output=denied,
+                    is_error=True,
+                )
+            )
+            return denied
 
         # PreToolUse:可拦截(block)或改写入参(updated_input)。permission 已在
         # 更高层(orchestrator _execute_tool_uses)裁决过,此处 hook 只能更严,不能提权。
@@ -250,6 +377,8 @@ class ToolService:
                 turn_id=turn_id,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                principal_name=resolved_principal,
+                profile=resolved_profile,
                 allowed_tool_names=self.registry.names,
                 allowed_skill_names=allowed_skill_names,
                 shell_access=shell_access,

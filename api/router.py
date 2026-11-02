@@ -6,6 +6,7 @@ from department import api as department_api
 from group import api as group_api
 from interaction import api as interaction_api
 from memory import api as memory_api
+from model_service import api as model_service_api
 from permission import api as permission_api
 from plan import api as plan_api
 from session import api as session_api
@@ -18,6 +19,7 @@ from workflow import api as workflow_api
 from workspace import api as workspace_api
 
 api_router = APIRouter(prefix="/api")
+api_router.include_router(model_service_api.router, prefix="/models", tags=["models"])
 api_router.include_router(agent_api.router, prefix="/agents", tags=["agents"])
 api_router.include_router(auth_api.router, prefix="/auth", tags=["auth"])
 api_router.include_router(

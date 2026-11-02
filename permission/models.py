@@ -16,6 +16,13 @@ class PermissionRuleRecord(Base):
             "session_id",
             "tool_name",
         ),
+        Index(
+            "ix_permission_rules_workspace_scope_session_tool",
+            "workspace_id",
+            "scope",
+            "session_id",
+            "tool_name",
+        ),
         {"comment": "工具权限规则(全局 / 会话双作用域)"},
     )
 
@@ -30,6 +37,12 @@ class PermissionRuleRecord(Base):
         nullable=True,
         index=True,
         comment="所属会话ID(scope=session 时必填, global 时为空)",
+    )
+    workspace_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="所属工作区(scope=global 时必填; NULL 仅表示迁移前遗留规则)",
     )
     tool_name: Mapped[str] = mapped_column(
         String(120), index=True, comment="规则针对的工具名"

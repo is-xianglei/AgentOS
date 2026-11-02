@@ -33,38 +33,43 @@ class GrepTool(BaseTool):
             except re.error as exc:
                 raise AgentException.message(f"无效的正则表达式: {exc}") from exc
 
-            results = []
+            files: list[Path] = []
             if base.is_file():
-                files = [base]
+                files.append(base)
             else:
-                files = list(base.glob(args.glob_pattern))
-                files = [f for f in files if f.is_file()]
+                for file_path in base.glob(args.glob_pattern):
+                    if file_path.is_file():
+                        files.append(file_path)
 
+            results: list[str] = []
             for file_path in files:
                 try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.readlines()
-
-                    for line_num, line in enumerate(lines, 1):
-                        if pattern.search(line):
-                            match_info = f"{file_path}:{line_num}:{line.rstrip()}"
-
-                            if args.context_lines > 0:
-                                context = []
-                                start = max(0, line_num - 1 - args.context_lines)
-                                end = min(len(lines), line_num + args.context_lines)
-                                for i in range(start, end):
-                                    prefix = ">" if i == line_num - 1 else " "
-                                    context.append(f"{prefix} {i + 1}: {lines[i].rstrip()}")
-                                match_info = f"{file_path}:\n" + "\n".join(context)
-
-                            results.append(match_info)
-
-                            if len(results) >= args.max_results:
-                                break
-                except Exception:
+                    lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
                     # 跳过无法读取的文件
                     continue
+
+                for line_index, line in enumerate(lines):
+                    if pattern.search(line) is None:
+                        continue
+
+                    line_number = line_index + 1
+                    match_info = f"{file_path}:{line_number}:{line.rstrip()}"
+                    if args.context_lines > 0:
+                        context: list[str] = []
+                        start = max(0, line_index - args.context_lines)
+                        end = min(len(lines), line_index + args.context_lines + 1)
+                        for context_index in range(start, end):
+                            prefix = ">" if context_index == line_index else " "
+                            context.append(
+                                f"{prefix} {context_index + 1}: "
+                                f"{lines[context_index].rstrip()}"
+                            )
+                        match_info = f"{file_path}:\n" + "\n".join(context)
+
+                    results.append(match_info)
+                    if len(results) >= args.max_results:
+                        break
 
                 if len(results) >= args.max_results:
                     break

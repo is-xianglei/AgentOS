@@ -19,7 +19,6 @@ from core.run_events import check_run_event_store, close_run_event_store
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
 from hooks.builtin import register_builtin_hooks
-from llm import create_llm_client
 from runtime.execution import shutdown_executions
 from runtime.recovery import reap_orphan_turns, run_reaper_loop
 from tools.service import ToolCatalogService
@@ -27,9 +26,7 @@ from tools.service import ToolCatalogService
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # LLM 配置启动自检:provider/api_key/模型缺失在启动时立刻暴露,
-    # 而非拖到首次对话或首个 Memory 作业(工厂本身仍是权威关卡)。
-    create_llm_client()
+    # 模型可由工作区设置维护；启动不依赖环境模型，聊天准入时校验实际配置。
     if settings.create_tables:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

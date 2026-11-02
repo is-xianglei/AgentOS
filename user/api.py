@@ -1,7 +1,9 @@
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.deps import get_current_active_user, get_db
+from api.deps import get_current_active_user, get_current_admin_user, get_db
 from core.responses import ApiResponse, ok
 from user.models import UserRecord
 from user.schemas import (
@@ -15,6 +17,7 @@ from workspace.schemas import WorkspaceResponse
 from workspace.service import WorkspaceService
 
 router = APIRouter()
+CurrentAdmin = Annotated[UserRecord, Depends(get_current_admin_user)]
 
 
 @router.get("/me", summary="获取当前用户信息", response_model=ApiResponse[UserResponse])
@@ -97,8 +100,12 @@ async def delete_current_user(
 
 @router.post("", summary="创建用户", response_model=ApiResponse[UserResponse])
 async def create_user(
-    payload: UserCreateRequest, request: Request, db: AsyncSession = Depends(get_db)
+    payload: UserCreateRequest,
+    request: Request,
+    current_user: CurrentAdmin,
+    db: AsyncSession = Depends(get_db),
 ):
+    """由当前工作区管理员创建用户；普通注册走认证域的公开注册接口。"""
     service = UserService(db)
     user = await service.create_user(
         username=payload.username,
@@ -112,17 +119,25 @@ async def create_user(
 @router.get("", summary="查询用户列表", response_model=ApiResponse[list[UserResponse]])
 async def list_users(
     request: Request,
+    current_user: CurrentAdmin,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
+    """查询用户列表，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
     users = await service.list_users(limit=limit, offset=offset)
     return ok([UserResponse.model_validate(user) for user in users], request)
 
 
 @router.get("/{user_id}", summary="查询用户详情", response_model=ApiResponse[UserResponse])
-async def get_user(user_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_user(
+    user_id: int,
+    request: Request,
+    current_user: CurrentAdmin,
+    db: AsyncSession = Depends(get_db),
+):
+    """查询指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
     user = await service.get_user(user_id)
     return ok(UserResponse.model_validate(user), request)
@@ -133,8 +148,10 @@ async def update_user(
     user_id: int,
     payload: UserUpdateRequest,
     request: Request,
+    current_user: CurrentAdmin,
     db: AsyncSession = Depends(get_db),
 ):
+    """更新指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
     user = await service.update_user(
         user_id=user_id,
@@ -152,8 +169,10 @@ async def change_password(
     user_id: int,
     payload: UserChangePasswordRequest,
     request: Request,
+    current_user: CurrentAdmin,
     db: AsyncSession = Depends(get_db),
 ):
+    """修改指定用户密码，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
     user = await service.change_password(
         user_id=user_id,
@@ -164,7 +183,13 @@ async def change_password(
 
 
 @router.delete("/{user_id}", summary="删除用户", response_model=ApiResponse[dict])
-async def delete_user(user_id: int, request: Request, db: AsyncSession = Depends(get_db)):
+async def delete_user(
+    user_id: int,
+    request: Request,
+    current_user: CurrentAdmin,
+    db: AsyncSession = Depends(get_db),
+):
+    """删除指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
     await service.delete_user(user_id)
     return ok({"deleted": True}, request)

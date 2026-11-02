@@ -56,7 +56,7 @@ class MemoryRecallService:
         self.repo = MemoryRecallRepository(db)
         self.memory_repo = MemoryRepository(db)
         self.memory_service = MemoryService(db)
-        self.llm = llm or create_llm_client(scenario="memory_selector")
+        self.llm = llm
 
     async def get_or_create_context(
         self,
@@ -203,8 +203,12 @@ class MemoryRecallService:
         degraded_reason: str
         try:
             async with asyncio.timeout(settings.memory_selector_timeout_seconds):
+                from runtime.model_selection import resolve_runtime_client
+                client = self.llm
+                if client is None:
+                    client, _ = await resolve_runtime_client(self.db, workspace_id, user_id, "memory_selector")
                 # 模型已在客户端构造时按 memory_selector 场景解析,此处不再显式传入。
-                output = await self.llm.complete_structured(
+                output = await client.complete_structured(
                     [{"role": "user", "content": prompt}],
                     _MemorySelection,
                     system_prompt=_SELECTOR_SYSTEM_PROMPT,

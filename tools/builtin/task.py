@@ -37,7 +37,10 @@ def _render_task_list(tasks) -> str:
 class TaskCreateInput(BaseModel):
     subject: str = Field(description="任务主题(必填)")
     description: str | None = Field(default=None, description="任务描述")
-    owner: str | None = Field(default=None, description="任务负责人,默认 agent")
+    owner: str | None = Field(
+        default=None,
+        description="兼容字段,系统使用当前运行身份作为负责人,忽略调用方提交的值",
+    )
     blocked_by: list[int] | None = Field(
         default=None,
         description="阻塞当前任务的任务ID列表",
@@ -55,7 +58,7 @@ class TaskCreateTool(BaseTool):
             session_id=ctx.session_id,
             subject=args.subject,
             description=args.description or "",
-            owner=args.owner or "agent",
+            owner=ctx.principal_name or "lead",
             blocked_by=args.blocked_by or [],
         )
         return json.dumps(_task_data(task), ensure_ascii=False)
@@ -74,9 +77,8 @@ class TaskGetTool(BaseTool):
     input_model = TaskGetInput
 
     async def run(self, args: TaskGetInput, ctx: ToolContext) -> str:
-        # service 未提供单任务 get,直接复用其 repo.get(session_id, task_id)
         service = TaskService(ctx.db)
-        task = await service.repo.get(ctx.session_id, args.id)
+        task = await service.get(ctx.session_id, args.id)
         if task is None:
             return f"任务不存在: #{args.id}"
         return json.dumps(_task_data(task), ensure_ascii=False)
@@ -92,7 +94,10 @@ class TaskUpdateInput(BaseModel):
     status: Literal["pending", "in_progress", "completed"] | None = Field(
         default=None, description="任务状态"
     )
-    owner: str | None = Field(default=None, description="任务负责人")
+    owner: str | None = Field(
+        default=None,
+        description="兼容字段,系统使用当前运行身份,忽略调用方提交的负责人名称",
+    )
     blocked_by: list[int] | None = Field(
         default=None,
         description="阻塞任务列表(整体替换),与 add_blocked_by/remove_blocked_by 互斥",
@@ -129,7 +134,7 @@ class TaskUpdateTool(BaseTool):
             subject=args.subject,
             description=args.description,
             status=args.status,
-            owner=args.owner,
+            owner=ctx.principal_name if args.owner is not None else None,
             blocked_by=args.blocked_by,
             add_blocked_by=args.add_blocked_by,
             remove_blocked_by=args.remove_blocked_by,

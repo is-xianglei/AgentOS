@@ -11,6 +11,7 @@ from core.responses import ApiResponse, ok
 from core.sse import sse_response
 from runtime.agent import AgentRuntime
 from runtime.execution import cancel_turn
+from runtime.orchestrator import TopLevelOrchestrator
 from runtime.turn_follow import follow_execution, subscribe_turn
 from runtime.workflow import WorkflowRuntime
 from session.schemas import (
@@ -95,20 +96,22 @@ async def send_message(
 
     # 准入(建轮次、认领租约、提交)在返回 SSE 前完成:冲突与配置错误走普通 JSON 错误响应,
     # 后台执行与本次连接解耦,客户端断开只停止跟随,不取消执行。
-    if effective_workflow_id is not None:
-        workflow_runtime = WorkflowRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
-        handle = await workflow_runtime.start(
-            payload.session_id,
-            payload.content,
-            workflow_id=effective_workflow_id,
-        )
-    else:
-        runtime = AgentRuntime(db, user_id=current_user.id, workspace_id=workspace_id)
-        handle = await runtime.start(
-            payload.session_id,
-            payload.content,
-            agent_id=payload.agent_id,
-        )
+    orchestrator = TopLevelOrchestrator(
+        db,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        # 注入模块级类，保留测试与部署层替换运行时的能力，同时把分发逻辑
+        # 从 HTTP handler 收口到统一 Orchestrator。
+        agent_runtime_cls=AgentRuntime,
+        workflow_runtime_cls=WorkflowRuntime,
+    )
+    handle = await orchestrator.start(
+        payload.session_id,
+        payload.content,
+        agent_id=payload.agent_id,
+        workflow_id=effective_workflow_id,
+        **({"model_options": payload.model_dump(include=payload.model_fields_set & {"model_provider_id", "mode_slug", "thinking_effort"})} if payload.model_fields_set & {"model_provider_id", "mode_slug", "thinking_effort"} else {}),
+    )
     return sse_response(follow_execution(handle))
 
 
@@ -242,11 +245,11 @@ async def rename_session(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    session = await SessionService(db).rename(
+    session = await SessionService(db).update_options(
         session_id,
-        payload.title,
         current_user.id,
         workspace_id,
+        payload.model_dump(exclude_unset=True),
     )
     return ok(SessionResponse.model_validate(session), request)
 

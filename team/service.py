@@ -39,6 +39,49 @@ class TeamService:
         await self.session_service.get_required(session_id)
         return await self.repo.list_members(session_id)
 
+    async def get_member(self, session_id: int, name: str) -> TeamMemberRecord | None:
+        """按名称读取团队成员，供运行时恢复 teammate。"""
+        await self.session_service.get_required(session_id)
+        return await self.repo.get_member(session_id, name)
+
+    async def save_member_history(
+        self,
+        session_id: int,
+        name: str,
+        history: str | None,
+    ) -> TeamMemberRecord:
+        """保存 teammate 对话历史。"""
+        await self.session_service.get_required(session_id)
+        member = await self.repo.get_member(session_id, name)
+        if member is None:
+            raise AgentException.message("团队成员不存在")
+        return await self.repo.update_member_history(member, history)
+
+    async def update_member_runtime(
+        self,
+        session_id: int,
+        name: str,
+        *,
+        status: str | None = None,
+        agent_type: str | None = None,
+        prompt: str | None = None,
+        team_id: int | None = None,
+    ) -> TeamMemberRecord:
+        """更新 teammate 运行时字段，统一校验会话和成员存在性。"""
+        await self.session_service.get_required(session_id)
+        if status is not None and status not in {"working", "idle", "shutdown"}:
+            raise AgentException.message("成员运行状态无效")
+        member = await self.repo.get_member(session_id, name)
+        if member is None:
+            raise AgentException.message("团队成员不存在")
+        return await self.repo.update_member_runtime(
+            member,
+            status=status,
+            agent_type=agent_type,
+            prompt=prompt,
+            team_id=team_id,
+        )
+
     async def list_members_for_user(
         self,
         session_id: int,
@@ -198,7 +241,7 @@ class TeamService:
         name: str,
         role: str,
         prompt: str,
-        agent_type: str = "general_purpose",
+        agent_type: str = "general-purpose",
         creator_type: str = "agent",
         creator_id: str | None = None,
     ) -> TeamMemberRecord:

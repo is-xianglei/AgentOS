@@ -79,6 +79,8 @@ class MemoryJobService:
             # 有意偏离文档 §9.1 的幂等键格式：shadow Job 只记录对比摘要、不写 Memory 数据，
             # 追加后缀使灰度切换窗口内同一 Turn 的 active 提取不被 shadow 记录挡住而丢失。
             idempotency_key = f"{idempotency_key}:shadow"
+        from model_service.service import ModelService
+        provider = await ModelService(self.db).select_provider(turn.workspace_id, turn.user_id, scenario="memory_extractor")
         job = await self.job_repo.enqueue_extract(
             space_id=space.id,
             session_id=session.id,
@@ -87,10 +89,10 @@ class MemoryJobService:
             max_attempts=settings.memory_job_max_attempts,
             # 入队即冻结实际生效的模型;解析不出会抛中文 AgentException,
             # 由调用方的 SAVEPOINT 隔离,不影响主链路。
-            model=resolve_scenario_model("memory_extractor"),
+            model=provider.model_name if provider else resolve_scenario_model("memory_extractor"),
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
-            payload={"mode": mode},
+            payload={"mode": mode, **({"model_provider_id": provider.provider_id} if provider else {})},
         )
         return job
 
@@ -159,15 +161,17 @@ class MemoryJobService:
         scan_window = int(completed_at.timestamp()) // scan_window_seconds
         prompt_version = settings.memory_dream_prompt_version
         idempotency_key = f"dream:{space.id}:{space.catalog_version}:{prompt_version}:{scan_window}"
+        from model_service.service import ModelService
+        provider = await ModelService(self.db).select_provider(space.workspace_id, space.user_id, scenario="memory_dream")
         job = await self.job_repo.enqueue_dream(
             space_id=space.id,
             idempotency_key=idempotency_key,
             max_attempts=settings.memory_job_max_attempts,
             # Dream 直接按自身场景解析,不再继承 Extractor 的模型配置。
-            model=resolve_scenario_model("memory_dream"),
+            model=provider.model_name if provider else resolve_scenario_model("memory_dream"),
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
-            payload={},
+            payload={"model_provider_id": provider.provider_id} if provider else {},
         )
         return job
 

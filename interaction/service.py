@@ -34,10 +34,28 @@ class InteractionService:
         resolution_policy: dict[str, Any],
         requests: list[InteractionRequestCreate],
     ) -> tuple[RuntimeSuspensionRecord, list[InteractionRequestRecord]]:
-        """原子创建暂停点及其全部交互请求，提交由调用方事务边界负责。"""
+        """兼容复数接口；顺序运行暂停点当前只允许一个请求。"""
         if len(requests) != 1:
             raise AgentException.message("顺序运行暂停点每次必须且只能创建一个交互请求")
 
+        suspension, request = await self.create_suspension_with_request(
+            session_id,
+            turn_id,
+            continuation_payload,
+            resolution_policy,
+            requests[0],
+        )
+        return suspension, [request]
+
+    async def create_suspension_with_request(
+        self,
+        session_id: int,
+        turn_id: UUID,
+        continuation_payload: dict[str, Any],
+        resolution_policy: dict[str, Any],
+        request: InteractionRequestCreate,
+    ) -> tuple[RuntimeSuspensionRecord, InteractionRequestRecord]:
+        """原子创建暂停点及单个交互请求，提交由调用方事务边界负责。"""
         session = await self.session_service.get_required(session_id)
         turn = await self.session_service.get_turn_required(turn_id)
         if turn.session_id != session.id:
@@ -50,47 +68,22 @@ class InteractionService:
                 {"suspension_id": str(existing.id), "status": existing.status},
             )
 
-        tool_use_ids = [request.tool_use_id for request in requests if request.tool_use_id]
-        if len(tool_use_ids) != len(set(tool_use_ids)):
-            raise AgentException.message("同一暂停点中的 tool_use_id 不能重复")
-
         suspension = await self.repo.create_suspension(
             session_id,
             turn_id,
             dict(continuation_payload),
             dict(resolution_policy),
         )
-        records: list[InteractionRequestRecord] = []
-        for sequence, request in enumerate(requests, start=1):
-            records.append(
-                await self.repo.create_request(
-                    suspension,
-                    kind=request.kind,
-                    request_payload=dict(request.request_payload),
-                    tool_call_id=request.tool_call_id,
-                    tool_use_id=request.tool_use_id,
-                    schema_version=request.schema_version,
-                    sequence=sequence,
-                )
-            )
-        return suspension, records
-
-    async def create_suspension_with_request(
-        self,
-        session_id: int,
-        turn_id: UUID,
-        continuation_payload: dict[str, Any],
-        resolution_policy: dict[str, Any],
-        request: InteractionRequestCreate,
-    ) -> tuple[RuntimeSuspensionRecord, InteractionRequestRecord]:
-        suspension, records = await self.create_suspension_with_requests(
-            session_id,
-            turn_id,
-            continuation_payload,
-            resolution_policy,
-            [request],
+        request_record = await self.repo.create_request(
+            suspension,
+            kind=request.kind,
+            request_payload=dict(request.request_payload),
+            tool_call_id=request.tool_call_id,
+            tool_use_id=request.tool_use_id,
+            schema_version=request.schema_version,
+            sequence=1,
         )
-        return suspension, records[0]
+        return suspension, request_record
 
     async def get_pending(
         self, session_id: int

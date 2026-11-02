@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
+
+from tools.policy import ToolProfile, get_tool_policy
 
 
 class ToolResponse(BaseModel):
@@ -17,6 +19,12 @@ class ToolResponse(BaseModel):
     updated_at: datetime = Field(description="更新时间")
 
     model_config = {"from_attributes": True}
+
+    @computed_field(description="能力策略允许显式绑定该工具的运行身份")
+    @property
+    def bindable_profiles(self) -> list[ToolProfile]:
+        """目录与绑定校验共享策略源，停用状态仍由 is_enabled 单独表达。"""
+        return sorted(get_tool_policy(self.runtime_name).bindable_profiles)
 
 
 class ToolDetailResponse(ToolResponse):

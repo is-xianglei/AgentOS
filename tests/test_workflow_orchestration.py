@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Self
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -939,6 +940,8 @@ def _session_service(repo: _FakeSessionRepo) -> SessionService:
     service = SessionService.__new__(SessionService)
     service.db = object()
     service.repo = repo
+    # 模型选项规则独立覆盖，本组仅验证既有工作流锁定与编排入口。
+    service.apply_model_options = AsyncMock()
     return service
 
 
@@ -1286,6 +1289,10 @@ def _make_runtime(
     session_service = _FakeRuntimeSessionService()
     runtime.session_service = session_service
     runtime.bus = _RecordingBus()
+    monkeypatch.setattr(
+        "runtime.model_selection.session_client",
+        AsyncMock(return_value=(None, None)),
+    )
 
     async def _build(session_id: int, turn_id: Any, workflow_id: int) -> Any:
         return SimpleNamespace(run=orchestrator_run)

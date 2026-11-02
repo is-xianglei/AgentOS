@@ -80,39 +80,42 @@ def _to_export_response(
         sources_by_item.setdefault(source.memory_id, []).append(
             MemoryExportSourceResponse.model_validate(source)
         )
-    items = [
-        MemoryExportItemResponse(
-            id=item.id,
-            space_id=item.space_id,
-            memory_key=item.memory_key,
-            memory_type=item.memory_type,
-            name=item.name,
-            description=item.description,
-            body=item.body,
-            status=item.status,
-            version=item.version,
-            superseded_by_id=item.superseded_by_id,
-            source_kind=item.source_kind,
-            last_used_at=item.last_used_at,
-            use_count=item.use_count,
-            created_at=item.created_at,
-            updated_at=item.updated_at,
-            is_deleted=item.is_deleted,
-            deleted_at=item.deleted_at,
-            revisions=revisions_by_item.get(item.id, []),
-            sources=sources_by_item.get(item.id, []),
+
+    items: list[MemoryExportItemResponse] = []
+    for item in bundle.items:
+        items.append(
+            MemoryExportItemResponse(
+                id=item.id,
+                space_id=item.space_id,
+                memory_key=item.memory_key,
+                memory_type=item.memory_type,
+                name=item.name,
+                description=item.description,
+                body=item.body,
+                status=item.status,
+                version=item.version,
+                superseded_by_id=item.superseded_by_id,
+                source_kind=item.source_kind,
+                last_used_at=item.last_used_at,
+                use_count=item.use_count,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
+                is_deleted=item.is_deleted,
+                deleted_at=item.deleted_at,
+                revisions=revisions_by_item.get(item.id, []),
+                sources=sources_by_item.get(item.id, []),
+            )
         )
-        for item in bundle.items
-    ]
+
+    space = None
+    if bundle.space is not None:
+        space = MemoryExportSpaceResponse.model_validate(bundle.space)
+
     return MemoryExportResponse(
         exported_at=export_result.exported_at,
         workspace_id=workspace_id,
         user_id=user_id,
-        space=(
-            MemoryExportSpaceResponse.model_validate(bundle.space)
-            if bundle.space is not None
-            else None
-        ),
+        space=space,
         items=items,
         jobs=[MemoryExportJobResponse.model_validate(job) for job in bundle.jobs],
         contexts=[

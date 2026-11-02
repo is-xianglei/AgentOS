@@ -295,6 +295,53 @@ class SessionService:
         await self.db.refresh(session)
         return session
 
+    async def update_options(self, session_id: int, actor_user_id: int, workspace_id: int, changes: dict[str, Any]) -> SessionRecord:
+        await self.require_write_access(session_id, actor_user_id, workspace_id)
+        session = await self.lock_required(session_id)
+        options = {key: value for key, value in changes.items() if key != "title"}
+        if options and session.status not in {"idle", "created", "failed"}:
+            raise AgentException.message("会话执行或等待交互期间不能修改模型选项", status_code=409)
+        if "title" in changes:
+            session.title = changes["title"]
+        if options:
+            await self.apply_model_options(session, actor_user_id, workspace_id, options)
+        await self.db.flush()
+        await self.db.refresh(session)
+        return session
+
+    async def apply_model_options(self, session: SessionRecord, user_id: int, workspace_id: int, options: dict[str, Any]) -> None:
+        from model_service.policy import fast_capabilities, normalize_effort
+        from model_service.service import ModelService
+
+        mode = options.get("mode_slug", getattr(session, "mode_slug", None) or "standard")
+        effort = options.get("thinking_effort", getattr(session, "thinking_effort", None) or "fast")
+        if session.workflow_id is not None and mode == "turbo":
+            raise AgentException.message("工作流包含多智能体执行，请使用标准模式", status_code=400)
+        provider_id = options.get("model_provider_id", getattr(session, "model_provider_id", None))
+        service = ModelService(self.db)
+        scenario = "workflow" if session.workflow_id is not None else "agent"
+        provider = await service.select_provider(workspace_id, user_id, provider_id, scenario)
+        if mode == "turbo":
+            from core.config import settings
+            capabilities = fast_capabilities(provider.provider, provider.extra_config or {}) if (
+                provider is not None
+            ) else {"turbo_supported": settings.llm_provider == "anthropic"}
+            if not capabilities["turbo_supported"]:
+                raise AgentException.message(
+                    "当前模型未配置关闭思考能力，请在模型服务配置后使用极速模式",
+                    status_code=400,
+                )
+        if "model_provider_id" in options:
+            session.extra = {**(session.extra or {}), "model_provider_override": provider_id is not None}
+        session.model_provider_id = provider.provider_id if provider else None
+        session.mode_slug = mode
+        session.thinking_effort = normalize_effort(provider.extra_config if provider else {}, effort, mode)
+        await self.db.flush()
+
+    async def runtime_model_options(self, session_id: int) -> SessionRecord:
+        """供子代理读取所属会话冻结的模型策略。"""
+        return await self.get_required(session_id)
+
     async def delete(
         self,
         session_id: int,
@@ -364,6 +411,7 @@ class SessionService:
         workspace_id: int,
         agent_id: int | None = None,
         workflow_id: int | None = None,
+        model_options: dict[str, Any] | None = None,
     ) -> SessionRecord:
         """获取或创建本次消息所属会话，并标记为运行中。
 
@@ -393,6 +441,7 @@ class SessionService:
                 workflow_id,
             )
             await self.repo.update_status(session, "running")
+            await self.apply_model_options(session, user_id, workspace_id, model_options or {})
             return session
         session = await self.get_required(session_id)
         if agent_id is not None and agent_id != session.agent_id:
@@ -411,7 +460,9 @@ class SessionService:
             from workflow.service import WorkflowService
 
             await WorkflowService(self.db).require_runnable(session.workflow_id, workspace_id)
-        return await self.mark_running(session_id)
+        session = await self.mark_running(session_id)
+        await self.apply_model_options(session, user_id, workspace_id, model_options or {})
+        return session
 
     @staticmethod
     def resolve_effective_workflow_id(

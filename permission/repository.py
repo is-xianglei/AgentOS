@@ -20,14 +20,20 @@ class PermissionRepository:
         self.db = db
 
     async def list(
-        self, scope: str | None = None, session_id: int | None = None
+        self,
+        scope: str | None = None,
+        session_id: int | None = None,
+        workspace_id: int | None = None,
     ) -> list[PermissionRuleRecord]:
         """按可选 scope / session_id 过滤列出规则。"""
         stmt = select(PermissionRuleRecord)
+        stmt = stmt.where(PermissionRuleRecord.is_deleted.is_(False))
         if scope is not None:
             stmt = stmt.where(PermissionRuleRecord.scope == scope)
         if session_id is not None:
             stmt = stmt.where(PermissionRuleRecord.session_id == session_id)
+        if workspace_id is not None:
+            stmt = stmt.where(PermissionRuleRecord.workspace_id == workspace_id)
         stmt = stmt.order_by(PermissionRuleRecord.id)
         return list(await self.db.scalars(stmt))
 
@@ -35,7 +41,11 @@ class PermissionRepository:
         return await self.db.get(PermissionRuleRecord, rule_id)
 
     async def find_candidates(
-        self, scope: str, session_id: int | None, tool_name: str
+        self,
+        scope: str,
+        session_id: int | None,
+        tool_name: str,
+        workspace_id: int | None = None,
     ) -> list[PermissionRuleRecord]:
         """列出作用域内针对某工具的全部规则,按 id 倒序(最新优先)。
 
@@ -43,6 +53,7 @@ class PermissionRepository:
         规则数极少,换取不与 JSONB 查询方言耦合,单测无需真实 PostgreSQL。
         """
         conditions = [
+            PermissionRuleRecord.is_deleted.is_(False),
             PermissionRuleRecord.scope == scope,
             PermissionRuleRecord.tool_name == tool_name,
         ]
@@ -50,6 +61,14 @@ class PermissionRepository:
             conditions.append(PermissionRuleRecord.session_id.is_(None))
         else:
             conditions.append(PermissionRuleRecord.session_id == session_id)
+        # Global rules are tenant-scoped. An omitted workspace_id deliberately
+        # matches no global row, so legacy callers cannot read another tenant's rule.
+        if scope == "global":
+            if workspace_id is None:
+                return []
+            conditions.append(PermissionRuleRecord.workspace_id == workspace_id)
+        elif workspace_id is not None:
+            conditions.append(PermissionRuleRecord.workspace_id == workspace_id)
         stmt = (
             select(PermissionRuleRecord)
             .where(and_(*conditions))
@@ -63,12 +82,18 @@ class PermissionRepository:
         session_id: int | None,
         tool_name: str,
         agent_type: str | None = None,
+        workspace_id: int | None = None,
     ) -> PermissionRuleRecord | None:
         """按 agent_type 优先级取一条规则:定向规则 > 未限定 agent_type 的通用规则。
 
         agent_type 为 None(主代理)时只认通用规则,不会误命中子代理的定向放行。
         """
-        candidates = await self.find_candidates(scope, session_id, tool_name)
+        candidates = await self.find_candidates(
+            scope,
+            session_id,
+            tool_name,
+            workspace_id,
+        )
         fallback: PermissionRuleRecord | None = None
         for rule in candidates:
             scoped = matcher_agent_type(rule.matcher)
@@ -84,9 +109,15 @@ class PermissionRepository:
         session_id: int | None,
         tool_name: str,
         agent_type: str | None = None,
+        workspace_id: int | None = None,
     ) -> PermissionRuleRecord | None:
         """精确匹配同一 agent_type 维度的规则,供 upsert 判定是否为同一条。"""
-        candidates = await self.find_candidates(scope, session_id, tool_name)
+        candidates = await self.find_candidates(
+            scope,
+            session_id,
+            tool_name,
+            workspace_id,
+        )
         for rule in candidates:
             if matcher_agent_type(rule.matcher) == agent_type:
                 return rule
@@ -100,6 +131,7 @@ class PermissionRepository:
         behavior: str,
         source: str = "user",
         matcher: dict[str, Any] | None = None,
+        workspace_id: int | None = None,
     ) -> PermissionRuleRecord:
         """新增或更新一条规则。
 
@@ -107,7 +139,11 @@ class PermissionRepository:
         定向规则与通用规则互不覆盖,否则给 verification 放行 Bash 会顺带改掉主代理的规则。
         """
         existing = await self.find_exact(
-            scope, session_id, tool_name, matcher_agent_type(matcher)
+            scope,
+            session_id,
+            tool_name,
+            matcher_agent_type(matcher),
+            workspace_id,
         )
         if existing is not None:
             existing.behavior = behavior
@@ -123,6 +159,7 @@ class PermissionRepository:
             behavior=behavior,
             source=source,
             matcher=matcher,
+            workspace_id=workspace_id,
         )
         self.db.add(record)
         await self.db.flush()

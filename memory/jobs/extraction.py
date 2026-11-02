@@ -3,7 +3,7 @@ import logging
 import math
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import UUID
 
@@ -150,6 +150,7 @@ class PreparedMemoryExtraction:
     catalog_version: int
     catalog_entries: tuple[MemoryCatalogEntry, ...]
     messages: tuple[ExtractionMessage, ...]
+    client: BaseLLMClient | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,7 @@ class MemoryExtractionService:
 
     def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None):
         self.db = db
-        self.llm = llm or create_llm_client(scenario="memory_extractor")
+        self.llm = llm
         self.job_repo = MemoryJobRepository(db)
         self.memory_repo = MemoryRepository(db)
         self.session_repo = SessionRepository(db)
@@ -276,7 +277,19 @@ class MemoryExtractionService:
 
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_extractor 场景解析。
         # 配置缺失属不可重试失败,转成 Job 语义错误而非让中文 AgentException 裸抛。
-        model = job.model
+        from runtime.model_selection import frozen_job_client
+        client = self.llm
+        if client is None:
+            try:
+                client = await frozen_job_client(
+                    self.db, turn.workspace_id, turn.user_id, "memory_extractor",
+                    model=job.model, provider_id=(job.payload or {}).get("model_provider_id"),
+                )
+            except AgentException as exc:
+                raise MemoryExtractionFailure(
+                    "model_missing", exc.message, retryable=False
+                ) from exc
+        model = job.model or getattr(client, "model", None)
         if not model:
             try:
                 model = resolve_scenario_model("memory_extractor")
@@ -304,6 +317,7 @@ class MemoryExtractionService:
             catalog_version=catalog.catalog_version,
             catalog_entries=catalog.entries,
             messages=projected,
+            client=client,
         )
 
     async def extract(self, prepared: PreparedMemoryExtraction) -> MemoryExtractionResult:
@@ -317,7 +331,7 @@ class MemoryExtractionService:
         llm: BaseLLMClient | None = None,
     ) -> MemoryExtractionResult:
         """不持有数据库 Session，调用模型并执行严格二次校验。"""
-        client = llm or create_llm_client(scenario="memory_extractor")
+        client = llm or prepared.client or create_llm_client(scenario="memory_extractor")
         payload = {
             "messages": [message.to_dict() for message in prepared.messages],
             "memory_catalog": [

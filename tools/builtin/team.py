@@ -39,7 +39,10 @@ def _message_data(message) -> dict:
 
 class TeamCreateInput(BaseModel):
     team_name: str | None = Field(default=None, description="团队名称,可选,缺省为 default")
-    creator_id: str | None = Field(default=None, description="创建者标识,可选")
+    creator_id: str | None = Field(
+        default=None,
+        description="兼容字段,系统使用当前运行身份,忽略调用方提交的值",
+    )
 
 class TeamCreateTool(BaseTool):
     name = "TeamCreate"
@@ -55,7 +58,7 @@ class TeamCreateTool(BaseTool):
             ctx.session_id,
             team_name=args.team_name or "default",
             creator_type="agent",  # 工具由大模型触发,创建者类型固定为 agent
-            creator_id=args.creator_id,
+            creator_id=ctx.principal_name or "lead",
         )
         return json.dumps(_team_data(team), ensure_ascii=False)
 
@@ -67,7 +70,7 @@ class TeamSpawnInput(BaseModel):
     name: str = Field(description="队友名称,会话内唯一")
     role: str = Field(description="队友角色描述")
     prompt: str = Field(description="队友的初始任务提示")
-    agent_type: str = Field(default="general_purpose", description="队友对应的子代理类型")
+    agent_type: str = Field(default="general-purpose", description="队友对应的子代理类型")
 
 
 class TeamSpawnTool(BaseTool):
@@ -87,7 +90,7 @@ class TeamSpawnTool(BaseTool):
             prompt=args.prompt,
             agent_type=args.agent_type,
             creator_type="agent",
-            creator_id=None,  # ToolContext 无创建者信息
+            creator_id=ctx.principal_name or "lead",
         )
         return json.dumps(_member_data(member), ensure_ascii=False)
 
@@ -123,7 +126,9 @@ _MessageType = Literal[
 
 
 class SendMessageInput(BaseModel):
-    sender: str = Field(description="发送方名称(队友名或 lead)")
+    sender: str = Field(
+        description="兼容字段,系统使用当前运行身份作为发送方,忽略调用方提交的值"
+    )
     recipient: str = Field(
         description='接收方名称;特殊值 "*" 表示广播给全体成员(自动排除 sender)'
     )
@@ -170,14 +175,16 @@ class SendMessageTool(BaseTool):
                     ensure_ascii=False,
                 )
             delivered = await service.broadcast(
-                ctx.session_id, sender=args.sender, content=args.content
+                ctx.session_id,
+                sender=ctx.principal_name or "lead",
+                content=args.content,
             )
             return json.dumps({"delivered": delivered}, ensure_ascii=False)
 
         # 单点发送分支:message_type 直接透传 type 值,握手类型即作为一条消息落库。
         message = await service.send_message(
             ctx.session_id,
-            sender=args.sender,
+            sender=ctx.principal_name or "lead",
             recipient=args.recipient,
             content=args.content,
             message_type=args.type,
@@ -188,7 +195,9 @@ class SendMessageTool(BaseTool):
 # ----- ReadInbox -----
 
 class ReadInboxInput(BaseModel):
-    recipient: str = Field(description="收件人名称(队友名或 lead),读取其未读消息")
+    recipient: str = Field(
+        description="兼容字段,系统只读取当前运行身份的收件箱,忽略调用方提交的值"
+    )
 
 
 class ReadInboxTool(BaseTool):
@@ -201,7 +210,7 @@ class ReadInboxTool(BaseTool):
 
     async def run(self, args: ReadInboxInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
-        messages = await service.read_inbox(ctx.session_id, args.recipient)
+        messages = await service.read_inbox(ctx.session_id, ctx.principal_name or "lead")
         return json.dumps([_message_data(m) for m in messages], ensure_ascii=False)
 
 

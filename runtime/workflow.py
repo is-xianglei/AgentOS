@@ -42,11 +42,14 @@ from runtime.execution import (
     lease_seconds,
     new_lease_owner,
 )
+from runtime.orchestrator import OrchestrationContext, Orchestrator
+from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from tools.subagents.definition import AgentType, SubAgentSpec
+from tools.registry import ToolRegistry
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
 
@@ -120,7 +123,7 @@ class OrchestrationResult:
     model: str | None = None
 
 
-class BaseOrchestrator:
+class BaseOrchestrator(Orchestrator):
     """三种编排器的公共骨架:成员配置加载、成员执行与最终文本推送。
 
     依赖全部以关键字传入,便于测试注入替身;子类只实现 run()。
@@ -137,6 +140,7 @@ class BaseOrchestrator:
         turn_id: UUID,
         workflow_id: int,
         members: Sequence[WorkflowRunMember],
+        context: OrchestrationContext | None = None,
     ) -> None:
         self.db = db
         self.bus = bus
@@ -146,6 +150,13 @@ class BaseOrchestrator:
         self.turn_id = turn_id
         self.workflow_id = workflow_id
         self.members = tuple(members)
+        self.context = context or OrchestrationContext(
+            run_id=turn_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            actor=ORCHESTRATOR_ACTOR,
+            bus=bus,
+        )
 
     async def run(self, user_content: str) -> OrchestrationResult:
         """执行编排并返回最终产出;最终文本由子类负责推送到 bus。"""
@@ -255,6 +266,18 @@ class BaseOrchestrator:
         member 阶段优先从 config 取 agent_id 与 Agent 原名;配置期失败没有 config,
         改用显式 agent_id,member_name 留空。
         """
+        # 编排上下文统一记录最近一个可观察游标和节点状态；后续接入持久化
+        # checkpoint 时只需替换上下文快照存储，不必改动三种控制流实现。
+        cursor = f"{phase.value}:{status.value}"
+        state_updates: dict[str, Any] = {}
+        if config is not None:
+            state_updates["last_member"] = {
+                "agent_id": config.agent_id,
+                "name": config.name,
+                "phase": phase.value,
+                "status": status.value,
+            }
+        self.context.update(cursor=cursor, state_updates=state_updates)
         await self.bus.emit(
             StreamEvent.workflow_progress(
                 ORCHESTRATOR_ACTOR,
@@ -457,15 +480,18 @@ class ParallelOrchestrator(BaseOrchestrator):
             user_content=user_content,
             member_outputs=member_outputs,
         )
-        # 汇总文本就是本轮最终回答,用装配器走既有 block/text_delta 事件让前端逐字渲染。
+        # 汇总文本就是本轮最终回答,统一经 AgentStep 走既有 block/text_delta 事件，
+        # 让 Workflow 汇总与主 Agent/SubAgent 使用同一个单步 LLM 原语。
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, self.session_id, turn_id=self.turn_id)
-        stream = self.llm.stream(
-            [{"role": "user", "content": prompt}],
-            system_prompt=PARALLEL_MERGE_SYSTEM_PROMPT,
+        step = AgentStep(self.llm, assembler, self.bus.emit)
+        step_result = await step.run(
+            StepRequest(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt=PARALLEL_MERGE_SYSTEM_PROMPT,
+                tool_registry=ToolRegistry([]),
+            )
         )
-        async for event in assembler.consume(stream):
-            await self.bus.emit(event)
-        text = assembler.last_result.text
+        text = step_result.text
         if not text:
             raise AgentException.message(
                 "并行编排汇总失败：LLM 未产出汇总文本",
@@ -596,6 +622,7 @@ class WorkflowRuntime:
         user_content: str,
         *,
         workflow_id: int,
+        model_options: dict[str, Any] | None = None,
     ) -> ExecutionHandle:
         """请求阶段准入:取/建会话 → 落用户消息 → 建 Turn → 认领租约,提交后启动后台编排。"""
         if self.user_id is None or self.workspace_id is None:
@@ -606,7 +633,12 @@ class WorkflowRuntime:
             self.user_id,
             self.workspace_id,
             workflow_id=workflow_id,
+            **({"model_options": model_options} if model_options else {}),
         )
+        if self.llm is None:
+            from runtime.model_selection import session_client
+            # 准入只验证配置，不将工作区客户端当作测试注入冻结给后台任务。
+            await session_client(self.db, session, "workflow")
         turn, _ = await self.session_service.start_turn(
             session,
             self.user_id,
@@ -750,6 +782,10 @@ class WorkflowRuntime:
             "workflow_id": workflow_id,
             "members": members,
         }
+        if self.llm is None:
+            from runtime.model_selection import session_client
+            session = await self.session_service.get_required(session_id)
+            self.llm, _ = await session_client(self.db, session, "workflow")
         if issubclass(orchestrator_cls, ParallelOrchestrator | LlmRoutingOrchestrator):
             return orchestrator_cls(llm=self.llm, **dependencies)
         return orchestrator_cls(**dependencies)

@@ -33,7 +33,11 @@ def _human_size(n: int) -> str:
 
 
 def _can_access_skill(name: str, ctx: ToolContext) -> bool:
-    return ctx.allowed_skill_names is None or name in ctx.allowed_skill_names
+    # 直接调用工具时 profile=None 仅为兼容旧测试和内部目录操作；正式运行时
+    # ToolService 会注入 profile，所有非 lead 身份都必须使用显式白名单。
+    if ctx.profile is None or ctx.profile == "lead":
+        return True
+    return ctx.allowed_skill_names is not None and name in ctx.allowed_skill_names
 
 
 # ---------------------------------------------------------------------------

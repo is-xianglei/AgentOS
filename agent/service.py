@@ -66,7 +66,10 @@ class AgentService:
     ) -> AgentRecord:
         await self._require_write_access(workspace_id, actor_user_id)
         await self._require_name_available(workspace_id, name)
-        normalized_tool_ids = await self.tool_catalog_service.require_bindable_tool_ids(tool_ids)
+        normalized_tool_ids = await self.tool_catalog_service.require_bindable_tool_ids(
+            tool_ids,
+            profile="user_agent",
+        )
         normalized_skill_ids = await self.skill_service.require_bindable_skill_ids(
             workspace_id,
             skill_ids,
@@ -160,7 +163,10 @@ class AgentService:
     ) -> AgentRecord:
         await self._require_write_access(workspace_id, actor_user_id)
         agent = await self._get_required_for_update(workspace_id, agent_id)
-        normalized_ids = await self.tool_catalog_service.require_bindable_tool_ids(tool_ids)
+        normalized_ids = await self.tool_catalog_service.require_bindable_tool_ids(
+            tool_ids,
+            profile="user_agent",
+        )
         await self.repo.replace_tool_bindings(agent.id, normalized_ids)
         return await self._get_required(workspace_id, agent.id)
 
@@ -195,7 +201,10 @@ class AgentService:
         agent = await self.require_runnable(agent_id, workspace_id)
         tool_ids = sorted(binding.tool_id for binding in agent.tool_bindings)
         skill_ids = sorted(binding.skill_id for binding in agent.skill_bindings)
-        tool_names = await self.tool_catalog_service.get_runtime_names(tool_ids)
+        tool_names = await self.tool_catalog_service.get_runtime_names(
+            tool_ids,
+            profile="user_agent",
+        )
         # skill_ids 保留全部绑定(含禁用),skill_names 只含已启用的,作为运行时可调用白名单。
         skill_names = await self.skill_service.get_enabled_names_by_ids(workspace_id, skill_ids)
         if skill_names:

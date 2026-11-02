@@ -53,6 +53,13 @@ class SessionRecord(Base):
         String(32), default="created", index=True, comment="会话状态"
     )
     model_name: Mapped[str | None] = mapped_column(String(120), nullable=True, comment="模型名称")
+    model_provider_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_providers.provider_id", ondelete="SET NULL"),
+        nullable=True,
+        comment="本会话指定的模型供应商ID",
+    )
+    mode_slug: Mapped[str] = mapped_column(String(20), default="standard", comment="对话模式")
+    thinking_effort: Mapped[str] = mapped_column(String(20), default="fast", comment="思考强度")
     system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True, comment="系统提示词")
     extra: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
