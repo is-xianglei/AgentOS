@@ -67,7 +67,7 @@ class TeamService:
         prompt: str | None = None,
         team_id: int | None = None,
     ) -> TeamMemberRecord:
-        """更新 teammate 运行时字段，统一校验会话和成员存在性。"""
+        """更新 teammate 运行时字段，统一校验会话和成员存在性；传 None 的字段保持不变。"""
         await self.session_service.get_required(session_id)
         if status is not None and status not in {"working", "idle", "shutdown"}:
             raise AgentException.message("成员运行状态无效")
@@ -98,18 +98,16 @@ class TeamService:
         self._validate_member_input(name, role)
         if await self.repo.get_member(session_id, name):
             raise AgentException.message("团队成员已存在")
-        member: TeamMemberRecord = await self.repo.create_member(session_id, name, role)
-        return member
+        return await self.repo.create_member(session_id, name, role)
 
     async def get_or_create_member(self, session_id: int, name: str, role: str) -> TeamMemberRecord:
-        """获取已有成员或创建新成员。"""
+        """获取已有成员或创建新成员；已有成员时不会更新其角色。"""
         await self.session_service.get_required(session_id)
         self._validate_member_input(name, role)
-        member: TeamMemberRecord = await self.repo.get_member(session_id, name)
+        member = await self.repo.get_member(session_id, name)
         if member is not None:
             return member
-        member = await self.repo.create_member(session_id, name, role)
-        return member
+        return await self.repo.create_member(session_id, name, role)
 
     async def update_member_status(
         self, session_id: int, name: str, status: str
@@ -118,11 +116,10 @@ class TeamService:
         await self.session_service.get_required(session_id)
         if status not in {"idle", "running", "failed"}:
             raise AgentException.message("成员状态无效")
-        member: TeamMemberRecord = await self.repo.get_member(session_id, name)
+        member = await self.repo.get_member(session_id, name)
         if member is None:
             raise AgentException.message("团队成员不存在")
-        updated: TeamMemberRecord = await self.repo.update_member_status(member, status)
-        return updated
+        return await self.repo.update_member_status(member, status)
 
     async def list_messages(self, session_id: int) -> list[TeamMessageRecord]:
         """查询指定会话的团队消息。"""
@@ -152,13 +149,14 @@ class TeamService:
         await self.session_service.get_required(session_id)
         if not content.strip():
             raise AgentException.message("消息内容不能为空")
+        # "lead" 是主代理，没有对应的成员记录，其余发送方都必须是已存在的成员。
         if sender != "lead" and await self.repo.get_member(session_id, sender) is None:
             raise AgentException.message("发送方不存在")
-        if recipient != "lead" and await self.repo.get_member(session_id, recipient) is None:
-            raise AgentException.message("接收方不存在")
+        await self._ensure_recipient(session_id, recipient)
+        # 调用方未指定消费实例时，由隔离配置决定是否把 task 消息绑定到当前实例。
         if consumer_instance_id is None:
             consumer_instance_id = outgoing_team_task_consumer_instance_id(message_type)
-        message: TeamMessageRecord = await self.repo.send_message(
+        return await self.repo.send_message(
             session_id,
             sender,
             recipient,
@@ -166,7 +164,6 @@ class TeamService:
             message_type,
             consumer_instance_id=consumer_instance_id,
         )
-        return message
 
     async def read_inbox(
         self,
@@ -177,11 +174,10 @@ class TeamService:
         """读取并标记收件箱消息为已读。"""
         await self.session_service.get_required(session_id)
         await self._ensure_recipient(session_id, recipient)
+        # 开启调试隔离时只能读到未绑定实例或绑定到当前实例的消息，避免多实例互相抢读。
         if consumer_instance_id is None and team_task_debug_isolation_enabled():
             consumer_instance_id = current_team_task_instance_id()
-        messages: list[TeamMessageRecord] = await self.repo.unread_messages(
-            session_id, recipient, consumer_instance_id
-        )
+        messages = await self.repo.unread_messages(session_id, recipient, consumer_instance_id)
         await self.repo.mark_read(messages)
         return messages
 
@@ -194,6 +190,7 @@ class TeamService:
         """只查看收件箱未读消息不标记已读。"""
         await self.session_service.get_required(session_id)
         await self._ensure_recipient(session_id, recipient)
+        # 实例过滤规则与 read_inbox 一致。
         if consumer_instance_id is None and team_task_debug_isolation_enabled():
             consumer_instance_id = current_team_task_instance_id()
         return await self.repo.unread_messages(session_id, recipient, consumer_instance_id)
@@ -251,20 +248,19 @@ class TeamService:
         与旧 update_member_status 的 {idle/running/failed} 校验互不干扰。
         """
         await self.session_service.get_required(session_id)
-        team: TeamRecord = await self.repo.get_or_create_team(
+        team = await self.repo.get_or_create_team(
             session_id,
             creator_type=creator_type,
             creator_id=creator_id,
         )
-        member: TeamMemberRecord = await self.get_or_create_member(session_id, name, role)
-        member = await self.repo.update_member_runtime(
+        member = await self.get_or_create_member(session_id, name, role)
+        return await self.repo.update_member_runtime(
             member,
             status="working",
             agent_type=agent_type,
             prompt=prompt,
             team_id=team.id,
         )
-        return member
 
     async def set_member_runtime_status(
         self, session_id: int, name: str, status: str
@@ -277,7 +273,7 @@ class TeamService:
         await self.session_service.get_required(session_id)
         if status not in {"working", "idle", "shutdown"}:
             raise AgentException.message("成员运行状态无效")
-        member: TeamMemberRecord = await self.repo.get_member(session_id, name)
+        member = await self.repo.get_member(session_id, name)
         if member is None:
             raise AgentException.message("团队成员不存在")
         return await self.repo.update_member_runtime(member, status=status)
@@ -287,7 +283,7 @@ class TeamService:
         await self.session_service.get_required(session_id)
         if not content.strip():
             raise AgentException.message("消息内容不能为空")
-        members: list[TeamMemberRecord] = await self.repo.list_members(session_id)
+        members = await self.repo.list_members(session_id)
         delivered = 0
         for member in members:
             if member.name == sender:

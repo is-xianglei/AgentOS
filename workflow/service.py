@@ -93,6 +93,7 @@ class WorkflowService:
         await self._require_write_access(workspace_id, actor_user_id)
         await self._require_name_available(workspace_id, name)
         normalized_members = await self._require_bindable_members(workspace_id, members)
+        # 名称预检查无法阻止并发创建同名 Workflow，由唯一索引兜底并转成 409。
         try:
             workflow = await self.repo.create(
                 workspace_id=workspace_id,
@@ -154,14 +155,17 @@ class WorkflowService:
                 updates["name"],
                 exclude_workflow_id=workflow.id,
             )
-        normalized_members = (
-            await self._require_bindable_members(workspace_id, members)
-            if members is not None
-            else None
-        )
+        # members 为 None 表示不调整成员；成员校验放在改字段之前，校验失败时 workflow 不被改动。
+        normalized_members: dict[int, int] | None = None
+        if members is not None:
+            normalized_members = await self._require_bindable_members(workspace_id, members)
 
+        # updates 只包含客户端显式提交的字段；mode 在库里存字符串，需要取枚举值。
         for field_name, value in updates.items():
-            setattr(workflow, field_name, value.value if isinstance(value, WorkflowMode) else value)
+            if isinstance(value, WorkflowMode):
+                value = value.value
+            setattr(workflow, field_name, value)
+        # 预检查之后仍可能有并发请求抢先占用同名，由唯一索引兜底并转成 409。
         try:
             await self.repo.update(workflow)
         except IntegrityError as exc:
@@ -198,11 +202,13 @@ class WorkflowService:
         这里只负责编排顺序，不重复查询 Agent。
         """
         workflow = await self.require_runnable(workflow_id, workspace_id)
+        # 关系声明里已有同样的 order_by，这里再排一次，不依赖加载方式。
         ordered = sorted(workflow.agents, key=lambda item: (item.sort_order, item.agent_id))
-        return tuple(
-            WorkflowRunMember(agent_id=item.agent_id, sort_order=item.sort_order)
-            for item in ordered
-        )
+        run_members: list[WorkflowRunMember] = []
+        for item in ordered:
+            member = WorkflowRunMember(agent_id=item.agent_id, sort_order=item.sort_order)
+            run_members.append(member)
+        return tuple(run_members)
 
     @staticmethod
     def list_modes() -> tuple[WorkflowModeMeta, ...]:
@@ -218,13 +224,19 @@ class WorkflowService:
         if not members:
             raise AgentException.message("Workflow至少需要绑定1个成员Agent")
         agent_ids = [member.agent_id for member in members]
-        duplicated = sorted({agent_id for agent_id in agent_ids if agent_ids.count(agent_id) > 1})
-        if duplicated:
+        seen_ids: set[int] = set()
+        duplicated_ids: set[int] = set()
+        for agent_id in agent_ids:
+            if agent_id in seen_ids:
+                duplicated_ids.add(agent_id)
+            seen_ids.add(agent_id)
+        if duplicated_ids:
             raise AgentException.message(
                 "同一Agent不能在Workflow中重复绑定",
-                {"agent_ids": duplicated},
+                {"agent_ids": sorted(duplicated_ids)},
             )
         await self.agent_service.require_bindable_agent_ids(workspace_id, agent_ids)
+        # 上面已排除重复 agent_id，转成字典不会丢成员。
         return {member.agent_id: member.sort_order for member in members}
 
     async def _get_required(self, workspace_id: int, workflow_id: int) -> WorkflowRecord:
@@ -238,6 +250,7 @@ class WorkflowService:
         workspace_id: int,
         workflow_id: int,
     ) -> WorkflowRecord:
+        """加行锁读取，串行化同一 Workflow 的并发更新、删除与成员替换。"""
         workflow = await self.repo.get_for_update(workspace_id, workflow_id)
         if workflow is None:
             raise AgentException.message("Workflow不存在", status_code=404)

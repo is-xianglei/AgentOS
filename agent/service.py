@@ -74,6 +74,7 @@ class AgentService:
             workspace_id,
             skill_ids,
         )
+        # 名称预检查无法阻止并发创建同名 Agent，由唯一索引兜底并转成 409。
         try:
             agent = await self.repo.create(
                 workspace_id=workspace_id,
@@ -136,8 +137,10 @@ class AgentService:
                 exclude_agent_id=agent.id,
             )
 
+        # updates 只包含客户端显式提交的字段，字段名与 AgentRecord 列名一致。
         for field_name, value in updates.items():
             setattr(agent, field_name, value)
+        # 预检查之后仍可能有并发请求抢先占用同名，由唯一索引兜底并转成 409。
         try:
             await self.repo.update(agent)
         except IntegrityError as exc:
@@ -207,6 +210,8 @@ class AgentService:
         )
         # skill_ids 保留全部绑定(含禁用),skill_names 只含已启用的,作为运行时可调用白名单。
         skill_names = await self.skill_service.get_enabled_names_by_ids(workspace_id, skill_ids)
+        # 有可用 Skill 时自动补上 Skill 系列工具，否则模型无法调用 Skill；
+        # 合并时去重并保持原有顺序。
         if skill_names:
             skill_tool_names = await self.tool_catalog_service.require_runtime_names(
                 ["Skill", "SkillResource", "SkillRun"]
@@ -233,10 +238,14 @@ class AgentService:
         agent_ids: list[int],
     ) -> list[int]:
         """校验Agent均存在且属于当前工作区，返回去重后的ID；供Workflow域绑定成员时复用。"""
+        # 去重但保留传入顺序，成员顺序由调用方决定。
         normalized = list(dict.fromkeys(agent_ids))
         records = await self.repo.list_by_ids(workspace_id, normalized)
         existing_ids = {record.id for record in records}
-        missing = [agent_id for agent_id in normalized if agent_id not in existing_ids]
+        missing: list[int] = []
+        for agent_id in normalized:
+            if agent_id not in existing_ids:
+                missing.append(agent_id)
         if missing:
             raise AgentException.message(
                 "绑定的Agent不存在",
@@ -256,6 +265,7 @@ class AgentService:
         workspace_id: int,
         agent_id: int,
     ) -> AgentRecord:
+        """加行锁读取，串行化同一 Agent 的并发更新、删除与绑定替换。"""
         agent = await self.repo.get_for_update(workspace_id, agent_id)
         if agent is None:
             raise AgentException.message("Agent不存在", status_code=404)

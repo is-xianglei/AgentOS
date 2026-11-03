@@ -64,6 +64,7 @@ async def _authorize_scope(
     user_id: int,
     workspace_id: int,
 ) -> int | None:
+    """按作用域校验参数与操作者权限，返回规则应绑定的 session_id（global 为 None）。"""
     if scope == "global":
         if session_id is not None:
             raise AgentException.message("scope=global 时不能提供 session_id")
@@ -109,7 +110,7 @@ async def list_rules(
         session_id=session_id,
         workspace_id=workspace_id,
     )
-    return ok([PermissionRuleResponse.model_validate(r) for r in rules], request)
+    return ok([PermissionRuleResponse.model_validate(rule) for rule in rules], request)
 
 
 @router.post(
@@ -158,6 +159,8 @@ async def delete_rule(
 ):
     service = PermissionService(db)
     rule = await service.get_required(rule_id)
+    # 其他工作区的规则按不存在处理（404），不暴露规则是否存在；
+    # 同工作区内 global 规则要求管理员，session 规则要求会话创建者。
     if rule.scope == "global":
         if rule.workspace_id != workspace_id:
             raise AgentException.message("权限规则不存在", status_code=404)

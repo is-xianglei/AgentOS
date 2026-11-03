@@ -12,7 +12,7 @@ class PermissionRuleCreateRequest(BaseModel):
     matcher: dict[str, Any] | None = Field(default=None, description="细化匹配条件(预留)")
 
     @model_validator(mode="after")
-    def _check_session(self) -> "PermissionRuleCreateRequest":
+    def _check_session(self) -> PermissionRuleCreateRequest:
         if self.scope == "session" and self.session_id is None:
             raise ValueError("scope=session 时必须提供 session_id")
         if self.scope == "global":

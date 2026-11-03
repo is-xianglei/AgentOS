@@ -81,6 +81,8 @@ class DepartmentRepository:
         department_id: int,
     ) -> list[DepartmentRecord]:
         """按从父部门到根部门的顺序查询全部祖先。"""
+        # 递归 CTE：起点是部门自身（depth=0），每轮沿 parent_id 向上找一层父部门。
+        # 已软删除的部门会截断向上的链路；结果去掉 depth=0 的起点。
         tree = (
             select(
                 DepartmentRecord.id.label("id"),
@@ -121,6 +123,8 @@ class DepartmentRepository:
         department_id: int,
     ) -> list[DepartmentRecord]:
         """按层级、排序值和名称查询全部子孙部门，不包含起始部门。"""
+        # 递归 CTE：起点是部门自身（depth=0），每轮找出 parent_id 指向上一层的子部门。
+        # 已软删除的部门不会再向下展开。
         tree = (
             select(
                 DepartmentRecord.id.label("id"),
@@ -177,6 +181,7 @@ class DepartmentRepository:
         return department
 
     async def delete(self, department: DepartmentRecord) -> None:
+        """软删除部门，记录保留在表中。"""
         department.is_deleted = True
         department.deleted_at = datetime.now(UTC)
         await self.db.flush()

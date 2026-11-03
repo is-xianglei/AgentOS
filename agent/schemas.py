@@ -28,6 +28,7 @@ class _AgentFields(BaseModel):
     @field_validator("model_name")
     @classmethod
     def normalize_model_name(cls, value: str | None) -> str | None:
+        # 空白字符串视为未指定模型，存为 None 使用系统默认模型。
         if value is None:
             return None
         value = value.strip()
@@ -70,6 +71,7 @@ class AgentUpdateRequest(BaseModel):
     def validate_changes(self) -> AgentUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("至少需要提供一个待更新字段")
+        # 这几个字段对应非空列，只能不传，不能显式传 null。
         for field_name in ("name", "system_prompt", "is_enabled"):
             if field_name in self.model_fields_set and getattr(self, field_name) is None:
                 raise ValueError(f"{field_name} 不能设置为空")

@@ -26,16 +26,16 @@ CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 
 def _require_current_workspace(workspace_id: int, current_workspace_id: int) -> None:
+    """路径中的工作区必须与 Token 中的可信工作区一致，防止越权访问其他工作区。"""
     if workspace_id != current_workspace_id:
         raise AgentException.message("路径工作区与当前工作区不一致", status_code=403)
 
 
 def _tree_response(node: DepartmentTreeNode) -> DepartmentTreeResponse:
+    """递归把 Service 返回的部门树节点转换为响应 Schema。"""
     department = DepartmentResponse.model_validate(node.department)
-    return DepartmentTreeResponse(
-        **department.model_dump(),
-        children=[_tree_response(child) for child in node.children],
-    )
+    children = [_tree_response(child) for child in node.children]
+    return DepartmentTreeResponse(**department.model_dump(), children=children)
 
 
 @router.post(
@@ -137,6 +137,7 @@ async def update_department(
     current_workspace_id: CurrentWorkspaceId,
 ):
     _require_current_workspace(workspace_id, current_workspace_id)
+    # 只传客户端显式提交的字段，显式提交 null 的可空字段会被清空。
     updates = cast(
         DepartmentUpdateFields,
         payload.model_dump(exclude_unset=True),
@@ -237,22 +238,30 @@ async def list_department_members(
         current_user.id,
         include_descendants=include_descendants,
     )
-    response = [
-        DepartmentMemberResponse(
-            id=member.id,
-            workspace_id=member.workspace_id,
-            user_id=member.user_id,
-            username=str(user["username"]),
-            email=str(user["email"]),
-            full_name=user["full_name"] if isinstance(user["full_name"], str) else None,
-            avatar_url=user["avatar_url"] if isinstance(user["avatar_url"], str) else None,
-            role=member.role,
-            department_id=member.department_id,
-            job_title=member.job_title,
-            joined_at=member.joined_at,
+    response: list[DepartmentMemberResponse] = []
+    for member, user in members:
+        # 用户信息来自跨域返回的 dict[str, object]，可空字段只接受字符串。
+        full_name = user["full_name"]
+        if not isinstance(full_name, str):
+            full_name = None
+        avatar_url = user["avatar_url"]
+        if not isinstance(avatar_url, str):
+            avatar_url = None
+        response.append(
+            DepartmentMemberResponse(
+                id=member.id,
+                workspace_id=member.workspace_id,
+                user_id=member.user_id,
+                username=str(user["username"]),
+                email=str(user["email"]),
+                full_name=full_name,
+                avatar_url=avatar_url,
+                role=member.role,
+                department_id=member.department_id,
+                job_title=member.job_title,
+                joined_at=member.joined_at,
+            )
         )
-        for member, user in members
-    ]
     return ok(response, request)
 
 

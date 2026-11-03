@@ -112,6 +112,7 @@ class DepartmentService:
         department = await self.get_required(workspace_id, department_id)
         await self._require_manager_or_roles(workspace_id, actor_user_id, department)
 
+        # updates 只包含客户端显式提交的字段；parent_id 为 None 表示移到顶级。
         if "parent_id" in updates:
             parent_id = updates["parent_id"]
             if parent_id == department.id:
@@ -120,6 +121,7 @@ class DepartmentService:
                 parent = await self.get_required(workspace_id, parent_id)
                 if not parent.is_active:
                     raise AgentException.message("不能移动到已停用部门下")
+                # 移到自己的子孙部门下会让部门树形成环。
                 descendants = await self.repo.list_descendants(workspace_id, department.id)
                 if parent_id in {item.id for item in descendants}:
                     raise AgentException.message("不能将部门移动到其子孙部门下")
@@ -147,6 +149,7 @@ class DepartmentService:
         department_id: int,
         actor_user_id: int,
     ) -> None:
+        """软删除部门，仅 owner 可操作；只能删除没有子部门且没有成员的叶子部门。"""
         await self.workspace_service.require_workspace_role(
             workspace_id,
             actor_user_id,
@@ -220,12 +223,14 @@ class DepartmentService:
             if not target.is_active:
                 raise AgentException.message("不能向已停用部门分配成员")
 
+        # owner/admin 可任意调整；部门负责人只能在自己负责的部门之间调动成员，
+        # 成员原部门和目标部门（存在的那些）都必须由当前操作者负责。
         if actor.role not in {"owner", "admin"}:
-            managed_department_ids = {
-                value
-                for value in (member.department_id, target.id if target is not None else None)
-                if value is not None
-            }
+            managed_department_ids: set[int] = set()
+            if member.department_id is not None:
+                managed_department_ids.add(member.department_id)
+            if target is not None:
+                managed_department_ids.add(target.id)
             if not managed_department_ids:
                 raise AgentException.message("无权管理该成员的部门归属", status_code=403)
             for managed_department_id in managed_department_ids:
@@ -246,12 +251,14 @@ class DepartmentService:
         department_ids: list[int],
     ) -> list[DepartmentRecord]:
         """供会话共享等跨域编排校验部门均属于工作区且处于启用状态。"""
+        # 去重但保留传入顺序，报错时 invalid_ids 的顺序与请求一致。
         unique_ids = list(dict.fromkeys(department_ids))
         departments = await self.repo.list_by_ids(workspace_id, unique_ids)
-        found_ids = {department.id for department in departments if department.is_active}
-        invalid_ids = [
-            department_id for department_id in unique_ids if department_id not in found_ids
-        ]
+        active_ids = {department.id for department in departments if department.is_active}
+        invalid_ids: list[int] = []
+        for department_id in unique_ids:
+            if department_id not in active_ids:
+                invalid_ids.append(department_id)
         if invalid_ids:
             raise AgentException.message(
                 "共享目标包含无效部门",
@@ -280,7 +287,12 @@ class DepartmentService:
         if department is None or not department.is_active:
             return []
         ancestors = await self.repo.list_ancestors(workspace_id, department.id)
-        return [department.id, *(item.id for item in ancestors if item.is_active)]
+        # 停用的祖先自身不计入范围，但不截断更上层的祖先。
+        scope_ids = [department.id]
+        for ancestor in ancestors:
+            if ancestor.is_active:
+                scope_ids.append(ancestor.id)
+        return scope_ids
 
     async def is_department_in_shared_departments(
         self,
@@ -331,27 +343,33 @@ class DepartmentService:
         self,
         departments: list[DepartmentRecord],
     ) -> tuple[DepartmentTreeNode, ...]:
-        by_id = {department.id: department for department in departments}
-        children: dict[int | None, list[DepartmentRecord]] = {}
+        """按 parent_id 把平铺列表组装成树，保留列表原有的排序。"""
+        department_ids = {department.id for department in departments}
+        # 父部门不在列表中（如已软删除）的部门挂到根节点（键为 None）下。
+        children_by_parent: dict[int | None, list[DepartmentRecord]] = {}
         for department in departments:
-            parent_id = department.parent_id if department.parent_id in by_id else None
-            children.setdefault(parent_id, []).append(department)
+            parent_id = department.parent_id
+            if parent_id not in department_ids:
+                parent_id = None
+            children_by_parent.setdefault(parent_id, []).append(department)
 
         visited: set[int] = set()
 
         def build(department: DepartmentRecord, path: frozenset[int]) -> DepartmentTreeNode:
+            # path 是从根到当前节点的部门 ID，重复出现说明存在环。
             if department.id in path:
                 raise AgentException.message("部门层级存在循环，无法生成部门树")
             visited.add(department.id)
             next_path = path | {department.id}
-            return DepartmentTreeNode(
-                department=department,
-                children=tuple(
-                    build(child, next_path) for child in children.get(department.id, [])
-                ),
-            )
+            child_nodes: list[DepartmentTreeNode] = []
+            for child in children_by_parent.get(department.id, []):
+                child_nodes.append(build(child, next_path))
+            return DepartmentTreeNode(department=department, children=tuple(child_nodes))
 
-        roots = tuple(build(root, frozenset()) for root in children.get(None, []))
+        root_nodes: list[DepartmentTreeNode] = []
+        for root in children_by_parent.get(None, []):
+            root_nodes.append(build(root, frozenset()))
+        # 环上的部门互为父子，从根出发永远到达不了，用访问数量兜底检测。
         if len(visited) != len(departments):
             raise AgentException.message("部门层级存在循环，无法生成部门树")
-        return roots
+        return tuple(root_nodes)

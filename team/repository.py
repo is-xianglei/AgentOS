@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +7,8 @@ from team.models import TeamMemberRecord, TeamMessageRecord, TeamRecord
 
 
 class TeamRepository:
+    """团队域持久化：团队、团队成员与成员间消息。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -83,6 +85,10 @@ class TeamRepository:
         recipient: str,
         consumer_instance_id: str | None = None,
     ) -> list[TeamMessageRecord]:
+        """按 ID 升序读取未读消息。
+
+        未指定消费实例时只读未绑定实例的消息；指定后再加上绑定到该实例的消息。
+        """
         conditions = [
             TeamMessageRecord.session_id == session_id,
             TeamMessageRecord.recipient == recipient,
@@ -105,7 +111,8 @@ class TeamRepository:
         return list(await self.db.scalars(stmt))
 
     async def mark_read(self, messages: list[TeamMessageRecord]) -> None:
-        now = datetime.now(timezone.utc)
+        """同一批消息使用相同的读取时间。"""
+        now = datetime.now(UTC)
         for message in messages:
             message.read_at = now
         await self.db.flush()
@@ -171,6 +178,7 @@ class TeamRepository:
         prompt: str | None = None,
         team_id: int | None = None,
     ) -> TeamMemberRecord:
+        """只更新传入了非 None 值的字段。"""
         if status is not None:
             member.status = status
         if agent_type is not None:

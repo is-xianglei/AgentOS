@@ -34,10 +34,14 @@ def current_team_task_instance_id() -> str:
     ctx_value = _instance_id_var.get()
     if ctx_value:
         return ctx_value
-    return (settings.instance_id or "").strip() or _PROCESS_INSTANCE_ID
+    configured_id = (settings.instance_id or "").strip()
+    if configured_id:
+        return configured_id
+    return _PROCESS_INSTANCE_ID
 
 
 def outgoing_team_task_consumer_instance_id(message_type: str) -> str | None:
+    """开启调试隔离时，task 消息绑定到当前实例；其他消息不绑定，任何实例都能消费。"""
     if message_type != "task" or not team_task_debug_isolation_enabled():
         return None
     return current_team_task_instance_id()

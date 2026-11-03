@@ -35,6 +35,8 @@ BUILTIN_AGENT_DEFAULTS: dict[tuple[str, str], Behavior] = {
 
 
 class PermissionService:
+    """工具调用的 allow / ask / deny 判定与权限规则维护。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
         self.repo = PermissionRepository(db)
@@ -45,7 +47,9 @@ class PermissionService:
             builtin = BUILTIN_AGENT_DEFAULTS.get((agent_type, tool_name))
             if builtin is not None:
                 return builtin
-        return DEFAULT_ASK if get_tool_policy(tool_name).requires_approval else DEFAULT_ALLOW
+        if get_tool_policy(tool_name).requires_approval:
+            return DEFAULT_ASK
+        return DEFAULT_ALLOW
 
     async def evaluate(
         self,
@@ -63,6 +67,7 @@ class PermissionService:
 
         workspace_id 是 global 规则的租户边界；未提供时不会读取任何 global 规则。
         """
+        # 按优先级逐层查找，命中即返回；会话级规则命中时不会再查询 global 规则。
         session_rule = await self.repo.find_match(
             "session",
             session_id,
@@ -130,9 +135,9 @@ class PermissionService:
         matcher: dict[str, Any] | None = None,
         workspace_id: int | None = None,
     ) -> PermissionRuleRecord:
-        """用户手动新增或更新一条规则,并提交事务。"""
+        """用户手动新增或更新一条规则；只 flush，提交交给请求边界统一处理。"""
         target_session = session_id if scope == "session" else None
-        rule: PermissionRuleRecord = await self.repo.upsert(
+        return await self.repo.upsert(
             scope=scope,
             session_id=target_session,
             tool_name=tool_name,
@@ -141,7 +146,6 @@ class PermissionService:
             matcher=matcher,
             workspace_id=workspace_id,
         )
-        return rule
 
     async def upsert_agent_rule(
         self,
@@ -166,7 +170,7 @@ class PermissionService:
 
     async def delete_rule(self, rule_id: int) -> int:
         """删除一条规则;规则不存在时抛 AgentException。提交交给请求边界统一处理。"""
-        deleted: int = await self.repo.delete(rule_id)
+        deleted = await self.repo.delete(rule_id)
         if deleted == 0:
             raise AgentException.message("权限规则不存在")
         return deleted

@@ -21,6 +21,7 @@ class AgentRepository:
     def _with_bindings(
         stmt: Select[tuple[AgentRecord]],
     ) -> Select[tuple[AgentRecord]]:
+        """预加载工具与 Skill 绑定，避免异步会话中访问关系时触发懒加载。"""
         return stmt.options(
             selectinload(AgentRecord.tool_bindings),
             selectinload(AgentRecord.skill_bindings),
@@ -52,6 +53,7 @@ class AgentRepository:
         return record
 
     async def get(self, workspace_id: int, agent_id: int) -> AgentRecord | None:
+        # populate_existing 让同一会话里刚替换过的绑定重新加载，不复用身份映射里的旧集合。
         stmt = self._with_bindings(
             select(AgentRecord).where(
                 AgentRecord.id == agent_id,
@@ -132,6 +134,7 @@ class AgentRepository:
         return record
 
     async def soft_delete(self, record: AgentRecord) -> None:
+        """软删除 Agent，并用批量 UPDATE 同时软删除它的工具与 Skill 绑定。"""
         now = datetime.now(UTC)
         record.is_deleted = True
         record.deleted_at = now
@@ -184,7 +187,9 @@ class AgentRepository:
         workspace_id: int,
         skill_id: int,
     ) -> None:
+        """软删除当前工作区内所有 Agent 对该 Skill 的绑定。"""
         now = datetime.now(UTC)
+        # 子查询把范围限定在当前工作区，避免误删其他工作区的绑定。
         agent_ids = select(AgentRecord.id).where(
             AgentRecord.workspace_id == workspace_id,
             AgentRecord.is_deleted.is_(False),
@@ -205,6 +210,8 @@ class AgentRepository:
         model: type[BindingRecord],
         agent_id: int,
     ) -> list[BindingRecord]:
+        # 连同已软删除的绑定一起读出：(agent_id, 目标 ID) 有唯一约束，
+        # 重新绑定时只能恢复旧行，不能再插入新行。
         stmt = (
             select(model)
             .where(model.agent_id == agent_id)
@@ -220,6 +227,7 @@ class AgentRepository:
         target_attr: str,
         create: Callable[[int], BindingRecord],
     ) -> None:
+        """把绑定全量替换为 target_ids：目标内的恢复或新建，目标外的软删除。"""
         desired = set(target_ids)
         existing_by_target = {getattr(item, target_attr): item for item in existing}
         now = datetime.now(UTC)
@@ -232,11 +240,10 @@ class AgentRepository:
                 item.is_deleted = True
                 item.deleted_at = now
 
-        new_records = [
-            create(target_id)
-            for target_id in desired
-            if target_id not in existing_by_target
-        ]
+        new_records: list[BindingRecord] = []
+        for target_id in desired:
+            if target_id not in existing_by_target:
+                new_records.append(create(target_id))
         if new_records:
             self.db.add_all(new_records)
         await self.db.flush()

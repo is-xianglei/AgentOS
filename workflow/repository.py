@@ -46,6 +46,7 @@ class WorkflowRepository:
         return record
 
     async def get(self, workspace_id: int, workflow_id: int) -> WorkflowRecord | None:
+        # populate_existing 让同一会话里刚替换过的成员重新加载，不复用身份映射里的旧集合。
         stmt = self._with_members(
             select(WorkflowRecord).where(
                 WorkflowRecord.id == workflow_id,
@@ -121,6 +122,7 @@ class WorkflowRepository:
         return record
 
     async def soft_delete(self, record: WorkflowRecord) -> None:
+        """软删除 Workflow，并用批量 UPDATE 同时软删除它的成员绑定。"""
         now = datetime.now(UTC)
         record.is_deleted = True
         record.deleted_at = now
@@ -162,11 +164,17 @@ class WorkflowRepository:
                 item.is_deleted = True
                 item.deleted_at = now
 
-        new_records = [
-            WorkflowAgentRecord(workflow_id=workflow_id, agent_id=agent_id, sort_order=sort_order)
-            for agent_id, sort_order in members.items()
-            if agent_id not in existing_by_agent
-        ]
+        new_records: list[WorkflowAgentRecord] = []
+        for agent_id, sort_order in members.items():
+            if agent_id in existing_by_agent:
+                continue
+            new_records.append(
+                WorkflowAgentRecord(
+                    workflow_id=workflow_id,
+                    agent_id=agent_id,
+                    sort_order=sort_order,
+                )
+            )
         if new_records:
             self.db.add_all(new_records)
         await self.db.flush()

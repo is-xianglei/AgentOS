@@ -25,13 +25,11 @@ CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 
 def _agent_response(record: AgentRecord) -> AgentResponse:
+    """ORM 上只有绑定关系，响应里的 tool_ids / skill_ids 需要从绑定中取出并排序。"""
     response = AgentResponse.model_validate(record)
-    return response.model_copy(
-        update={
-            "tool_ids": sorted(binding.tool_id for binding in record.tool_bindings),
-            "skill_ids": sorted(binding.skill_id for binding in record.skill_bindings),
-        }
-    )
+    tool_ids = sorted(binding.tool_id for binding in record.tool_bindings)
+    skill_ids = sorted(binding.skill_id for binding in record.skill_bindings)
+    return response.model_copy(update={"tool_ids": tool_ids, "skill_ids": skill_ids})
 
 
 @router.post(
@@ -77,15 +75,13 @@ async def list_agents(
         limit=limit,
         offset=offset,
     )
-    return ok(
-        AgentListResponse(
-            items=[_agent_response(record) for record in page.items],
-            total=page.total,
-            limit=page.limit,
-            offset=page.offset,
-        ),
-        request,
+    response = AgentListResponse(
+        items=[_agent_response(record) for record in page.items],
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
     )
+    return ok(response, request)
 
 
 @router.get(

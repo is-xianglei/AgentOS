@@ -18,6 +18,7 @@ class WorkflowAgentItem(BaseModel):
 
 
 def _require_unique_agents(items: list[WorkflowAgentItem]) -> list[WorkflowAgentItem]:
+    """请求层先拒绝重复成员（返回 422），Service 层仍会再校验一次。"""
     seen: set[int] = set()
     duplicated: list[int] = []
     for item in items:
@@ -94,6 +95,7 @@ class WorkflowUpdateRequest(BaseModel):
     def validate_changes(self) -> WorkflowUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("至少需要提供一个待更新字段")
+        # 这几个字段只能不传，不能显式传 null；agents 传 null 也不表示清空成员。
         for field_name in ("name", "mode", "is_enabled", "agents"):
             if field_name in self.model_fields_set and getattr(self, field_name) is None:
                 raise ValueError(f"{field_name} 不能设置为空")

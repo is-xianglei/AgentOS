@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import and_, select, update
@@ -12,10 +12,14 @@ def matcher_agent_type(matcher: dict[str, Any] | None) -> str | None:
     if not matcher:
         return None
     value = matcher.get("agent_type")
-    return value if isinstance(value, str) and value else None
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 class PermissionRepository:
+    """工具权限规则持久化。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -61,8 +65,8 @@ class PermissionRepository:
             conditions.append(PermissionRuleRecord.session_id.is_(None))
         else:
             conditions.append(PermissionRuleRecord.session_id == session_id)
-        # Global rules are tenant-scoped. An omitted workspace_id deliberately
-        # matches no global row, so legacy callers cannot read another tenant's rule.
+        # global 规则按工作区隔离：未传 workspace_id 时故意不匹配任何 global 规则，
+        # 防止旧调用方读到其他租户的规则。session 规则已由会话限定，工作区条件只在传入时追加。
         if scope == "global":
             if workspace_id is None:
                 return []
@@ -94,11 +98,13 @@ class PermissionRepository:
             tool_name,
             workspace_id,
         )
+        # 候选已按 id 倒序：命中的定向规则立即返回；通用规则只记下最新的一条作为兜底。
         fallback: PermissionRuleRecord | None = None
         for rule in candidates:
             scoped = matcher_agent_type(rule.matcher)
             if scoped is None:
-                fallback = fallback or rule
+                if fallback is None:
+                    fallback = rule
             elif agent_type is not None and scoped == agent_type:
                 return rule
         return fallback
@@ -178,7 +184,7 @@ class PermissionRepository:
                 PermissionRuleRecord.id == rule_id,
                 PermissionRuleRecord.is_deleted.is_(False),
             )
-            .values(is_deleted=True, deleted_at=datetime.now(timezone.utc))
+            .values(is_deleted=True, deleted_at=datetime.now(UTC))
         )
         result = await self.db.execute(stmt)
         await self.db.flush()

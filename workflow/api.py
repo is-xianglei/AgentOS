@@ -26,26 +26,30 @@ CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 
 def _member_inputs(items: list[WorkflowAgentItem]) -> list[WorkflowMemberInput]:
+    """把请求 Schema 中的成员转换为 Service 的输入值对象。"""
     return [
         WorkflowMemberInput(agent_id=item.agent_id, sort_order=item.sort_order) for item in items
     ]
 
 
 def _workflow_response(record: WorkflowRecord) -> WorkflowResponse:
+    """组装响应，成员按 (sort_order, agent_id) 升序并带上 Agent 名称。"""
     response = WorkflowResponse.model_validate(record)
     members = sorted(record.agents, key=lambda item: (item.sort_order, item.agent_id))
-    return response.model_copy(
-        update={
-            "agents": [
-                WorkflowAgentResponse(
-                    agent_id=item.agent_id,
-                    agent_name=item.agent.name if item.agent is not None else None,
-                    sort_order=item.sort_order,
-                )
-                for item in members
-            ],
-        }
-    )
+    agents: list[WorkflowAgentResponse] = []
+    for item in members:
+        # 成员 Agent 没有加载出来时（如已被软删除）名称留空。
+        agent_name = None
+        if item.agent is not None:
+            agent_name = item.agent.name
+        agents.append(
+            WorkflowAgentResponse(
+                agent_id=item.agent_id,
+                agent_name=agent_name,
+                sort_order=item.sort_order,
+            )
+        )
+    return response.model_copy(update={"agents": agents})
 
 
 @router.post(
@@ -150,16 +154,20 @@ async def update_workflow(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
+    # 普通字段只传客户端显式提交的；成员单独传，未提交 agents 时不调整成员。
     updates = cast(
         WorkflowUpdateFields,
         payload.model_dump(exclude_unset=True, exclude={"agents"}),
     )
+    members = None
+    if payload.agents is not None:
+        members = _member_inputs(payload.agents)
     record = await WorkflowService(db).update_workflow(
         workspace_id,
         workflow_id,
         current_user.id,
         updates,
-        members=_member_inputs(payload.agents) if payload.agents is not None else None,
+        members=members,
     )
     return ok(_workflow_response(record), request)
 

@@ -32,6 +32,7 @@ class DepartmentUpdateRequest(BaseModel):
     def validate_changes(self) -> DepartmentUpdateRequest:
         if not self.model_fields_set:
             raise ValueError("至少需要提供一个待更新字段")
+        # 这几个字段对应非空列，只能不传，不能显式传 null。
         for field_name in ("name", "sort_order", "is_active"):
             if field_name in self.model_fields_set and getattr(self, field_name) is None:
                 raise ValueError(f"{field_name} 不能设置为空")

@@ -7,6 +7,8 @@ from team.models import SubAgentRunRecord
 
 
 class SubAgentRunRepository:
+    """子代理运行记录持久化：创建时为 running，结束时转为 succeeded 或 failed。"""
+
     def __init__(self, db: AsyncSession):
         self.db = db
 
