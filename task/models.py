@@ -1,16 +1,15 @@
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.ext.mutable import MutableList
 from sqlalchemy.orm import Mapped, mapped_column
 
-from database.base import Base
-from database.base import json_type
+from database.base import Base, json_type
 
 
 class TaskRecord(Base):
     __tablename__ = "tasks"
-    __table_args__ = {"comment": "会话任务记录"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "会话任务记录"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="任务ID")
     session_id: Mapped[int] = mapped_column(

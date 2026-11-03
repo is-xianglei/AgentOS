@@ -32,7 +32,7 @@ class PromptContext:
         memory_catalog: str | None = None,
         cwd: str | None = None,
         today: date | None = None,
-    ) -> "PromptContext":
+    ) -> PromptContext:
         """从当前运行态构造；cwd 与 today 默认取进程真实状态。"""
         return cls(
             cwd=cwd if cwd is not None else str(Path.cwd()),

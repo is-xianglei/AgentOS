@@ -45,6 +45,7 @@ def compose_lead_blocks(ctx: PromptContext) -> list[PromptBlock]:
     （供同一 turn 内多轮工具迭代复用完整 system）。断点如何落成各家 SDK
     形状由客户端编码决定，不支持缓存的 provider 忽略该标志。
     """
+    # 段文案多以换行结尾（如 LEAD_SYSTEM_PROMPT），拼接前逐段 strip，保证段间恰好一个空行。
     stable = "\n\n".join(section.strip() for section in _stable_sections(ctx))
     blocks: list[PromptBlock] = [PromptBlock(text=stable, cache_breakpoint=True)]
     volatile = _volatile_sections(ctx)

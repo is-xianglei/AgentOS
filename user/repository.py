@@ -65,6 +65,7 @@ class UserRepository:
         return list(await self.db.scalars(stmt))
 
     async def update(self, user: UserRecord) -> UserRecord:
+        """持久化调用方已在实体上做的修改，并刷新 updated_at 等数据库生成的列。"""
         await self.db.flush()
         await self.db.refresh(user)
         return user

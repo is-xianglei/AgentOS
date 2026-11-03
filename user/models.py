@@ -8,8 +8,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database.base import Base, json_type
 
 if TYPE_CHECKING:
-    from workspace.models import WorkspaceMemberRecord
     from session.models import SessionRecord
+    from workspace.models import WorkspaceMemberRecord
 
 
 class UserRecord(Base):

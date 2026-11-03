@@ -97,8 +97,8 @@ class HookRegistry:
     def clear(self, event: HookEvent | None = None) -> None:
         """清空回调(不传 event 清全部)。主要供测试重置用。"""
         if event is None:
-            for e in self._hooks:
-                self._hooks[e] = []
+            for hook_event in self._hooks:
+                self._hooks[hook_event] = []
         else:
             self._hooks[event] = []
 
@@ -111,6 +111,8 @@ class HookRegistry:
         outcomes: list[HookOutcome] = []
         for callback in self._hooks[ctx.event]:
             callback_name = getattr(callback, "__qualname__", repr(callback))
+            # 单个回调最多等 60 秒，超时会被取消并跳过。只捕获 Exception，
+            # 外层取消产生的 CancelledError 属于 BaseException，会照常向上传播。
             try:
                 result = await asyncio.wait_for(callback(ctx), timeout=60)
             except TimeoutError:

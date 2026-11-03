@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
     if settings.create_tables:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+    # 启动阶段不经过 get_db，内置工具目录同步自行提交；失败则回滚并中止启动。
     async with AsyncSessionLocal() as db:
         try:
             await ToolCatalogService(db).sync_builtins()
@@ -57,6 +59,7 @@ def create_app() -> FastAPI:
     setup_logging()
     register_builtin_hooks()
     app = FastAPI(title="AgentOS API", version="0.1.0", lifespan=lifespan)
+    # 后注册的中间件在外层：请求先经 request_context_middleware 生成 request_id，再进入 CORS。
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -71,10 +74,8 @@ def create_app() -> FastAPI:
     return app
 
 
-import uvicorn
+# 模块级 app 供 `uvicorn main:app` 和测试导入；直接运行本文件时用它启动开发服务。
+app = create_app()
 
 if __name__ == "__main__":
-    app = create_app()
     uvicorn.run(app, host="0.0.0.0", port=8000)
-else:
-    app = create_app()

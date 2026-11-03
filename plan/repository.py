@@ -17,6 +17,7 @@ class PlanRepository:
         *,
         for_update: bool = False,
     ) -> SessionPlanRecord | None:
+        """查询会话进行中的计划；for_update 时加行锁，串行化同一计划的并发写入与审批。"""
         stmt = select(SessionPlanRecord).where(
             SessionPlanRecord.session_id == session_id,
             SessionPlanRecord.status == "active",
@@ -72,6 +73,7 @@ class PlanRepository:
         feedback: str | None,
         edited_plan: str | None,
     ) -> SessionPlanRecord:
+        """记录用户反馈；用户改过正文时同时更新正文，内容未变则不递增版本号。"""
         if edited_plan is not None and edited_plan != record.content:
             record.content = edited_plan
             record.version += 1
@@ -89,7 +91,9 @@ class PlanRepository:
         feedback: str | None,
         edited_plan: str | None,
     ) -> SessionPlanRecord:
+        """批准退出 Plan Mode：先按拒绝时的规则合入反馈与改稿，再记录批准信息。"""
         await self.record_feedback(record, feedback, edited_plan)
+        # 批准即退出，两个时间点取同一时刻。
         now = datetime.now(UTC)
         record.status = "approved"
         record.exited_turn_id = turn_id

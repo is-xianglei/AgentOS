@@ -1,7 +1,7 @@
 """内建 hook 实现与装配。
 
 这里写具体的 hook 回调,并通过 register_builtin_hooks 把它们挂到全局注册表。
-业务方新增 hook 在本文件追加回调 + 在 register_builtin_hooks 里追加一行 register 即可
+业务方新增 hook 在本文件追加回调 + 在 register_builtin_hooks 里追加一行 register 即可。
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from tools.subagents.trigger import assess, compose_hint
 logger = logging.getLogger(__name__)
 
 
+# 以下四个回调是各事件点的默认挂载位，目前只打 debug 日志、不改变流程。
 async def user_prompt_submit(ctx: HookContext) -> HookOutcome | None:
     logger.debug("用户已提交消息", extra={"session_id": ctx.session_id})
     return None
@@ -77,14 +78,11 @@ def register_builtin_hooks(registry: HookRegistry | None = None) -> None:
 
     这里显式注册即"配置":业务方新增 hook 在此追加 register 调用即可。
     """
-    registry = registry or get_hook_registry()
-    # 用户输入后
+    if registry is None:
+        registry = get_hook_registry()
     registry.register(HookEvent.USER_PROMPT_SUBMIT, user_prompt_submit)
-    # 工具执行前
     registry.register(HookEvent.PRE_TOOL_USE, pre_tool_use)
-    # 工具执行后
     registry.register(HookEvent.POST_TOOL_USE, post_tool_use)
-    # 对话结束时
+    # 同一事件按注册顺序执行：先跑占位 stop，再判断是否需要补一次独立验收。
     registry.register(HookEvent.STOP, stop)
-    # 对话结束时:非平凡改动补一次独立验收(阈值判定见 tools/subagents/trigger.py)
     registry.register(HookEvent.STOP, verification_trigger)

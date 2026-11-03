@@ -8,7 +8,7 @@ from user.repository import UserRepository
 
 
 class _Unset:
-    pass
+    """参数哨兵：区分“未传”与“显式传 None”，便于 PATCH 语义把字段清空。"""
 
 
 UNSET = _Unset()
@@ -34,13 +34,11 @@ class UserService:
         password: str,
         full_name: str | None = None,
     ) -> UserRecord:
-        """创建用户"""
-        # 检查用户名是否已存在
+        """管理员创建用户，用户名和邮箱都必须未被占用。"""
         existing_user = await self.repo.get_by_username(username)
         if existing_user:
             raise AgentException.message("用户名已存在")
 
-        # 检查邮箱是否已存在
         existing_email = await self.repo.get_by_email(email)
         if existing_email:
             raise AgentException.message("邮箱已被注册")
@@ -84,7 +82,7 @@ class UserService:
         phone: str | None | _Unset = UNSET,
         preferences: dict | None | _Unset = UNSET,
     ) -> UserRecord:
-        """更新用户信息"""
+        """更新用户资料：未传的字段保持不变，显式传 None 表示清空。"""
         user = await self.get_user(user_id)
 
         if not isinstance(full_name, _Unset):
@@ -94,6 +92,7 @@ class UserService:
         if not isinstance(phone, _Unset):
             user.phone = phone
         if not isinstance(preferences, _Unset):
+            # preferences 列不允许为空，清空时存成空字典。
             user.preferences = preferences or {}
 
         await self.repo.update(user)
@@ -102,7 +101,7 @@ class UserService:
     async def change_password(
         self, user_id: int, old_password: str, new_password: str
     ) -> UserRecord:
-        """修改密码"""
+        """修改密码，必须先校验旧密码；管理员代改他人密码时同样要求旧密码。"""
         user = await self.get_user(user_id)
 
         if not self._verify_password(old_password, user.password):
@@ -118,7 +117,7 @@ class UserService:
         await self.repo.delete(user)
 
     async def authenticate(self, username: str, password: str) -> UserRecord | None:
-        """认证用户"""
+        """按用户名和密码认证：用户不存在或密码错误返回 None，已停用则直接报错。"""
         user = await self.repo.get_by_username(username)
         if not user or user.is_deleted:
             return None

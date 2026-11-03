@@ -34,5 +34,8 @@ async def get_session_plan(
     if not await session_service.check_access(session, current_user.id, workspace_id):
         raise AgentException.message("无权限访问该会话", status_code=403)
 
+    # 会话从未进入过 Plan Mode 时返回 data=null。
     plan = await PlanService(db).get_latest(session_id)
-    return ok(SessionPlanResponse.model_validate(plan) if plan is not None else None, request)
+    if plan is None:
+        return ok(None, request)
+    return ok(SessionPlanResponse.model_validate(plan), request)

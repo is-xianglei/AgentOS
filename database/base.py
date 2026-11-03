@@ -14,6 +14,10 @@ def json_type() -> JSONB:
 
 
 class Base(DeclarativeBase):
+    """全部 ORM 实体的基类，统一提供审计时间与软删除字段。
+
+    sort_order 取 100 起，让这四列排在各表自有列之后；软删除的读过滤见 database/engine.py。
+    """
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

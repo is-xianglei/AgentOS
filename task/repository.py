@@ -9,7 +9,11 @@ class TaskRepository:
         self.db = db
 
     async def list_by_session(self, session_id: int) -> list[TaskRecord]:
-        stmt = select(TaskRecord).where(TaskRecord.session_id == session_id).order_by(TaskRecord.id)
+        stmt = (
+            select(TaskRecord)
+            .where(TaskRecord.session_id == session_id)
+            .order_by(TaskRecord.id)
+        )
         return list(await self.db.scalars(stmt))
 
     async def create(
@@ -73,6 +77,7 @@ class TaskRepository:
         return task
 
     async def remove_blocker_from_others(self, session_id: int, blocker_id: int) -> None:
+        """任务完成后，把它从本会话其他任务的 blocked_by 中移除。"""
         for task in await self.list_by_session(session_id):
             if blocker_id in task.blocked_by:
                 task.blocked_by = [item for item in task.blocked_by if item != blocker_id]
@@ -80,7 +85,7 @@ class TaskRepository:
 
     # ----- 任务认领(多实例安全) -----
     # 供 team 域子代理认领任务;原先写在 team repository 里直接操作本域表,
-    # 现收归本域,team 侧改为经 TaskRepository 调用。
+    # 现收归本域,team 侧经 TaskService 转发调用。
 
     async def list_claimable_tasks(self, session_id: int) -> list[TaskRecord]:
         """查本会话可认领的任务: 待处理、无负责人、无阻塞。"""

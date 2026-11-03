@@ -66,7 +66,7 @@ class TaskService:
         owner: str = "agent",
         blocked_by: list[int] | None = None,
     ) -> TaskRecord:
-        """创建任务。"""
+        """创建任务，初始状态固定为 pending。"""
         await self.session_service.get_required(session_id)
         self._validate_status("pending")
         normalized_blocked_by: list[int] = await self._validate_blocked_by(
@@ -94,9 +94,9 @@ class TaskService:
         add_blocked_by: list[int] | None = None,
         remove_blocked_by: list[int] | None = None,
     ) -> TaskRecord:
-        """更新任务字段。"""
+        """更新任务字段，传 None 的字段保持不变；任务完成时自动解除它对其他任务的阻塞。"""
         await self.session_service.get_required(session_id)
-        task: TaskRecord = await self.repo.get(session_id, task_id)
+        task = await self.repo.get(session_id, task_id)
         if task is None:
             raise AgentException.message("任务不存在")
         if status is not None:
@@ -161,7 +161,10 @@ class TaskService:
         add: list[int] | None,
         remove: list[int] | None,
     ) -> list[int] | None:
-        """合并阻塞任务的整体替换与增量改动。"""
+        """合并阻塞任务改动：先整体替换（未传则基于当前值），再追加，最后移除。
+
+        三者都未传时返回 None，表示不修改 blocked_by。
+        """
         if replace is None and add is None and remove is None:
             return None
         base = list(replace) if replace is not None else list(current)
@@ -178,11 +181,12 @@ class TaskService:
         blocked_by: list[int],
         current_task_id: int | None = None,
     ) -> list[int]:
-        """校验阻塞任务列表是否合法。"""
+        """去重排序后校验：不能阻塞自己，且所有阻塞任务都必须属于本会话。"""
         normalized = sorted(set(blocked_by))
         if current_task_id is not None and current_task_id in normalized:
             raise AgentException.message("任务不能阻塞自己")
-        existing = {task.id for task in await self.repo.get_many(session_id, normalized)}
+        found_tasks = await self.repo.get_many(session_id, normalized)
+        existing = {task.id for task in found_tasks}
         missing = [task_id for task_id in normalized if task_id not in existing]
         if missing:
             raise AgentException.message("阻塞任务不存在", {"missing": missing})

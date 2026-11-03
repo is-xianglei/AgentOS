@@ -17,13 +17,16 @@ from workspace.schemas import WorkspaceResponse
 from workspace.service import WorkspaceService
 
 router = APIRouter()
+DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
+CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
+# 管理员接口的权限校验完全由该依赖完成，路由函数本身不再使用 current_user。
 CurrentAdmin = Annotated[UserRecord, Depends(get_current_admin_user)]
 
 
 @router.get("/me", summary="获取当前用户信息", response_model=ApiResponse[UserResponse])
 async def get_current_user_info(
     request: Request,
-    current_user: UserRecord = Depends(get_current_active_user),
+    current_user: CurrentUser,
 ):
     """获取当前登录用户的信息"""
     return ok(UserResponse.model_validate(current_user), request)
@@ -36,18 +39,17 @@ async def get_current_user_info(
 )
 async def get_current_user_workspaces(
     request: Request,
-    current_user: UserRecord = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser,
+    db: DatabaseSession,
 ):
     """获取当前用户加入的所有工作区列表"""
     workspace_service = WorkspaceService(db)
     memberships = await workspace_service.list_user_workspace_memberships(current_user.id)
-    workspaces = [
-        WorkspaceResponse.model_validate(member.workspace).model_copy(
-            update={"membership_role": member.role}
-        )
-        for member in memberships
-    ]
+    # 返回的是工作区信息，额外带上当前用户在该工作区中的角色。
+    workspaces: list[WorkspaceResponse] = []
+    for member in memberships:
+        response = WorkspaceResponse.model_validate(member.workspace)
+        workspaces.append(response.model_copy(update={"membership_role": member.role}))
     return ok(workspaces, request)
 
 
@@ -55,8 +57,8 @@ async def get_current_user_workspaces(
 async def update_current_user(
     payload: UserUpdateRequest,
     request: Request,
-    current_user: UserRecord = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser,
+    db: DatabaseSession,
 ):
     """更新当前登录用户的信息"""
     service = UserService(db)
@@ -73,8 +75,8 @@ async def update_current_user(
 async def change_current_user_password(
     payload: UserChangePasswordRequest,
     request: Request,
-    current_user: UserRecord = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser,
+    db: DatabaseSession,
 ):
     """修改当前登录用户的密码"""
     service = UserService(db)
@@ -89,8 +91,8 @@ async def change_current_user_password(
 @router.delete("/me", summary="删除当前用户", response_model=ApiResponse[dict])
 async def delete_current_user(
     request: Request,
-    current_user: UserRecord = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser,
+    db: DatabaseSession,
 ):
     """删除当前登录用户（软删除）"""
     service = UserService(db)
@@ -103,7 +105,7 @@ async def create_user(
     payload: UserCreateRequest,
     request: Request,
     current_user: CurrentAdmin,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession,
 ):
     """由当前工作区管理员创建用户；普通注册走认证域的公开注册接口。"""
     service = UserService(db)
@@ -120,9 +122,9 @@ async def create_user(
 async def list_users(
     request: Request,
     current_user: CurrentAdmin,
+    db: DatabaseSession,
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db),
 ):
     """查询用户列表，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
@@ -135,7 +137,7 @@ async def get_user(
     user_id: int,
     request: Request,
     current_user: CurrentAdmin,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession,
 ):
     """查询指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
@@ -149,7 +151,7 @@ async def update_user(
     payload: UserUpdateRequest,
     request: Request,
     current_user: CurrentAdmin,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession,
 ):
     """更新指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
@@ -170,7 +172,7 @@ async def change_password(
     payload: UserChangePasswordRequest,
     request: Request,
     current_user: CurrentAdmin,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession,
 ):
     """修改指定用户密码，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
@@ -187,7 +189,7 @@ async def delete_user(
     user_id: int,
     request: Request,
     current_user: CurrentAdmin,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession,
 ):
     """删除指定用户，仅当前工作区 owner/admin 可用。"""
     service = UserService(db)
