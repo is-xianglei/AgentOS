@@ -81,14 +81,14 @@ class AuthService:
     async def login(self, email: str, password: str) -> dict:
         """邮箱密码登录，Token 绑定默认工作区（优先个人工作区）。"""
         user = await self.repo.get_by_email(email)
-        if not user:
+        # 先验密码再查状态：不知道密码的人只能拿到同一句报错，无法探测邮箱是否注册或已停用。
+        if not user or not self._verify_password(password, user.password):
             raise AgentException.message("用户名或密码错误")
+        # 全局软删除过滤下查不到已删除用户，此分支正常走不到；保留作纵深防御。
         if user.is_deleted:
             raise AgentException.message("账号已被删除")
         if user.suspended:
             raise AgentException.message("账号已被禁用")
-        if not self._verify_password(password, user.password):
-            raise AgentException.message("用户名或密码错误")
 
         # 只改实体字段，提交交给请求边界统一处理。
         user.last_login_at = datetime.now(UTC)

@@ -117,15 +117,17 @@ class UserService:
         await self.repo.delete(user)
 
     async def authenticate(self, username: str, password: str) -> UserRecord | None:
-        """按用户名和密码认证：用户不存在或密码错误返回 None，已停用则直接报错。"""
+        """按用户名和密码认证：用户不存在、密码错误或已删除返回 None，密码正确但已停用则报错。"""
         user = await self.repo.get_by_username(username)
-        if not user or user.is_deleted:
+        # 先验密码再查状态：不知道密码的人只能拿到 None，无法探测用户名是否存在或已停用。
+        if not user or not self._verify_password(password, user.password):
+            return None
+
+        # 全局软删除过滤下查不到已删除用户，此分支正常走不到；保留作纵深防御。
+        if user.is_deleted:
             return None
 
         if user.suspended:
             raise AgentException.message("用户已被禁用")
-
-        if not self._verify_password(password, user.password):
-            return None
 
         return user
