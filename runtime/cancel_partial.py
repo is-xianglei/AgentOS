@@ -31,6 +31,7 @@ def extract_unsaved_messages(state: TurnState) -> list[MessageDraft]:
     if actor is None:
         return []
     start = state.execution_start_offset
+    # index 为 -1 的是找不到对应 tool_use 的孤立 tool_result 块，不属于本次 LLM 输出。
     blocks = [
         block
         for block in actor.blocks
@@ -73,33 +74,47 @@ def _has_result_before(blocks: list[Block], sequence: int | None) -> bool:
 
 
 def _round_messages(blocks: list[Block]) -> list[MessageDraft]:
+    """把一次 LLM 调用的块还原成一条 assistant 消息，后跟各工具调用的 tool 消息。"""
     text = "".join(block.text for block in blocks if block.kind == "text")
-    tool_blocks = [
-        (block, tool_use)
-        for block in blocks
-        if block.kind == "tool_use" and (tool_use := _complete_tool_use(block)) is not None
-    ]
+    # 只含空白的文本视同没有文本。
     if not text.strip():
         text = ""
+
+    tool_blocks: list[tuple[Block, ToolUse]] = []
+    for block in blocks:
+        if block.kind != "tool_use":
+            continue
+        tool_use = _complete_tool_use(block)
+        if tool_use is not None:
+            tool_blocks.append((block, tool_use))
+
     if not text and not tool_blocks:
         return []
+
     tool_uses = [tool_use for _, tool_use in tool_blocks]
     drafts = [MessageDraft("assistant", build_assistant_blocks(text, tool_uses))]
-    drafts.extend(
-        MessageDraft("tool", _tool_result(tool_use, block.result).to_content_dict())
-        for block, tool_use in tool_blocks
-    )
+    for block, tool_use in tool_blocks:
+        result = _tool_result(tool_use, block.result)
+        drafts.append(MessageDraft("tool", result.to_content_dict()))
     return drafts
 
 
 def _complete_tool_use(block: Block) -> ToolUse | None:
     """tool_use 事件在入参完整后才发出;只见 block_start 的块没有可回放的调用。"""
     tool = block.tool or {}
-    tool_id, name = tool.get("id"), tool.get("name")
-    if not isinstance(tool_id, str) or not tool_id or not isinstance(name, str) or not name:
+    tool_id = tool.get("id")
+    name = tool.get("name")
+    if not isinstance(tool_id, str) or not tool_id:
         return None
+    if not isinstance(name, str) or not name:
+        return None
+
     raw_input = tool.get("input")
-    return ToolUse(id=tool_id, name=name, input=raw_input if isinstance(raw_input, dict) else {})
+    if isinstance(raw_input, dict):
+        tool_input = raw_input
+    else:
+        tool_input = {}
+    return ToolUse(id=tool_id, name=name, input=tool_input)
 
 
 def _tool_result(tool_use: ToolUse, result: dict[str, Any] | None) -> ToolResultMessage:

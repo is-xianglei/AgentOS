@@ -1,3 +1,5 @@
+"""主 Agent 运行时：请求阶段准入、后台 ReAct 主循环、工具执行与人工交互挂起/恢复。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -30,19 +32,16 @@ from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
 from llm import BaseLLMClient
-from llm.types import (
-    PromptBlock,
-    ToolResultMessage,
-    ToolUse,
-)
+from llm.types import PromptBlock, ToolResultMessage, ToolUse
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
-from permission.service import DANGEROUS_TOOLS, PermissionService
+from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
+from permission.service import DANGEROUS_TOOLS
 from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
-from runtime.compact import CompactService
 from runtime.budget import ToolCallBudget
+from runtime.compact import CompactService
 from runtime.execution import (
     ExecutionHandle,
     launch_turn_execution,
@@ -58,9 +57,9 @@ from session.service import SessionService
 from skill.service import SkillService
 from task.service import TaskService
 from team.service import TeamService
+from tools.gateway import ToolGateway
 from tools.models import ToolCallRecord
 from tools.policy import ToolCapabilityResolver, ToolProfile
-from tools.gateway import ToolGateway
 from tools.policy_engine import PolicyEngine
 from tools.registry import ToolRegistry, build_tool_registry
 from tools.service import ToolService
@@ -172,15 +171,20 @@ class AgentRuntime:
         """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
+        # 没有模型选项时不传该参数，沿用会话当前设置。
+        prepare_kwargs: dict[str, Any] = {}
+        if model_options:
+            prepare_kwargs["model_options"] = model_options
         session = await self.session_service.prepare_for_message(
             session_id,
             user_content,
             self.user_id,
             self.workspace_id,
             agent_id,
-            **({"model_options": model_options} if model_options else {}),
+            **prepare_kwargs,
         )
         # 准入前解析实际模型，缺配置通过普通 JSON 错误返回。
+        # getattr 兜底：测试用 __new__ 构造的实例没有 _llm_injected 属性。
         if not getattr(self, "_llm_injected", self.llm is not None):
             await self._configure_agent(session)
         turn, _ = await self.session_service.start_turn(
@@ -198,12 +202,16 @@ class AgentRuntime:
         await self.db.commit()
         target_session_id, turn_id = session.id, turn.id
         user_id, workspace_id = self.user_id, self.workspace_id
-        llm = self.llm if getattr(self, "_llm_injected", self.llm is not None) else None
+        # 只把构造时注入的客户端传给后台任务；按会话解析的客户端由后台运行时重新解析。
+        if getattr(self, "_llm_injected", self.llm is not None):
+            llm = self.llm
+        else:
+            llm = None
 
         async def body(bus: RunStreamBus) -> None:
             # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
             async with AsyncSessionLocal() as db:
-                runtime = AgentRuntime(db, user_id=user_id , workspace_id=workspace_id, llm=llm)
+                runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
                 runtime.bind_execution(bus, owner)
                 await runtime._produce(target_session_id, turn_id, user_content)
 
@@ -239,9 +247,15 @@ class AgentRuntime:
             await self._configure_agent(session)
 
             # Hook 只生成本次模型请求的临时上下文，绝不改写已保存的原始用户消息。
-            additional_context = None if self.mode_slug == "turbo" else (
-                await self._apply_user_prompt_hooks(session_id, turn.id, user_content)
-            )
+            # 极速模式不触发 Hook。
+            if self.mode_slug == "turbo":
+                additional_context = None
+            else:
+                additional_context = await self._apply_user_prompt_hooks(
+                    session_id,
+                    turn.id,
+                    user_content,
+                )
 
             # 会话级控制事件:前端据此拿 session 元信息建立 UI。
             await self.bus.emit(
@@ -252,7 +266,6 @@ class AgentRuntime:
             # 断线重连后前端也据此重建,无需额外轮询 GET /tasks。
             await TaskService(self.db, bus=self.bus).emit_snapshot(session.id, "baseline")
 
-            # 开始 LLM Loop
             loop_result = await self._run_llm_loop(
                 session_id,
                 session,
@@ -328,7 +341,11 @@ class AgentRuntime:
         # 显式提交:租约须在后台任务读取前可见,请求作用域的 db 不随 SSE 挂着事务。
         await self.db.commit()
         user_id, workspace_id = self.user_id, self.workspace_id
-        llm = self.llm if getattr(self, "_llm_injected", self.llm is not None) else None
+        # 与 start 相同：只传递构造时注入的客户端。
+        if getattr(self, "_llm_injected", self.llm is not None):
+            llm = self.llm
+        else:
+            llm = None
 
         async def body(bus: RunStreamBus) -> None:
             async with AsyncSessionLocal() as db:
@@ -662,40 +679,54 @@ class AgentRuntime:
         # 回合开始(开场事件,带完整 actor)。
         await self.bus.emit(StreamEvent.turn_start(actor, session_id))
 
-        # skill catalog 每次 run 取一次缓存复用(仅主代理注入,§15.2):进 for 循环前取一次,
-        # 循环内各轮共用,避免每轮 loop 都打 DB。
         if self.workspace_id is None:
             raise AgentException.message("缺少可信工作区上下文")
-        skills_catalog = "" if self.mode_slug == "turbo" else await SkillService(self.db).get_catalog(
-            self.workspace_id,
-            list(self.active_skill_ids) if self.active_skill_ids is not None else None,
-        )
-        memory_context = None if self.mode_slug == "turbo" else await self.memory_recall_service.get_or_create_context(turn)
-        # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
+        # 极速模式跳过 skill、记忆、Plan Mode、上下文压缩与 Stop hook，只用固定提示词。
+        turbo = self.mode_slug == "turbo"
+
+        # skill catalog 每次 run 取一次缓存复用(仅主代理注入,§15.2):进 for 循环前取一次,
+        # 循环内各轮共用,避免每轮 loop 都打 DB。
+        if turbo:
+            skills_catalog = ""
+        else:
+            if self.active_skill_ids is not None:
+                skill_ids = list(self.active_skill_ids)
+            else:
+                skill_ids = None
+            skills_catalog = await SkillService(self.db).get_catalog(self.workspace_id, skill_ids)
+
+        if turbo:
+            memory_context = None
+        else:
+            memory_context = await self.memory_recall_service.get_or_create_context(turn)
         if memory_context is not None:
+            # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
             await self.db.commit()
-        rendered_memories = memory_context.rendered_memories if memory_context else None
+            rendered_memories = memory_context.rendered_memories
+            memory_catalog = memory_context.rendered_catalog
+        else:
+            rendered_memories = None
+            memory_catalog = None
+
+        # 会话绑定了 Agent 时用 Agent 的提示词，否则用会话自带的系统提示。
+        if self.active_agent_id is not None:
+            session_prompt = self.active_agent_prompt
+        else:
+            session_prompt = session.system_prompt
         # blocks 形式携带 cache 断点：tools + 稳定段跨 turn 复用，
         # 完整 system 供本 turn 内多轮工具迭代复用。
         system_prompt: list[PromptBlock] = compose_lead_blocks(
             PromptContext.create(
                 skills_catalog=skills_catalog,
-                session_prompt=(
-                    self.active_agent_prompt
-                    if self.active_agent_id is not None
-                    else session.system_prompt
-                ),
-                memory_catalog=memory_context.rendered_catalog if memory_context else None,
+                session_prompt=session_prompt,
+                memory_catalog=memory_catalog,
             )
         )
-        active_plan = (
-            None if self.mode_slug == "turbo"
-            else await self.plan_service.get_active(session_id)
-        )
-        if self.mode_slug == "turbo":
-            from model_service.policy import TURBO_PROMPT
+        if turbo:
             system_prompt = [PromptBlock(text=TURBO_PROMPT)]
             active_plan = None
+        else:
+            active_plan = await self.plan_service.get_active(session_id)
         active_registry = self._registry_for_mode(active_plan is not None)
         if active_plan is not None:
             # plan 内容随计划编辑而变,属易失段,不设 cache 断点以免击穿前两段的缓存前缀。
@@ -705,17 +736,20 @@ class AgentRuntime:
         step = AgentStep(self.llm, assembler, self.bus.emit)
         # 一次 Turn 内跨所有 LLM 回合共享工具预算；恢复人工交互时由调用方传入
         # continuation 中持久化的同一实例，避免重建 AgentRuntime 后额度被重置。
-        budget = budget or ToolCallBudget(
-            total_limit=max(1, settings.max_tool_iterations * 4),
-            per_tool_limit=max(1, settings.max_tool_iterations),
-        )
+        if budget is None:
+            budget = ToolCallBudget(
+                total_limit=max(1, settings.max_tool_iterations * 4),
+                per_tool_limit=max(1, settings.max_tool_iterations),
+            )
 
         # 观测用计时与轮次计数，仅供日志使用，不参与业务控制流。
         loop_started = time.perf_counter()
         rounds = 0
         stop_reason: str | None = None
-        from model_service.policy import TURBO_MAX_ITERATIONS
-        iterations = TURBO_MAX_ITERATIONS if self.mode_slug == "turbo" else settings.max_tool_iterations
+        if turbo:
+            iterations = TURBO_MAX_ITERATIONS
+        else:
+            iterations = settings.max_tool_iterations
         for iteration in range(iterations):
             history, current, through_message_id = await self.session_service.load_context_for_turn(
                 turn,
@@ -723,17 +757,14 @@ class AgentRuntime:
                 rendered_memories=rendered_memories,
             )
             # 只压缩当前 Turn 之前的历史，原始请求和本轮工具轨迹始终完整保留。
-            history = history if self.mode_slug == "turbo" else await self.compact_service.maybe_compact(
-                session_id,
-                history,
-                through_message_id=through_message_id,
-            )
-            context = history + current
-            model_override = (
-                None if self._database_model else (
-                    self.active_model_name if self.active_agent_id is not None else session.model_name
+            if not turbo:
+                history = await self.compact_service.maybe_compact(
+                    session_id,
+                    history,
+                    through_message_id=through_message_id,
                 )
-            )
+            context = history + current
+            model_override = self._model_override(session)
             rounds += 1
             round_model = self._llm_attribution(model_override)[1]
             round_started = time.perf_counter()
@@ -747,11 +778,16 @@ class AgentRuntime:
                     "msg_count": len(context),
                 },
             )
+            # 极速模式最后一轮不给工具，迫使模型直接作答。
+            if turbo and iteration == iterations - 1:
+                round_registry = active_registry.only()
+            else:
+                round_registry = active_registry
             step_result = await step.run(
                 StepRequest(
                     messages=context,
                     system_prompt=system_prompt,
-                    tool_registry=(active_registry.only() if self.mode_slug == "turbo" and iteration == iterations - 1 else active_registry),
+                    tool_registry=round_registry,
                     model=model_override,
                 )
             )
@@ -784,9 +820,15 @@ class AgentRuntime:
             if not tool_uses:
                 # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
                 # (作为一条 user 消息注入),否则正常结束本回合。
-                continuation = None if self.mode_slug == "turbo" else await self._apply_stop_hooks(
-                    session_id, turn.id, actor, context
-                )
+                if turbo:
+                    continuation = None
+                else:
+                    continuation = await self._apply_stop_hooks(
+                        session_id,
+                        turn.id,
+                        actor,
+                        context,
+                    )
                 if continuation is not None:
                     await self.session_service.add_message(
                         session_id,
@@ -814,7 +856,7 @@ class AgentRuntime:
                 return TurnLoopResult(suspended=True, interaction=interaction)
         else:
             # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
-            if self.mode_slug == "turbo":
+            if turbo:
                 raise AgentException.message("极速模式已达到模型调用上限，请切换标准模式继续")
             assistant_message = await self._finalize_without_tools(
                 session_id,
@@ -823,16 +865,10 @@ class AgentRuntime:
                 additional_context,
                 rendered_memories,
                 system_prompt,
-                (
-                    None if self._database_model else (
-                        self.active_model_name if self.active_agent_id is not None
-                        else session.model_name
-                    )
-                ),
+                self._model_override(session),
             )
             stop_reason = assembler.last_result.stop_reason or "max_iterations"
 
-        # 回合结束
         usage = assembler.last_result.usage
         logger.info(
             "回合结束",
@@ -982,11 +1018,13 @@ class AgentRuntime:
         budget: ToolCallBudget | None = None,
     ) -> SuspendedInteraction | None:
         """按原始顺序执行工具；需要人工输入时返回可发布的交互事件快照。"""
-        budget = budget or ToolCallBudget(
-            total_limit=max(1, settings.max_tool_iterations * 4),
-            per_tool_limit=max(1, settings.max_tool_iterations),
-        )
+        if budget is None:
+            budget = ToolCallBudget(
+                total_limit=max(1, settings.max_tool_iterations * 4),
+                per_tool_limit=max(1, settings.max_tool_iterations),
+            )
         for idx, tool_use in enumerate(tool_uses):
+            # 恢复人工交互时，挂起前已完成的工具不再重复执行。
             if tool_use.id in done_ids:
                 continue
 
@@ -1003,7 +1041,12 @@ class AgentRuntime:
                 done_ids.append(tool_use.id)
                 continue
 
-            active_plan = None if getattr(self, "mode_slug", "standard") == "turbo" else await self.plan_service.get_active(session_id)
+            # 每个工具前重新读取 Plan 状态：同一批工具中前面的 Enter/ExitPlanMode
+            # 经人工确认恢复后可能已改变它。
+            if getattr(self, "mode_slug", "standard") == "turbo":
+                active_plan = None
+            else:
+                active_plan = await self.plan_service.get_active(session_id)
             if active_plan is not None and tool_use.name not in PLAN_MODE_ALLOWED_TOOLS:
                 await self._record_tool_response(
                     session_id,
@@ -1022,11 +1065,11 @@ class AgentRuntime:
                     tool_use.input,
                 )
             except AgentException as exc:
-                details = (
-                    f"：{json.dumps(exc.details, ensure_ascii=False, default=str)}"
-                    if exc.details
-                    else ""
-                )
+                # 入参校验失败不中断回合，把错误详情作为工具结果回给模型自行修正。
+                if exc.details:
+                    details = f"：{json.dumps(exc.details, ensure_ascii=False, default=str)}"
+                else:
+                    details = ""
                 await self._record_tool_response(
                     session_id,
                     turn.id,
@@ -1197,7 +1240,7 @@ class AgentRuntime:
         turn_id: UUID,
         actor: Actor,
         assistant_message_id: int,
-        tool_use,
+        tool_use: ToolUse,
         record: ToolCallRecord | None = None,
     ) -> str:
         """执行单个工具:调用 tool_service、emit tool_result、落 tool 消息。
@@ -1422,13 +1465,14 @@ class AgentRuntime:
     ) -> SuspendedInteraction | None:
         """应用已持久化的业务响应，并继续同一 assistant 工具序列。"""
         pending = suspension.continuation_payload
-        budget = budget or ToolCallBudget.from_dict(
-            pending.get("tool_budget"),
-            default=ToolCallBudget(
-                total_limit=max(1, settings.max_tool_iterations * 4),
-                per_tool_limit=max(1, settings.max_tool_iterations),
-            ),
-        )
+        if budget is None:
+            budget = ToolCallBudget.from_dict(
+                pending.get("tool_budget"),
+                default=ToolCallBudget(
+                    total_limit=max(1, settings.max_tool_iterations * 4),
+                    per_tool_limit=max(1, settings.max_tool_iterations),
+                ),
+            )
         pending_items = pending.get("pending", [])
         if not pending_items:
             raise AgentException.message("运行暂停点缺少待处理工具")
@@ -1716,7 +1760,6 @@ class AgentRuntime:
 
     def _registry_for_mode(self, plan_mode: bool) -> ToolRegistry:
         if self.mode_slug == "turbo":
-            from model_service.policy import TURBO_ALLOWED_TOOLS
             return self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
         if plan_mode:
             return self.tool_registry.only(*PLAN_MODE_ALLOWED_TOOLS)
@@ -1727,13 +1770,21 @@ class AgentRuntime:
         base_registry = build_tool_registry()
         self.mode_slug = getattr(session, "mode_slug", "standard")
         if not self._llm_injected:
+            # 局部导入：每次调用时按模块属性读取，测试替换 model_selection 的函数后立即生效。
             from runtime.model_selection import resolve_runtime_client, session_client
+
             self.llm, provider = await session_client(self.db, session, "agent")
             self._database_model = provider is not None
             self.compact_service.llm, _ = await resolve_runtime_client(
-                self.db, self.workspace_id, self.user_id, "compact",
+                self.db,
+                self.workspace_id,
+                self.user_id,
+                "compact",
             )
-            context_length = (provider.extra_config or {}).get("context_length") if provider else None
+            # 端点声明了上下文长度时，压缩阈值取其 3/4；type() 判断排除 bool 等 int 子类。
+            context_length = None
+            if provider:
+                context_length = (provider.extra_config or {}).get("context_length")
             if type(context_length) is int:
                 self.compact_service.threshold = max(1, context_length * 3 // 4)
         session_agent_id = getattr(session, "agent_id", None)
@@ -1768,7 +1819,6 @@ class AgentRuntime:
             self.allowed_skill_names = frozenset(config.skill_names)
             self.tool_registry = base_registry.only(*runtime_names)
         if self.mode_slug == "turbo":
-            from model_service.policy import TURBO_ALLOWED_TOOLS
             self.tool_registry = self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
             self.allowed_skill_names = frozenset()
         self.tool_gateway = ToolGateway.from_registry(
@@ -1880,6 +1930,17 @@ class AgentRuntime:
             )
         )
 
+    def _model_override(self, session: SessionRecord) -> str | None:
+        """本次 LLM 调用要覆盖的模型名；None 表示使用客户端构造时解析好的模型。
+
+        数据库模型服务端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
+        """
+        if self._database_model:
+            return None
+        if self.active_agent_id is not None:
+            return self.active_model_name
+        return session.model_name
+
     def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
         """返回本次 LLM 调用实际生效的 (provider, model)，用于 assistant 消息成本归因。
 
@@ -1925,7 +1986,6 @@ class AgentRuntime:
                 model=model_name,
             )
         )
-        result = step_result.llm_result
         final_content = step_result.assistant_blocks
         provider, effective_model = self._llm_attribution(model_name)
         return await self.session_service.add_message(
@@ -1979,17 +2039,20 @@ class AgentRuntime:
                 messages=messages,
             )
         )
-        return next((o.continuation for o in outcomes if o.continuation), None)
+        for outcome in outcomes:
+            if outcome.continuation:
+                return outcome.continuation
+        return None
 
     async def _wake_team_members(
         self,
         session_id: int,
         turn: SessionTurnRecord,
     ) -> None:
-        """B1: 请求内单步唤醒。
+        """请求内单步唤醒队友。
 
         lead 主循环结束后,把本会话所有 status=='working' 的队友各唤醒一次,
-        每人调一次 run_teammate 推进一步(单轮,不 while 连锁,B2 后台自动唤醒后续再加)。
+        每人调一次 run_teammate 推进一步(单轮,不循环连锁唤醒;后台自动唤醒尚未实现)。
         每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """

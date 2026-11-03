@@ -123,7 +123,7 @@ class TurnEventAssembler:
                         {"block_ref": event.block_ref},
                     )
                 yield StreamEvent.tool_use(self._actor, self._session_id, index, event.tool)
-                # R4.2 方案 A:tool_use 块同样成对,紧随其后补发 block_stop。
+                # provider 不为 tool_use 块发 BLOCK_STOP,这里紧随其后补发,保持块边界成对。
                 self._open.discard(index)
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
                 continue

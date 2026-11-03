@@ -1,6 +1,6 @@
 """编排运行的持久化模型。"""
 
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, Integer, String
@@ -15,7 +15,7 @@ class OrchestrationCheckpointRecord(Base):
     """一次 Orchestrator run 的最新可恢复快照。"""
 
     __tablename__ = "orchestration_checkpoints"
-    __table_args__ = {"comment": "编排运行检查点"}
+    __table_args__: ClassVar[dict[str, str]] = {"comment": "编排运行检查点"}
 
     run_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True),

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from llm import BaseLLMClient
-from llm.types import LLMTurnResult, PromptBlock, build_assistant_blocks
+from llm.types import LLMTurnResult, PromptBlock, ToolUse, build_assistant_blocks
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
 
@@ -33,7 +33,7 @@ class StepResult:
     assistant_blocks: list[dict[str, Any]]
 
     @property
-    def tool_uses(self):
+    def tool_uses(self) -> list[ToolUse]:
         return self.llm_result.tool_uses
 
     @property
@@ -60,7 +60,6 @@ class AgentStep:
         ``emit`` 由调用方提供，因此 AgentStep 不依赖具体的 StreamBus；主 Agent、
         子代理和 Workflow 可以共享同一实现，同时保留各自的事件归属和生命周期。
         """
-
         async for event in self._assembler.consume(
             self._llm.stream(
                 request.messages,

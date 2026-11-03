@@ -48,8 +48,8 @@ from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
-from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.registry import ToolRegistry
+from tools.subagents.definition import AgentType, SubAgentSpec
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
 
@@ -278,6 +278,13 @@ class BaseOrchestrator(Orchestrator):
                 "status": status.value,
             }
         self.context.update(cursor=cursor, state_updates=state_updates)
+
+        if config is not None:
+            event_agent_id = config.agent_id
+            member_name = config.name
+        else:
+            event_agent_id = agent_id
+            member_name = None
         await self.bus.emit(
             StreamEvent.workflow_progress(
                 ORCHESTRATOR_ACTOR,
@@ -285,8 +292,8 @@ class BaseOrchestrator(Orchestrator):
                 WorkflowProgressInfo(
                     phase=phase,
                     status=status,
-                    agent_id=config.agent_id if config else agent_id,
-                    member_name=config.name if config else None,
+                    agent_id=event_agent_id,
+                    member_name=member_name,
                     ordinal=ordinal,
                     total=total,
                 ),
@@ -351,15 +358,14 @@ class SequentialOrchestrator(BaseOrchestrator):
         previous_output: str | None = None
         total = len(self.members)
         for ordinal, member in enumerate(self.members, start=1):
-            prompt = (
-                user_content
-                if previous_output is None
-                else SEQUENTIAL_HANDOFF_PROMPT_TEMPLATE.format(
+            if previous_output is None:
+                prompt = user_content
+            else:
+                prompt = SEQUENTIAL_HANDOFF_PROMPT_TEMPLATE.format(
                     user_content=user_content,
                     previous_member=previous_member,
                     previous_output=previous_output,
                 )
-            )
             try:
                 config, previous_output = await self.run_member(
                     self.db, member.agent_id, prompt, ordinal=ordinal, total=total
@@ -398,9 +404,9 @@ class ParallelOrchestrator(BaseOrchestrator):
         self._require_min_members(2, "并行编排")
         # 配置期串行加载全部成员(用主 db):不可运行的成员在派发前就整体抛错,
         # 若放进成员协程里静默跳过,bus 上零事件,前端无从得知该成员被略过。
-        configs = [
-            await self._load_member_config(self.db, member.agent_id) for member in self.members
-        ]
+        configs: list[AgentRuntimeConfig] = []
+        for member in self.members:
+            configs.append(await self._load_member_config(self.db, member.agent_id))
         # 派发前对全部成员发 running:前端一次性点亮所有节点,而不是随各协程调度顺序零散出现。
         for config in configs:
             await self._emit_progress(_MEMBER, _RUNNING, config=config)
@@ -515,9 +521,9 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
     async def run(self, user_content: str) -> OrchestrationResult:
         self._require_min_members(2, "智能路由编排")
         # 路由依据是各成员的 description,需先加载全部成员配置;顺带完成 AC7 的可运行校验。
-        configs = [
-            await self._load_member_config(self.db, member.agent_id) for member in self.members
-        ]
+        configs: list[AgentRuntimeConfig] = []
+        for member in self.members:
+            configs.append(await self._load_member_config(self.db, member.agent_id))
         await self._emit_progress(_ROUTING, _RUNNING)
         try:
             chosen = await self._route(user_content, configs)
@@ -565,7 +571,11 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
                 "智能路由决策失败",
                 {"workflow_id": self.workflow_id},
             ) from exc
-        chosen = next((config for config in configs if config.agent_id == choice.agent_id), None)
+        chosen: AgentRuntimeConfig | None = None
+        for config in configs:
+            if config.agent_id == choice.agent_id:
+                chosen = config
+                break
         if chosen is None:
             raise AgentException.message(
                 "智能路由选出的Agent不在Workflow成员列表中",
@@ -627,16 +637,19 @@ class WorkflowRuntime:
         """请求阶段准入:取/建会话 → 落用户消息 → 建 Turn → 认领租约,提交后启动后台编排。"""
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
+        prepare_kwargs: dict[str, Any] = {"workflow_id": workflow_id}
+        if model_options:
+            prepare_kwargs["model_options"] = model_options
         session: SessionRecord = await self.session_service.prepare_for_message(
             session_id,
             user_content,
             self.user_id,
             self.workspace_id,
-            workflow_id=workflow_id,
-            **({"model_options": model_options} if model_options else {}),
+            **prepare_kwargs,
         )
         if self.llm is None:
             from runtime.model_selection import session_client
+
             # 准入只验证配置，不将工作区客户端当作测试注入冻结给后台任务。
             await session_client(self.db, session, "workflow")
         turn, _ = await self.session_service.start_turn(
@@ -738,7 +751,10 @@ class WorkflowRuntime:
                 },
             )
             await self._mark_abnormal_end(session_id, turn_id, "failed")
-            message = exc.message if isinstance(exc, AgentException) else "Workflow执行失败。"
+            if isinstance(exc, AgentException):
+                message = exc.message
+            else:
+                message = "Workflow执行失败。"
             await self.bus.emit(
                 StreamEvent.error_event(
                     ORCHESTRATOR_ACTOR,
@@ -784,8 +800,10 @@ class WorkflowRuntime:
         }
         if self.llm is None:
             from runtime.model_selection import session_client
+
             session = await self.session_service.get_required(session_id)
             self.llm, _ = await session_client(self.db, session, "workflow")
+        # 只有并行汇总和智能路由要调 LLM，顺序编排不接收客户端。
         if issubclass(orchestrator_cls, ParallelOrchestrator | LlmRoutingOrchestrator):
             return orchestrator_cls(llm=self.llm, **dependencies)
         return orchestrator_cls(**dependencies)

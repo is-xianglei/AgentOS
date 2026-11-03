@@ -36,9 +36,15 @@ def _synth_run_end(
     execution: TurnExecutionState | None,
     sequence: int,
 ) -> dict[str, Any]:
-    status = run_end_status(execution.status) if execution else "interrupted"
+    """写入方与回收方都没写出 run_end 时，按数据库状态补一个；查不到轮次则视为中断。"""
+    if execution is not None:
+        status = run_end_status(execution.status)
+        offset = execution.last_event_offset
+    else:
+        status = "interrupted"
+        offset = sequence
     event = RunEvent.run_end(str(turn_id), status)
-    event.sequence = execution.last_event_offset if execution else sequence
+    event.sequence = offset
     return event.to_dict()
 
 
@@ -68,6 +74,8 @@ async def _tail(
     while True:
         batch = await store.wait(str(turn_id), cursor, timeout_ms=STREAM_BLOCK_MS)
         if not batch:
+            # 读超时：仍有执行中的任务就继续等；否则补发已知的 run_end，
+            # 连续空等若干轮仍无结果时按数据库状态合成 run_end。
             execution = await _execution(turn_id)
             if execution is not None and execution.executing:
                 idle_polls = 0
@@ -81,6 +89,7 @@ async def _tail(
                 return
             continue
         idle_polls = 0
+        # 游标已被裁剪越过时增量事件不连续，改发一帧完整快照并从快照尾部继续跟随。
         if await _trimmed_past(store, turn_id, cursor):
             state, cursor, _ = await _capture_state(store, turn_id)
             last_seq = state.last_offset
@@ -116,9 +125,14 @@ async def subscribe_turn(turn_id: UUID) -> AsyncIterator[dict[str, Any]]:
     executing = execution is not None and execution.executing
     if not exists and not executing:
         # key 已过期:明确告知客户端改用消息历史接口加载。
-        status = run_end_status(execution.status) if execution else "interrupted"
+        if execution is not None:
+            status = run_end_status(execution.status)
+            offset = execution.last_event_offset
+        else:
+            status = "interrupted"
+            offset = 0
         event = RunEvent.run_end(str(turn_id), status, expired=True)
-        event.sequence = execution.last_event_offset if execution else 0
+        event.sequence = offset
         yield event.to_dict()
         return
     yield snapshot_frame(str(turn_id), state)

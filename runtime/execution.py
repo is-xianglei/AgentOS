@@ -20,7 +20,6 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TypeVar
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,8 +35,6 @@ from runtime.cancel_partial import extract_unsaved_messages
 from session.service import MessageDraft, SessionService, TurnTermination
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 # 每次向数据库预留的 offset 个数,预留本身即一次带租约校验的写入。
 OFFSET_RESERVATION = 64
@@ -55,7 +52,6 @@ PROCESS_INSTANCE_ID = (
 )[:120]
 
 
-
 def new_lease_owner() -> str:
     """一次执行的租约持有者标识。"""
     return f"{PROCESS_INSTANCE_ID}:{uuid4().hex[:12]}"
@@ -65,7 +61,7 @@ def lease_seconds() -> float:
     return float(settings.run_lease_seconds)
 
 
-async def run_in_session(
+async def run_in_session[T](
     action: Callable[[SessionService], Awaitable[T]],
     *,
     commit: bool = False,
@@ -143,7 +139,6 @@ class _Execution:
 _executions: dict[UUID, _Execution] = {}
 
 
-
 async def launch_turn_execution(
     *,
     turn_id: UUID,
@@ -155,6 +150,7 @@ async def launch_turn_execution(
     """租约已提交后启动后台执行;body 负责业务执行,收尾由本模块统一完成。"""
     existing = _executions.get(turn_id)
     if existing is not None and existing.task is not None and not existing.task.done():
+        # 调用方已为本次请求提交了新租约,拒绝前先清掉,不让它挂到过期。
         await run_in_session(
             lambda service: service.release_turn_lease(turn_id, owner),
             commit=True,
@@ -191,7 +187,6 @@ def _on_done(execution: _Execution, task: asyncio.Task[None]) -> None:
             exc_info=exc,
             extra={"turn_id": str(execution.turn_id)},
         )
-
 
 
 async def _run(execution: _Execution, body: Callable[[RunStreamBus], Awaitable[None]]) -> None:
@@ -279,7 +274,6 @@ async def _heartbeat(execution: _Execution) -> None:
         last_renewed = time.monotonic()
 
 
-
 async def _finish(execution: _Execution) -> None:
     """持有者收尾:停心跳 → 刷出缓冲 → 租约内分配 run_end offset → 写 run_end → EXPIRE → 清租约。"""
     turn_key = str(execution.turn_id)
@@ -293,8 +287,16 @@ async def _finish(execution: _Execution) -> None:
     if execution.lease_lost:
         # 被隔离(回收、接管或跨进程取消已清除租约):不写任何消息、状态或事件。
         return
-    partial = _local_partial(execution) if execution.interrupted else []
+    if execution.interrupted:
+        partial = _local_partial(execution)
+    else:
+        partial = []
+    # 用户取消后会话回到 idle 可继续对话;其余中断(如进程关闭)标 failed。
     cancelled = execution.stop_reason == STOP_USER_CANCEL
+    if cancelled:
+        interrupted_session_status = "idle"
+    else:
+        interrupted_session_status = "failed"
     try:
         termination = await run_in_session(
             lambda service: service.finish_turn_execution(
@@ -302,7 +304,7 @@ async def _finish(execution: _Execution) -> None:
                 execution.turn_id,
                 execution.owner,
                 partial=partial,
-                interrupted_session_status="idle" if cancelled else "failed",
+                interrupted_session_status=interrupted_session_status,
             ),
             commit=True,
         )
@@ -333,7 +335,9 @@ async def _finish(execution: _Execution) -> None:
 
 def run_end_status(turn_status: str) -> str:
     """轮次状态映射为 run_end 状态;仍是 running 说明执行已失联,按 interrupted 处理。"""
-    return "interrupted" if turn_status == "running" else turn_status
+    if turn_status == "running":
+        return "interrupted"
+    return turn_status
 
 
 async def write_detached_run_end(termination: TurnTermination, *, cancelled: bool) -> None:
@@ -347,7 +351,6 @@ async def write_detached_run_end(termination: TurnTermination, *, cancelled: boo
         await store.expire(turn_key, settings.run_stream_ttl_seconds)
     except Exception:
         logger.exception("补写run_end失败", extra={"turn_id": turn_key})
-
 
 
 def _local_partial(execution: _Execution) -> list[MessageDraft]:
@@ -424,12 +427,12 @@ async def cancel_turn(db: AsyncSession, session_id: int, turn_id: UUID) -> TurnT
 
 async def shutdown_executions(timeout: float = LOCAL_STOP_TIMEOUT_SECONDS) -> None:
     """进程退出:停止本进程全部执行,让它们走取消路径保存半截回答、收尾并清除租约。"""
-    executions = [
-        execution
-        for execution in _executions.values()
-        if execution.task is not None and not execution.task.done()
-    ]
-    tasks = [execution.task for execution in executions if execution.task is not None]
+    executions: list[_Execution] = []
+    tasks: list[asyncio.Task[None]] = []
+    for execution in _executions.values():
+        if execution.task is not None and not execution.task.done():
+            executions.append(execution)
+            tasks.append(execution.task)
     for execution in executions:
         _request_stop(execution, STOP_SHUTDOWN)
     if tasks:
@@ -440,4 +443,6 @@ async def shutdown_executions(timeout: float = LOCAL_STOP_TIMEOUT_SECONDS) -> No
 def local_execution_task(turn_id: UUID) -> asyncio.Task[None] | None:
     """本进程中该轮次的执行任务(测试与诊断用)。"""
     execution = _executions.get(turn_id)
-    return execution.task if execution is not None else None
+    if execution is None:
+        return None
+    return execution.task

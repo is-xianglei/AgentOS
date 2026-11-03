@@ -27,10 +27,11 @@ class ToolCallBudget:
             "calls_by_tool": dict(self.calls_by_tool),
         }
 
+    # snapshot / from_snapshot 是 to_dict / from_dict 的别名，供按快照语义调用的代码使用。
     snapshot = to_dict
 
     @classmethod
-    def from_dict(cls, payload: Any, *, default: "ToolCallBudget") -> "ToolCallBudget":
+    def from_dict(cls, payload: Any, *, default: ToolCallBudget) -> ToolCallBudget:
         """从持久化 continuation 恢复预算；旧 continuation 回落到 default。"""
         if not isinstance(payload, dict):
             return default
@@ -59,9 +60,7 @@ class ToolCallBudget:
         )
 
     @classmethod
-    def from_snapshot(
-        cls, payload: Any, *, default: "ToolCallBudget"
-    ) -> "ToolCallBudget":
+    def from_snapshot(cls, payload: Any, *, default: ToolCallBudget) -> ToolCallBudget:
         return cls.from_dict(payload, default=default)
 
     @property

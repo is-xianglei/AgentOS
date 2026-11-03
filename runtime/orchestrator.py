@@ -43,7 +43,7 @@ class OrchestrationCheckpoint:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "OrchestrationCheckpoint":
+    def from_dict(cls, data: Mapping[str, Any]) -> OrchestrationCheckpoint:
         """从 JSON/JSONB 形状恢复快照，保留未知 state 字段以支持前向兼容。"""
         return cls(
             run_id=UUID(str(data["run_id"])),
@@ -165,12 +165,11 @@ class TopLevelOrchestrator:
             if self.llm is not None:
                 kwargs["llm"] = self.llm
             runtime = runtime_cls(self.db, **kwargs)
-            return await runtime.start(
-                session_id,
-                user_content,
-                workflow_id=workflow_id,
-                **({"model_options": model_options} if model_options else {}),
-            )
+            # 没有模型选项时不传该参数，让运行时类使用自己的默认值。
+            start_kwargs: dict[str, Any] = {"workflow_id": workflow_id}
+            if model_options:
+                start_kwargs["model_options"] = model_options
+            return await runtime.start(session_id, user_content, **start_kwargs)
 
         runtime_cls = self.agent_runtime_cls
         if runtime_cls is None:
@@ -181,10 +180,8 @@ class TopLevelOrchestrator:
         if self.llm is not None:
             kwargs["llm"] = self.llm
         runtime = runtime_cls(self.db, **kwargs)
-        return await runtime.start(
-            session_id,
-            user_content,
-            agent_id=agent_id,
-            **({"model_options": model_options} if model_options else {}),
-        )
+        start_kwargs: dict[str, Any] = {"agent_id": agent_id}
+        if model_options:
+            start_kwargs["model_options"] = model_options
+        return await runtime.start(session_id, user_content, **start_kwargs)
 

@@ -1,3 +1,5 @@
+"""上下文压缩：L1 微压缩旧工具结果，超阈值时 L2 调用 LLM 生成摘要。"""
+
 import json
 import logging
 import time
@@ -21,6 +23,8 @@ _MICRO_MIN_LEN = 500
 
 
 class CompactService:
+    """在每次 LLM 调用前控制上下文长度；llm 未注入时 L2 按 compact 场景现建客户端。"""
+
     def __init__(
         self,
         session_repo: SessionRepository,
@@ -68,7 +72,11 @@ class CompactService:
         )
         started_at = time.perf_counter()
         compacted = await self._auto_compact(messages)
-        summary = compacted[0]["content"] if compacted else ""
+        if compacted:
+            summary = compacted[0]["content"]
+        else:
+            summary = ""
+        # 没有可锚定的消息 ID 时只返回压缩结果，不落快照。
         if through_message_id is not None:
             await self.session_repo.add_snapshot(
                 session_id,
@@ -92,7 +100,7 @@ class CompactService:
         return len(str(messages)) // 4
 
     def _micro_compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """L1 微压缩:把第 4 条以后的旧工具结果替换为占位符。
+        """L1 微压缩:把最近 3 条以外的旧工具结果原地替换为占位符。
 
         遍历的是中立上下文:工具结果是 role="tool" 的 ToolResultMessage dict,
         自带 tool_name,无需再从 assistant 的 tool_use 块反查;语义不随 provider 变。
@@ -112,7 +120,7 @@ class CompactService:
         if len(tool_results) <= _MICRO_KEEP_RECENT:
             return messages
 
-        # 注意:这里压缩"前 N-3"条(即较旧的部分),保留最近 3 条。
+        # 直接改写 content dict，调用方持有的消息列表同步生效。
         for result_item in tool_results[:-_MICRO_KEEP_RECENT]:
             output = result_item.get("output")
             if not isinstance(output, str):

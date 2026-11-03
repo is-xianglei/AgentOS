@@ -1,3 +1,5 @@
+"""子代理运行器：一次性子代理(Agent 工具)与 teammate 单次推进的 ReAct 循环。"""
+
 import asyncio
 import json
 import logging
@@ -20,10 +22,9 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
-from llm import BaseLLMClient, create_llm_client
-from llm.types import LLMTurnResult, ToolResultMessage, build_assistant_blocks
+from llm import BaseLLMClient
+from llm.types import LLMTurnResult, ToolResultMessage, ToolUse, build_assistant_blocks
 from memory.recall.repository import MemoryRecallRepository
-from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
 from runtime.budget import ToolCallBudget
 from runtime.step import AgentStep, StepRequest
@@ -35,11 +36,13 @@ from team.isolation import (
 )
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
-from tools.registry import ToolRegistry, build_tool_registry
-from tools.policy import ToolCapabilityResolver, ToolProfile
 from tools.gateway import ToolGateway
+from tools.policy import ToolCapabilityResolver, ToolProfile
 from tools.policy_engine import PolicyEngine
-from tools.service import ToolService  # 兼容旧测试/扩展点；实际执行统一经 ToolGateway
+from tools.registry import ToolRegistry, build_tool_registry
+
+# 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
+from tools.service import ToolService  # noqa: F401
 from tools.subagents.definition import SubAgentSpec
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,8 @@ def _get_concurrency_gate() -> asyncio.Semaphore:
 
 
 class SubAgentRunner:
+    """在父轮次内运行子代理；事件经父 bus 发出，actor 标识子代理自身。"""
+
     def __init__(
         self,
         db: AsyncSession,
@@ -93,9 +98,17 @@ class SubAgentRunner:
         names = ToolCapabilityResolver().resolve_names(registry.names, profile)
         return registry.only(*names)
 
-    async def _configure_model(self, session_id: int, spec: SubAgentSpec, workspace_id: int | None, user_id: int | None) -> str | None:
+    async def _configure_model(
+        self,
+        session_id: int,
+        spec: SubAgentSpec,
+        workspace_id: int | None,
+        user_id: int | None,
+    ) -> str | None:
+        """按会话模型选项建客户端，返回本次调用要覆盖的模型名(None 表示用客户端自带模型)。"""
         if self._llm_injected:
             return spec.resolve_model()
+        # 局部导入：每次调用时按模块属性读取 resolve_runtime_client，测试替换后立即生效。
         from runtime.model_selection import resolve_runtime_client
         from session.service import SessionService
 
@@ -111,10 +124,17 @@ class SubAgentRunner:
                 provider_id = session.model_provider_id
             effort = getattr(session, "thinking_effort", "fast")
         self.llm, provider = await resolve_runtime_client(
-            self.db, workspace_id, user_id, spec.model_scenario or "subagent",
-            provider_id=provider_id, effort=effort,
+            self.db,
+            workspace_id,
+            user_id,
+            spec.model_scenario or "subagent",
+            provider_id=provider_id,
+            effort=effort,
         )
-        return None if provider is not None else spec.resolve_model()
+        # 数据库端点有自己的模型名，不再用 spec 的 .env 模型名覆盖。
+        if provider is not None:
+            return None
+        return spec.resolve_model()
 
     async def run(
         self,
@@ -152,19 +172,21 @@ class SubAgentRunner:
                 "workflow_node",
             )
             tool_registry = tool_registry.only(*workflow_names)
-        profile: ToolProfile = "workflow_node" if spec.agent_id is not None else "subagent"
+        # 带 agent_id 的 spec 是工作流节点，工具调用按 workflow_node 档位裁决。
+        profile: ToolProfile = "subagent"
+        if spec.agent_id is not None:
+            profile = "workflow_node"
         # omit_inherited_memory 的 spec(如 Explore)不继承父 Turn 记忆:
         # 它只做代码检索,注入用户偏好等长期记忆既无用又占满上下文预算。
-        rendered_memories = (
-            None
-            if spec.omit_inherited_memory
-            else await self._load_frozen_memories(
+        if spec.omit_inherited_memory:
+            rendered_memories = None
+        else:
+            rendered_memories = await self._load_frozen_memories(
                 session_id,
                 parent_turn_id,
                 user_id,
                 workspace_id,
             )
-        )
         system_prompt = compose_subagent_prompt(spec.system_prompt, rendered_memories)
         if spec.critical_reminder:
             # 关键约束放在系统提示末尾:近端位置比开头更不容易被长上下文冲淡。
@@ -268,7 +290,9 @@ class SubAgentRunner:
             parent_turn_id,
             session_id=session_id,
         )
-        return context.rendered_memories if context is not None else None
+        if context is None:
+            return None
+        return context.rendered_memories
 
     @staticmethod
     def _with_memory_context(
@@ -322,7 +346,7 @@ class SubAgentRunner:
         self,
         actor: Actor,
         session_id: int,
-        tool_use,
+        tool_use: ToolUse,
         output: str,
         *,
         is_error: bool = False,
@@ -358,11 +382,13 @@ class SubAgentRunner:
         不能沿用"未裁决直接执行"的旧行为,否则子代理成为绕过审批的提权路径。
         """
         agent_type = spec.runtime_name
-        budget = budget or ToolCallBudget(
-            total_limit=max(1, spec.max_rounds * 4),
-            per_tool_limit=max(1, spec.max_rounds * 2),
-        )
+        if budget is None:
+            budget = ToolCallBudget(
+                total_limit=max(1, spec.max_rounds * 4),
+                per_tool_limit=max(1, spec.max_rounds * 2),
+            )
         for tool_use in tool_uses:
+            # 预算耗尽不执行工具，原因作为错误结果回给模型。
             allowed, budget_error = budget.try_consume(tool_use.name)
             if not allowed:
                 output = budget_error or "error: 工具调用预算不足。"
@@ -482,7 +508,9 @@ class SubAgentRunner:
                     "content": build_assistant_blocks(result.text, tool_uses, result.thinking),
                 }
             )
-            last_text = result.text or last_text
+            # 记住最近一次非空文本，轮次耗尽时作为截断报告的正文。
+            if result.text:
+                last_text = result.text
 
             if not tool_uses:
                 return result.text, round_index + 1
@@ -512,9 +540,12 @@ class SubAgentRunner:
             extra={"session_id": session_id, "agent_type": spec.runtime_name},
         )
         notice = f"[注意] 子代理已达 {spec.max_rounds} 轮工具调用上限,以下为截断的中间结论:"
-        return (f"{notice}\n\n{last_text}" if last_text else notice), max(1, spec.max_rounds)
+        rounds = max(1, spec.max_rounds)
+        if last_text:
+            return f"{notice}\n\n{last_text}", rounds
+        return notice, rounds
 
-    # ============ teammate 模式(B1: 无状态短运行 + 请求内唤醒) ============
+    # ============ teammate 模式:无状态短运行,在请求内被唤醒 ============
 
     async def run_teammate(
         self,
@@ -572,7 +603,9 @@ class SubAgentRunner:
         token = set_team_task_instance_id(instance_id)
         # teammate 的 actor:role=teammate,唯一键 name,run_id=本次推进隔离 id,
         # task=初始任务,team 携带 team_id(若已归属团队)。
-        team_ref = TeamRef(id=member.team_id) if member.team_id is not None else None
+        team_ref: TeamRef | None = None
+        if member.team_id is not None:
+            team_ref = TeamRef(id=member.team_id)
         actor = teammate_actor(name, run_id=instance_id, task=member.prompt, team=team_ref)
         assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
         try:
@@ -676,8 +709,9 @@ class SubAgentRunner:
     ) -> None:
         """在 messages 最前面注入 identity;若首条已是 identity 则跳过避免重复。"""
         identity = self._identity_block(session_id, name, role)
-        first = messages[0] if messages else None
-        first_text = first.get("content") if isinstance(first, dict) else None
+        first_text = None
+        if messages and isinstance(messages[0], dict):
+            first_text = messages[0].get("content")
         if (
             isinstance(first_text, str)
             and first_text.startswith("<identity>")
@@ -692,7 +726,10 @@ class SubAgentRunner:
         """据剩余未读消息 / 可认领任务,把成员置 working 或 idle。"""
         pending_inbox = await team_service.peek_inbox(session_id, name)
         claimable = await team_service.list_claimable_tasks(session_id)
-        status = "working" if (pending_inbox or claimable) else "idle"
+        if pending_inbox or claimable:
+            status = "working"
+        else:
+            status = "idle"
         await team_service.update_member_runtime(session_id, name, status=status)
 
     async def _run_teammate_loop(

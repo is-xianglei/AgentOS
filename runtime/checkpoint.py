@@ -56,11 +56,10 @@ class InMemoryCheckpointStore:
     async def load(self, run_id: UUID) -> OrchestrationCheckpoint | None:
         async with self._lock:
             checkpoint = self._items.get(run_id)
-            return (
-                OrchestrationCheckpoint.from_dict(checkpoint.to_dict())
-                if checkpoint is not None
-                else None
-            )
+            if checkpoint is None:
+                return None
+            # 返回副本，调用方修改不会影响存储中的快照。
+            return OrchestrationCheckpoint.from_dict(checkpoint.to_dict())
 
     async def delete(self, run_id: UUID) -> None:
         async with self._lock:
@@ -90,32 +89,36 @@ class DatabaseCheckpointStore:
                 revision=checkpoint.revision,
             )
             self.db.add(row)
-        else:
-            if checkpoint.revision < row.revision:
-                raise CheckpointConflictError(
-                    f"检查点版本过旧: run_id={checkpoint.run_id} "
-                    f"revision={checkpoint.revision} < {row.revision}"
-                )
-            if checkpoint.revision == row.revision:
-                current = OrchestrationCheckpoint(
-                    run_id=row.run_id,
-                    session_id=row.session_id,
-                    turn_id=row.turn_id,
-                    cursor=row.cursor,
-                    state=deepcopy(row.state),
-                    revision=row.revision,
-                )
-                if current.to_dict() == checkpoint.to_dict():
-                    return
-                raise CheckpointConflictError(
-                    f"检查点版本冲突: run_id={checkpoint.run_id} "
-                    f"revision={checkpoint.revision}"
-                )
-            row.session_id = checkpoint.session_id
-            row.turn_id = checkpoint.turn_id
-            row.cursor = checkpoint.cursor
-            row.state = deepcopy(checkpoint.state)
-            row.revision = checkpoint.revision
+            await self.db.flush()
+            return
+
+        if checkpoint.revision < row.revision:
+            raise CheckpointConflictError(
+                f"检查点版本过旧: run_id={checkpoint.run_id} "
+                f"revision={checkpoint.revision} < {row.revision}"
+            )
+        # 同版本重复保存：内容一致视为幂等重放直接返回，内容不同说明有并发写入。
+        if checkpoint.revision == row.revision:
+            current = OrchestrationCheckpoint(
+                run_id=row.run_id,
+                session_id=row.session_id,
+                turn_id=row.turn_id,
+                cursor=row.cursor,
+                state=deepcopy(row.state),
+                revision=row.revision,
+            )
+            if current.to_dict() == checkpoint.to_dict():
+                return
+            raise CheckpointConflictError(
+                f"检查点版本冲突: run_id={checkpoint.run_id} "
+                f"revision={checkpoint.revision}"
+            )
+
+        row.session_id = checkpoint.session_id
+        row.turn_id = checkpoint.turn_id
+        row.cursor = checkpoint.cursor
+        row.state = deepcopy(checkpoint.state)
+        row.revision = checkpoint.revision
         await self.db.flush()
 
     async def load(self, run_id: UUID) -> OrchestrationCheckpoint | None:
