@@ -8,13 +8,13 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
+from llm.errors import LLMConnectionError, LLMStatusError, error_type_name
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import (
     MemoryItemRecord,
@@ -325,18 +325,24 @@ class MemoryDreamService:
                 max_tokens=settings.llm_memory_dream_max_tokens,
                 timeout=settings.memory_dream_timeout_seconds,
             )
-        except (APITimeoutError, APIConnectionError, RateLimitError, TimeoutError) as exc:
+        except (LLMConnectionError, TimeoutError) as exc:
             raise MemoryDreamFailure(
                 "dream_unavailable",
-                type(exc).__name__,
+                error_type_name(exc),
                 retryable=True,
             ) from exc
-        except APIStatusError as exc:
-            retryable = exc.status_code == 429 or exc.status_code >= 500
+        except LLMStatusError as exc:
+            # 429 限流与传输不可用同归 dream_unavailable,与 Extractor 的失败码口径一致。
+            if exc.status_code == 429:
+                raise MemoryDreamFailure(
+                    "dream_unavailable",
+                    exc.sdk_error_type,
+                    retryable=True,
+                ) from exc
             raise MemoryDreamFailure(
                 f"dream_http_{exc.status_code}",
-                type(exc).__name__,
-                retryable=retryable,
+                exc.sdk_error_type,
+                retryable=exc.status_code >= 500,
             ) from exc
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             raise MemoryDreamFailure(
@@ -347,7 +353,7 @@ class MemoryDreamService:
         except Exception as exc:
             raise MemoryDreamFailure(
                 "dream_error",
-                type(exc).__name__,
+                error_type_name(exc),
                 retryable=False,
             ) from exc
 

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, cast
 
-from openai import NOT_GIVEN, AsyncOpenAI
+from openai import NOT_GIVEN, APIConnectionError, APIStatusError, AsyncOpenAI, OpenAIError
 from openai.types.chat import ChatCompletionFunctionToolParam, ChatCompletionMessageParam
 from pydantic import BaseModel
 
@@ -14,6 +14,7 @@ from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
+from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
 from llm.types import (
     LLMEventKind,
     LLMStreamEvent,
@@ -73,6 +74,28 @@ def _encode_tool_result(tool_result: ToolResultMessage) -> dict[str, Any]:
         "tool_call_id": tool_result.tool_use_id,
         "content": content,
     }
+
+
+def _to_llm_error(exc: OpenAIError) -> LLMCallError:
+    """把 OpenAI SDK 异常转成中立异常,消息与 SDK 类名原样保留。
+
+    OpenAI 异常与 Anthropic 的没有继承关系,不在此转换就会让调用方的分类全部落空。
+    APITimeoutError 是 APIConnectionError 的子类,一并归为连接失败;流中途的错误事件
+    是不带状态码的裸 APIError,与 LengthFinishReasonError 等其余异常一样归入 LLMCallError。
+    APIResponseValidationError 带 status_code 但不是状态错误,原样带上供诊断展示。
+    """
+    sdk_error_type = type(exc).__name__
+    if isinstance(exc, APIConnectionError):
+        return LLMConnectionError(str(exc), sdk_error_type=sdk_error_type)
+    if isinstance(exc, APIStatusError):
+        return LLMStatusError(
+            str(exc), sdk_error_type=sdk_error_type, status_code=exc.status_code
+        )
+    return LLMCallError(
+        str(exc),
+        sdk_error_type=sdk_error_type,
+        status_code=getattr(exc, "status_code", None),
+    )
 
 
 def _map_usage(usage: dict[str, Any]) -> Usage:
@@ -504,15 +527,18 @@ class OpenAIClient(BaseLLMClient):
             sampling = {}
         else:
             sampling = {"temperature": 0}
-        response = await client.chat.completions.parse(
-            model=model or self.model,
-            # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
-            messages=cast("list[ChatCompletionMessageParam]", openai_messages),
-            response_format=output_format,
-            max_completion_tokens=max_tokens,
-            **sampling,
-            **thinking_kwargs,
-        )
+        try:
+            response = await client.chat.completions.parse(
+                model=model or self.model,
+                # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
+                messages=cast("list[ChatCompletionMessageParam]", openai_messages),
+                response_format=output_format,
+                max_completion_tokens=max_tokens,
+                **sampling,
+                **thinking_kwargs,
+            )
+        except OpenAIError as exc:
+            raise _to_llm_error(exc) from exc
 
         parsed = response.choices[0].message.parsed
         if parsed is None:
@@ -578,14 +604,18 @@ class OpenAIClient(BaseLLMClient):
         # 被显式关闭而非留给 GC;否则解释器回收异步生成器时会抛
         # "generator didn't stop after athrow()"。Anthropic 侧由 messages.stream()
         # 的上下文管理器承担同一职责。
-        async with await client.chat.completions.create(**request_kwargs) as raw_stream:
-            async for chunk in raw_stream:
-                chunk_dict = (
-                    chunk.model_dump(mode="json", warnings=False)
-                    if hasattr(chunk, "model_dump")
-                    else cast("dict[str, Any]", chunk)
-                )
-                for neutral_event in adapter.adapt(chunk_dict):
-                    yield neutral_event
+        # 建流和迭代都可能抛 SDK 异常(含流中途的 error 事件),统一在此转成中立异常。
+        try:
+            async with await client.chat.completions.create(**request_kwargs) as raw_stream:
+                async for chunk in raw_stream:
+                    chunk_dict = (
+                        chunk.model_dump(mode="json", warnings=False)
+                        if hasattr(chunk, "model_dump")
+                        else cast("dict[str, Any]", chunk)
+                    )
+                    for neutral_event in adapter.adapt(chunk_dict):
+                        yield neutral_event
+        except OpenAIError as exc:
+            raise _to_llm_error(exc) from exc
         for neutral_event in adapter.finalize():
             yield neutral_event

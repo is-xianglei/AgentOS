@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from llm import BaseLLMClient
+from llm.errors import error_type_name
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from memory.recall.repository import (
     MemoryLexicalCandidate,
@@ -233,7 +234,8 @@ class MemoryRecallService:
             degraded_reason = "selector_timeout"
             logger.warning("Memory选择器超时，切换词法降级")
         except Exception as exc:
-            degraded_reason = f"selector_error:{type(exc).__name__}"[:200]
+            # 中立 LLM 异常取原始 SDK 类名,与已落库的 degraded_reason 取值口径一致。
+            degraded_reason = f"selector_error:{error_type_name(exc)}"[:200]
             logger.exception("Memory选择器失败，切换词法降级")
 
         fallback_ids = await self._fallback_select(

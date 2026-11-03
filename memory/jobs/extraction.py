@@ -7,13 +7,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import UUID
 
-from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
+from llm.errors import LLMConnectionError, LLMStatusError, error_type_name
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import MemoryItemRecord
 from memory.repository import MemoryCatalogEntry, MemoryRepository
@@ -196,13 +196,13 @@ def _classify_extractor_error(exc: Exception) -> tuple[str, bool]:
 
     失败码会写入 Job 记录用于排障，故按传输不可用、HTTP 状态、输出不合规三类区分；
     429 与 5xx 属于服务端瞬时问题可重试，输出不合规重试无意义。
+    SDK 异常已由各家客户端转成中立异常，此处不区分 provider。
     """
     match exc:
-        case APITimeoutError() | APIConnectionError() | RateLimitError() | TimeoutError():
+        case LLMConnectionError() | LLMStatusError(status_code=429) | TimeoutError():
             return "extractor_unavailable", True
-        case APIStatusError():
-            retryable = exc.status_code == 429 or exc.status_code >= 500
-            return f"extractor_http_{exc.status_code}", retryable
+        case LLMStatusError():
+            return f"extractor_http_{exc.status_code}", exc.status_code >= 500
         case ValidationError() | ValueError():
             return "invalid_extractor_output", False
         case _:
@@ -365,7 +365,7 @@ class MemoryExtractionService:
             )
         except Exception as exc:
             code, retryable = _classify_extractor_error(exc)
-            raise MemoryExtractionFailure(code, type(exc).__name__, retryable=retryable) from exc
+            raise MemoryExtractionFailure(code, error_type_name(exc), retryable=retryable) from exc
 
     async def apply(
         self,

@@ -6,7 +6,14 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, cast
 
-from anthropic import NOT_GIVEN, AsyncAnthropic, NotGiven
+from anthropic import (
+    NOT_GIVEN,
+    AnthropicError,
+    APIConnectionError,
+    APIStatusError,
+    AsyncAnthropic,
+    NotGiven,
+)
 from anthropic.types import MessageParam, TextBlockParam, ToolChoiceToolParam, ToolParam
 from pydantic import BaseModel, ValidationError
 
@@ -14,6 +21,7 @@ from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from llm.base import BaseLLMClient
+from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
 from llm.types import (
     AssistantBlock,
     LLMEventKind,
@@ -71,6 +79,28 @@ _BLOCK_TYPE_MAP = {
     "redacted_thinking": BlockType.THINKING,
     "tool_use": BlockType.TOOL_USE,
 }
+
+
+def _to_llm_error(exc: AnthropicError) -> LLMCallError:
+    """把 Anthropic SDK 异常转成中立异常,消息与 SDK 类名原样保留。
+
+    APITimeoutError 是 APIConnectionError 的子类,一并归为连接失败;
+    429 仍按状态码归入 LLMStatusError,是否视为「不可用」由调用方决定。
+    APIResponseValidationError、WorkloadIdentityError 等非状态错误也可能带
+    status_code,原样带上供诊断展示,但不归为 LLMStatusError。
+    """
+    sdk_error_type = type(exc).__name__
+    if isinstance(exc, APIConnectionError):
+        return LLMConnectionError(str(exc), sdk_error_type=sdk_error_type)
+    if isinstance(exc, APIStatusError):
+        return LLMStatusError(
+            str(exc), sdk_error_type=sdk_error_type, status_code=exc.status_code
+        )
+    return LLMCallError(
+        str(exc),
+        sdk_error_type=sdk_error_type,
+        status_code=getattr(exc, "status_code", None),
+    )
 
 
 def _chunk_type(chunk: dict[str, Any]) -> str | None:
@@ -492,41 +522,45 @@ class AnthropicClient(BaseLLMClient):
         adapter = _AnthropicChunkAdapter()
         # 实例上的 max_tokens 由调用方按需设置(如模型连通性测试只要很短的回复)。
         max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
-        async with client.messages.stream(
-            max_tokens=max_tokens,
-            model=model or self.model,
-            system=self._encode_system(system_prompt),
-            messages=self._encode_messages(messages),
-            tools=self._encode_tools(tools),
-            **self._thinking_kwargs(max_tokens),
-        ) as stream:
-            async for event in stream:
-                # SDK 事件都是 Pydantic 模型;防御性兜底把其他对象转成只有 type 的噪声事件。
-                if hasattr(event, "model_dump"):
-                    chunk = event.model_dump(mode="json", warnings=False)
-                else:
-                    chunk = {"type": str(event)}
-                for neutral_event in adapter.adapt(chunk):
+        # 建流和迭代都可能抛 SDK 异常(含流中途的 error 事件),统一在此转成中立异常。
+        try:
+            async with client.messages.stream(
+                max_tokens=max_tokens,
+                model=model or self.model,
+                system=self._encode_system(system_prompt),
+                messages=self._encode_messages(messages),
+                tools=self._encode_tools(tools),
+                **self._thinking_kwargs(max_tokens),
+            ) as stream:
+                async for event in stream:
+                    # SDK 事件都是 Pydantic 模型;防御性兜底把其他对象转成只有 type 的噪声事件。
+                    if hasattr(event, "model_dump"):
+                        chunk = event.model_dump(mode="json", warnings=False)
+                    else:
+                        chunk = {"type": str(event)}
+                    for neutral_event in adapter.adapt(chunk):
+                        yield neutral_event
+
+                # 流耗尽后由 SDK 聚合出完整消息,合成 message_final 交给适配器产出 TURN_RESULT。
+                final = await stream.get_final_message()
+
+                usage = None
+                if hasattr(final, "usage") and final.usage is not None:
+                    usage = final.usage.model_dump(mode="json", warnings=False)
+                    self._log_cache_usage(usage)
+                final_content = [
+                    block.model_dump(mode="json", warnings=False) for block in final.content
+                ]
+                message_final = {
+                    "type": "message_final",
+                    "stop_reason": final.stop_reason,
+                    "usage": usage,
+                    "content": final_content,
+                }
+                for neutral_event in adapter.adapt(message_final):
                     yield neutral_event
-
-            # 流耗尽后由 SDK 聚合出完整消息,合成 message_final 交给适配器产出 TURN_RESULT。
-            final = await stream.get_final_message()
-
-            usage = None
-            if hasattr(final, "usage") and final.usage is not None:
-                usage = final.usage.model_dump(mode="json", warnings=False)
-                self._log_cache_usage(usage)
-            final_content = [
-                block.model_dump(mode="json", warnings=False) for block in final.content
-            ]
-            message_final = {
-                "type": "message_final",
-                "stop_reason": final.stop_reason,
-                "usage": usage,
-                "content": final_content,
-            }
-            for neutral_event in adapter.adapt(message_final):
-                yield neutral_event
+        except AnthropicError as exc:
+            raise _to_llm_error(exc) from exc
 
     @staticmethod
     def _log_cache_usage(usage: dict[str, Any]) -> None:
@@ -613,12 +647,15 @@ class AnthropicClient(BaseLLMClient):
                 # 显式None会禁用SDK超时，未指定时保留客户端默认值。
                 "timeout": timeout if timeout is not None else NOT_GIVEN,
             }
-            if thinking_on:
-                # 大思考预算须流式传输；SDK聚合完整块，保留签名和用量供重试。
-                async with client.messages.stream(**request) as stream:
-                    response = await stream.get_final_message()
-            else:
-                response = await client.messages.create(**request)
+            try:
+                if thinking_on:
+                    # 大思考预算须流式传输；SDK聚合完整块，保留签名和用量供重试。
+                    async with client.messages.stream(**request) as stream:
+                        response = await stream.get_final_message()
+                else:
+                    response = await client.messages.create(**request)
+            except AnthropicError as exc:
+                raise _to_llm_error(exc) from exc
             # 取第一个调用结构化工具的 tool_use 块。
             tool_block = None
             for block in response.content:

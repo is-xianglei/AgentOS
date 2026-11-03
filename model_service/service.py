@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
 from llm.base import BaseLLMClient
+from llm.errors import error_type_name
 from model_service.models import ModelProviderRecord, ModelRoleRecord
 from model_service.policy import (
     MODES,
@@ -331,10 +332,12 @@ class ModelService:
         except Exception as exc:
             # 上游异常可能包含密钥或连接串，只向客户端暴露分类后的安全信息。
             status = getattr(exc, "status_code", None)
-            error = f"上游 HTTP {status}" if status else f"无法连接模型服务（{type(exc).__name__}）"
+            # 中立 LLM 异常取原始 SDK 类名,保持对外文案与日志字段口径不变。
+            exception_type = error_type_name(exc)
+            error = f"上游 HTTP {status}" if status else f"无法连接模型服务（{exception_type}）"
             logger.warning(
                 "模型服务测试失败",
-                extra={"exception_type": type(exc).__name__, "upstream_status": status},
+                extra={"exception_type": exception_type, "upstream_status": status},
             )
             return ModelTestResponse(
                 success=False,
