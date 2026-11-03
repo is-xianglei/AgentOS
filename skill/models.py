@@ -4,11 +4,11 @@ from sqlalchemy import Boolean, ForeignKey, Integer, String, Text, UniqueConstra
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
-from database.base import Base
-from database.base import json_type
+from database.base import Base, json_type
 
 
 class SkillRecord(Base):
+    """工作区内的 skill：SKILL.md 原文、附属文件和解析出的元数据。"""
 
     __tablename__ = "skills"
     __table_args__ = (

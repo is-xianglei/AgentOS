@@ -12,10 +12,10 @@ from interaction.models import (
 )
 from interaction.repository import InteractionRepository
 from interaction.schemas import (
+    RESPONSE_PAYLOAD_MODELS,
     AskUserQuestionRequestPayload,
     InteractionRequestCreate,
     PendingInteractionResponse,
-    RESPONSE_PAYLOAD_MODELS,
 )
 from session.service import SessionService
 
@@ -93,14 +93,15 @@ class InteractionService:
         suspension = await self.repo.get_pending_by_session(session_id)
         if suspension is None:
             return None
-        requests = (
-            [request for request in suspension.requests if request.status == "pending"]
-            if suspension.status == "pending"
-            else list(suspension.requests)
-        )
+        # pending 时只返回还没回答的请求；resuming 时返回全部请求，便于客户端展示已提交的回答。
+        if suspension.status == "pending":
+            requests = [request for request in suspension.requests if request.status == "pending"]
+        else:
+            requests = list(suspension.requests)
         return suspension, requests
 
     async def get_pending_response(self, session_id: int) -> PendingInteractionResponse | None:
+        """get_pending 的响应 Schema 版本，没有进行中的暂停点时返回 None。"""
         pending = await self.get_pending(session_id)
         if pending is None:
             return None
@@ -116,6 +117,7 @@ class InteractionService:
         *,
         session_id: int | None = None,
     ) -> InteractionRequestRecord:
+        """查询交互请求；指定 session_id 时，不属于该会话的请求按不存在处理。"""
         request = await self.repo.get_request(request_id)
         if request is None or (session_id is not None and request.session_id != session_id):
             raise AgentException.message("人工交互请求不存在")
@@ -127,6 +129,7 @@ class InteractionService:
         *,
         session_id: int | None = None,
     ) -> RuntimeSuspensionRecord:
+        """查询暂停点；指定 session_id 时，不属于该会话的暂停点按不存在处理。"""
         suspension = await self.repo.get_suspension(suspension_id)
         if suspension is None or (
             session_id is not None and suspension.session_id != session_id
@@ -154,7 +157,7 @@ class InteractionService:
         continuation_payload: dict[str, Any],
         request: InteractionRequestCreate,
     ) -> tuple[RuntimeSuspensionRecord, InteractionRequestRecord]:
-        """在同一 continuation 中追加下一项顺序交互。"""
+        """在同一 continuation 中追加下一项顺序交互，暂停点从 resuming 回到 pending。"""
         suspension = await self.repo.get_suspension_for_update(suspension_id)
         if suspension is None:
             raise AgentException.message("运行暂停点不存在")
@@ -166,6 +169,7 @@ class InteractionService:
         if await self.repo.count_pending_requests(suspension.id) != 0:
             raise AgentException.message("运行暂停点仍有未处理的交互请求")
 
+        # 序号按已有请求数递增；暂停点行锁保证不会并发分配出相同序号。
         existing_requests = await self.repo.list_requests(
             suspension.id,
             for_update=True,
@@ -197,6 +201,7 @@ class InteractionService:
         current = await self.repo.get_request(request_id)
         if current is None or (session_id is not None and current.session_id != session_id):
             raise AgentException.message("人工交互请求不存在")
+        # 先锁暂停点，串行化同一暂停点下的并发响应、追加与取消。
         suspension = await self.repo.get_suspension_for_update(current.suspension_id)
         if suspension is None:
             raise AgentException.message("人工交互请求对应的运行暂停点不存在")
@@ -206,6 +211,7 @@ class InteractionService:
                 {"expected_kind": current.kind, "actual_kind": expected_kind},
             )
         normalized = self._validate_response_payload(current, response_payload)
+        # 幂等重放：用相同响应重复提交直接返回原结果，客户端可安全重试；响应不同则 409。
         if current.status == "resolved":
             if current.response_payload != normalized:
                 raise AgentException.message(
@@ -218,11 +224,13 @@ class InteractionService:
                 "人工交互请求已处理或已失效",
                 {"request_status": current.status, "suspension_status": suspension.status},
             )
+        # current 是加锁前读到的，可能已过期；在 SQL 里按 pending 状态加行锁重新确认。
         request = await self.repo.lock_pending_request(request_id, session_id)
         if request is None:
             raise AgentException.message("人工交互请求已处理或已失效")
         await self.repo.resolve_request(request, normalized, responded_by)
 
+        # 暂停点下全部请求都已回答，才进入 resuming 等待运行时恢复。
         if await self.repo.count_pending_requests(suspension.id) == 0:
             await self.repo.update_suspension_status(suspension, "resuming")
         return request, suspension
@@ -280,41 +288,47 @@ class InteractionService:
         request: InteractionRequestRecord,
         response_payload: dict[str, Any],
     ) -> dict[str, Any]:
+        """按请求类型校验响应并返回规范化后的 JSON，用于落库和幂等比对。"""
         model_type = RESPONSE_PAYLOAD_MODELS.get(request.kind)  # type: ignore[arg-type]
         if model_type is None:
             raise AgentException.message("不支持的人工交互类型")
         try:
             response = model_type.model_validate(response_payload)
         except ValidationError as exc:
+            # exc.errors() 可能含不可 JSON 序列化的对象，先转成字符串再放进错误详情。
             errors = json.loads(json.dumps(exc.errors(), default=str))
             raise AgentException.message("人工交互响应格式无效", {"errors": errors}) from exc
 
         normalized = response.model_dump(mode="json", by_alias=True)
-        if request.kind == "user_question":
-            try:
-                question_request = AskUserQuestionRequestPayload.model_validate(
-                    request.request_payload
-                )
-            except ValidationError as exc:
-                errors = json.loads(json.dumps(exc.errors(), default=str))
-                raise AgentException.message(
-                    "已保存的问题请求格式无效",
-                    {"errors": errors},
-                ) from exc
-            expected = {question.question for question in question_request.questions}
-            actual = set(normalized["answers"])
-            decision = normalized["decision"]
-            if decision == "submit" and actual != expected:
-                raise AgentException.message(
-                    "用户答案必须完整对应本次全部问题",
-                    {
-                        "missing": sorted(expected - actual),
-                        "unexpected": sorted(actual - expected),
-                    },
-                )
-            if decision != "submit" and not actual.issubset(expected):
-                raise AgentException.message(
-                    "用户答案包含不属于本次交互的问题",
-                    {"unexpected": sorted(actual - expected)},
-                )
+        if request.kind != "user_question":
+            return normalized
+
+        # 用户提问还要核对答案与当初提出的问题一一对应。
+        try:
+            question_request = AskUserQuestionRequestPayload.model_validate(
+                request.request_payload
+            )
+        except ValidationError as exc:
+            errors = json.loads(json.dumps(exc.errors(), default=str))
+            raise AgentException.message(
+                "已保存的问题请求格式无效",
+                {"errors": errors},
+            ) from exc
+        expected = {question.question for question in question_request.questions}
+        actual = set(normalized["answers"])
+        decision = normalized["decision"]
+        # submit 必须答全；其他决策可以只答一部分，但不能出现本次之外的问题。
+        if decision == "submit" and actual != expected:
+            raise AgentException.message(
+                "用户答案必须完整对应本次全部问题",
+                {
+                    "missing": sorted(expected - actual),
+                    "unexpected": sorted(actual - expected),
+                },
+            )
+        if decision != "submit" and not actual.issubset(expected):
+            raise AgentException.message(
+                "用户答案包含不属于本次交互的问题",
+                {"unexpected": sorted(actual - expected)},
+            )
         return normalized

@@ -21,13 +21,15 @@ router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
 CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
+SkillZipFile = Annotated[UploadFile, File(description="skill 的 zip 打包文件")]
+ValidateZipFile = Annotated[UploadFile, File(description="待预检的 skill zip 打包文件")]
 
 # 上传 zip 大小上限(字节):8MB,对齐官方 Agent Skills 规范。
 _MAX_BUNDLE_BYTES = 8 * 1024 * 1024
 
 
-def _read_and_guard(data: bytes) -> bytes:
-    """校验上传体大小上限。"""
+def _check_bundle_size(data: bytes) -> bytes:
+    """校验上传的 zip 体积不超过上限，通过时原样返回。"""
     if len(data) > _MAX_BUNDLE_BYTES:
         raise AgentException.message(
             f"bundle 体积超过上限 {_MAX_BUNDLE_BYTES} 字节({len(data)})",
@@ -46,9 +48,9 @@ async def upload_skill(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
-    file: UploadFile = File(description="skill 的 zip 打包文件"),
+    file: SkillZipFile,
 ):
-    data = _read_and_guard(await file.read())
+    data = _check_bundle_size(await file.read())
     service = SkillService(db)
     record = await service.create_from_bundle(workspace_id, current_user.id, data)
     return ok(SkillResponse.model_validate(record), request)
@@ -64,9 +66,9 @@ async def validate_skill(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
-    file: UploadFile = File(description="待预检的 skill zip 打包文件"),
+    file: ValidateZipFile,
 ):
-    data = _read_and_guard(await file.read())
+    data = _check_bundle_size(await file.read())
     service = SkillService(db)
     result = await service.validate(data)
     return ok(result, request)
@@ -160,9 +162,9 @@ async def replace_skill_bundle(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
-    file: UploadFile = File(description="skill 的 zip 打包文件"),
+    file: SkillZipFile,
 ):
-    data = _read_and_guard(await file.read())
+    data = _check_bundle_size(await file.read())
     service = SkillService(db)
     record = await service.replace_bundle(workspace_id, skill_id, current_user.id, data)
     return ok(SkillResponse.model_validate(record), request)

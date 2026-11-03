@@ -74,6 +74,7 @@ class InteractionRepository:
     async def get_suspension_for_update(
         self, suspension_id: UUID
     ) -> RuntimeSuspensionRecord | None:
+        """加行锁读取暂停点；populate_existing 让锁内读到库中最新状态而非会话缓存。"""
         stmt = (
             select(RuntimeSuspensionRecord)
             .where(RuntimeSuspensionRecord.id == suspension_id)
@@ -85,6 +86,7 @@ class InteractionRepository:
     async def get_active_suspension_for_update(
         self, session_id: int
     ) -> RuntimeSuspensionRecord | None:
+        """加锁读取会话最近一个未结束（pending 或 resuming）的暂停点。"""
         stmt = (
             select(RuntimeSuspensionRecord)
             .where(
@@ -137,6 +139,7 @@ class InteractionRepository:
         request_id: UUID,
         session_id: int | None = None,
     ) -> InteractionRequestRecord | None:
+        """仅当请求仍为 pending 时加锁返回，已被并发处理时返回 None。"""
         stmt = select(InteractionRequestRecord).where(
             InteractionRequestRecord.id == request_id,
             InteractionRequestRecord.status == "pending",
@@ -186,6 +189,7 @@ class InteractionRepository:
         *,
         terminal: bool = False,
     ) -> RuntimeSuspensionRecord:
+        """更新暂停点状态并递增版本号；进入终态时记录结束时间，否则清空。"""
         suspension.status = status
         suspension.version += 1
         suspension.resolved_at = datetime.now(UTC) if terminal else None

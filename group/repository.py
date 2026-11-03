@@ -53,8 +53,10 @@ class GroupRepository:
         group_type: str | None = None,
         search: str | None = None,
     ) -> list[GroupRecord]:
+        """列出启用的群组；不含私有群组时，只保留非私有群组和用户已加入的私有群组。"""
         stmt = select(GroupRecord)
         if not include_private:
+            # 左连接当前用户已加入的成员记录，连得上说明用户是该群组成员。
             stmt = stmt.outerjoin(
                 GroupMemberRecord,
                 and_(
@@ -86,6 +88,7 @@ class GroupRepository:
         return group
 
     async def soft_delete(self, group: GroupRecord) -> None:
+        """软删除群组，并在同一事务内批量软删除其全部有效成员记录。"""
         now = datetime.now(UTC)
         group.is_deleted = True
         group.deleted_at = now
@@ -113,6 +116,10 @@ class GroupMemberRepository:
         invited_by: int | None,
         joined_at: datetime | None,
     ) -> GroupMemberRecord:
+        """新建成员记录；该用户已有记录（含软删除的旧记录）时复用该行并覆盖字段。
+
+        调用方负责先确认不存在有效记录，这里不再区分。
+        """
         existing = await self.get(group_id, user_id, include_deleted=True)
         if existing is not None:
             existing.role = role

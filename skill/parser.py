@@ -43,6 +43,7 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 def _invalid(message: str) -> AgentException:
+    """构造 400 业务错误；bundle 内容不合法都属于客户端输入问题。"""
     return AgentException.message(message, status_code=400)
 
 
@@ -101,9 +102,10 @@ def parse_skill_md(text: str) -> ParsedSkill:
     match = _FRONTMATTER_RE.match(text)
     if match is None:
         raise _invalid("SKILL.md 缺少合法的 frontmatter(首行须为 ---,且存在第二个 --- 分隔)")
-    raw_fm, body = match.group(1), match.group(2)
+    raw_frontmatter = match.group(1)
+    body = match.group(2)
     try:
-        loaded = yaml.safe_load(raw_fm)
+        loaded = yaml.safe_load(raw_frontmatter)
     except yaml.YAMLError as exc:
         raise _invalid(f"frontmatter YAML 解析失败: {exc}") from exc
     if not isinstance(loaded, dict):
@@ -180,12 +182,14 @@ def encode_file(data: bytes) -> dict[str, str]:
 
 
 def decode_file(entry: dict[str, str]) -> bytes:
+    """encode_file 的逆操作，还原文件原始字节。"""
     if entry["encoding"] == ENCODING_BASE64:
         return base64.b64decode(entry["content"])
     return entry["content"].encode("utf-8")
 
 
 def guess_mime(relative_path: str) -> str:
+    """按扩展名猜测 MIME 类型，猜不出时按二进制处理。"""
     return mimetypes.guess_type(relative_path)[0] or "application/octet-stream"
 
 
@@ -228,14 +232,18 @@ def parse_skill_zip(file_bytes: bytes) -> SkillBundle:
         files: dict[str, bytes] = {}
         total_bytes = 0
         for path, info in members:
+            # skill 根之外的成员（如同级的其他目录）直接忽略。
             if not path.startswith(root_prefix):
                 continue
             rel = path[len(root_prefix):]
+            # 不同写法规范化后可能落到同一路径，例如 a//b 与 a/./b。
             if rel in files:
                 raise _invalid(f"bundle 内存在重复路径: {rel!r}")
             if len(files) >= MAX_BUNDLE_FILES:
                 raise _invalid(f"bundle 文件数超过上限 {MAX_BUNDLE_FILES}")
-            data = _read_member(zf, info, MAX_UNCOMPRESSED_BYTES - total_bytes)
+            # 每个成员只能使用剩余的解压额度，所有成员合计不超过 MAX_UNCOMPRESSED_BYTES。
+            remaining_bytes = MAX_UNCOMPRESSED_BYTES - total_bytes
+            data = _read_member(zf, info, remaining_bytes)
             total_bytes += len(data)
             files[rel] = data
 
@@ -256,6 +264,7 @@ def build_skill_zip(bundle: SkillBundle) -> bytes:
 
 
 def _is_ignored(path: str) -> bool:
+    """判断是否为打包工具产生的噪声文件，如 macOS 的 __MACOSX 目录与 ._ 资源分叉文件。"""
     parts = path.split("/")
     if _IGNORED_SEGMENTS.intersection(parts):
         return True
@@ -268,6 +277,7 @@ def _resolve_root_prefix(paths: list[str]) -> str:
     candidates = [path for path in paths if path.rsplit("/", 1)[-1] == SKILL_MD]
     if not candidates:
         raise _invalid("bundle 缺少 SKILL.md(根级或任一目录内均可)")
+    # 先比目录层级，层级相同时取路径更短的，保证同一个包每次选出的根目录相同。
     chosen = min(candidates, key=lambda path: (path.count("/"), len(path)))
     head, _, _ = chosen.rpartition("/")
     return f"{head}/" if head else ""

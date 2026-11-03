@@ -51,10 +51,11 @@ class ModelProviderUpdate(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def reject_null_fields(cls, value: Any) -> Any:
-        if isinstance(value, dict) and any(
-            field != "api_key" and item is None for field, item in value.items()
-        ):
-            raise ValueError("更新字段不能为 null；留空密钥表示保留已有密钥")
+        if not isinstance(value, dict):
+            return value
+        for field, item in value.items():
+            if field != "api_key" and item is None:
+                raise ValueError("更新字段不能为 null；留空密钥表示保留已有密钥")
         return value
 
 

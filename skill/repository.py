@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -17,7 +17,6 @@ def _metadata_only() -> tuple[Any, ...]:
 
 
 class SkillRepository:
-
     def __init__(self, db: AsyncSession):
         self.db = db
 
@@ -143,5 +142,5 @@ class SkillRepository:
     async def soft_delete(self, record: SkillRecord) -> None:
         """软删除:置 is_deleted=True/deleted_at=now。"""
         record.is_deleted = True
-        record.deleted_at = datetime.now(timezone.utc)
+        record.deleted_at = datetime.now(UTC)
         await self.db.flush()

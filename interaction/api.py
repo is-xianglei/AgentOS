@@ -36,15 +36,16 @@ async def _require_session_access(
     *,
     write: bool = False,
 ) -> None:
+    """校验当前用户对会话的读或写权限，无权限时返回 403。"""
     service = SessionService(db)
     session = await service.get_required(session_id)
-    allowed = (
-        await service.check_write_access(session, user_id, workspace_id)
-        if write
-        else await service.check_access(session, user_id, workspace_id)
-    )
+    if write:
+        allowed = await service.check_write_access(session, user_id, workspace_id)
+        message = "无权限修改该会话"
+    else:
+        allowed = await service.check_access(session, user_id, workspace_id)
+        message = "无权限访问该会话"
     if not allowed:
-        message = "无权限修改该会话" if write else "无权限访问该会话"
         raise AgentException.message(message, status_code=403)
 
 
@@ -133,12 +134,10 @@ async def cancel_interaction(
     workspace_id: CurrentWorkspaceId,
 ):
     await _require_session_write_access(db, session_id, current_user.id, workspace_id)
-    suspension = await AgentRuntime(
+    runtime = AgentRuntime(
         db,
         user_id=current_user.id,
         workspace_id=workspace_id,
-    ).cancel_interaction(
-        session_id,
-        suspension_id,
     )
+    suspension = await runtime.cancel_interaction(session_id, suspension_id)
     return ok(RuntimeSuspensionResponse.model_validate(suspension), request)

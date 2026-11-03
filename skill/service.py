@@ -60,6 +60,7 @@ class SkillService:
 
     @property
     def executor(self) -> Executor:
+        """首次执行脚本时才获取执行器；测试可通过构造参数注入替身。"""
         if self._executor is None:
             self._executor = get_executor()
         return self._executor
@@ -146,6 +147,8 @@ class SkillService:
         actor_user_id: int,
         bundle: SkillBundle,
     ) -> SkillRecord:
+        """新建 skill：同名有效记录报 409，同名软删记录由 save 原地复活。"""
+        # lock_by_name 会读到已软删的行，便于复活时沿用原 ID。
         existing = await self.repo.lock_by_name(workspace_id, bundle.name)
         if existing is not None and not existing.is_deleted:
             raise _name_conflict(bundle.name)
@@ -162,6 +165,7 @@ class SkillService:
         record: SkillRecord,
         bundle: SkillBundle,
     ) -> SkillRecord:
+        """覆盖已有 skill；内容哈希不变时不写库，重复提交保持幂等。"""
         if record.skill_hash == bundle.skill_hash:
             return record
         return await self._save_bundle(workspace_id, actor_user_id, bundle, record)
@@ -254,6 +258,7 @@ class SkillService:
         return parse_skill_md(record.content).body
 
     async def list_resources(self, workspace_id: int, name: str) -> list[SkillResourceItem]:
+        """运行时列出已启用 skill 的附属文件清单，不含 SKILL.md 本身。"""
         record = await self._require_enabled_skill(workspace_id, name)
         return _resource_items(record.extra_files)
 
@@ -266,16 +271,33 @@ class SkillService:
         """读取单个资源;SKILL.md 返回原文,base64 存储的资源只返回描述。"""
         rel = normalize_relative_path(relative_path)
         record = await self._require_enabled_skill(workspace_id, name)
+        # SKILL.md 不存放在 extra_files 中，单独返回含 frontmatter 的原文。
         if rel == SKILL_MD:
             text = record.content
-            return SkillResource(rel, guess_mime(rel), len(text.encode("utf-8")), text)
+            return SkillResource(
+                relative_path=rel,
+                mime=guess_mime(rel),
+                size=len(text.encode("utf-8")),
+                text=text,
+            )
         entry = record.extra_files.get(rel)
         if entry is None:
             raise AgentException.message(f"资源不存在: {name}/{rel}", status_code=404)
         if entry["encoding"] == ENCODING_UTF8:
             text = entry["content"]
-            return SkillResource(rel, guess_mime(rel), len(text.encode("utf-8")), text)
-        return SkillResource(rel, guess_mime(rel), len(decode_file(entry)), None)
+            return SkillResource(
+                relative_path=rel,
+                mime=guess_mime(rel),
+                size=len(text.encode("utf-8")),
+                text=text,
+            )
+        # 二进制资源不内联内容，只给出解码后的字节数。
+        return SkillResource(
+            relative_path=rel,
+            mime=guess_mime(rel),
+            size=len(decode_file(entry)),
+            text=None,
+        )
 
     async def run_script(
         self,
@@ -310,6 +332,10 @@ class SkillService:
                 record.content,
                 record.extra_files,
             )
+            argv = [*interpreter, str(skill_root / rel), *(args or [])]
+            stdin_bytes = None
+            if stdin_text is not None:
+                stdin_bytes = stdin_text.encode("utf-8")
             # 最小 env 白名单:严禁下发 API Key、数据库连接串等敏感变量。
             env = {
                 "PATH": os.environ.get("PATH", ""),
@@ -317,8 +343,8 @@ class SkillService:
             }
             return await self.executor.run(
                 workdir=str(skill_root),
-                argv=[*interpreter, str(skill_root / rel), *(args or [])],
-                stdin=stdin_text.encode("utf-8") if stdin_text is not None else None,
+                argv=argv,
+                stdin=stdin_bytes,
                 timeout=settings.skill_exec_timeout,
                 env=env,
             )
@@ -395,6 +421,7 @@ class SkillService:
         return record
 
     async def _require_write_access(self, workspace_id: int, actor_user_id: int) -> None:
+        """写操作仅限工作区 owner 和 admin。"""
         await WorkspaceService(self.db).require_workspace_role(
             workspace_id,
             actor_user_id,
@@ -410,7 +437,9 @@ def _merge_optional_fields(
 ) -> None:
     """只写入非 None 的可选字段:新建时即不出现该键,更新时即保留原值。"""
     optional = {"version": version, "compatibility": compatibility, "metadata": metadata}
-    frontmatter.update((key, value) for key, value in optional.items() if value is not None)
+    for key, value in optional.items():
+        if value is not None:
+            frontmatter[key] = value
 
 
 def _name_conflict(name: str) -> AgentException:
@@ -422,6 +451,7 @@ def _name_conflict(name: str) -> AgentException:
 
 
 def _resource_items(extra_files: dict[str, dict[str, str]]) -> list[SkillResourceItem]:
+    """按路径排序生成资源清单；size 为解码后的原始字节数。"""
     return [
         SkillResourceItem(
             relative_path=rel,
@@ -444,7 +474,8 @@ def _materialize(
     if not root.is_relative_to(workdir):
         raise AgentException.message(f"skill 名称非法: {name!r}")
     files: dict[str, bytes] = {SKILL_MD: content.encode("utf-8")}
-    files.update((rel, decode_file(entry)) for rel, entry in extra_files.items())
+    for rel, entry in extra_files.items():
+        files[rel] = decode_file(entry)
     for rel, data in files.items():
         dest = (root / normalize_relative_path(rel)).resolve()
         if not dest.is_relative_to(root):

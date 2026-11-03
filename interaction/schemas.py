@@ -80,17 +80,13 @@ class AskUserQuestionRequestPayload(StrictSchema):
         if len(texts) != len(set(texts)):
             raise ValueError("同一次交互中的问题文本不能重复")
 
-        total_chars = sum(
-            len(question.question)
-            + len(question.header)
-            + sum(
-                len(option.label)
-                + len(option.description)
-                + len(option.preview or "")
-                for option in question.options
-            )
-            for question in self.questions
-        )
+        # 单个字段各有上限，这里再限制整次交互的总字符数，防止多个大预览叠加。
+        total_chars = 0
+        for question in self.questions:
+            total_chars += len(question.question) + len(question.header)
+            for option in question.options:
+                total_chars += len(option.label) + len(option.description)
+                total_chars += len(option.preview or "")
         if total_chars > 100_000:
             raise ValueError("问题与预览内容总长度不能超过100000字符")
         return self

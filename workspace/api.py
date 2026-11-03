@@ -61,13 +61,12 @@ async def list_workspaces(
     offset: int = Query(default=0, ge=0),
 ):
     memberships = await WorkspaceService(db).list_user_workspace_memberships(current_user.id)
+    # 不可用的工作区已在 Service 中过滤，这里直接在内存中分页。
     selected = memberships[offset : offset + limit]
-    workspaces = [
-        WorkspaceResponse.model_validate(member.workspace).model_copy(
-            update={"membership_role": member.role}
-        )
-        for member in selected
-    ]
+    workspaces: list[WorkspaceResponse] = []
+    for member in selected:
+        response = WorkspaceResponse.model_validate(member.workspace)
+        workspaces.append(response.model_copy(update={"membership_role": member.role}))
     return ok(workspaces, request)
 
 
@@ -84,8 +83,9 @@ async def get_workspace(
     current_workspace_id: CurrentWorkspaceId,
 ):
     _require_path_workspace(workspace_id, current_workspace_id)
-    await WorkspaceService(db).require_active_membership(workspace_id, current_user.id)
-    workspace = await WorkspaceService(db).get_workspace(workspace_id)
+    service = WorkspaceService(db)
+    await service.require_active_membership(workspace_id, current_user.id)
+    workspace = await service.get_workspace(workspace_id)
     return ok(WorkspaceResponse.model_validate(workspace), request)
 
 
@@ -138,25 +138,26 @@ async def list_members(
 ):
     _require_path_workspace(workspace_id, current_workspace_id)
     members_data = await WorkspaceService(db).list_members(workspace_id, current_user.id)
-    members = [
-        WorkspaceMemberDetailResponse(
-            id=member.id,
-            workspace_id=member.workspace_id,
-            user_id=member.user_id,
-            username=str(user_info["username"]),
-            email=str(user_info["email"]),
-            full_name=user_info["full_name"],
-            avatar_url=user_info["avatar_url"],
-            role=member.role,
-            department_id=member.department_id,
-            job_title=member.job_title,
-            invited_by=member.invited_by,
-            invited_at=member.invited_at,
-            joined_at=member.joined_at,
-            created_at=member.created_at,
+    members: list[WorkspaceMemberDetailResponse] = []
+    for member, user_info in members_data:
+        members.append(
+            WorkspaceMemberDetailResponse(
+                id=member.id,
+                workspace_id=member.workspace_id,
+                user_id=member.user_id,
+                username=str(user_info["username"]),
+                email=str(user_info["email"]),
+                full_name=user_info["full_name"],
+                avatar_url=user_info["avatar_url"],
+                role=member.role,
+                department_id=member.department_id,
+                job_title=member.job_title,
+                invited_by=member.invited_by,
+                invited_at=member.invited_at,
+                joined_at=member.joined_at,
+                created_at=member.created_at,
+            )
         )
-        for member, user_info in members_data
-    ]
     return ok(members, request)
 
 

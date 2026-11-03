@@ -25,6 +25,7 @@ class GroupService:
         actor_user_id: int,
         **values: Any,
     ) -> GroupRecord:
+        """创建群组，创建者同时成为负责人和第一个 owner 成员。"""
         await self.workspace_service.require_active_membership(workspace_id, actor_user_id)
         slug = str(values["slug"])
         if await self.repo.get_by_slug(workspace_id, slug):
@@ -68,6 +69,7 @@ class GroupService:
             workspace_id,
             actor_user_id,
         )
+        # 工作区 owner 能看到全部群组；其他成员看不到自己未加入的私有群组。
         return await self.repo.list_visible(
             workspace_id,
             actor_user_id,
@@ -82,13 +84,17 @@ class GroupService:
         group_id: int,
         actor_user_id: int,
     ) -> GroupRecord:
+        """查看群组详情：私有群组仅对已加入的成员和工作区 owner 可见。"""
         workspace_member = await self.workspace_service.require_active_membership(
             workspace_id,
             actor_user_id,
         )
         group = await self.require_active_group(workspace_id, group_id)
-        if group.visibility != "private" or workspace_member.role == "owner":
+        if group.visibility != "private":
             return group
+        if workspace_member.role == "owner":
+            return group
+        # 待审批的申请（joined_at 为空）不算已加入。
         membership = await self.member_repo.get(group.id, actor_user_id)
         if membership is None or membership.joined_at is None:
             raise AgentException.message("无权查看该私有群组", status_code=403)
@@ -101,6 +107,7 @@ class GroupService:
         actor_user_id: int,
         updates: dict[str, Any],
     ) -> GroupRecord:
+        """更新群组信息，仅群组 owner/admin 或工作区 owner 可操作。"""
         if not updates:
             raise AgentException.message("至少需要提供一个待更新字段")
         group, _, _ = await self._require_group_manager(
@@ -126,6 +133,7 @@ class GroupService:
             "settings",
             "is_active",
         }
+        # 只有 description 和 avatar_url 允许显式置空。
         non_nullable = {
             "name",
             "slug",
@@ -136,10 +144,12 @@ class GroupService:
             "is_active",
         }
         for key, value in updates.items():
-            if key in allowed:
-                if key in non_nullable and value is None:
-                    raise AgentException.message(f"{key} 不能设置为空")
-                setattr(group, key, value)
+            # 不在白名单内的字段直接忽略，不报错。
+            if key not in allowed:
+                continue
+            if key in non_nullable and value is None:
+                raise AgentException.message(f"{key} 不能设置为空")
+            setattr(group, key, value)
         return await self.repo.update(group)
 
     async def delete_group(
@@ -148,6 +158,7 @@ class GroupService:
         group_id: int,
         actor_user_id: int,
     ) -> None:
+        """删除群组，仅群组 owner 或工作区 owner 可操作；已停用的群组也允许删除。"""
         group = await self.require_group(workspace_id, group_id)
         workspace_member = await self.workspace_service.require_active_membership(
             workspace_id,
@@ -171,12 +182,14 @@ class GroupService:
         target_user_id: int,
         role: Literal["admin", "member"] = "member",
     ) -> GroupMemberRecord:
+        """管理员邀请工作区内的有效成员，被邀请人直接加入，无需审批。"""
         group, _, _ = await self._require_group_manager(
             workspace_id,
             group_id,
             actor_user_id,
         )
         await self.workspace_service.require_active_user_ids(workspace_id, [target_user_id])
+        # 已加入或有待审批申请都算已存在，避免邀请覆盖掉申请记录。
         if await self.member_repo.get(group.id, target_user_id):
             raise AgentException.message("用户已经有群组成员或申请记录")
         return await self.member_repo.create_or_restore(
@@ -201,6 +214,7 @@ class GroupService:
             raise AgentException.message("该群组仅支持邀请加入")
         if await self.member_repo.get(group.id, actor_user_id):
             raise AgentException.message("已经加入或申请过该群组")
+        # open 模式立即加入；approval 模式先留空 joined_at，等待管理员审批。
         joined_at = datetime.now(UTC) if group.join_mode == "open" else None
         return await self.member_repo.create_or_restore(
             group_id=group.id,
@@ -252,12 +266,14 @@ class GroupService:
         user_id: int,
         actor_user_id: int,
     ) -> None:
+        """移除群组成员；actor 与 user 相同时表示本人退出群组。"""
         group = await self.require_active_group(workspace_id, group_id)
         target = await self._require_group_member(group.id, user_id)
         if target.joined_at is None:
             raise AgentException.message("待审批成员应使用拒绝操作")
         if target.role == "owner" or group.owner_id == user_id:
             raise AgentException.message("请先转让群组负责人")
+        # 本人退出无需管理权限；移除他人时，群组 admin 只能移除普通成员。
         if actor_user_id != user_id:
             _, actor_group_member, workspace_member = await self._require_group_manager(
                 workspace_id,
@@ -298,6 +314,8 @@ class GroupService:
         new_owner_user_id: int,
         actor_user_id: int,
     ) -> GroupRecord:
+        """转让群组负责人，原负责人降为 admin。"""
+        # 先锁群组行并重读，串行化并发转让以及工作区移除成员时的负责人检查。
         group = await self.repo.get_for_update(workspace_id, group_id)
         if group is None:
             raise AgentException.message("群组不存在")
@@ -308,6 +326,7 @@ class GroupService:
         if new_owner.joined_at is None:
             raise AgentException.message("待审批成员不能成为群组负责人")
         current_owner = await self._require_group_member(group.id, group.owner_id)
+        # 转给现任负责人本人时不做任何修改。
         if current_owner.id == new_owner.id:
             return group
         current_owner.role = "admin"
@@ -325,6 +344,7 @@ class GroupService:
         *,
         include_pending: bool = False,
     ) -> list[tuple[GroupMemberRecord, dict[str, object]]]:
+        """列出群组成员及其用户摘要；查看待审批申请需要管理权限。"""
         group = await self.get_group(workspace_id, group_id, actor_user_id)
         if include_pending:
             await self._require_group_manager(workspace_id, group.id, actor_user_id)
@@ -336,6 +356,7 @@ class GroupService:
         user_map = {user.id: user for user in users}
         result: list[tuple[GroupMemberRecord, dict[str, object]]] = []
         for member in members:
+            # 用户已被软删除时查不到摘要，直接跳过该成员。
             user = user_map.get(member.user_id)
             if user is None:
                 continue
@@ -373,6 +394,7 @@ class GroupService:
         workspace_id: int,
         group_ids: list[int],
     ) -> list[GroupRecord]:
+        """校验共享目标群组均存在且启用，一次性报告全部无效的群组 ID。"""
         groups: list[GroupRecord] = []
         missing: list[int] = []
         for group_id in group_ids:
@@ -399,6 +421,7 @@ class GroupService:
         user_id: int,
     ) -> None:
         """工作区移除成员时同步清理群组关系，调用方已经完成成员权限校验。"""
+        # 锁住相关群组后再检查负责人，避免与并发的负责人转让交错。
         user_groups = await self.member_repo.list_user_groups_for_update(workspace_id, user_id)
         owned = [group for group in user_groups if group.owner_id == user_id]
         if owned:
@@ -424,6 +447,10 @@ class GroupService:
         group_id: int,
         actor_user_id: int,
     ) -> tuple[GroupRecord, GroupMemberRecord | None, WorkspaceMemberRecord]:
+        """要求 actor 是工作区 owner，或已加入群组的 owner/admin。
+
+        工作区 owner 不必是群组成员，此时返回的群组成员记录可能为 None。
+        """
         group = await self.require_active_group(workspace_id, group_id)
         workspace_member = await self.workspace_service.require_active_membership(
             workspace_id,

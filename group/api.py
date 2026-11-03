@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
+from group.models import GroupMemberRecord
 from group.schemas import (
     GroupCreateRequest,
     GroupJoinResponse,
@@ -30,7 +31,11 @@ def _require_path_workspace(workspace_id: int, current_workspace_id: int) -> Non
         raise AgentException.message("路径工作区与当前工作区不一致", status_code=403)
 
 
-def _member_response(member, user_info: dict[str, object]) -> GroupMemberResponse:
+def _member_response(
+    member: GroupMemberRecord,
+    user_info: dict[str, object],
+) -> GroupMemberResponse:
+    """把成员记录和用户摘要拼成响应；GroupMemberResponse 未开启 from_attributes。"""
     return GroupMemberResponse(
         id=member.id,
         group_id=member.group_id,

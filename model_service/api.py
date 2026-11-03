@@ -153,15 +153,13 @@ async def update_preferences(
     user: User,
     workspace_id: Workspace,
 ):
-    return ok(
-        await ModelService(db).preferences(
-            workspace_id,
-            user.id,
-            payload.default_model_provider_id,
-            update=True,
-        ),
-        request,
+    preferences = await ModelService(db).preferences(
+        workspace_id,
+        user.id,
+        payload.default_model_provider_id,
+        update=True,
     )
+    return ok(preferences, request)
 
 
 @router.get("/capabilities", response_model=ApiResponse[dict[str, Any]])

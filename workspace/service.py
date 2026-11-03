@@ -12,7 +12,7 @@ WorkspaceRole = Literal["owner", "admin", "member"]
 
 
 class _Unset:
-    pass
+    """参数哨兵：区分“未传”与“显式传 None”，便于 PATCH 语义把字段清空。"""
 
 
 UNSET = _Unset()
@@ -107,6 +107,10 @@ class WorkspaceService:
         billing_email: str | None | _Unset = UNSET,
         settings: dict | None | _Unset = UNSET,
     ) -> WorkspaceRecord:
+        """部分更新工作区，仅 owner 和 admin 可操作；未传的字段保持不变。
+
+        display_name 不可清空，传 None 时忽略；settings 传 None 时重置为空字典。
+        """
         await self.require_workspace_role(workspace_id, actor_user_id, {"owner", "admin"})
         workspace = await self.get_workspace(workspace_id)
         if not isinstance(display_name, _Unset) and display_name is not None:
@@ -124,8 +128,10 @@ class WorkspaceService:
         return await self.repo.update(workspace)
 
     async def delete_workspace(self, workspace_id: int, actor_user_id: int) -> None:
+        """软删除工作区，仅 owner 可操作。"""
         await self.require_workspace_role(workspace_id, actor_user_id, {"owner"})
-        await self.repo.delete(await self.get_workspace(workspace_id))
+        workspace = await self.get_workspace(workspace_id)
+        await self.repo.delete(workspace)
 
     async def get_membership(
         self,
@@ -139,6 +145,7 @@ class WorkspaceService:
         workspace_id: int,
         user_id: int,
     ) -> WorkspaceMemberRecord:
+        """要求工作区存在且未停用，用户已接受邀请正式加入；是各域成员校验的统一入口。"""
         workspace = await self.repo.get_by_id(workspace_id)
         if workspace is None or workspace.is_deleted:
             raise AgentException.message("当前工作区不存在")
@@ -170,10 +177,12 @@ class WorkspaceService:
         return member
 
     async def is_member(self, workspace_id: int, user_id: int) -> bool:
+        """只看成员记录是否已正式加入，不检查工作区是否已停用。"""
         member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
         return member is not None and member.joined_at is not None
 
     async def is_active_member(self, workspace_id: int, user_id: int) -> bool:
+        """require_active_membership 的布尔版本，同时检查工作区状态。"""
         try:
             await self.require_active_membership(workspace_id, user_id)
         except AgentException:
@@ -204,6 +213,10 @@ class WorkspaceService:
         email: str,
         role: WorkspaceRole = "member",
     ) -> WorkspaceMemberRecord:
+        """按邮箱邀请已注册用户；owner 和 admin 可邀请成员，只有 owner 能邀请管理员。
+
+        邀请只写入 invited_at，用户调用 accept_invite 后才算正式加入。
+        """
         inviter = await self.require_workspace_role(
             workspace_id,
             inviter_user_id,
@@ -217,6 +230,7 @@ class WorkspaceService:
         invited_user = await self.user_service.get_user_by_email(email)
         if invited_user is None:
             raise AgentException.message("被邀请的用户不存在")
+        # 已加入或已有待接受的邀请都算已存在，不重复邀请。
         existing = await self.member_repo.get_by_workspace_and_user(
             workspace_id,
             invited_user.id,
@@ -236,6 +250,7 @@ class WorkspaceService:
         workspace_id: int,
         user_id: int,
     ) -> WorkspaceMemberRecord:
+        """被邀请人接受邀请，写入 joined_at 后才成为有效成员。"""
         member = await self.member_repo.get_by_workspace_and_user(workspace_id, user_id)
         if member is None or member.invited_at is None:
             raise AgentException.message("邀请记录不存在")
@@ -266,6 +281,7 @@ class WorkspaceService:
         self,
         members: list[WorkspaceMemberRecord],
     ) -> list[tuple[WorkspaceMemberRecord, dict[str, object]]]:
+        """批量查出成员对应的用户摘要；用户已被软删除的成员不出现在结果中。"""
         users = await self.user_service.list_users_by_ids([member.user_id for member in members])
         by_id = {user.id: user for user in users}
         result: list[tuple[WorkspaceMemberRecord, dict[str, object]]] = []
@@ -292,6 +308,7 @@ class WorkspaceService:
         user_id: int,
         operator_user_id: int,
     ) -> None:
+        """移除成员：owner 不可移除，管理员只能由 owner 移除；移除前先清理其群组关系。"""
         operator = await self.require_workspace_role(
             workspace_id,
             operator_user_id,
@@ -345,6 +362,7 @@ class WorkspaceService:
         role: Literal["admin", "member"],
         operator_user_id: int,
     ) -> WorkspaceMemberRecord:
+        """仅 owner 可调整成员角色，且不能借此变更 owner 本身。"""
         await self.require_workspace_role(workspace_id, operator_user_id, {"owner"})
         member = await self.get_member(workspace_id, user_id)
         if member.role == "owner":

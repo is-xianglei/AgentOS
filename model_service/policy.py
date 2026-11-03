@@ -62,13 +62,16 @@ def validate_reasoning_config(extra: dict[str, Any], provider_type: str) -> None
     for level in levels:
         if not isinstance(level, dict):
             raise AgentException.message("思考档位格式不正确", status_code=400)
-        key, value = level.get("key"), level.get("value")
-        valid_value = (type(value) is int and value > 0) or (
-            isinstance(value, str)
-            and bool(value)
-            and value == value.strip()
-            and len(value) <= 64
-        )
+        key = level.get("key")
+        value = level.get("value")
+        # 上游映射值可以是正整数（思考预算 token 数）或不带首尾空白的非空短字符串（档位名）。
+        # 用 type() 而非 isinstance，避免 True/False 被当作整数接受。
+        if type(value) is int:
+            valid_value = value > 0
+        elif isinstance(value, str):
+            valid_value = bool(value) and value == value.strip() and len(value) <= 64
+        else:
+            valid_value = False
         if key not in REASONING_KEYS or key in keys or not valid_value:
             raise AgentException.message("思考档位或上游映射值无效", status_code=400)
         keys.append(key)
@@ -76,15 +79,25 @@ def validate_reasoning_config(extra: dict[str, Any], provider_type: str) -> None
         raise AgentException.message("默认思考档位必须在已配置档位中", status_code=400)
 
 
+def resolve_thinking_protocol(provider: str, extra: dict[str, Any]) -> str:
+    """确定开关思考所用的参数协议：优先用显式配置，否则按供应商推断。
+
+    极速能力判断和客户端构造必须使用同一套推断规则，因此集中在这里。
+    """
+    configured = extra.get("thinking_protocol")
+    if configured:
+        return configured
+    if provider == "deepseek":
+        return "deepseek"
+    if provider == "openai":
+        return "openai"
+    return "chat_template"
+
+
 def fast_capabilities(provider: str, extra: dict[str, Any]) -> dict[str, Any]:
     """原生 reasoning_effort 未声明关闭映射时，不承诺极速模式可用。"""
-    protocol = extra.get("thinking_protocol") or (
-        "deepseek"
-        if provider == "deepseek"
-        else "openai"
-        if provider == "openai"
-        else "chat_template"
-    )
+    protocol = resolve_thinking_protocol(provider, extra)
+    # Anthropic 和非 openai 协议都能显式关闭思考；openai 协议需要配置 none 映射才能关闭。
     disabled = provider == "anthropic" or protocol != "openai" or (
         extra.get("fast_reasoning_effort") == "none"
     )
@@ -96,6 +109,7 @@ def fast_capabilities(provider: str, extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def reasoning_capabilities(extra: dict[str, Any]) -> dict[str, Any]:
+    """读取模型的思考档位能力；开启但未配置档位时沿用 medium/high/max 兼容档位。"""
     enabled = bool(extra.get("supports_reasoning_effort"))
     levels = extra.get("reasoning_effort_levels", LEGACY_LEVELS) if enabled else []
     default = extra.get("default_reasoning_effort", "medium")
@@ -110,6 +124,7 @@ def reasoning_capabilities(extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_effort(extra: dict[str, Any], effort: str, mode_slug: str = "standard") -> str:
+    """把请求的思考强度收敛到模型实际支持的档位，不支持时回落到模型默认档位。"""
     if mode_slug == "turbo" or effort == "fast":
         return "fast"
     policy = reasoning_capabilities(extra)

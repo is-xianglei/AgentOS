@@ -92,6 +92,10 @@ class WorkspaceMemberRepository:
         department_id: int | None = None,
         job_title: str | None = None,
     ) -> WorkspaceMemberRecord:
+        """新建成员记录；已有记录（含软删除）时复用该行并覆盖全部字段。
+
+        唯一索引 (workspace_id, user_id) 不区分软删除，重新邀请必须复用旧行。
+        """
         existing = await self.get_by_workspace_and_user(
             workspace_id,
             user_id,
@@ -189,6 +193,7 @@ class WorkspaceMemberRepository:
         return list(await self.db.scalars(stmt))
 
     async def list_by_user(self, user_id: int) -> list[WorkspaceMemberRecord]:
+        """查询用户已正式加入的成员关系，并一次性加载所属工作区。"""
         stmt = (
             select(WorkspaceMemberRecord)
             .options(joinedload(WorkspaceMemberRecord.workspace))
