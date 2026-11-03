@@ -91,7 +91,7 @@ def create_llm_client(scenario: str | None = None) -> BaseLLMClient:
 
     Args:
         scenario: 场景标识(agent/subagent/subagent_fast/compact/
-                  memory_selector/memory_extractor/memory_dream),
+                  memory_selector/memory_extractor/memory_dream/workflow),
                   None 表示直接使用 provider 主模型。
 
     Returns:
@@ -114,6 +114,7 @@ def create_llm_client(scenario: str | None = None) -> BaseLLMClient:
             timeout=settings.anthropic_timeout_seconds,
         )
 
+    # _require_provider 已保证取值合法,走到这里只能是 openai。
     api_key = _blank_to_none(settings.openai_api_key)
     if not api_key:
         raise AgentException.message(

@@ -1,13 +1,11 @@
+"""LLM 层的中立类型:消息块、流事件、工具与 system prompt 描述,不含任何 provider 的 wire 形状。"""
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from core.errors import AgentException
-from core.events import (
-    BlockType,
-    ToolInfo,
-    Usage,
-)
+from core.events import BlockType, ToolInfo, Usage
 
 
 @dataclass(frozen=True)
@@ -155,21 +153,22 @@ def build_assistant_blocks(
     其后是文本块、工具调用块——这两类之间顺序不承载语义(两家 wire 都按角色而非
     块序解释消息),故不保留其交错顺序。空文本不产出空块;空思考段同样跳过。
     """
-    blocks: list[dict[str, Any]] = [
-        ThinkingBlock(
+    blocks: list[dict[str, Any]] = []
+    for segment in thinking or []:
+        # redacted_thinking 没有可读文本但必须保留,只有文本和加密载荷都为空才跳过。
+        if not segment.text and not segment.redacted_data:
+            continue
+        thinking_block = ThinkingBlock(
             text=segment.text,
             signature=segment.signature,
             redacted_data=segment.redacted_data,
-        ).to_dict()
-        for segment in (thinking or [])
-        if segment.text or segment.redacted_data
-    ]
+        )
+        blocks.append(thinking_block.to_dict())
     if text:
         blocks.append(TextBlock(text=text).to_dict())
-    blocks.extend(
-        ToolUseBlock(id=tool_use.id, name=tool_use.name, input=tool_use.input).to_dict()
-        for tool_use in tool_uses
-    )
+    for tool_use in tool_uses:
+        tool_use_block = ToolUseBlock(id=tool_use.id, name=tool_use.name, input=tool_use.input)
+        blocks.append(tool_use_block.to_dict())
     return blocks
 
 
@@ -254,8 +253,10 @@ def parse_tool_result(content: Any) -> ToolResultMessage:
     try:
         return ToolResultMessage.from_content_dict(content)
     except KeyError as exc:
+        # KeyError 的首个参数就是缺失的键名。
+        missing_field = str(exc.args[0]) if exc.args else ""
         raise AgentException.message(
-            "tool 消息缺少必需字段", {"field": str(exc.args[0]) if exc.args else ""}
+            "tool 消息缺少必需字段", {"field": missing_field}
         ) from exc
 
 

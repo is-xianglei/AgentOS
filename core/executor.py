@@ -1,4 +1,7 @@
+"""skill 脚本执行器:以子进程运行解释器命令,带超时整组回收与输出截断。"""
+
 import asyncio
+import contextlib
 import os
 import signal
 from abc import ABC, abstractmethod
@@ -72,25 +75,23 @@ class SubprocessExecutor(Executor):
             stdout_raw, stderr_raw = await asyncio.wait_for(
                 proc.communicate(input=stdin), timeout=timeout
             )
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
+            # Python 3.11 起 asyncio.TimeoutError 就是内置 TimeoutError。
             timed_out = True
             stdout_raw, stderr_raw = b"", b""
-            # 杀整个进程组(POSIX);兜底直接 kill 单进程。
+            # 杀整个进程组(POSIX);拿不到进程组时退而只杀子进程本身。
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
-                try:
+                with contextlib.suppress(ProcessLookupError):
                     proc.kill()
-                except ProcessLookupError:
-                    pass
             # 回收已被杀死的进程,避免僵尸与 communicate 泄漏。
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 await proc.wait()
-            except ProcessLookupError:
-                pass
 
         limit = settings.skill_exec_max_output
         truncated = len(stdout_raw) > limit or len(stderr_raw) > limit
+        # 按字节截断可能切开多字节字符,errors="replace" 让解码不因此失败。
         stdout = stdout_raw[:limit].decode("utf-8", errors="replace")
         stderr = stderr_raw[:limit].decode("utf-8", errors="replace")
         exit_code = None if timed_out else proc.returncode

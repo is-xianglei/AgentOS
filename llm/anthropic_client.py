@@ -1,3 +1,5 @@
+"""Anthropic 客户端实现:中立消息出站编码、流式事件适配与结构化输出。"""
+
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -59,6 +61,7 @@ def _thinking_param() -> dict[str, Any] | NotGiven:
         )
     return {"type": "enabled", "budget_tokens": budget}
 
+
 # redacted_thinking 归到 THINKING:它是被加密的思考块,对外协议语义与思考一致,
 # 只是无可读文本。漏登记会走静默兜底当成文本块,终局提取时被丢掉,
 # 回传给 Anthropic 时思考块缺失直接 400。
@@ -76,25 +79,16 @@ def _chunk_type(chunk: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _chunk_text(chunk: dict[str, Any]) -> str:
-    """从原始 content_block_delta 中取出文本增量,非文本事件返回空串。"""
-    delta = chunk.get("delta")
-    if (
-        isinstance(delta, dict)
-        and delta.get("type") == "text_delta"
-        and isinstance(delta.get("text"), str)
-    ):
-        return delta["text"]
-    return ""
-
-
 def _extract_tool_uses(content: list[dict[str, Any]] | None) -> list[ToolUse]:
     """从完整消息内容中提取 tool_use 块,返回类型化的 ToolUse 列表。"""
-    return [
-        ToolUse(id=block["id"], name=block["name"], input=block.get("input") or {})
-        for block in (content or [])
-        if isinstance(block, dict) and block.get("type") == "tool_use"
-    ]
+    tool_uses: list[ToolUse] = []
+    for block in content or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        tool_uses.append(
+            ToolUse(id=block["id"], name=block["name"], input=block.get("input") or {})
+        )
+    return tool_uses
 
 
 def _extract_thinking(content: list[dict[str, Any]] | None) -> list[ThinkingSegment]:
@@ -121,11 +115,11 @@ def _extract_thinking(content: list[dict[str, Any]] | None) -> list[ThinkingSegm
 
 def _text_from_content(content: list[dict[str, Any]] | None) -> str:
     """从完整消息内容中拼接文本块。"""
-    return "".join(
-        block.get("text", "")
-        for block in (content or [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
 
 
 def _encode_assistant_block(block: AssistantBlock) -> dict[str, Any] | None:
@@ -170,13 +164,12 @@ def _is_tool_result_carrier(message: dict[str, Any]) -> bool:
     """判断某条已编码消息是否为可继续追加 tool_result 的 user 消息。"""
     if message.get("role") != "user":
         return False
+    # 普通 user 消息的 content 是字符串;只有工具结果消息是以 tool_result 块开头的数组。
     content = message.get("content")
-    return (
-        isinstance(content, list)
-        and bool(content)
-        and isinstance(content[0], dict)
-        and content[0].get("type") == "tool_result"
-    )
+    if not isinstance(content, list) or not content:
+        return False
+    first_block = content[0]
+    return isinstance(first_block, dict) and first_block.get("type") == "tool_result"
 
 
 @dataclass
@@ -219,8 +212,8 @@ class _AnthropicChunkAdapter:
 
     def _on_block_start(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
         index = int(chunk.get("index", 0))
-        cb = chunk.get("content_block") or {}
-        raw_type = cb.get("type", "text")
+        content_block = chunk.get("content_block") or {}
+        raw_type = content_block.get("type", "text")
         block_type = _BLOCK_TYPE_MAP.get(raw_type)
         if block_type is None:
             # 无静默兜底:未知块兜成 TEXT 会让内容以错误类型流向前端,
@@ -228,11 +221,12 @@ class _AnthropicChunkAdapter:
             raise AgentException.message(
                 "未知的 Anthropic 内容块类型", {"block_type": raw_type}
             )
+        # 只有 tool_use 块带 id / name,其余块取空串。
         self._open[index] = _OpenBlock(
             index=index,
             block_type=block_type,
-            tool_id=cb.get("id", "") or "",
-            tool_name=cb.get("name", "") or "",
+            tool_id=content_block.get("id", "") or "",
+            tool_name=content_block.get("name", "") or "",
         )
         return [
             LLMStreamEvent(kind=LLMEventKind.BLOCK_START, block_ref=index, block_type=block_type)
@@ -243,11 +237,11 @@ class _AnthropicChunkAdapter:
         delta = chunk.get("delta") or {}
         dtype = delta.get("type")
         if dtype == "text_delta":
-            return [
-                LLMStreamEvent(
-                    kind=LLMEventKind.TEXT_DELTA, block_ref=index, text=_chunk_text(chunk)
-                )
-            ]
+            # text 缺失或不是字符串时按空串处理,事件照常产出。
+            text = delta.get("text")
+            if not isinstance(text, str):
+                text = ""
+            return [LLMStreamEvent(kind=LLMEventKind.TEXT_DELTA, block_ref=index, text=text)]
         if dtype == "thinking_delta":
             return [
                 LLMStreamEvent(
@@ -271,20 +265,24 @@ class _AnthropicChunkAdapter:
         if block is None:
             # 从没开过的块:原样透传 stop,由装配器判定丢弃并留日志。
             return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
-        if block.block_type is BlockType.TOOL_USE:
-            # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件;
-            # 协议层的 block_stop 配对由装配器补发,provider 侧不参与协议决策。
+        if block.block_type is not BlockType.TOOL_USE:
+            return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+
+        # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件;
+        # 协议层的 block_stop 配对由装配器补发,provider 侧不参与协议决策。
+        # 没收到任何入参增量即无参数调用,入参为空对象。
+        tool_input: dict[str, Any] = {}
+        if block.json_buffer:
             try:
-                tool_input = json.loads(block.json_buffer) if block.json_buffer else {}
+                tool_input = json.loads(block.json_buffer)
             except json.JSONDecodeError as exc:
                 # 无静默兜底:兜成 {} 会让工具带空参执行,失败原因在链路上彻底消失。
                 raise AgentException.message(
                     "工具调用入参 JSON 解析失败",
                     {"tool_name": block.tool_name, "tool_use_id": block.tool_id},
                 ) from exc
-            tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
-            return [LLMStreamEvent(kind=LLMEventKind.TOOL_USE, block_ref=index, tool=tool)]
-        return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+        tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
+        return [LLMStreamEvent(kind=LLMEventKind.TOOL_USE, block_ref=index, tool=tool)]
 
     def _on_message_final(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
         """把合成的 message_final 组装成 TURN_RESULT 终结事件。"""
@@ -321,18 +319,21 @@ class AnthropicClient(BaseLLMClient):
         thinking_enabled: bool | None = None,
         reasoning_effort: str | int | None = None,
         thinking_budget_tokens: int | None = None,
-    ):
+    ) -> None:
         self.model = model
         self.api_key = api_key or settings.anthropic_api_key
         self.base_url = base_url or settings.anthropic_base_url
         self.max_retries = max_retries
         self.timeout = timeout
+        # 三个思考参数由工作区模型服务按数据库配置传入;
+        # thinking_enabled 为 None 表示沿用环境配置(anthropic_thinking_*)。
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.thinking_budget_tokens = thinking_budget_tokens
 
     def _thinking_kwargs(self, max_tokens: int) -> dict[str, Any]:
         """统一流式与结构化思考配置，严格验证预算和输出上限。"""
+        # 未显式指定时沿用环境配置。
         if self.thinking_enabled is None:
             thinking = _thinking_param()
             if isinstance(thinking, dict) and thinking["budget_tokens"] >= max_tokens:
@@ -340,13 +341,16 @@ class AnthropicClient(BaseLLMClient):
             return {"thinking": thinking}
         if not self.thinking_enabled:
             return {"thinking": {"type": "disabled"}}
+        # 字符串档位走自适应思考,档位经 output_config.effort 下发。
         if isinstance(self.reasoning_effort, str):
             return {
                 "thinking": {"type": "adaptive"},
                 "output_config": {"effort": self.reasoning_effort},
             }
+        # 整数档位直接作为思考预算;未给出时依次回落到实例预算和环境预算。
         budget = (
-            self.reasoning_effort or self.thinking_budget_tokens
+            self.reasoning_effort
+            or self.thinking_budget_tokens
             or settings.anthropic_thinking_budget_tokens
         )
         if not _MIN_THINKING_BUDGET <= budget < max_tokens:
@@ -357,14 +361,19 @@ class AnthropicClient(BaseLLMClient):
 
     def _structured_max_tokens(self, requested: int) -> int:
         """结构化输出在思考预算之外保留请求的结果空间。"""
-        enabled = (
-            settings.anthropic_thinking_enabled if self.thinking_enabled is None
-            else self.thinking_enabled
-        )
+        if self.thinking_enabled is None:
+            enabled = settings.anthropic_thinking_enabled
+        else:
+            enabled = self.thinking_enabled
         if not enabled:
             return requested
+        # 字符串档位(自适应思考)没有显式预算,按实例预算或环境预算预留空间。
+        if isinstance(self.reasoning_effort, int):
+            effort_budget = self.reasoning_effort
+        else:
+            effort_budget = None
         budget = (
-            (self.reasoning_effort if isinstance(self.reasoning_effort, int) else None)
+            effort_budget
             or self.thinking_budget_tokens
             or settings.anthropic_thinking_budget_tokens
         )
@@ -432,12 +441,15 @@ class AnthropicClient(BaseLLMClient):
                 encoded.append({"role": "user", "content": parse_user_text(content)})
             elif role == "assistant":
                 # 原样遍历不重排:思考块的落库序即 Anthropic 要求的回传序。
-                blocks = [
-                    encoded_block
-                    for block in parse_assistant_blocks(content)
-                    if (encoded_block := _encode_assistant_block(block)) is not None
-                ]
-                encoded.append({"role": "assistant", "content": blocks or ""})
+                blocks: list[dict[str, Any]] = []
+                for neutral_block in parse_assistant_blocks(content):
+                    encoded_block = _encode_assistant_block(neutral_block)
+                    if encoded_block is not None:
+                        blocks.append(encoded_block)
+                if blocks:
+                    encoded.append({"role": "assistant", "content": blocks})
+                else:
+                    encoded.append({"role": "assistant", "content": ""})
             elif role == "tool":
                 block = _encode_tool_result(parse_tool_result(content))
                 if encoded and _is_tool_result_carrier(encoded[-1]):
@@ -467,7 +479,6 @@ class AnthropicClient(BaseLLMClient):
 
         扩展思考由 anthropic_thinking_enabled 控制,默认关。
         """
-
         client = AsyncAnthropic(
             base_url=self.base_url,
             api_key=self.api_key,
@@ -479,6 +490,7 @@ class AnthropicClient(BaseLLMClient):
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _AnthropicChunkAdapter()
+        # 实例上的 max_tokens 由调用方按需设置(如模型连通性测试只要很短的回复)。
         max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
         async with client.messages.stream(
             max_tokens=max_tokens,
@@ -489,30 +501,31 @@ class AnthropicClient(BaseLLMClient):
             **self._thinking_kwargs(max_tokens),
         ) as stream:
             async for event in stream:
-                chunk = (
-                    event.model_dump(mode="json", warnings=False)
-                    if hasattr(event, "model_dump")
-                    else {"type": str(event)}
-                )
+                # SDK 事件都是 Pydantic 模型;防御性兜底把其他对象转成只有 type 的噪声事件。
+                if hasattr(event, "model_dump"):
+                    chunk = event.model_dump(mode="json", warnings=False)
+                else:
+                    chunk = {"type": str(event)}
                 for neutral_event in adapter.adapt(chunk):
                     yield neutral_event
 
+            # 流耗尽后由 SDK 聚合出完整消息,合成 message_final 交给适配器产出 TURN_RESULT。
             final = await stream.get_final_message()
 
             usage = None
             if hasattr(final, "usage") and final.usage is not None:
                 usage = final.usage.model_dump(mode="json", warnings=False)
                 self._log_cache_usage(usage)
-            for neutral_event in adapter.adapt(
-                {
-                    "type": "message_final",
-                    "stop_reason": final.stop_reason,
-                    "usage": usage,
-                    "content": [
-                        block.model_dump(mode="json", warnings=False) for block in final.content
-                    ],
-                }
-            ):
+            final_content = [
+                block.model_dump(mode="json", warnings=False) for block in final.content
+            ]
+            message_final = {
+                "type": "message_final",
+                "stop_reason": final.stop_reason,
+                "usage": usage,
+                "content": final_content,
+            }
+            for neutral_event in adapter.adapt(message_final):
                 yield neutral_event
 
     @staticmethod
@@ -547,9 +560,9 @@ class AnthropicClient(BaseLLMClient):
     ) -> T:
         """用 tool use 强制结构化输出，校验失败时回灌错误重试一次。
 
-        相比 complete_structured：结果落在独立的 tool_use block，模型的思考与寒暄留在
-        text block，二者互不干扰，因此不依赖端点是否实现 output_config。tool use 自
-        2024 年 GA，第三方中转普遍支持。校验由 Pydantic 在客户端完成。
+        结果落在独立的 tool_use block，模型的思考与寒暄留在 text block，二者互不干扰，
+        因此不依赖端点是否实现 output_config 结构化输出。tool use 自 2024 年 GA，
+        第三方中转普遍支持。校验由 Pydantic 在客户端完成。
         """
         client = AsyncAnthropic(
             base_url=self.base_url,
@@ -573,12 +586,14 @@ class AnthropicClient(BaseLLMClient):
         thinking = thinking_kwargs["thinking"]
         thinking_on = isinstance(thinking, dict) and thinking["type"] != "disabled"
         # 开启思考时API只允许auto工具选择，不能强制tool或temperature=0。
-        request_options: dict[str, Any] = (
-            {"tool_choice": {"type": "auto"}} if thinking_on else {
+        request_options: dict[str, Any]
+        if thinking_on:
+            request_options = {"tool_choice": {"type": "auto"}}
+        else:
+            request_options = {
                 "tool_choice": ToolChoiceToolParam(type="tool", name=_STRUCTURED_TOOL_NAME),
                 "temperature": 0,
             }
-        )
         structured_system = (system_prompt or "") + (
             "\n请完成必要思考后，必须调用emit_structured_output工具提交结果。"
             "不要用普通文本替代结构化结果。"
@@ -604,14 +619,12 @@ class AnthropicClient(BaseLLMClient):
                     response = await stream.get_final_message()
             else:
                 response = await client.messages.create(**request)
-            tool_block = next(
-                (
-                    block
-                    for block in response.content
-                    if block.type == "tool_use" and block.name == _STRUCTURED_TOOL_NAME
-                ),
-                None,
-            )
+            # 取第一个调用结构化工具的 tool_use 块。
+            tool_block = None
+            for block in response.content:
+                if block.type == "tool_use" and block.name == _STRUCTURED_TOOL_NAME:
+                    tool_block = block
+                    break
             if tool_block is None:
                 # 无 tool_use block（如被 max_tokens 截断或模型拒答），与校验失败同归 ValueError。
                 raise ValueError(f"结构化输出缺失，stop_reason={response.stop_reason}")

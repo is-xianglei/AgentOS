@@ -87,15 +87,20 @@ class RunEventStore(Protocol):
 
 
 def _decode(entries: Any) -> list[Entry]:
+    """把 XRANGE / XREAD 返回的 entry 解码为 (游标, 事件);缺 data 或 JSON 损坏的条目跳过。"""
     decoded: list[Entry] = []
     for cursor, fields in entries or ():
-        raw = fields.get("data") if isinstance(fields, dict) else None
+        if not isinstance(fields, dict):
+            continue
+        raw = fields.get("data")
         if raw is None:
             continue
+        # 单条损坏不应拖垮整次回放,跳过即可。
         try:
-            decoded.append((str(cursor), json.loads(raw)))
+            event = json.loads(raw)
         except (TypeError, ValueError):
             continue
+        decoded.append((str(cursor), event))
     return decoded
 
 
@@ -147,6 +152,7 @@ class RedisRunEventStore:
             count=count,
             block=timeout_ms,
         )
+        # 只读了一个 key,结果最多一组 [key, entries];超时返回空,循环体不执行。
         for _key, entries in result or ():
             return _decode(entries)
         return []
@@ -194,8 +200,13 @@ class _LocalLog:
         self.seq = 0
 
     def mint(self) -> str:
+        """生成与 Redis 同格式的 "毫秒-序号" 游标。"""
+        # 时钟回拨时沿用上次的毫秒数,只递增序号,游标保持单调。
         millis = max(int(time.time() * 1000), self.last_millis)
-        self.seq = self.seq + 1 if millis == self.last_millis else 0
+        if millis == self.last_millis:
+            self.seq = self.seq + 1
+        else:
+            self.seq = 0
         self.last_millis = millis
         return f"{millis}-{self.seq}"
 
@@ -212,12 +223,14 @@ class LocalRunEventStore:
         self._waiters: dict[str, set[asyncio.Event]] = {}
 
     def _log(self, turn_id: str, *, create: bool) -> _LocalLog | None:
+        """取 turn 的日志;已过期的当作不存在并顺手清理,create=True 时缺失即新建。"""
         log = self._logs.get(turn_id)
         if log is not None and log.expires_at is not None and log.expires_at <= time.time():
             self._logs.pop(turn_id, None)
             log = None
         if log is None and create:
-            log = self._logs[turn_id] = _LocalLog(self.maxlen)
+            log = _LocalLog(self.maxlen)
+            self._logs[turn_id] = log
         return log
 
     def _since(self, turn_id: str, after: str, count: int) -> list[Entry]:
@@ -243,7 +256,11 @@ class LocalRunEventStore:
         log = self._log(turn_id, create=False)
         if log is None:
             return StreamCapture(None, [])
-        projection = json.loads(json.dumps(log.projection)) if log.projection else None
+        # 返回 projection 的深拷贝,调用方修改它不会影响存储内容。
+        if log.projection:
+            projection = json.loads(json.dumps(log.projection))
+        else:
+            projection = None
         return StreamCapture(projection, list(log.entries))
 
     async def wait(
@@ -307,19 +324,20 @@ def get_run_event_store() -> RunEventStore:
     disable_redis_events=false 且 redis_url 为空时抛中文异常,不静默降级到本地后端。
     """
     global _store
-    if _store is None:
-        if settings.disable_redis_events:
-            _store = LocalRunEventStore(maxlen=settings.run_stream_maxlen)
-        elif not settings.redis_url:
-            raise AgentException.message(
-                "未配置 AGENTOS_REDIS_URL;如需单进程本地事件流,请设置 "
-                "AGENTOS_DISABLE_REDIS_EVENTS=true",
-            )
-        else:
-            _store = RedisRunEventStore(
-                build_redis_clients(block_ms=STREAM_BLOCK_MS),
-                maxlen=settings.run_stream_maxlen,
-            )
+    if _store is not None:
+        return _store
+    if settings.disable_redis_events:
+        _store = LocalRunEventStore(maxlen=settings.run_stream_maxlen)
+        return _store
+    if not settings.redis_url:
+        raise AgentException.message(
+            "未配置 AGENTOS_REDIS_URL;如需单进程本地事件流,请设置 "
+            "AGENTOS_DISABLE_REDIS_EVENTS=true",
+        )
+    _store = RedisRunEventStore(
+        build_redis_clients(block_ms=STREAM_BLOCK_MS),
+        maxlen=settings.run_stream_maxlen,
+    )
     return _store
 
 
@@ -338,6 +356,9 @@ async def check_run_event_store() -> None:
 async def close_run_event_store() -> None:
     """关闭连接池并清空单例;lifespan 退出时调用。"""
     global _store
-    if _store is not None:
-        store, _store = _store, None
-        await store.aclose()
+    if _store is None:
+        return
+    # 先清空单例再关闭:关闭期间若有调用方取存储,拿到的是新建实例而不是已关闭的旧实例。
+    store = _store
+    _store = None
+    await store.aclose()

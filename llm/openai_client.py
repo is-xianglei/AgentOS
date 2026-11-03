@@ -1,4 +1,4 @@
-"""OpenAI 客户端实现。"""
+"""OpenAI 客户端实现:中立消息出站编码、裸 chunk 流式适配与结构化输出。"""
 
 import json
 import logging
@@ -65,11 +65,13 @@ def _encode_tool_result(tool_result: ToolResultMessage) -> dict[str, Any]:
     与 Anthropic 的结构性差异:OpenAI 每个工具结果是一条独立消息并以
     tool_call_id 与调用配对,不合并、也不塞进 user 消息。
     """
-    output = tool_result.output
+    content = tool_result.output
+    if tool_result.is_error:
+        content = f"{_TOOL_ERROR_PREFIX}{content}"
     return {
         "role": "tool",
         "tool_call_id": tool_result.tool_use_id,
-        "content": f"{_TOOL_ERROR_PREFIX}{output}" if tool_result.is_error else output,
+        "content": content,
     }
 
 
@@ -247,8 +249,9 @@ class _OpenAIChunkAdapter:
                     "工具调用增量缺少 index,无法与已开块配对",
                     {"tool_call": str(raw)[:200]},
                 )
+            tool_call_index = raw["index"]
             function = raw.get("function") or {}
-            pending = self._tool_calls.get(raw["index"])
+            pending = self._tool_calls.get(tool_call_index)
             if pending is None:
                 tool_id = raw.get("id") or ""
                 tool_name = function.get("name") or ""
@@ -259,9 +262,11 @@ class _OpenAIChunkAdapter:
                         {"tool_name": tool_name, "tool_call_id": tool_id},
                     )
                 pending = _PendingToolCall(
-                    ref=self._TOOL_REF_BASE + raw["index"], tool_id=tool_id, tool_name=tool_name
+                    ref=self._TOOL_REF_BASE + tool_call_index,
+                    tool_id=tool_id,
+                    tool_name=tool_name,
                 )
-                self._tool_calls[raw["index"]] = pending
+                self._tool_calls[tool_call_index] = pending
                 events.append(
                     LLMStreamEvent(
                         kind=LLMEventKind.BLOCK_START,
@@ -269,6 +274,7 @@ class _OpenAIChunkAdapter:
                         block_type=BlockType.TOOL_USE,
                     )
                 )
+            # 后续增量只带入参片段,拼到收束点再统一解析。
             arguments = function.get("arguments")
             if isinstance(arguments, str):
                 pending.args_buffer += arguments
@@ -305,8 +311,10 @@ class _OpenAIChunkAdapter:
     @staticmethod
     def _parse_tool_input(pending: _PendingToolCall) -> dict[str, Any]:
         """解析累积完整的工具入参 JSON;空串视为无参数调用。"""
+        if not pending.args_buffer:
+            return {}
         try:
-            return json.loads(pending.args_buffer) if pending.args_buffer else {}
+            return json.loads(pending.args_buffer)
         except json.JSONDecodeError as exc:
             # 无静默兜底:兜成 {} 会让工具带空参执行,失败原因在链路上彻底消失。
             raise AgentException.message(
@@ -327,12 +335,14 @@ class OpenAIClient(BaseLLMClient):
         reasoning_effort: str | int | None = None,
         thinking_protocol: str = "deepseek",
         fast_reasoning_effort: str | None = None,
-    ):
+    ) -> None:
         self.model = model
         self.api_key = api_key or settings.openai_api_key
         self.base_url = base_url or settings.openai_base_url
         self.max_retries = max_retries
         self.timeout = timeout
+        # 思考相关参数由工作区模型服务按数据库配置传入;
+        # thinking_enabled 为 None 表示沿用环境配置(openai_thinking_enabled 等)。
         self.thinking_enabled = thinking_enabled
         self.reasoning_effort = reasoning_effort
         self.thinking_protocol = thinking_protocol
@@ -340,6 +350,7 @@ class OpenAIClient(BaseLLMClient):
 
     def _thinking_kwargs(self) -> dict[str, Any]:
         """让流式与结构化请求共享实例级思考策略。"""
+        # 未显式指定时沿用环境配置(DeepSeek 的 extra_body.thinking 扩展)。
         if self.thinking_enabled is None:
             if not settings.openai_thinking_enabled:
                 return {}
@@ -347,23 +358,31 @@ class OpenAIClient(BaseLLMClient):
             if settings.openai_reasoning_effort:
                 result["reasoning_effort"] = settings.openai_reasoning_effort
             return result
+
+        # 按网关协议决定思考开关的下发位置:deepseek 用 extra_body.thinking,
+        # chat_template 用 extra_body.chat_template_kwargs,openai 原生协议没有开关字段。
         result = {}
         if self.thinking_protocol == "deepseek":
-            result["extra_body"] = {
-                "thinking": {"type": "enabled" if self.thinking_enabled else "disabled"}
-            }
+            if self.thinking_enabled:
+                thinking_type = "enabled"
+            else:
+                thinking_type = "disabled"
+            result["extra_body"] = {"thinking": {"type": thinking_type}}
         elif self.thinking_protocol == "chat_template":
             template: dict[str, Any] = {"enable_thinking": self.thinking_enabled}
             if self.thinking_enabled and self.reasoning_effort is not None:
                 template = {"thinking": True, "reasoning_effort": self.reasoning_effort}
             result["extra_body"] = {"chat_template_kwargs": template}
-        if self.thinking_enabled and self.reasoning_effort is not None:
-            if self.thinking_protocol in {"openai", "deepseek"}:
+
+        # reasoning_effort 是顶层参数:思考开启时只有 openai 与 deepseek 协议支持;
+        # 思考关闭时只有 openai 原生协议可下发配置好的快速档位。
+        if self.thinking_enabled:
+            supports_effort = self.thinking_protocol in {"openai", "deepseek"}
+            if self.reasoning_effort is not None and supports_effort:
                 result["reasoning_effort"] = self.reasoning_effort
-        elif not self.thinking_enabled and self.thinking_protocol == "openai":
+        elif self.thinking_protocol == "openai" and self.fast_reasoning_effort is not None:
             # 原生协议必须由管理员确认支持 none，不能按模型名猜测禁用能力。
-            if self.fast_reasoning_effort is not None:
-                result["reasoning_effort"] = self.fast_reasoning_effort
+            result["reasoning_effort"] = self.fast_reasoning_effort
         return result
 
     @property
@@ -433,10 +452,12 @@ class OpenAIClient(BaseLLMClient):
                 reasoning = "".join(
                     block.text for block in blocks if isinstance(block, ThinkingBlock)
                 )
-                assistant: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": text if text or not tool_calls else None,
-                }
+                # 只有工具调用、没有文本时 content 必须显式为 None。
+                if text or not tool_calls:
+                    assistant_content: str | None = text
+                else:
+                    assistant_content = None
+                assistant: dict[str, Any] = {"role": "assistant", "content": assistant_content}
                 if reasoning:
                     # 该键不在 SDK 的 TypedDict 内,依赖末尾的 cast 收窄。
                     assistant["reasoning_content"] = reasoning
@@ -478,7 +499,11 @@ class OpenAIClient(BaseLLMClient):
 
         thinking_kwargs = self._thinking_kwargs()
         # 推理模型经常不接受 temperature=0；由上游默认温度决定采样。
-        sampling = {} if self.thinking_enabled or thinking_kwargs.get("reasoning_effort") else {"temperature": 0}
+        sampling: dict[str, Any]
+        if self.thinking_enabled or thinking_kwargs.get("reasoning_effort"):
+            sampling = {}
+        else:
+            sampling = {"temperature": 0}
         response = await client.chat.completions.parse(
             model=model or self.model,
             # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
@@ -532,10 +557,12 @@ class OpenAIClient(BaseLLMClient):
             openai_messages.append({"role": "system", "content": system_text})
         openai_messages.extend(self._encode_messages(messages))
 
+        # 实例上的 max_tokens 由调用方按需设置(如模型连通性测试只要很短的回复)。
+        max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
         request_kwargs: dict[str, Any] = {
             "model": model or self.model,
             "messages": openai_messages,
-            "max_completion_tokens": getattr(self, "max_tokens", settings.llm_default_max_tokens),
+            "max_completion_tokens": max_tokens,
             "stream": True,
             # 不显式开启则 usage 恒为 None(SDK 不会自动注入该选项)。
             "stream_options": {"include_usage": True},

@@ -16,6 +16,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 HEARTBEAT_FRAME = ": heartbeat\n\n"
 _QUEUE_SIZE = 64
+# pump 正常读完事件迭代器的结束标记。
 _END = object()
 
 
@@ -37,12 +38,14 @@ async def with_heartbeat(
     queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_SIZE)
 
     async def pump() -> None:
+        # 读取异常经队列交给写出方,由它记日志并补发 stream_error 帧后结束;
+        # 取消属正常停止跟随,原样向上抛出。
         try:
             async for event in events:
                 await queue.put(event)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             await queue.put(exc)
         else:
             await queue.put(_END)
@@ -69,6 +72,7 @@ async def with_heartbeat(
                 return
             yield format_sse(item)
     finally:
+        # 正常结束、读取失败或客户端断开都走这里:先停 pump,再关闭上游迭代器释放资源。
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task

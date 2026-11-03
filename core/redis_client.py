@@ -36,9 +36,11 @@ def build_redis_clients(*, block_ms: int) -> RedisClients:
         raise AgentException.message(
             "未配置 AGENTOS_REDIS_URL,且未启用 AGENTOS_DISABLE_REDIS_EVENTS",
         )
+    # 两个连接池共用的选项;只有读写超时(socket_timeout)不同。
     options: dict[str, object] = {
         "decode_responses": True,
         "socket_connect_timeout": _COMMAND_SOCKET_TIMEOUT_SECONDS,
+        # 连接空闲超过 30 秒,复用前先 PING 一次,及早发现已断开的连接。
         "health_check_interval": 30,
     }
     if settings.redis_password:

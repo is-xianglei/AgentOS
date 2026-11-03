@@ -76,6 +76,7 @@ class RunStreamBus:
         self._closed = False
         self._lease_lost = False
         self._checkpoint_offset = state.last_offset
+        # 快照间隔不超过 Stream 裁剪上限的一半,保证被裁掉的事件已折叠进某次 projection。
         self._interval = max(1, min(PROJECTION_INTERVAL, store.maxlen // 2))
         self._failures = 0
 
@@ -147,7 +148,8 @@ class RunStreamBus:
         except LeaseLostError:
             self.mark_lease_lost()
             return False
-        except Exception:
+        except Exception:  # noqa: BLE001
+            # 偶发分配失败只丢这一条事件,返回 True 让调用方继续写后续事件。
             self._log_failure("分配事件offset失败，本条事件已丢弃")
             return True
         await self._append(event, offset)
@@ -160,16 +162,18 @@ class RunStreamBus:
         payload = json.loads(data)
         # 内存 projection 先折叠:即使本次写入失败,后续 projection 也只会更完整。
         self._state = fold(self._state, payload)
+        # 关键事件或距上次快照满间隔时,随本条事件一并写入完整 projection。
         checkpoint = (
             payload["type"] in _CHECKPOINT_TYPES
             or offset - self._checkpoint_offset >= self._interval
         )
-        projection = (
-            json.dumps(self._state.to_dict(), ensure_ascii=False) if checkpoint else None
-        )
+        if checkpoint:
+            projection = json.dumps(self._state.to_dict(), ensure_ascii=False)
+        else:
+            projection = None
         try:
             await self._store.append(self._turn_id, data, projection)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # 数据库是最终事实来源:事件流写失败只影响实时展示,不中断执行。
             self._log_failure("写入run事件流失败，本条事件已丢弃")
             return
@@ -186,6 +190,7 @@ class RunStreamBus:
             self._on_lease_lost()
 
     def _log_failure(self, message: str) -> None:
+        """记录写入失败:首次和此后每 _FAILURE_LOG_EVERY 次记一条带堆栈的日志。"""
         self._failures += 1
         if self._failures == 1 or self._failures % _FAILURE_LOG_EVERY == 0:
             logger.exception(

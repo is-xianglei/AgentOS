@@ -1,3 +1,5 @@
+"""全局配置:Settings 从 .env 与环境变量加载 AGENTOS_ 前缀的配置,导入时即完成校验。"""
+
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -17,7 +19,8 @@ class Settings(BaseSettings):
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="forbid",  # 严格校验:.env 出现未声明的键立即报错,强制 .env/.env.example/Settings 三处同步
+        # 严格校验:.env 出现未声明的键立即报错,强制 .env/.env.example/Settings 三处同步。
+        extra="forbid",
     )
 
     # --- 日志 ----------------------------------------------------------------

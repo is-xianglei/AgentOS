@@ -33,6 +33,8 @@ def _delta_key(event: BusEvent) -> tuple[Any, ...] | None:
 
 
 class DeltaCoalescer:
+    """单路增量缓冲;不做并发保护,由调用方(RunStreamBus 的锁)串行调用。"""
+
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
         self._key: tuple[Any, ...] | None = None
@@ -45,16 +47,26 @@ class DeltaCoalescer:
         """接收一个事件,按序返回此刻应写出的事件。"""
         key = _delta_key(event)
         if key is None:
+            # 非增量事件:先刷出缓冲,保证它排在之前的增量之后。
             return [*self.drain(now), event]
+        # _delta_key 非 None 已保证是 StreamEvent,这里只为收窄类型。
         assert isinstance(event, StreamEvent)
         if not event.text:
             return []
         now = self._clock() if now is None else now
-        out = self.drain(now) if key != self._key else []
+
+        # 换了一路增量:先把旧路的缓冲刷出,再开始缓冲新的一路。
+        if key != self._key:
+            out = self.drain(now)
+        else:
+            out = []
         if self._key is None:
-            self._key, self._first = key, event
+            self._key = key
+            self._first = event
         self._parts.append(event.text)
         self._size += len(event.text)
+
+        # 攒够字符数或距上次刷新已满间隔就立即刷出;首次刷新时间为 -inf,首个增量总是立即发出。
         if (
             self._size >= DELTA_FLUSH_CHARS
             or now - self._last_flush >= DELTA_FLUSH_INTERVAL_SECONDS
@@ -66,9 +78,12 @@ class DeltaCoalescer:
         """刷出缓冲中的增量(合并为一个事件)。"""
         if self._key is None or self._first is None:
             return []
+        # 以本路首个增量为模板,只替换拼接后的文本;sequence 由写入方重新分配。
         merged = replace(self._first, text="".join(self._parts), sequence=None)
-        self._key, self._first = None, None
-        self._parts, self._size = [], 0
+        self._key = None
+        self._first = None
+        self._parts = []
+        self._size = 0
         self._last_flush = self._clock() if now is None else now
         return [merged]
 
@@ -82,4 +97,6 @@ class DeltaCoalescer:
         """缓冲已到期则刷出。"""
         now = self._clock() if now is None else now
         due = self.deadline()
-        return self.drain(now) if due is not None and now >= due else []
+        if due is None or now < due:
+            return []
+        return self.drain(now)

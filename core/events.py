@@ -121,12 +121,19 @@ def subagent_actor(
 ) -> Actor:
     """构造一次性子代理来源(唯一键是 run_id);agent_id 仅 workflow 成员传入。"""
     return Actor(
-        role=ActorRole.SUBAGENT, name=agent_type, run_id=run_id, task=task, agent_id=agent_id
+        role=ActorRole.SUBAGENT,
+        name=agent_type,
+        run_id=run_id,
+        task=task,
+        agent_id=agent_id,
     )
 
 
 def teammate_actor(
-    name: str, run_id: str, task: str | None = None, team: TeamRef | None = None
+    name: str,
+    run_id: str,
+    task: str | None = None,
+    team: TeamRef | None = None,
 ) -> Actor:
     """构造持久成员来源(唯一键是 name)。"""
     return Actor(role=ActorRole.TEAMMATE, name=name, run_id=run_id, task=task, team=team)
@@ -419,11 +426,10 @@ class StreamEvent:
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 SSE 帧。turn_start 用完整 actor(带 task/team),其余用精简 actor。"""
-        actor_dict = (
-            self.actor.to_dict_full()
-            if self.type is EventType.TURN_START
-            else self.actor.to_dict_compact()
-        )
+        if self.type is EventType.TURN_START:
+            actor_dict = self.actor.to_dict_full()
+        else:
+            actor_dict = self.actor.to_dict_compact()
         data: dict[str, Any] = {
             "type": self.type.value,
             "session_id": self.session_id,

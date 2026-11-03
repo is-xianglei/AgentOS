@@ -203,7 +203,9 @@ def fold(state: TurnState, event: Mapping[str, Any]) -> TurnState:
         truncated = state.truncated or (state.last_offset == 0 and sequence > 1)
         state = replace(state, last_offset=sequence, truncated=truncated)
     handler = _HANDLERS.get(str(event.get("type")))
-    return handler(state, event) if handler is not None else state
+    if handler is None:
+        return state
+    return handler(state, event)
 
 
 def fold_all(state: TurnState, events: Iterable[Mapping[str, Any]]) -> TurnState:
@@ -250,13 +252,18 @@ def _on_run_started(state: TurnState, event: Mapping[str, Any]) -> TurnState:
 
 def _on_run_end(state: TurnState, event: Mapping[str, Any]) -> TurnState:
     status = event.get("status")
+    # 只有挂起等待交互时保留待处理交互;其余结束状态(含交互被取消)一律清空。
+    if status == "awaiting_interaction":
+        interaction = state.interaction
+    else:
+        interaction = None
     return replace(
         state,
         turn_id=event.get("turn_id", state.turn_id),
         status=status,
         cancelled=bool(event.get("cancelled")),
         run_end=dict(event),
-        interaction=state.interaction if status == "awaiting_interaction" else None,
+        interaction=interaction,
     )
 
 
@@ -266,7 +273,10 @@ def _on_session_ready(state: TurnState, event: Mapping[str, Any]) -> TurnState:
 
 
 def _on_task_snapshot(state: TurnState, event: Mapping[str, Any]) -> TurnState:
-    return replace(state, tasks=list((event.get("data") or {}).get("tasks") or []))
+    # 全量替换语义:直接用最新快照覆盖,不与旧任务合并。
+    data = event.get("data") or {}
+    tasks = data.get("tasks") or []
+    return replace(state, tasks=list(tasks))
 
 
 def _on_interaction(state: TurnState, event: Mapping[str, Any]) -> TurnState:
@@ -295,10 +305,10 @@ def _on_workflow_progress(state: TurnState, event: Mapping[str, Any]) -> TurnSta
     nodes = list(state.workflow)
     for position, node in enumerate(nodes):
         if _progress_key(node) == key:
+            # 已有节点:新字段覆盖旧字段,位置不变。
             nodes[position] = {**node, **progress}
-            break
-    else:
-        nodes.append(progress)
+            return replace(state, workflow=tuple(nodes))
+    nodes.append(progress)
     return replace(state, workflow=tuple(nodes))
 
 
@@ -310,20 +320,21 @@ def _update_actor(
     event: Mapping[str, Any],
     update: Callable[[ActorState], ActorState],
 ) -> TurnState:
+    """找到事件所属的 actor 并用 update 更新;首次出现的 actor 追加到末尾。"""
     actor = dict(event.get("actor") or {})
     key = actor_key(actor)
     actors = list(state.actors)
     for position, current in enumerate(actors):
         if current.key == key:
             actors[position] = update(current)
-            break
-    else:
-        actors.append(update(ActorState(actor=actor)))
+            return replace(state, actors=tuple(actors))
+    actors.append(update(ActorState(actor=actor)))
     return replace(state, actors=tuple(actors))
 
 
 def _find_block(actor: ActorState, index: int) -> int | None:
-    for position in range(len(actor.blocks) - 1, -1, -1):
+    """在当前 segment 内按 index 找块的位置;倒序查找,重复的 index 以最新建的块为准。"""
+    for position in reversed(range(len(actor.blocks))):
         block = actor.blocks[position]
         if block.segment == actor.segment and block.index == index:
             return position
@@ -337,7 +348,8 @@ def _set_block(actor: ActorState, position: int, block: Block) -> ActorState:
 
 
 def _block_index(event: Mapping[str, Any]) -> int:
-    return int((event.get("block") or {}).get("index", 0))
+    block = event.get("block") or {}
+    return int(block.get("index", 0))
 
 
 def _sequence(event: Mapping[str, Any]) -> int | None:
@@ -375,7 +387,8 @@ def _on_turn_end(state: TurnState, event: Mapping[str, Any]) -> TurnState:
 
 def _on_block_start(state: TurnState, event: Mapping[str, Any]) -> TurnState:
     index = _block_index(event)
-    kind = str((event.get("block") or {}).get("block_type") or "text")
+    block_info = event.get("block") or {}
+    kind = str(block_info.get("block_type") or "text")
 
     def update(actor: ActorState) -> ActorState:
         block = Block(
@@ -451,11 +464,12 @@ def _on_tool_result(state: TurnState, event: Mapping[str, Any]) -> TurnState:
 
     def update(actor: ActorState) -> ActorState:
         # 交互恢复后 tool_result 可能落在后续 segment,故跨 segment 按工具 ID 回溯。
-        for position in range(len(actor.blocks) - 1, -1, -1):
+        for position in reversed(range(len(actor.blocks))):
             block = actor.blocks[position]
             if block.tool is not None and block.tool.get("id") == result.get("id"):
                 block = replace(block, result=result, result_sequence=sequence)
                 return _set_block(actor, position, block)
+        # 找不到对应 tool_use(如头部被裁剪)时补建一个已关闭的孤儿块承载结果。
         orphan = Block(
             segment=actor.segment,
             index=-1,

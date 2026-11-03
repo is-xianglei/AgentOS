@@ -1,3 +1,5 @@
+"""日志装配与请求上下文中间件:统一日志格式,extra 字段以 key=value 输出。"""
+
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -39,12 +41,14 @@ class _KeyValueFormatter(logging.Formatter):
 
     def formatMessage(self, record: logging.LogRecord) -> str:
         message = super().formatMessage(record)
-        pairs = " ".join(
-            f"{key}={value}"
-            for key, value in record.__dict__.items()
-            if key not in _BUILTIN_FIELDS
-        )
-        return f"{message} {pairs}" if pairs else message
+        # LogRecord 上内置属性以外的字段都来自 extra。
+        pairs: list[str] = []
+        for key, value in record.__dict__.items():
+            if key not in _BUILTIN_FIELDS:
+                pairs.append(f"{key}={value}")
+        if not pairs:
+            return message
+        return f"{message} {' '.join(pairs)}"
 
 
 def setup_logging() -> None:
@@ -78,6 +82,10 @@ async def request_context_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
+    """为每个请求生成 request_id,写入 request.state 与 X-Request-ID 响应头,并记录耗时。
+
+    完成日志放在 finally 里:下游抛异常时也会记一条,此时不设置响应头,异常原样上抛。
+    """
     request_id = str(uuid4())
     request.state.request_id = request_id
     started = time.perf_counter()
