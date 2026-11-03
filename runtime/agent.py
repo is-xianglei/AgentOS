@@ -32,6 +32,7 @@ from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
 from llm import BaseLLMClient
+from llm.errors import LLMConnectionError, LLMStatusError
 from llm.types import PromptBlock, ToolResultMessage, ToolUse
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
@@ -107,6 +108,27 @@ class SuspendedInteraction:
     kind: str
     request_payload: dict[str, Any]
     schema_version: int
+
+
+def _turn_failure_info(exc: Exception) -> ErrorInfo:
+    """主循环失败时推给客户端的错误信息。
+
+    只有 AgentException 的消息是面向用户的业务文案;其余异常的 str() 可能含连接串、
+    上游原始响应等内部细节,一律换成固定文案,详情只进服务端日志。
+    """
+    if isinstance(exc, AgentException):
+        return ErrorInfo(code="TURN_FAILED", message=exc.message, fatal=True)
+    transient = isinstance(exc, LLMConnectionError) or (
+        isinstance(exc, LLMStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
+    )
+    if transient:
+        return ErrorInfo(
+            code="TURN_FAILED",
+            message="模型服务暂时不可用，请稍后重试",
+            retriable=True,
+            fatal=True,
+        )
+    return ErrorInfo(code="TURN_FAILED", message="本轮处理失败，请稍后重试", fatal=True)
 
 
 class AgentRuntime:
@@ -307,15 +329,24 @@ class AgentRuntime:
             else:
                 await self._mark_abnormal_end(session_id, turn_id, "interrupted")
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "处理会话消息失败",
                 extra={"session_id": session_id, "turn_id": str(turn_id)},
             )
             if suspension_committed:
                 await self.db.rollback()
-            else:
-                await self._mark_abnormal_end(session_id, turn_id, "failed")
+            elif await self._mark_abnormal_end(session_id, turn_id, "failed"):
+                # 补发 error:否则 SSE 里只有 run_end(failed),用户看不到失败原因。
+                # 先写终态再 emit,与恢复路径一致;此时仍在执行体内、总线未关闭,
+                # run_end 到收尾时才分配 offset,必然排在其后。emit 内部已吞掉写入失败。
+                await self.bus.emit(
+                    StreamEvent.error_event(
+                        ORCHESTRATOR_ACTOR,
+                        session_id,
+                        _turn_failure_info(exc),
+                    )
+                )
 
     async def start_resume(
         self,
@@ -968,15 +999,17 @@ class AgentRuntime:
         session_id: int | None,
         turn_id: UUID | None,
         turn_status: str,
-    ) -> None:
+    ) -> bool:
         """回滚当前失败事务，再尽力持久化 Turn 和 Session 的异常终态。
 
         绑定执行时先确认租约仍属于本次执行:用户取消已写下 interrupted+idle,
         回收已写下终态,都不能被这里覆盖成 failed。
+        返回终态是否归本次执行:租约已失效、轮次缺失或已完成时为 False,
+        调用方据此不再报告失败;写库本身失败时轮次仍是失败的,返回 True。
         """
         await self.db.rollback()
         if session_id is None or turn_id is None:
-            return
+            return False
         try:
             if self.lease_owner is not None:
                 session, turn = await self.session_service.lock_owned_turn(
@@ -987,7 +1020,7 @@ class AgentRuntime:
                 turn = await self.session_service.repo.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
                 await self.db.rollback()
-                return
+                return False
             await self.session_service.mark_turn_status(turn, turn_status)
             await self.session_service.repo.update_status(session, "failed")
             await self.db.commit()
@@ -997,12 +1030,14 @@ class AgentRuntime:
                 "执行租约已失效，异常终态由清除租约的一方负责",
                 extra={"session_id": session_id, "turn_id": str(turn_id)},
             )
+            return False
         except Exception:
             await self.db.rollback()
             logger.exception(
                 "持久化交互轮次异常终态失败",
                 extra={"session_id": session_id, "turn_id": str(turn_id)},
             )
+        return True
 
     async def _execute_tool_uses(
         self,
