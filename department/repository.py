@@ -19,7 +19,7 @@ class DepartmentRepository:
         self.db = db
 
     async def lock_tree(self, workspace_id: int) -> None:
-        """对工作区的部门树加事务级咨询锁，串行化可能成环的层级调整。
+        """对工作区的部门树加事务级咨询锁，串行化层级调整与删除，防止成环或挂在已删除部门下。
 
         锁在事务提交或回滚时自动释放，同一事务内重复获取不会阻塞自己。
         """

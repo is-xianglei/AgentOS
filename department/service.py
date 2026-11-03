@@ -52,6 +52,9 @@ class DepartmentService:
             {"owner", "admin"},
         )
         if parent_id is not None:
+            # 父部门被并发删除且未提交时仍能读到它，新部门会挂在已删除部门下；
+            # 与 delete_department 共用部门树锁，锁内再校验父部门。顶级部门不加锁。
+            await self.repo.lock_tree(workspace_id)
             parent = await self.get_required(workspace_id, parent_id)
             if not parent.is_active:
                 raise AgentException.message("不能在已停用部门下创建子部门")
@@ -158,6 +161,9 @@ class DepartmentService:
             actor_user_id,
             {"owner"},
         )
+        # 并发建子部门或移入部门未提交时，叶子检查看不到新子部门，删除后它会挂在已删除部门下；
+        # 与 create_department、update_department 共用部门树锁串行化，锁内再加载和检查。
+        await self.repo.lock_tree(workspace_id)
         department = await self.get_required(workspace_id, department_id)
         if await self.repo.has_children(workspace_id, department.id):
             raise AgentException.message("仅允许删除叶子部门", status_code=409)
@@ -222,6 +228,9 @@ class DepartmentService:
         member = await self.workspace_service.get_member(workspace_id, user_id)
         target: DepartmentRecord | None = None
         if department_id is not None:
+            # 目标部门被并发删除且未提交时仍能读到它，成员会挂在已删除部门下；与 delete_department
+            # 共用部门树锁，锁内再校验。移出部门不加锁：不会产生不一致，只会让并发删除更保守地拒绝。
+            await self.repo.lock_tree(workspace_id)
             target = await self.get_required(workspace_id, department_id)
             if not target.is_active:
                 raise AgentException.message("不能向已停用部门分配成员")
