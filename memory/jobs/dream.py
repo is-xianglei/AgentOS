@@ -15,8 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
-from memory.models import MemoryItemRecord, MemoryRevisionRecord, MemorySpaceRecord
 from memory.jobs.repository import MemoryJobRepository
+from memory.models import (
+    MemoryItemRecord,
+    MemoryJobRecord,
+    MemoryRevisionRecord,
+    MemorySpaceRecord,
+)
 from memory.repository import MemoryDreamEntry, MemoryRepository
 from memory.service import MEMORY_BODY_MAX_BYTES
 
@@ -242,6 +247,7 @@ class MemoryDreamService:
                 space.id,
             )
         )
+        # Dream 要看到全部 active Memory 才能做整理，输入超限时整体失败而不是截断。
         payload = self._prompt_payload(entries)
         if len(json.dumps(payload, ensure_ascii=False)) > settings.memory_dream_max_input_chars:
             raise MemoryDreamFailure(
@@ -252,17 +258,20 @@ class MemoryDreamService:
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_dream 场景解析,
         # 不再继承 Extractor 的模型配置(2 层回落:场景覆盖 > provider 主模型)。
         from runtime.model_selection import frozen_job_client
+
         client = self.llm
         if client is None:
             try:
                 client = await frozen_job_client(
-                    self.db, space.workspace_id, space.user_id, "memory_dream",
-                    model=job.model, provider_id=(job.payload or {}).get("model_provider_id"),
+                    self.db,
+                    space.workspace_id,
+                    space.user_id,
+                    "memory_dream",
+                    model=job.model,
+                    provider_id=(job.payload or {}).get("model_provider_id"),
                 )
             except AgentException as exc:
-                raise MemoryDreamFailure(
-                    "model_missing", exc.message, retryable=False
-                ) from exc
+                raise MemoryDreamFailure("model_missing", exc.message, retryable=False) from exc
         model = job.model or getattr(client, "model", None)
         if not model:
             try:
@@ -363,6 +372,7 @@ class MemoryDreamService:
             or space.user_id != prepared.user_id
         ):
             raise MemoryDreamFailure("space_scope_invalid", "Dream目标空间越界", retryable=False)
+        # 模型调用期间不持锁，落库前要确认 Catalog 和 active Revision 集合都没变。
         self._validate_catalog_cas(job, space, prepared)
 
         current_entries = tuple(
@@ -379,6 +389,7 @@ class MemoryDreamService:
                 retryable=True,
             )
 
+        # 按 ID 升序锁定所有被引用的 Item；查不全说明引用了非 active 或他人的 Memory。
         required_ids = self._required_item_ids(result.operations)
         locked_items = await self.memory_repo.get_active_items_by_ids_for_update(
             prepared.workspace_id,
@@ -514,6 +525,8 @@ class MemoryDreamService:
                 retryable=False,
             )
 
+        # 第一遍：按 Item ID 升序加锁，并确认每条 Item 仍停留在 Dream 刚完成时的状态，
+        # 任何一条被改过都拒绝回滚，避免覆盖 Dream 之后的修改。
         items_by_id: dict[int, MemoryItemRecord] = {}
         revisions_by_id: dict[int, MemoryRevisionRecord] = {}
         for change in sorted(audit.changes, key=lambda value: value.item_id):
@@ -565,6 +578,7 @@ class MemoryDreamService:
             items_by_id[item.id] = item
             revisions_by_id[before_revision.id] = before_revision
 
+        # 第二遍：按应用顺序的逆序恢复到 Dream 前的 Revision，每条恢复都追加新 Revision。
         rollback_revisions: list[dict[str, int | str]] = []
         effective_actor_id = actor_id or f"rollback:{dream_job_id}"
         for change in reversed(audit.changes):
@@ -641,19 +655,24 @@ class MemoryDreamService:
                 exc.code,
             )
             if exc.code in ("catalog_changed", "after_version_mismatch"):
-                raise AgentException.message("Dream回滚版本冲突，请刷新后重试", status_code=409) from exc
+                raise AgentException.message(
+                    "Dream回滚版本冲突，请刷新后重试",
+                    status_code=409,
+                ) from exc
             if exc.code in ("dream_not_rollbackable", "dream_already_rolled_back"):
                 raise AgentException.message(str(exc), status_code=409) from exc
-            if exc.code in ("space_scope_invalid",):
+            if exc.code == "space_scope_invalid":
                 raise AgentException.message("无权限回滚该 Dream", status_code=403) from exc
+            # 其余失败码只记服务端日志，对外统一返回通用错误。
             raise AgentException.message("Dream回滚失败", status_code=422) from exc
 
     @staticmethod
     def _validate_catalog_cas(
-        job: Any,
+        job: MemoryJobRecord,
         space: MemorySpaceRecord,
         prepared: PreparedDream,
     ) -> None:
+        """Job 记录、当前 Space 和 Prepare 快照三方的 Catalog 版本与 Revision 集合必须一致。"""
         payload_revision_ids = (job.payload or {}).get("revision_ids")
         if (
             job.base_catalog_version != prepared.base_catalog_version
@@ -674,14 +693,16 @@ class MemoryDreamService:
 
     @staticmethod
     def _required_item_ids(operations: list[DreamOperation]) -> set[int]:
+        """收集操作集引用到的全部 Item ID，supersede 的替代目标也要锁定。"""
         required: set[int] = set()
         for operation in operations:
             if isinstance(operation, DreamMergeOperation):
                 required.update(operation.source_ids)
+            elif isinstance(operation, DreamSupersedeOperation):
+                required.add(operation.item_id)
+                required.add(operation.by_item_id)
             else:
                 required.add(operation.item_id)
-                if isinstance(operation, DreamSupersedeOperation):
-                    required.add(operation.by_item_id)
         return required
 
     @classmethod
@@ -692,7 +713,9 @@ class MemoryDreamService:
         items_by_id: dict[int, MemoryItemRecord],
     ) -> None:
         """在任何写入前校验引用、版本、依赖、key 和 user 类型保护。"""
+        # 被本操作集修改的 Item（merge 的全部来源 + 其余操作的目标）
         mutated_ids: list[int] = []
+        # supersede 指向的替代 Item，它们在同一操作集里不能再被修改
         supersede_targets: set[int] = set()
         key_owners = {entry.memory_key: entry.item_id for entry in entries_by_id.values()}
 
@@ -708,8 +731,8 @@ class MemoryDreamService:
                         "merge目标类型必须来自source类型集合",
                         retryable=False,
                     )
-                user_entries = [entry for entry in source_entries if entry.memory_type == "user"]
-                if user_entries and (
+                has_user_source = any(entry.memory_type == "user" for entry in source_entries)
+                if has_user_source and (
                     survivor.memory_type != "user" or operation.target.type != "user"
                 ):
                     raise MemoryDreamFailure(
@@ -743,12 +766,14 @@ class MemoryDreamService:
                         retryable=False,
                     )
                 supersede_targets.add(operation.by_item_id)
-            elif entry.memory_type == "user":
-                raise MemoryDreamFailure(
-                    "user_memory_protected",
-                    "Dream不能直接archive user Memory",
-                    retryable=False,
-                )
+            else:
+                # 剩下的是 archive
+                if entry.memory_type == "user":
+                    raise MemoryDreamFailure(
+                        "user_memory_protected",
+                        "Dream不能直接archive user Memory",
+                        retryable=False,
+                    )
             mutated_ids.append(operation.item_id)
 
         if len(mutated_ids) != len(set(mutated_ids)):
@@ -763,6 +788,7 @@ class MemoryDreamService:
                 "supersede目标不能在同一操作集中被修改",
                 retryable=False,
             )
+        # 加锁后的 Item 必须仍与快照一致；不一致说明模型调用期间被并发修改，可重试。
         for item_id, item in items_by_id.items():
             entry = entries_by_id[item_id]
             if item.status != "active" or item.version != entry.version:
@@ -778,6 +804,7 @@ class MemoryDreamService:
         entry: MemoryDreamEntry,
         key_owners: dict[str, int],
     ) -> None:
+        """memory_key 不允许改动；占用了别人的 key 时报冲突，否则报不可修改。"""
         if proposed_key == entry.memory_key:
             return
         owner_id = key_owners.get(proposed_key)
@@ -933,6 +960,7 @@ class MemoryDreamService:
         workspace_id: int,
         user_id: int,
     ) -> MemoryRevisionRecord:
+        # actor_id 截断到列宽 String(120)。
         revision = await self.memory_repo.create_revision(
             workspace_id,
             user_id,
@@ -960,6 +988,7 @@ class MemoryDreamService:
         revision: MemoryRevisionRecord,
         related_item_ids: list[int],
     ) -> _DreamAuditChange:
+        # Dream 只处理 active Item，前置状态固定为 active 且没有替代关系。
         return _DreamAuditChange(
             action=action,
             item_id=item.id,
@@ -976,8 +1005,13 @@ class MemoryDreamService:
 
     @staticmethod
     def _prompt_payload(entries: tuple[MemoryDreamEntry, ...]) -> dict[str, Any]:
-        return {
-            "active_memories": [
+        """发给 Dream 模型的输入，同时用于 Prepare 阶段的输入大小检查。"""
+        active_memories: list[dict[str, Any]] = []
+        for entry in entries:
+            last_used_at = None
+            if entry.last_used_at is not None:
+                last_used_at = entry.last_used_at.isoformat()
+            active_memories.append(
                 {
                     "item_id": entry.item_id,
                     "revision_id": entry.revision_id,
@@ -988,14 +1022,11 @@ class MemoryDreamService:
                     "description": entry.description,
                     "body": entry.body,
                     "source_kind": entry.source_kind,
-                    "last_used_at": (
-                        entry.last_used_at.isoformat() if entry.last_used_at is not None else None
-                    ),
+                    "last_used_at": last_used_at,
                     "use_count": entry.use_count,
                 }
-                for entry in entries
-            ]
-        }
+            )
+        return {"active_memories": active_memories}
 
     @staticmethod
     def _system_prompt(prompt_version: str) -> str:

@@ -189,6 +189,7 @@ class MemoryService:
         """显式创建 Memory，并在同一事务写入 Revision、Source 和 Catalog 版本。"""
         self._validate_memory(memory_key, memory_type, name, description, body)
 
+        # 先锁住 Space，后面的 key 查重和数量检查才不会被并发创建绕过。
         space = await self.repo.get_or_create_space_for_update(workspace_id, user_id)
         existing = await self.repo.get_active_item_by_key(workspace_id, user_id, memory_key)
         if existing is not None:
@@ -197,10 +198,8 @@ class MemoryService:
                 {"memory_key": memory_key},
                 status_code=409,
             )
-        if (
-            await self.repo.count_active_items(workspace_id, user_id, space.id)
-            >= MEMORY_CATALOG_MAX_ITEMS
-        ):
+        active_count = await self.repo.count_active_items(workspace_id, user_id, space.id)
+        if active_count >= MEMORY_CATALOG_MAX_ITEMS:
             raise AgentException.message(
                 f"active Memory 数量不能超过 {MEMORY_CATALOG_MAX_ITEMS} 条",
                 status_code=409,
@@ -233,6 +232,7 @@ class MemoryService:
             revision=revision,
             source_kind="explicit",
         )
+        # 写入后按新状态重新渲染 Catalog 校验预算；超限时抛错，由请求边界回滚整笔写入。
         await self._validate_current_catalog(workspace_id, user_id)
         catalog_version = await self.repo.increment_catalog_version(workspace_id, user_id, space)
         return MemoryDetail(item, catalog_version, (revision,), (source,))
@@ -257,6 +257,7 @@ class MemoryService:
         )
         self._validate_expected_version(item, expected_version)
 
+        # 参数为 None 表示该字段不修改，沿用当前值。
         next_memory_type = memory_type if memory_type is not None else item.memory_type
         next_name = name if name is not None else item.name
         next_description = description if description is not None else item.description
@@ -372,6 +373,7 @@ class MemoryService:
             user_id,
             space=space,
         )
+        # 导出由多条查询拼成，读完后再查一次版本，确认期间 Catalog 没有被改写。
         if space is not None:
             current_catalog_version = await self.repo.get_catalog_version(
                 workspace_id,
@@ -435,6 +437,7 @@ class MemoryService:
                 status_code=409,
             )
         claims = self._verify_purge_token(confirmation_token)
+        # 令牌必须是为当前租户、当前 Space 和当前 Catalog 版本签发的。
         expected_claims = {
             "v": _PURGE_TOKEN_VERSION,
             "workspace_id": workspace_id,
@@ -494,16 +497,14 @@ class MemoryService:
         """按 memory_key、ID 的查询顺序生成一行一条的数据库版 MEMORY.md。
         标签使用 memory_key（受正则约束，仅含小写字母、数字、连字符和下划线），无需转义。
         """
-        return "\n".join(
-            f"- [{entry.memory_key}]"
-            f"(memory:{entry.id}@{entry.version}) - "
-            f"{MemoryService._escape_description(entry.description)}"
-            for entry in entries
-        )
-
-    @staticmethod
-    def _escape_description(value: str) -> str:
-        return value.replace("\r", " ").replace("\n", " ")
+        lines: list[str] = []
+        for entry in entries:
+            # 摘要中的换行替换为空格，保证一条记忆只占一行。
+            description = entry.description.replace("\r", " ").replace("\n", " ")
+            lines.append(
+                f"- [{entry.memory_key}](memory:{entry.id}@{entry.version}) - {description}"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _validate_catalog_budget(
@@ -566,6 +567,7 @@ class MemoryService:
 
     @staticmethod
     def _sign_purge_claims(claims: dict[str, int]) -> str:
+        """生成 `base64url(声明 JSON).base64url(HMAC-SHA256)` 形式的令牌，去掉 = 填充。"""
         payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("utf-8")
         encoded_payload = base64.urlsafe_b64encode(payload).rstrip(b"=")
         signature = hmac.new(
@@ -578,6 +580,7 @@ class MemoryService:
 
     @staticmethod
     def _verify_purge_token(token: str) -> dict[str, int]:
+        """先验签再解析声明；任何格式或签名问题都统一报令牌无效，不暴露失败细节。"""
         try:
             encoded_payload, encoded_signature = token.split(".", 1)
             payload_bytes = encoded_payload.encode("ascii")
@@ -611,5 +614,6 @@ class MemoryService:
 
     @staticmethod
     def _decode_urlsafe_base64(value: str) -> bytes:
+        # 签发时去掉了 = 填充，解码前补齐到 4 的倍数。
         padding = "=" * (-len(value) % 4)
         return base64.b64decode(value + padding, altchars=b"-_", validate=True)

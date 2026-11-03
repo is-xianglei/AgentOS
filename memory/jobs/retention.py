@@ -38,17 +38,19 @@ class MemoryRetentionService:
     ) -> MemoryRetentionResult:
         """分别限制 Item 和 Job 删除批量，并扫描所有 Space 防止饥饿。"""
         effective_now = now or datetime.now(UTC)
-        effective_batch_size = (
-            batch_size if batch_size is not None else settings.memory_retention_batch_size
-        )
+        effective_batch_size = batch_size
+        if effective_batch_size is None:
+            effective_batch_size = settings.memory_retention_batch_size
         if effective_batch_size < 1:
             raise ValueError("Memory保留策略批量大小必须大于0")
 
+        # Item 与 Job 各自一份删除额度，一方用完不影响另一方继续清理。
         remaining_items = effective_batch_size
         remaining_jobs = effective_batch_size
         counts = MemoryPhysicalDeleteCounts()
         spaces_scanned = 0
         current_space_id = after_space_id
+        # 按 Space ID 游标分页扫描，每页 100 到 500 个 Space。
         page_size = min(max(effective_batch_size, 100), 500)
 
         while remaining_items > 0 or remaining_jobs > 0:
@@ -89,14 +91,21 @@ class MemoryRetentionService:
                     remaining_jobs -= job_counts.jobs
                     counts += job_counts
                 if remaining_items == 0 and remaining_jobs == 0:
+                    # 额度用完时记住扫描位置，下一批从后面的 Space 继续，
+                    # 避免排在前面的 Space 每次都占满额度；只扫单个 Space 时无需续扫。
+                    if space_id is not None:
+                        next_space_id = 0
+                    else:
+                        next_space_id = current_space_id
                     return MemoryRetentionResult(
                         spaces_scanned=spaces_scanned,
                         counts=counts,
-                        next_space_id=0 if space_id is not None else current_space_id,
+                        next_space_id=next_space_id,
                     )
             if len(spaces) < page_size:
                 break
 
+        # 已扫到最后一个 Space，下一批从头开始。
         return MemoryRetentionResult(
             spaces_scanned=spaces_scanned,
             counts=counts,
@@ -109,7 +118,9 @@ class MemoryRetentionService:
         key: str,
         default: int,
     ) -> int:
+        """读取 Space 自定义保留天数；类型或范围不合法时回落到全局配置。"""
         value = space_settings.get(key, default)
+        # bool 是 int 的子类，需单独排除 true/false 被当成 1/0 天。
         if isinstance(value, bool) or not isinstance(value, int):
             return default
         if not 0 <= value <= _MAX_RETENTION_DAYS:
@@ -131,6 +142,7 @@ class MemoryRetentionRunner:
                     after_space_id=self._after_space_id,
                 )
                 await db.commit()
+                # 提交成功后才推进游标，提交失败时下次重扫同一批 Space。
                 self._after_space_id = result.next_space_id
                 return result
             except Exception:

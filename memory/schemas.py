@@ -8,6 +8,7 @@ MemoryType = Literal["user", "feedback", "project", "reference"]
 MemoryStatus = Literal["active", "superseded", "archived"]
 MemorySourceKind = Literal["explicit", "extracted", "dream", "manual"]
 
+# 与 memory.service.MEMORY_BODY_MAX_BYTES 及表约束 ck_memory_items_body_bytes 保持一致。
 _MEMORY_BODY_MAX_BYTES = 16 * 1024
 _MUTABLE_FIELDS = {"memory_type", "name", "description", "body"}
 
@@ -78,6 +79,7 @@ class MemoryUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_changes(self) -> MemoryUpdateRequest:
+        # 未出现的字段表示不修改；显式传 null 无法区分意图，直接拒绝。
         supplied = self.model_fields_set & _MUTABLE_FIELDS
         if not supplied:
             raise ValueError("至少提供一个需要更新的字段")

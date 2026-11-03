@@ -242,18 +242,23 @@ class MemoryJobRepository:
         调用方必须在返回后立即提交短事务，不能在持有行锁时调用 LLM。
         now 未显式传入时使用 DB 时钟，与 available_at 的写入时间源保持一致。
         """
-        claimed_at: datetime | ColumnElement[datetime] = (
-            now if now is not None else func.now()
-        )
-        scope_conditions = []
+        if (workspace_id is None) != (user_id is None):
+            raise ValueError("workspace_id 和 user_id 必须同时提供")
+
+        claimed_at: datetime | ColumnElement[datetime]
+        if now is not None:
+            claimed_at = now
+        else:
+            claimed_at = func.now()
+
+        # 以下过滤条件同时用于「清理耗尽的 Job」和「认领」两条语句。
+        scope_conditions: list[ColumnElement[bool]] = []
         if job_id is not None:
             scope_conditions.append(MemoryJobRecord.id == job_id)
         if job_type is not None:
             scope_conditions.append(MemoryJobRecord.job_type == job_type)
         if payload_mode is not None:
             scope_conditions.append(MemoryJobRecord.payload["mode"].as_string() == payload_mode)
-        if (workspace_id is None) != (user_id is None):
-            raise ValueError("workspace_id 和 user_id 必须同时提供")
         if workspace_id is not None and user_id is not None:
             scoped_space_ids = select(MemorySpaceRecord.id).where(
                 MemorySpaceRecord.workspace_id == workspace_id,
@@ -261,6 +266,9 @@ class MemoryJobRepository:
                 MemorySpaceRecord.is_deleted.is_(False),
             )
             scope_conditions.append(MemoryJobRecord.space_id.in_(scoped_space_ids))
+
+        # 租约已过期且尝试次数已用完的 running Job 不会再被认领，先转为 dead，
+        # 否则它会永远停在 running。
         await self.db.execute(
             update(MemoryJobRecord)
             .where(
@@ -280,6 +288,8 @@ class MemoryJobRepository:
                 last_error_message="Lease到期且已达到最大尝试次数",
             )
         )
+
+        # 可认领的 Job：到期的 pending/retry，或租约已过期的 running（原 Worker 视为已失联）。
         available_condition = and_(
             MemoryJobRecord.status.in_(("pending", "retry")),
             MemoryJobRecord.available_at <= func.now(),
@@ -397,13 +407,15 @@ class MemoryJobRepository:
         failed_at 未显式传入时同样用 DB 时钟落库。
         """
         self._assert_lease_owner(job, worker_id, datetime.now(UTC))
+        # attempts 在认领时已加一，等于 max_attempts 说明这次就是最后一次尝试。
         should_retry = retryable and job.attempts < job.max_attempts
-        job.status = "retry" if should_retry else "dead"
-        job.available_at = available_at
         if should_retry:
+            job.status = "retry"
             job.finished_at = None
         else:
+            job.status = "dead"
             job.finished_at = failed_at if failed_at is not None else func.now()
+        job.available_at = available_at
         job.last_error_code = error_code
         job.last_error_message = error_message
         job.worker_id = None

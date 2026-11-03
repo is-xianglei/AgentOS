@@ -14,12 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
-from memory.models import MemoryItemRecord
-from session.models import SessionMessage, SessionRecord, SessionTurnRecord
 from memory.jobs.repository import MemoryJobRepository
+from memory.models import MemoryItemRecord
 from memory.repository import MemoryCatalogEntry, MemoryRepository
-from session.repository import SessionRepository
 from memory.service import MEMORY_BODY_MAX_BYTES, MEMORY_CATALOG_MAX_ITEMS
+from session.models import SessionMessage, SessionRecord, SessionTurnRecord
+from session.repository import SessionRepository
 
 _MEMORY_KEY_PATTERN = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
 # 英文凭据模式与中文敏感表述并列维护；中文模式匹配“密码是/为/：值”这类口语化泄露。
@@ -251,6 +251,7 @@ class MemoryExtractionService:
                 raise MemoryExtractionFailure(
                     "source_scope_invalid", "来源消息越界", retryable=False
                 )
+        # 起止消息必须属于当前轮次，且分别是用户请求和助手终答。
         boundary_messages = {
             message.id: message for message in messages if message.id in required_ids
         }
@@ -278,16 +279,23 @@ class MemoryExtractionService:
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_extractor 场景解析。
         # 配置缺失属不可重试失败,转成 Job 语义错误而非让中文 AgentException 裸抛。
         from runtime.model_selection import frozen_job_client
+
         client = self.llm
         if client is None:
             try:
                 client = await frozen_job_client(
-                    self.db, turn.workspace_id, turn.user_id, "memory_extractor",
-                    model=job.model, provider_id=(job.payload or {}).get("model_provider_id"),
+                    self.db,
+                    turn.workspace_id,
+                    turn.user_id,
+                    "memory_extractor",
+                    model=job.model,
+                    provider_id=(job.payload or {}).get("model_provider_id"),
                 )
             except AgentException as exc:
                 raise MemoryExtractionFailure(
-                    "model_missing", exc.message, retryable=False
+                    "model_missing",
+                    exc.message,
+                    retryable=False,
                 ) from exc
         model = job.model or getattr(client, "model", None)
         if not model:
@@ -295,7 +303,9 @@ class MemoryExtractionService:
                 model = resolve_scenario_model("memory_extractor")
             except AgentException as exc:
                 raise MemoryExtractionFailure(
-                    "model_missing", exc.message, retryable=False
+                    "model_missing",
+                    exc.message,
+                    retryable=False,
                 ) from exc
         mode = (job.payload or {}).get("mode", "active")
         if mode not in {"active", "shadow"}:
@@ -397,11 +407,9 @@ class MemoryExtractionService:
                 "轮次边界消息归属无效",
                 retryable=False,
             )
+        # 按 Prepare 相同的规则重建模型看到的消息窗口，候选只能引用这个窗口内的消息。
         projected = tuple(self._project_message(message) for message in messages)
-        projected = self._limit_message_chars(
-            projected,
-            required_ids,
-        )
+        projected = self._limit_message_chars(projected, required_ids)
         messages_by_id = {message.id: message for message in projected}
 
         accepted: list[ExtractedMemory] = []
@@ -571,6 +579,7 @@ class MemoryExtractionService:
                     )
                 unchanged_ids.append(item.id)
 
+            # 每条来源消息记一条来源证据；重复投递时幂等跳过，摘录含敏感信息时不保存。
             for source_message_id in candidate.source_message_ids:
                 source_message = messages_by_id[source_message_id]
                 await self.memory_repo.create_source_if_absent(
@@ -627,18 +636,17 @@ class MemoryExtractionService:
 
     @staticmethod
     def _project_message(message: SessionMessage) -> ExtractionMessage:
+        """把会话消息投影成 Extractor 输入：只保留文本，工具结果压缩成一行摘要。"""
         if message.role == "user":
             content = message.content if isinstance(message.content, str) else ""
             return ExtractionMessage(message.id, "user", content)
         if message.role == "assistant":
-            text_parts = []
+            text_parts: list[str] = []
             if isinstance(message.content, list):
                 # 落库的 assistant 消息是中立块数组,判别键为 kind(llm/types.py)。
-                text_parts = [
-                    str(block.get("text", ""))
-                    for block in message.content
-                    if isinstance(block, dict) and block.get("kind") == "text"
-                ]
+                for block in message.content:
+                    if isinstance(block, dict) and block.get("kind") == "text":
+                        text_parts.append(str(block.get("text", "")))
             elif isinstance(message.content, str):
                 text_parts = [message.content]
             return ExtractionMessage(message.id, "assistant", "\n".join(text_parts))
@@ -661,22 +669,23 @@ class MemoryExtractionService:
         messages: tuple[ExtractionMessage, ...],
         required_ids: set[int],
     ) -> tuple[ExtractionMessage, ...]:
+        """按字符预算裁剪消息窗口，当前轮次的起止消息必定保留。"""
         limit = settings.memory_extractor_max_chars
         if limit <= 0:
             return tuple(message for message in messages if message.id in required_ids)
 
         required = [message for message in messages if message.id in required_ids]
         optional = [message for message in messages if message.id not in required_ids]
+
+        # 必选消息平分预算，超出部分从开头截断。
         required_budget = max(1, limit // max(1, len(required)))
-        selected: dict[int, ExtractionMessage] = {
-            message.id: ExtractionMessage(
-                message.id,
-                message.role,
-                MemoryExtractionService._truncate_text(message.content, required_budget),
-            )
-            for message in required
-        }
+        selected: dict[int, ExtractionMessage] = {}
+        for message in required:
+            truncated = MemoryExtractionService._truncate_text(message.content, required_budget)
+            selected[message.id] = ExtractionMessage(message.id, message.role, truncated)
         used = sum(len(message.content) for message in selected.values())
+
+        # 剩余预算从最近的消息往前补；放不下的整条跳过，继续尝试更早、更短的消息。
         for message in reversed(optional):
             remaining = limit - used
             if remaining <= 0:
@@ -685,6 +694,7 @@ class MemoryExtractionService:
                 continue
             selected[message.id] = message
             used += len(message.content)
+        # 按消息 ID 升序返回，恢复对话的原始顺序。
         return tuple(selected[message_id] for message_id in sorted(selected))
 
     @staticmethod
@@ -692,6 +702,7 @@ class MemoryExtractionService:
         item: MemoryItemRecord | None,
         candidate: ExtractedMemory,
     ) -> str:
+        """判定候选对同 key 已有记忆的处理方式：create/noop/update/supersede/conflict。"""
         if item is None:
             return "create"
         current = (item.memory_type, item.name, item.description, item.body)
@@ -701,6 +712,8 @@ class MemoryExtractionService:
         if item.memory_type != candidate.type:
             return "conflict"
 
+        # 正文按归一化后的文本比较：新正文包含旧正文视为补充更新，
+        # 旧正文已包含新正文视为没有新信息。
         current_body = MemoryExtractionService._normalize_comparable(item.body)
         proposed_body = MemoryExtractionService._normalize_comparable(candidate.body)
         if current_body == proposed_body or current_body in proposed_body:
@@ -721,13 +734,18 @@ class MemoryExtractionService:
 
     @staticmethod
     def _contains_sensitive_text(value: str) -> bool:
-        return any(pattern.search(value) for pattern in _CREDENTIAL_PATTERNS) or any(
-            MemoryExtractionService._looks_high_entropy_credential(token)
-            for token in re.findall(r"[A-Za-z0-9+/=_-]{32,}", value)
-        )
+        """先匹配已知凭据格式，再检查 32 位以上的随机字符串是否像密钥。"""
+        for pattern in _CREDENTIAL_PATTERNS:
+            if pattern.search(value):
+                return True
+        for token in re.findall(r"[A-Za-z0-9+/=_-]{32,}", value):
+            if MemoryExtractionService._looks_high_entropy_credential(token):
+                return True
+        return False
 
     @staticmethod
     def _looks_high_entropy_credential(value: str) -> bool:
+        """同时含小写、大写、数字和符号，且香农熵不低于 4.2 bit/字符时视为密钥。"""
         character_classes = sum(
             (
                 any(char.islower() for char in value),
@@ -755,6 +773,7 @@ class MemoryExtractionService:
 
     @staticmethod
     def _truncate_text(value: str, max_chars: int) -> str:
+        """超长时保留末尾内容，并在开头加截断标记，总长不超过 max_chars。"""
         if max_chars <= 0:
             return ""
         if len(value) <= max_chars:

@@ -134,6 +134,7 @@ class MemoryRepository:
         user_id: int,
     ) -> MemorySpaceRecord:
         """并发安全地创建或锁定当前用户的 Space。"""
+        # 已存在 Space 时 ON CONFLICT DO NOTHING 不报错，随后统一加锁重读。
         stmt = (
             insert(MemorySpaceRecord)
             .values(
@@ -201,6 +202,7 @@ class MemoryRepository:
         limit: int,
     ) -> list[MemoryItemRecord]:
         """在稳定标识、标题和摘要中执行大小写不敏感的词法搜索。"""
+        # 转义 LIKE 通配符，让用户输入的 % 和 _ 按字面匹配。
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         conditions = self._scope_conditions(workspace_id, user_id)
@@ -722,6 +724,8 @@ class MemoryRepository:
         space: MemorySpaceRecord | None,
     ) -> MemoryExportBundle:
         """按明确租户边界读取仍保留的全部 Memory 数据。"""
+        # 导出要包含已软删除的记录，所有查询都用 include_deleted 跳过全局软删除过滤。
+        # 冻结上下文按 Turn 的租户归属查询，没有 Space 时也要导出。
         contexts_stmt = (
             select(TurnMemoryContextRecord)
             .join(
@@ -776,12 +780,13 @@ class MemoryRepository:
             .order_by(MemoryJobRecord.created_at.asc(), MemoryJobRecord.id.asc())
             .execution_options(include_deleted=True)
         )
+        jobs = tuple(await self.db.scalars(jobs_stmt))
         return MemoryExportBundle(
             space=space,
             items=items,
             revisions=revisions,
             sources=sources,
-            jobs=tuple(await self.db.scalars(jobs_stmt)),
+            jobs=jobs,
             contexts=contexts,
         )
 
@@ -814,59 +819,48 @@ class MemoryRepository:
         )
         item_ids = select(MemoryItemRecord.id).where(MemoryItemRecord.space_id == space.id)
         item_ids = item_ids.execution_options(include_deleted=True)
+
+        # 级联删除后无法再统计，先逐类计数（含已软删除的记录）。
+        items_stmt = (
+            select(func.count())
+            .select_from(item_ids.subquery())
+            .execution_options(include_deleted=True)
+        )
+        item_count = int((await self.db.scalar(items_stmt)) or 0)
+        revisions_stmt = (
+            select(func.count(MemoryRevisionRecord.id))
+            .where(MemoryRevisionRecord.memory_id.in_(item_ids))
+            .execution_options(include_deleted=True)
+        )
+        revision_count = int((await self.db.scalar(revisions_stmt)) or 0)
+        sources_stmt = (
+            select(func.count(MemorySourceRecord.id))
+            .where(MemorySourceRecord.memory_id.in_(item_ids))
+            .execution_options(include_deleted=True)
+        )
+        source_count = int((await self.db.scalar(sources_stmt)) or 0)
+        jobs_stmt = (
+            select(func.count(MemoryJobRecord.id))
+            .where(MemoryJobRecord.space_id == space.id)
+            .execution_options(include_deleted=True)
+        )
+        job_count = int((await self.db.scalar(jobs_stmt)) or 0)
+        contexts_stmt = (
+            select(func.count(TurnMemoryContextRecord.id))
+            .where(TurnMemoryContextRecord.turn_id.in_(tenant_turn_ids))
+            .execution_options(include_deleted=True)
+        )
+        context_count = int((await self.db.scalar(contexts_stmt)) or 0)
         counts = MemoryPhysicalDeleteCounts(
             spaces=1,
-            items=int(
-                (
-                    await self.db.scalar(
-                        select(func.count())
-                        .select_from(item_ids.subquery())
-                        .execution_options(include_deleted=True)
-                    )
-                )
-                or 0
-            ),
-            revisions=int(
-                (
-                    await self.db.scalar(
-                        select(func.count(MemoryRevisionRecord.id))
-                        .where(MemoryRevisionRecord.memory_id.in_(item_ids))
-                        .execution_options(include_deleted=True)
-                    )
-                )
-                or 0
-            ),
-            sources=int(
-                (
-                    await self.db.scalar(
-                        select(func.count(MemorySourceRecord.id))
-                        .where(MemorySourceRecord.memory_id.in_(item_ids))
-                        .execution_options(include_deleted=True)
-                    )
-                )
-                or 0
-            ),
-            jobs=int(
-                (
-                    await self.db.scalar(
-                        select(func.count(MemoryJobRecord.id))
-                        .where(MemoryJobRecord.space_id == space.id)
-                        .execution_options(include_deleted=True)
-                    )
-                )
-                or 0
-            ),
-            contexts=int(
-                (
-                    await self.db.scalar(
-                        select(func.count(TurnMemoryContextRecord.id))
-                        .where(TurnMemoryContextRecord.turn_id.in_(tenant_turn_ids))
-                        .execution_options(include_deleted=True)
-                    )
-                )
-                or 0
-            ),
+            items=item_count,
+            revisions=revision_count,
+            sources=source_count,
+            jobs=job_count,
+            contexts=context_count,
         )
+
+        # 冻结上下文挂在 Turn 上，对 Space 的外键是 SET NULL，不会随 Space 级联删除。
         await self.db.execute(
             delete(TurnMemoryContextRecord).where(
                 TurnMemoryContextRecord.turn_id.in_(tenant_turn_ids)
@@ -879,6 +873,7 @@ class MemoryRepository:
                 MemorySpaceRecord.user_id == user_id,
             )
         )
+        # 调用方已持有 Space 行锁，正常必删 1 行；否则按并发变更处理，整笔回滚。
         if result.rowcount != 1:
             raise RuntimeError("彻底删除Memory空间时检测到并发变更")
         await self.db.flush()
@@ -916,6 +911,8 @@ class MemoryRepository:
         """锁定并物理清理一批超期归档 Item，明确统计级联数据。"""
         if limit <= 0:
             return MemoryPhysicalDeleteCounts()
+        # 用户删除的记录同时是 archived 且已软删除，需要 include_deleted 才能选中；
+        # SKIP LOCKED 跳过正被其他事务锁定的行，清理不与在线写入互相等待。
         ids_stmt = (
             select(MemoryItemRecord.id)
             .where(
@@ -931,26 +928,20 @@ class MemoryRepository:
         item_ids = list(await self.db.scalars(ids_stmt))
         if not item_ids:
             return MemoryPhysicalDeleteCounts()
-        revision_count = int(
-            (
-                await self.db.scalar(
-                    select(func.count(MemoryRevisionRecord.id))
-                    .where(MemoryRevisionRecord.memory_id.in_(item_ids))
-                    .execution_options(include_deleted=True)
-                )
-            )
-            or 0
+
+        # Revision 和 Source 随 Item 外键级联删除，删除前先计数。
+        revisions_stmt = (
+            select(func.count(MemoryRevisionRecord.id))
+            .where(MemoryRevisionRecord.memory_id.in_(item_ids))
+            .execution_options(include_deleted=True)
         )
-        source_count = int(
-            (
-                await self.db.scalar(
-                    select(func.count(MemorySourceRecord.id))
-                    .where(MemorySourceRecord.memory_id.in_(item_ids))
-                    .execution_options(include_deleted=True)
-                )
-            )
-            or 0
+        revision_count = int((await self.db.scalar(revisions_stmt)) or 0)
+        sources_stmt = (
+            select(func.count(MemorySourceRecord.id))
+            .where(MemorySourceRecord.memory_id.in_(item_ids))
+            .execution_options(include_deleted=True)
         )
+        source_count = int((await self.db.scalar(sources_stmt)) or 0)
         await self.db.execute(delete(MemoryItemRecord).where(MemoryItemRecord.id.in_(item_ids)))
         await self.db.flush()
         return MemoryPhysicalDeleteCounts(
@@ -1149,25 +1140,31 @@ class MemoryRepository:
             .limit(limit)
         )
         rows = (await self.db.execute(stmt)).all()
+        # 没有行说明用户还没有 Space。
         if not rows:
             return MemoryCatalogSnapshot(space_id=None, catalog_version=0, entries=())
 
-        entries = tuple(
-            MemoryCatalogEntry(
-                id=row[2],
-                version=row[3],
-                memory_key=row[4],
-                memory_type=row[5],
-                name=row[6],
-                description=row[7],
+        # 外连接下，没有 active 条目的 Space 也会返回一行，其 Item 列全为 NULL。
+        entries: list[MemoryCatalogEntry] = []
+        for row in rows:
+            item_id = row[2]
+            if item_id is None:
+                continue
+            entries.append(
+                MemoryCatalogEntry(
+                    id=item_id,
+                    version=row[3],
+                    memory_key=row[4],
+                    memory_type=row[5],
+                    name=row[6],
+                    description=row[7],
+                )
             )
-            for row in rows
-            if row[2] is not None
-        )
+        space_id, catalog_version = rows[0][0], rows[0][1]
         return MemoryCatalogSnapshot(
-            space_id=rows[0][0],
-            catalog_version=rows[0][1],
-            entries=entries,
+            space_id=space_id,
+            catalog_version=catalog_version,
+            entries=tuple(entries),
         )
 
     def _scope_conditions(

@@ -12,10 +12,6 @@ from core.config import settings
 from core.errors import AgentException
 from database.engine import AsyncSessionLocal
 from llm import BaseLLMClient, resolve_scenario_model
-from memory.models import MemoryJobRecord
-from session.models import SessionRecord, SessionTurnRecord
-from memory.jobs.repository import MemoryJobRepository
-from memory.repository import MemoryRepository
 from memory.jobs.dream import (
     DreamApplyResult,
     MemoryDreamFailure,
@@ -30,10 +26,15 @@ from memory.jobs.extraction import (
     MemoryExtractionService,
     PreparedMemoryExtraction,
 )
+from memory.jobs.repository import MemoryJobRepository
+from memory.models import MemoryJobRecord
+from memory.repository import MemoryRepository
 from memory.rollout_service import MemoryRolloutService
+from session.models import SessionRecord, SessionTurnRecord
 
 logger = logging.getLogger(__name__)
 
+# 第 N 次失败后等待 _RETRY_DELAYS_SECONDS[N-1] 秒再重试，超出部分沿用最后一档。
 _RETRY_DELAYS_SECONDS = (5, 30, 120, 600, 1800)
 
 
@@ -79,22 +80,34 @@ class MemoryJobService:
             # 有意偏离文档 §9.1 的幂等键格式：shadow Job 只记录对比摘要、不写 Memory 数据，
             # 追加后缀使灰度切换窗口内同一 Turn 的 active 提取不被 shadow 记录挡住而丢失。
             idempotency_key = f"{idempotency_key}:shadow"
+
+        # 入队即冻结实际生效的模型:工作区配置了模型服务时用其模型并记下 provider,
+        # 否则回落到 .env 的场景模型。解析不出会抛中文 AgentException,
+        # 由调用方的 SAVEPOINT 隔离,不影响主链路。
         from model_service.service import ModelService
-        provider = await ModelService(self.db).select_provider(turn.workspace_id, turn.user_id, scenario="memory_extractor")
-        job = await self.job_repo.enqueue_extract(
+
+        provider = await ModelService(self.db).select_provider(
+            turn.workspace_id,
+            turn.user_id,
+            scenario="memory_extractor",
+        )
+        payload: dict[str, str] = {"mode": mode}
+        if provider is not None:
+            model = provider.model_name
+            payload["model_provider_id"] = provider.provider_id
+        else:
+            model = resolve_scenario_model("memory_extractor")
+        return await self.job_repo.enqueue_extract(
             space_id=space.id,
             session_id=session.id,
             turn_id=turn.id,
             idempotency_key=idempotency_key,
             max_attempts=settings.memory_job_max_attempts,
-            # 入队即冻结实际生效的模型;解析不出会抛中文 AgentException,
-            # 由调用方的 SAVEPOINT 隔离,不影响主链路。
-            model=provider.model_name if provider else resolve_scenario_model("memory_extractor"),
+            model=model,
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
-            payload={"mode": mode, **({"model_provider_id": provider.provider_id} if provider else {})},
+            payload=payload,
         )
-        return job
 
     async def record_extract_success_and_maybe_enqueue_dream(
         self,
@@ -109,6 +122,8 @@ class MemoryJobService:
         space = await self.memory_repo.get_space_for_worker(job.space_id, for_update=True)
         if space is None:
             raise RuntimeError("提取Job所属Memory空间不存在")
+        # 计数单位是「会话」：同一会话在上次 Dream 之后已有成功提取时不重复计数。
+        # 本 Job 尚未标记成功，不会被这次查询统计到。
         since = space.last_dream_at or datetime.min.replace(tzinfo=UTC)
         already_counted = await self.job_repo.has_succeeded_extract_for_session_since(
             space.id,
@@ -148,6 +163,8 @@ class MemoryJobService:
         ):
             return None
 
+        # 门控全部通过即记为一次扫描，即使下面因已有 Dream 而不入队，
+        # 也要按扫描间隔节流，避免每次提取成功都重复检查。
         await self.memory_repo.mark_dream_scan(
             space.workspace_id,
             space.user_id,
@@ -157,23 +174,35 @@ class MemoryJobService:
         if await self.job_repo.has_live_dream(space.id):
             return None
 
+        # 幂等键带上扫描时间窗编号，同一窗口内的重复触发只会入队一次。
         scan_window_seconds = max(settings.memory_dream_scan_interval_seconds, 1)
         scan_window = int(completed_at.timestamp()) // scan_window_seconds
         prompt_version = settings.memory_dream_prompt_version
         idempotency_key = f"dream:{space.id}:{space.catalog_version}:{prompt_version}:{scan_window}"
+
+        # Dream 直接按自身场景解析,不再继承 Extractor 的模型配置。
         from model_service.service import ModelService
-        provider = await ModelService(self.db).select_provider(space.workspace_id, space.user_id, scenario="memory_dream")
-        job = await self.job_repo.enqueue_dream(
+
+        provider = await ModelService(self.db).select_provider(
+            space.workspace_id,
+            space.user_id,
+            scenario="memory_dream",
+        )
+        payload: dict[str, str] = {}
+        if provider is not None:
+            model = provider.model_name
+            payload["model_provider_id"] = provider.provider_id
+        else:
+            model = resolve_scenario_model("memory_dream")
+        return await self.job_repo.enqueue_dream(
             space_id=space.id,
             idempotency_key=idempotency_key,
             max_attempts=settings.memory_job_max_attempts,
-            # Dream 直接按自身场景解析,不再继承 Extractor 的模型配置。
-            model=provider.model_name if provider else resolve_scenario_model("memory_dream"),
+            model=model,
             prompt_version=prompt_version,
             base_catalog_version=space.catalog_version,
-            payload={"model_provider_id": provider.provider_id} if provider else {},
+            payload=payload,
         )
-        return job
 
 
 class MemoryJobRunner:
@@ -192,6 +221,7 @@ class MemoryJobRunner:
         # 保持 None 让各下游服务按自身 scenario 建客户端;注入非 None 时统一覆盖(测试用)。
         self.llm = llm
         self.worker_id = worker_id or self._default_worker_id()
+        # (workspace_id, user_id)：就地执行时限定只认领当前用户的 Job；独立 Worker 不限定。
         self.claim_scope = claim_scope
 
     async def run_once(self, *, job_id: UUID | None = None) -> int:
@@ -263,6 +293,7 @@ class MemoryJobRunner:
                 raise
 
     async def _execute_claimed(self, job_id: UUID, job_type: str) -> bool:
+        """按「读取 → 模型调用 → 落库」三段执行；普通异常记录到 Job 后返回 False，不向上抛出。"""
         if job_type == "dream":
             return await self._execute_dream_claimed(job_id)
 
@@ -409,6 +440,7 @@ class MemoryJobRunner:
         async with self.session_factory() as db:
             try:
                 service = MemoryExtractionService(db, self.llm)
+                # 影子模式只记录候选数量供灰度对比，不写任何 Memory 数据。
                 if mode == "shadow":
                     job = await service.job_repo.require_owned_lease(job_id, self.worker_id)
                     if (job.payload or {}).get("mode") != "shadow":
@@ -436,6 +468,7 @@ class MemoryJobRunner:
                     await db.commit()
                     return applied
 
+                # 写入 Memory、推进 Dream 门控和标记成功在同一事务内提交。
                 applied = await service.apply(job_id, self.worker_id, result)
                 job = await service.job_repo.require_owned_lease(job_id, self.worker_id)
                 if (job.payload or {}).get("mode", "active") != mode:
@@ -494,14 +527,16 @@ class MemoryJobRunner:
             try:
                 repo = MemoryJobRepository(db)
                 job = await repo.require_owned_lease(job_id, self.worker_id)
+                # attempts 在认领时已加一，第 1 次失败对应第一档退避。
                 delay_index = min(max(job.attempts - 1, 0), len(_RETRY_DELAYS_SECONDS) - 1)
                 # 重试退避基于 DB 时钟，与认领条件的 func.now() 使用同一时间源。
+                retry_at = func.now() + timedelta(seconds=_RETRY_DELAYS_SECONDS[delay_index])
+                # 截断到列宽 String(64) / String(1000)。
                 await repo.mark_failed(
                     job,
                     self.worker_id,
                     retryable=failure.retryable,
-                    available_at=func.now()
-                    + timedelta(seconds=_RETRY_DELAYS_SECONDS[delay_index]),
+                    available_at=retry_at,
                     error_code=failure.code[:64],
                     error_message=str(failure)[:1000],
                 )

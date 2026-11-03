@@ -6,8 +6,8 @@ import time
 from core.config import settings
 from core.logging import setup_logging
 from database.engine import AsyncSessionLocal
-from memory.jobs.service import MemoryJobRunner
 from memory.jobs.retention import MemoryRetentionRunner
+from memory.jobs.service import MemoryJobRunner
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +23,12 @@ class MemoryWorker:
         if runner is None:
             runner = MemoryJobRunner(session_factory=AsyncSessionLocal)
         self.runner = runner
-        self.retention_runner = retention_runner or MemoryRetentionRunner(
-            session_factory=getattr(runner, "session_factory", AsyncSessionLocal)
-        )
+        if retention_runner is None:
+            # 与 Job Runner 共用同一会话工厂；注入的替身 Runner 可能没有该属性。
+            retention_runner = MemoryRetentionRunner(
+                session_factory=getattr(runner, "session_factory", AsyncSessionLocal)
+            )
+        self.retention_runner = retention_runner
         self._next_retention_at = 0.0
         self.stop_event = asyncio.Event()
 
@@ -34,6 +37,7 @@ class MemoryWorker:
         self._install_signal_handlers()
         logger.info("Memory Worker已启动", extra={"worker_id": self.runner.worker_id})
         while not self.stop_event.is_set():
+            # 保留清理不受提取/Dream 开关影响，两者都关闭时仍按周期执行。
             await self._run_retention_if_due()
             extraction_enabled = settings.memory_extraction_enabled
             dream_enabled = settings.memory_dream_enabled
@@ -46,6 +50,7 @@ class MemoryWorker:
                 logger.exception("Memory Worker认领任务失败")
                 await self._wait_for_next_poll()
                 continue
+            # 本轮认领到任务时立即进入下一轮，队列空闲才等待。
             if claimed == 0:
                 await self._wait_for_next_poll()
         logger.info("Memory Worker已停止", extra={"worker_id": self.runner.worker_id})
@@ -60,6 +65,7 @@ class MemoryWorker:
         now = time.monotonic()
         if now < self._next_retention_at:
             return
+        # 先推进下次执行时间，本次失败也要等满一个周期再重试。
         self._next_retention_at = now + settings.memory_retention_interval_seconds
         try:
             result = await self.retention_runner.run_once()
@@ -79,6 +85,7 @@ class MemoryWorker:
         )
 
     async def _wait_for_next_poll(self) -> None:
+        """等待一个轮询间隔；期间收到停止信号会立即返回。"""
         try:
             await asyncio.wait_for(
                 self.stop_event.wait(),
@@ -93,6 +100,7 @@ class MemoryWorker:
             try:
                 loop.add_signal_handler(signum, self.request_stop)
             except NotImplementedError:
+                # 部分平台（如 Windows）的事件循环不支持 add_signal_handler。
                 signal.signal(signum, lambda *_: self.request_stop())
 
 

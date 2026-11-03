@@ -10,8 +10,8 @@ from memory.models import (
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from session.models import SessionMessage, SessionTurnRecord
 from memory.repository import MemoryCatalogEntry
+from session.models import SessionMessage, SessionTurnRecord
 
 
 @dataclass(frozen=True)
@@ -114,6 +114,7 @@ class MemoryRecallRepository:
             .execution_options(include_deleted=True)
         )
         records = list(await self.db.scalars(stmt))
+        # 按入参 entries 的顺序返回，查不到的条目直接跳过。
         by_pair = {(record.memory_id, record.revision): record for record in records}
         return [
             by_pair[(entry.id, entry.version)]
@@ -146,11 +147,14 @@ class MemoryRecallRepository:
             )
             .order_by(TurnMemoryContextRecord.id)
         )
+        # JSONB 内容不受列类型约束，只收正整数；type() 判断同时排除 bool。
         result: list[int] = []
         for values in await self.db.scalars(stmt):
             if not isinstance(values, list):
                 continue
-            result.extend(value for value in values if type(value) is int and value > 0)
+            for value in values:
+                if type(value) is int and value > 0:
+                    result.append(value)
         return result
 
     async def get_revisions_by_ids(
@@ -174,6 +178,7 @@ class MemoryRecallRepository:
             .execution_options(include_deleted=True)
         )
         records = list(await self.db.scalars(stmt))
+        # 按入参 revision_ids 的顺序返回，查不到的 ID 直接跳过。
         by_id = {record.id: record for record in records}
         return [by_id[revision_id] for revision_id in revision_ids if revision_id in by_id]
 
@@ -263,6 +268,7 @@ class MemoryRecallRepository:
         if turn is None:
             raise RuntimeError("冻结Memory上下文时找不到可信交互轮次")
 
+        # 持有 Turn 行锁后再查一次：并发冻结时后到者直接复用先写入的 Context。
         existing = await self.get_context(workspace_id, user_id, turn_id)
         if existing is not None:
             return existing
@@ -279,6 +285,7 @@ class MemoryRecallRepository:
             byte_count=byte_count,
         )
         self.db.add(context)
+        # 第一次 flush 拿到 Context ID，再回填到 Turn 上。
         await self.db.flush()
         turn.memory_context_id = context.id
         await self.db.flush()

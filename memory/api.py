@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from api.deps import DatabaseSession, get_current_active_user, get_current_workspace_id
 from core.responses import ApiResponse, ok
-from user.models import UserRecord
+from memory.jobs.dream import MemoryDreamService
 from memory.schemas import (
     MemoryCreateRequest,
     MemoryDeleteRequest,
@@ -33,13 +33,13 @@ from memory.schemas import (
     MemoryType,
     MemoryUpdateRequest,
 )
-from memory.jobs.dream import MemoryDreamService
 from memory.service import (
     MemoryDetail,
     MemoryExportResult,
     MemoryExportRunner,
     MemoryService,
 )
+from user.models import UserRecord
 
 router = APIRouter()
 CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
@@ -217,6 +217,7 @@ async def export_memories(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
+    # 不注入请求级 db：导出需要在独立的 REPEATABLE READ 事务里读取一致快照。
     export_result = await MemoryExportRunner().export(workspace_id, current_user.id)
     return ok(
         _to_export_response(

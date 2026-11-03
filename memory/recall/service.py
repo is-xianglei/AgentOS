@@ -11,9 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from llm import BaseLLMClient, create_llm_client
+from llm import BaseLLMClient
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
-from session.models import SessionTurnRecord
 from memory.recall.repository import (
     MemoryLexicalCandidate,
     MemoryRecallRepository,
@@ -21,6 +20,7 @@ from memory.recall.repository import (
 from memory.repository import MemoryCatalogEntry, MemoryRepository
 from memory.rollout_service import MemoryRolloutService
 from memory.service import MemoryService
+from session.models import SessionTurnRecord
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,7 @@ class MemoryRecallService:
             catalog.snapshot.entries,
             limited_texts,
         )
+        # 按选择顺序取回冻结 Catalog 中对应版本的 Revision 正文。
         entries_by_id = {entry.id: entry for entry in catalog.snapshot.entries}
         selected_entries = [
             entries_by_id[memory_id]
@@ -113,13 +114,12 @@ class MemoryRecallService:
             turn,
             revisions,
         )
-        selector_status = (
-            "degraded"
-            if selection.degraded_reason is not None
-            else "selected"
-            if selected_revisions
-            else "empty"
-        )
+        if selection.degraded_reason is not None:
+            selector_status = "degraded"
+        elif selected_revisions:
+            selector_status = "selected"
+        else:
+            selector_status = "empty"
         byte_count = len((catalog.content + rendered_memories).encode("utf-8"))
         context = await self.repo.freeze_context(
             turn.workspace_id,
@@ -173,6 +173,7 @@ class MemoryRecallService:
         entries: tuple[MemoryCatalogEntry, ...],
         recent_texts: list[str],
     ) -> _SelectionResult:
+        """先让选择器模型挑选；超时、出错或返回目录外 ID 时改用词法降级并记录原因。"""
         if not entries or not recent_texts:
             return _SelectionResult(())
 
@@ -202,11 +203,18 @@ class MemoryRecallService:
         )
         degraded_reason: str
         try:
+            # 超时预算同时覆盖客户端解析和模型调用。
             async with asyncio.timeout(settings.memory_selector_timeout_seconds):
                 from runtime.model_selection import resolve_runtime_client
+
                 client = self.llm
                 if client is None:
-                    client, _ = await resolve_runtime_client(self.db, workspace_id, user_id, "memory_selector")
+                    client, _ = await resolve_runtime_client(
+                        self.db,
+                        workspace_id,
+                        user_id,
+                        "memory_selector",
+                    )
                 # 模型已在客户端构造时按 memory_selector 场景解析,此处不再显式传入。
                 output = await client.complete_structured(
                     [{"role": "user", "content": prompt}],
@@ -216,6 +224,7 @@ class MemoryRecallService:
                     timeout=settings.memory_selector_timeout_seconds,
                 )
             memory_ids = self._deduplicate(output.selected_memory_ids)
+            # 只要有一个 ID 不在目录里，整份输出都不可信，改走词法降级。
             if any(memory_id not in catalog_ids for memory_id in memory_ids):
                 degraded_reason = "selector_out_of_catalog"
             else:
@@ -243,6 +252,7 @@ class MemoryRecallService:
         recent_texts: list[str],
     ) -> list[int]:
         query = "\n".join(recent_texts)
+        # pg_trgm 查询失败会让事务进入 aborted，用 SAVEPOINT 隔离，失败时本轮不注入正文。
         nested = await self.db.begin_nested()
         try:
             candidates = await self.repo.search_lexical_candidates(
@@ -277,6 +287,7 @@ class MemoryRecallService:
             turn.user_id,
             previous_ids,
         )
+        # 会话预算按「本会话呈现过的不同 Revision」累计字节数，重复呈现不重复计费。
         surfaced_ids = {revision.id for revision in previous_revisions}
         used_bytes = sum(
             len(self._render_memory_block(revision).encode("utf-8"))
@@ -288,16 +299,18 @@ class MemoryRecallService:
         for revision in revisions[: settings.memory_recall_max_items]:
             block = self._render_memory_block(revision)
             block_bytes = len(block.encode("utf-8"))
-            if (
-                revision.id not in surfaced_ids
-                and used_bytes + block_bytes > settings.memory_session_max_bytes
-            ):
+            if revision.id in surfaced_ids:
+                # 之前呈现过的 Revision 已计入预算，直接再次注入。
+                selected.append(revision)
+                blocks.append(block)
+                continue
+            if used_bytes + block_bytes > settings.memory_session_max_bytes:
+                # 放不下的跳过，后面体积更小的 Revision 仍可能放得下。
                 continue
             selected.append(revision)
             blocks.append(block)
-            if revision.id not in surfaced_ids:
-                surfaced_ids.add(revision.id)
-                used_bytes += block_bytes
+            surfaced_ids.add(revision.id)
+            used_bytes += block_bytes
 
         if not blocks:
             return selected, ""
@@ -310,8 +323,10 @@ class MemoryRecallService:
 
     @staticmethod
     def _render_memory_block(revision: MemoryRevisionRecord) -> str:
+        """渲染单条 Memory：先按行数截断、去掉控制字符，再转义并按字节截断。"""
         lines = revision.body.splitlines()[: settings.memory_recall_item_max_lines]
         body = "\n".join(lines)
+        # 只保留换行和制表符，其余控制字符（Cc 类）一律去掉。
         body = "".join(
             char for char in body if char in {"\n", "\t"} or unicodedata.category(char) != "Cc"
         )
@@ -342,6 +357,7 @@ class MemoryRecallService:
 
     @staticmethod
     def _limit_recent_texts(values: list[str]) -> list[str]:
+        """从最近一条往前取，总字符数不超过上限；超长的那条只保留末尾部分。"""
         remaining = settings.memory_selector_query_max_chars
         selected: list[str] = []
         for value in reversed(values):
@@ -357,6 +373,7 @@ class MemoryRecallService:
         query: str,
         candidates: list[MemoryLexicalCandidate],
     ) -> list[int]:
+        """标题命中词权重 3、摘要命中词权重 1，再加 trigram 相似度；同分按 key、ID 排序。"""
         query_tokens = MemoryRecallService._tokens(query)
         scored: list[tuple[float, str, int]] = []
         for candidate in candidates:
@@ -372,6 +389,7 @@ class MemoryRecallService:
 
     @staticmethod
     def _tokens(value: str) -> set[str]:
+        """英文数字按词（含下划线拆分）切分；中文切成单字和相邻二字组合。"""
         normalized = unicodedata.normalize("NFKC", value).lower()
         chunks = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", normalized)
         tokens: set[str] = set()

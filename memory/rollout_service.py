@@ -22,9 +22,12 @@ class MemoryRolloutService:
         """按百分比判断用户是否命中灰度。"""
         if not 0 <= percentage <= cls._BUCKETS:
             raise ValueError("灰度百分比必须在 0 到 100 之间")
-        return percentage == cls._BUCKETS or (
-            percentage > 0 and cls.bucket(user_id, feature) < percentage
-        )
+        # 0% 和 100% 直接判定，不必计算哈希桶。
+        if percentage == cls._BUCKETS:
+            return True
+        if percentage == 0:
+            return False
+        return cls.bucket(user_id, feature) < percentage
 
     @classmethod
     def recall_enabled(cls, user_id: int) -> bool:
