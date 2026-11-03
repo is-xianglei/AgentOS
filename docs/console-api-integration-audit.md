@@ -48,7 +48,7 @@ flowchart LR
 {"data": {}, "error": null, "request_id": "请求标识"}
 ```
 
-错误信息使用 `error.code`、`error.message`、`error.details`。前端 `src/http/index.ts` 的 `request<T>` 解包 `data`，`errorFromBody` 解析信封错误并兼容已有顶层 `message/detail/code`。Skill zip 导出使用 `requestBlob`。
+错误信息使用 `error.code`、`error.message`、`error.details`，其中 `error.code` 目前为可选字段，后端暂不输出。前端 `src/http/index.ts` 的 `request<T>` 解包 `data`，`errorFromBody` 解析信封错误并兼容已有顶层 `message/detail/code`。Skill zip 导出使用 `requestBlob`。
 
 ### 3.2 认证原始 JSON
 

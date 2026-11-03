@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 
 class ErrorBody(BaseModel):
-    code: str = Field(description="错误码")
+    code: str | None = Field(default=None, description="错误码")
     message: str = Field(description="错误信息")
     details: dict[str, Any] = Field(default_factory=dict, description="错误详情")
 
