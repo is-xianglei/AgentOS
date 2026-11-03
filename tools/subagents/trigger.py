@@ -83,14 +83,14 @@ def _matches(path: str, hints: tuple[str, ...]) -> bool:
 def verification_already_ran(messages: list[dict[str, Any]] | None) -> bool:
     """本回合是否已派发过 verification 子代理。
 
-    只认 Agent 工具且 subagent_type 为 verification 的调用:阈值提示是"补一次
+    只认 Agent 工具且 agent_type 为 verification 的调用:阈值提示是"补一次
     验收",已经做过就不该再提示,否则回合永远结束不了。
     """
     for block in _iter_tool_uses(messages):
         if block.get("name") != "Agent":
             continue
         tool_input = block.get("input")
-        if isinstance(tool_input, dict) and tool_input.get("subagent_type") == "verification":
+        if isinstance(tool_input, dict) and tool_input.get("agent_type") == "verification":
             return True
     return False
 
@@ -136,6 +136,6 @@ def compose_hint(assessment: TriggerAssessment) -> str:
         f"[系统检查] 本回合已产生非平凡改动({assessment.reason_text})。\n"
         f"变更文件清单:\n{files}\n\n"
         "按验收规则,此类改动需要一次独立验收:请调用 Agent 工具、"
-        "subagent_type 为 verification,并提供原始需求、上述变更文件清单、"
+        "agent_type 为 verification,并提供原始需求、上述变更文件清单、"
         "实现方法与已知风险。若确认本次确实无需验收,请说明理由后结束。"
     )

@@ -180,7 +180,9 @@ def _extract_path(entry: str) -> str:
     words = entry.split()
     if not words:
         return ""
-    return words[0].rstrip(":,;。:,").strip()
+    # 半角与全角的冒号、逗号、分号都要剥:Plan 报告多为中文输出,全角分号与全角
+    # 冒号/逗号同属清单行尾常见分隔符。句点只剥全角,半角 "." 可能属于路径本身。
+    return words[0].rstrip(":,;：，；。").strip()
 
 
 def routing_catalog() -> str:
