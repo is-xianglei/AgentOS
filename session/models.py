@@ -73,7 +73,7 @@ class SessionRecord(Base):
         comment="最后活跃时间",
     )
 
-    # 用户与工作区关联（新增字段）
+    # 归属：创建者、工作区，以及会话绑定的 Agent 或锁定的 Workflow
     user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=True,
@@ -99,7 +99,7 @@ class SessionRecord(Base):
         comment="会话锁定的Workflow ID，空表示普通Agent会话",
     )
 
-    # 共享与权限（新增字段）
+    # 共享范围：只授予读取权，写操作仍只允许创建者
     visibility: Mapped[str] = mapped_column(
         String(32),
         default="private",
@@ -135,7 +135,7 @@ class SessionRecord(Base):
         cascade="all, delete-orphan",
     )
 
-    # 关联关系（新增）
+    # 归属对象的 relationship，外键列见上方
     user: Mapped[UserRecord | None] = relationship(
         "UserRecord", foreign_keys=[user_id], back_populates="sessions"
     )

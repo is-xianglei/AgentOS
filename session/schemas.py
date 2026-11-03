@@ -22,7 +22,10 @@ class SessionSendMessageRequest(_StrictRequest):
         description="使用的Workflow ID，与agent_id互斥",
     )
     content: str = Field(description="用户消息")
-    model_provider_id: str | None = Field(default=None, description="指定模型供应商；新会话可显式传 null 使用默认")
+    model_provider_id: str | None = Field(
+        default=None,
+        description="指定模型供应商；新会话可显式传 null 使用默认",
+    )
     mode_slug: Literal["standard", "turbo"] = "standard"
     thinking_effort: Literal["fast", "low", "medium", "high", "xhigh", "max"] = "fast"
 
@@ -45,11 +48,12 @@ class SessionRenameRequest(_StrictRequest):
 
     @model_validator(mode="after")
     def validate_patch(self) -> SessionRenameRequest:
-        if not self.model_fields_set or any(
-            name in self.model_fields_set and getattr(self, name) is None
-            for name in ("title", "mode_slug", "thinking_effort")
-        ):
+        """PATCH 至少要改一项；model_provider_id 显式传 null 表示恢复默认，其余字段不接受 null。"""
+        if not self.model_fields_set:
             raise ValueError("请提供有效的会话标题或模型选项")
+        for name in ("title", "mode_slug", "thinking_effort"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError("请提供有效的会话标题或模型选项")
         return self
 
 

@@ -65,7 +65,7 @@ class SessionService:
         agent_id: int | None = None,
     ) -> SessionRecord:
         """创建会话。提交交给请求边界（get_db）统一处理。"""
-        session: SessionRecord = await self.repo.create(
+        return await self.repo.create(
             title=title or "新会话",
             model_name=model_name,
             system_prompt=system_prompt,
@@ -74,7 +74,6 @@ class SessionService:
             workspace_id=workspace_id,
             agent_id=agent_id,
         )
-        return session
 
     async def create_from_first_message(
         self,
@@ -173,18 +172,20 @@ class SessionService:
             return True
         if session.visibility == "public":
             return True
-
         if session.visibility == "workspace":
             return True
 
-        if session.shared_with_departments and await DepartmentService(
-            self.db
-        ).is_department_in_shared_departments(
-            workspace_id,
-            membership.department_id,
-            session.shared_with_departments,
-        ):
-            return True
+        # 部门与群组判断需要额外查询，放在最后，且共享列表为空时直接跳过。
+        if session.shared_with_departments:
+            in_shared_department = await DepartmentService(
+                self.db
+            ).is_department_in_shared_departments(
+                workspace_id,
+                membership.department_id,
+                session.shared_with_departments,
+            )
+            if in_shared_department:
+                return True
 
         if not session.shared_with_groups:
             return False
@@ -245,11 +246,12 @@ class SessionService:
         if visibility not in {"private", "workspace", "public"}:
             raise AgentException.message("会话可见性无效")
 
+        # dict.fromkeys 按首次出现的顺序去重；创建者本人本就可读，不写入共享用户列表。
         users = [item for item in dict.fromkeys(user_ids) if item != actor_user_id]
         departments = list(dict.fromkeys(department_ids))
         groups = list(dict.fromkeys(group_ids))
-        await WorkspaceService(self.db).require_active_user_ids(workspace_id, users)
 
+        await WorkspaceService(self.db).require_active_user_ids(workspace_id, users)
         await DepartmentService(self.db).require_department_ids(
             workspace_id,
             departments,
@@ -265,7 +267,7 @@ class SessionService:
 
     async def get_required(self, session_id: int) -> SessionRecord:
         """查询会话，不存在时抛出业务错误。"""
-        session: SessionRecord = await self.repo.get(session_id)
+        session = await self.repo.get(session_id)
         if session is None:
             raise AgentException.message("会话不存在")
         return session
@@ -295,12 +297,21 @@ class SessionService:
         await self.db.refresh(session)
         return session
 
-    async def update_options(self, session_id: int, actor_user_id: int, workspace_id: int, changes: dict[str, Any]) -> SessionRecord:
+    async def update_options(
+        self,
+        session_id: int,
+        actor_user_id: int,
+        workspace_id: int,
+        changes: dict[str, Any],
+    ) -> SessionRecord:
+        """PATCH 会话：标题随时可改，模型选项只能在会话空闲时修改。"""
         await self.require_write_access(session_id, actor_user_id, workspace_id)
+        # 加行锁后再判断状态，避免与正在启动执行的请求并发改写同一会话。
         session = await self.lock_required(session_id)
         options = {key: value for key, value in changes.items() if key != "title"}
         if options and session.status not in {"idle", "created", "failed"}:
             raise AgentException.message("会话执行或等待交互期间不能修改模型选项", status_code=409)
+
         if "title" in changes:
             session.title = changes["title"]
         if options:
@@ -309,33 +320,69 @@ class SessionService:
         await self.db.refresh(session)
         return session
 
-    async def apply_model_options(self, session: SessionRecord, user_id: int, workspace_id: int, options: dict[str, Any]) -> None:
+    async def apply_model_options(
+        self,
+        session: SessionRecord,
+        user_id: int,
+        workspace_id: int,
+        options: dict[str, Any],
+    ) -> None:
+        """校验并写入会话的模型供应商、对话模式和思考强度。
+
+        所有校验都在改写 session 之前完成，任一校验失败时会话保持原样。
+        options 中未出现的项沿用会话当前值。
+        """
         from model_service.policy import fast_capabilities, normalize_effort
         from model_service.service import ModelService
 
         mode = options.get("mode_slug", getattr(session, "mode_slug", None) or "standard")
         effort = options.get("thinking_effort", getattr(session, "thinking_effort", None) or "fast")
+        provider_id = options.get("model_provider_id", getattr(session, "model_provider_id", None))
+
         if session.workflow_id is not None and mode == "turbo":
             raise AgentException.message("工作流包含多智能体执行，请使用标准模式", status_code=400)
-        provider_id = options.get("model_provider_id", getattr(session, "model_provider_id", None))
-        service = ModelService(self.db)
-        scenario = "workflow" if session.workflow_id is not None else "agent"
-        provider = await service.select_provider(workspace_id, user_id, provider_id, scenario)
+
+        if session.workflow_id is not None:
+            scenario = "workflow"
+        else:
+            scenario = "agent"
+        # provider 为 None 表示工作区没有可用的模型服务配置，回落到 .env 的全局 provider。
+        provider = await ModelService(self.db).select_provider(
+            workspace_id,
+            user_id,
+            provider_id,
+            scenario,
+        )
+
         if mode == "turbo":
             from core.config import settings
-            capabilities = fast_capabilities(provider.provider, provider.extra_config or {}) if (
-                provider is not None
-            ) else {"turbo_supported": settings.llm_provider == "anthropic"}
-            if not capabilities["turbo_supported"]:
+
+            if provider is not None:
+                capabilities = fast_capabilities(provider.provider, provider.extra_config or {})
+                turbo_supported = capabilities["turbo_supported"]
+            else:
+                turbo_supported = settings.llm_provider == "anthropic"
+            if not turbo_supported:
                 raise AgentException.message(
                     "当前模型未配置关闭思考能力，请在模型服务配置后使用极速模式",
                     status_code=400,
                 )
+
+        # 校验全部通过，开始写入会话。
         if "model_provider_id" in options:
-            session.extra = {**(session.extra or {}), "model_provider_override": provider_id is not None}
-        session.model_provider_id = provider.provider_id if provider else None
+            # 记录用户是否显式指定了供应商；显式传 null 表示恢复默认。
+            extra = dict(session.extra or {})
+            extra["model_provider_override"] = provider_id is not None
+            session.extra = extra
+
+        if provider is not None:
+            session.model_provider_id = provider.provider_id
+            provider_config = provider.extra_config
+        else:
+            session.model_provider_id = None
+            provider_config = {}
         session.mode_slug = mode
-        session.thinking_effort = normalize_effort(provider.extra_config if provider else {}, effort, mode)
+        session.thinking_effort = normalize_effort(provider_config, effort, mode)
         await self.db.flush()
 
     async def runtime_model_options(self, session_id: int) -> SessionRecord:
@@ -360,10 +407,10 @@ class SessionService:
     ) -> int:
         """批量软删除会话,返回实际标记数量。级联同上。提交交给请求边界统一处理。"""
         normalized_ids = list(dict.fromkeys(ids))
+        # 先逐个校验写权限，任一无权限即整批失败，不会出现只删掉一部分的情况。
         for session_id in normalized_ids:
             await self.require_write_access(session_id, actor_user_id, workspace_id)
-        deleted: int = await self.repo.delete_by_ids(normalized_ids)
-        return deleted
+        return await self.repo.delete_by_ids(normalized_ids)
 
     async def ensure_runnable(self, session_id: int) -> SessionRecord:
         """校验会话当前是否允许继续执行。"""
@@ -393,7 +440,7 @@ class SessionService:
 
     async def mark_running(self, session_id: int) -> SessionRecord:
         """将可执行会话标记为运行中。"""
-        session: SessionRecord = await self.ensure_runnable(session_id)
+        session = await self.ensure_runnable(session_id)
         await self.repo.update_status(session, "running")
         return session
 
@@ -418,22 +465,23 @@ class SessionService:
         workflow_id 与 agent_id 语义互斥；会话一旦锁定 Workflow，后续每轮都复检其可运行性，
         且不允许切换（与 Agent 的锁定规则同构）。不涉及 Workflow 的请求不进入任何新分支。
         """
+        # 局部导入：真实双向 Service 依赖，改顶层仍成环
+        # agent.service -> tools.service -> tools.registry -> tools.builtin.task
+        # -> task.service -> session.service（workflow.service 经 agent.service 同样成环），
+        # 待依赖倒置任务处理。
+        from agent.service import AgentService
+        from workflow.service import WorkflowService
+
         if agent_id is not None and workflow_id is not None:
             raise AgentException.message("同一次请求不能同时指定Agent和Workflow")
+
+        # 新会话：先校验请求指定的 Agent / Workflow 可运行，再按首条消息建会话。
         if session_id is None:
             if agent_id is not None:
-                # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> tools.service
-                # -> tools.registry -> tools.builtin.task -> task.service -> session.service，待依赖倒置任务处理。
-                from agent.service import AgentService
-
                 await AgentService(self.db).require_runnable(agent_id, workspace_id)
             if workflow_id is not None:
-                # 局部导入：真实双向 Service 依赖，改顶层仍成环 workflow.service -> agent.service
-                # -> ... -> task.service -> session.service，待依赖倒置任务处理。
-                from workflow.service import WorkflowService
-
                 await WorkflowService(self.db).require_runnable(workflow_id, workspace_id)
-            session: SessionRecord = await self.create_from_first_message(
+            session = await self.create_from_first_message(
                 content,
                 user_id,
                 workspace_id,
@@ -443,23 +491,18 @@ class SessionService:
             await self.repo.update_status(session, "running")
             await self.apply_model_options(session, user_id, workspace_id, model_options or {})
             return session
+
+        # 已有会话：不允许切换已绑定的 Agent / Workflow，并复检其仍可运行。
         session = await self.get_required(session_id)
         if agent_id is not None and agent_id != session.agent_id:
             raise AgentException.message("已有会话不能切换Agent", status_code=409)
         if workflow_id is not None and workflow_id != session.workflow_id:
             raise AgentException.message("已有会话不能切换Workflow", status_code=409)
         if session.agent_id is not None:
-            # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> tools.service
-            # -> tools.registry -> tools.builtin.task -> task.service -> session.service，待依赖倒置任务处理。
-            from agent.service import AgentService
-
             await AgentService(self.db).require_runnable(session.agent_id, workspace_id)
         if session.workflow_id is not None:
-            # 局部导入：真实双向 Service 依赖，改顶层仍成环 workflow.service -> agent.service
-            # -> ... -> task.service -> session.service，待依赖倒置任务处理。
-            from workflow.service import WorkflowService
-
             await WorkflowService(self.db).require_runnable(session.workflow_id, workspace_id)
+        # mark_running 加行锁并校验会话状态，模型选项在持锁后写入。
         session = await self.mark_running(session_id)
         await self.apply_model_options(session, user_id, workspace_id, model_options or {})
         return session
@@ -476,7 +519,9 @@ class SessionService:
         """
         if requested_workflow_id is not None:
             return requested_workflow_id
-        return session.workflow_id if session is not None else None
+        if session is None:
+            return None
+        return session.workflow_id
 
     async def start_turn(
         self,
@@ -552,11 +597,15 @@ class SessionService:
         await self.get_required(session_id)
         snapshot = await self.repo.latest_snapshot(session_id)
         context: list[dict[str, Any]] = []
+        snapshot_through_id: int | None = None
         if snapshot is not None:
             context.extend(deepcopy(snapshot.messages))
+            snapshot_through_id = snapshot.through_message_id
+
+        # 快照已覆盖到 snapshot_through_id，之后的消息逐条追加。
         messages = await self.repo.list_messages_range(
             session_id,
-            after_message_id=snapshot.through_message_id if snapshot else None,
+            after_message_id=snapshot_through_id,
         )
         context.extend(self._messages_to_context(messages))
         return context
@@ -567,16 +616,27 @@ class SessionService:
         additional_context: str | None = None,
         rendered_memories: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int | None]:
-        """分别加载可压缩历史和必须原样保留的当前 Turn 上下文。"""
+        """分别加载可压缩历史和必须原样保留的当前 Turn 上下文。
+
+        返回 (history, current, through_message_id)：through_message_id 是 history 覆盖到的
+        最后一条消息 ID，供压缩时作为新快照的水位；既无快照也无历史消息时为 None。
+        """
+        # 1. 历史 = 最新有效快照 + 快照水位之后、本轮起始消息之前的消息。
         snapshot: SessionSnapshot | None = await self.repo.latest_snapshot(turn.session_id)
-        history: list[dict[str, Any]] = deepcopy(snapshot.messages) if snapshot else []
+        history: list[dict[str, Any]] = []
+        snapshot_through_id: int | None = None
+        if snapshot is not None:
+            history = deepcopy(snapshot.messages)
+            snapshot_through_id = snapshot.through_message_id
+
         history_messages = await self.repo.list_messages_range(
             turn.session_id,
-            after_message_id=snapshot.through_message_id if snapshot else None,
+            after_message_id=snapshot_through_id,
             before_message_id=turn.started_message_id,
         )
         history.extend(self._messages_to_context(history_messages))
 
+        # 2. 当前轮次的全部消息，记忆和附加上下文只拼到本轮起始的用户消息上。
         current_messages = await self.repo.list_messages_range(
             turn.session_id,
             turn_id=turn.id,
@@ -588,13 +648,11 @@ class SessionService:
             rendered_memories_message_id=turn.started_message_id,
             rendered_memories=rendered_memories,
         )
-        through_message_id = (
-            history_messages[-1].id
-            if history_messages
-            else snapshot.through_message_id
-            if snapshot
-            else None
-        )
+        # 3. 历史水位：有快照后的消息取最后一条，否则沿用快照自身的水位。
+        if history_messages:
+            through_message_id = history_messages[-1].id
+        else:
+            through_message_id = snapshot_through_id
         return history, current, through_message_id
 
     def _messages_to_context(
@@ -738,9 +796,12 @@ class SessionService:
         """
         session = await self.lock_required(session_id)
         found = await self.repo.get_turn_lease_state(turn_id, for_update=True)
-        if found is None or found[0].session_id != session_id:
+        if found is None:
             raise AgentException.message("交互轮次不存在", status_code=404)
         turn, executing = found
+        # 轮次不属于该会话时同样按不存在处理，不暴露其他会话的轮次。
+        if turn.session_id != session_id:
+            raise AgentException.message("交互轮次不存在", status_code=404)
         if not executing:
             raise AgentException.message("该轮次没有执行中的任务", status_code=409)
         if turn.status == "awaiting_interaction":
@@ -776,6 +837,7 @@ class SessionService:
         return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
 
     async def list_reapable_turn_ids(self, *, include_unleased_running: bool) -> list[UUID]:
+        """列出待回收的孤儿轮次 ID;只做初筛,reap_turn 加锁后会再复核。"""
         return await self.repo.list_reapable_turn_ids(
             include_unleased_running=include_unleased_running,
         )
@@ -815,8 +877,12 @@ class SessionService:
         return TurnTermination(turn.id, session.id, turn.status, session.status, offset)
 
     async def get_turn_execution(self, turn_id: UUID) -> TurnExecutionState | None:
+        """读取轮次的业务状态与执行状态;轮次不存在时返回 None。"""
         found = await self.repo.get_turn_lease_state(turn_id)
-        return None if found is None else self._execution_state(*found)
+        if found is None:
+            return None
+        turn, executing = found
+        return self._execution_state(turn, executing)
 
     async def get_session_turn_execution(
         self,
@@ -832,7 +898,10 @@ class SessionService:
     async def get_active_turn(self, session_id: int) -> TurnExecutionState | None:
         """会话最新一轮的状态与是否有执行中的任务;尚无轮次时返回 None。"""
         found = await self.repo.get_latest_turn_lease_state(session_id)
-        return None if found is None else self._execution_state(*found)
+        if found is None:
+            return None
+        turn, executing = found
+        return self._execution_state(turn, executing)
 
     @staticmethod
     def _execution_state(turn: SessionTurnRecord, executing: bool) -> TurnExecutionState:

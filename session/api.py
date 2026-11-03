@@ -1,5 +1,5 @@
 import logging
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -69,7 +69,7 @@ async def send_message(
     )
     if payload.agent_id is not None and payload.workflow_id is not None:
         raise AgentException.message("同一次请求不能同时指定Agent和Workflow")
-    # 如果提供了 session_id，需要验证权限
+    # 已有会话：只有创建者能继续发消息，且不能借本次请求切换已绑定的 Agent / Workflow。
     session = None
     if payload.session_id:
         session = await SessionService(db).require_write_access(
@@ -94,6 +94,14 @@ async def send_message(
         session,
     )
 
+    # 只透传客户端显式提交的模型选项，未提交的项由 Service 沿用会话已保存的值；
+    # 一个都没提交时不传 model_options。
+    model_option_fields = {"model_provider_id", "mode_slug", "thinking_effort"}
+    submitted_option_fields = payload.model_fields_set & model_option_fields
+    start_kwargs: dict[str, Any] = {}
+    if submitted_option_fields:
+        start_kwargs["model_options"] = payload.model_dump(include=submitted_option_fields)
+
     # 准入(建轮次、认领租约、提交)在返回 SSE 前完成:冲突与配置错误走普通 JSON 错误响应,
     # 后台执行与本次连接解耦,客户端断开只停止跟随,不取消执行。
     orchestrator = TopLevelOrchestrator(
@@ -110,7 +118,7 @@ async def send_message(
         payload.content,
         agent_id=payload.agent_id,
         workflow_id=effective_workflow_id,
-        **({"model_options": payload.model_dump(include=payload.model_fields_set & {"model_provider_id", "mode_slug", "thinking_effort"})} if payload.model_fields_set & {"model_provider_id", "mode_slug", "thinking_effort"} else {}),
+        **start_kwargs,
     )
     return sse_response(follow_execution(handle))
 
@@ -130,15 +138,15 @@ async def get_active_turn(
     service = SessionService(db)
     await service.require_read_access(session_id, current_user.id, workspace_id)
     state = await service.get_active_turn(session_id)
-    data = (
-        None
-        if state is None
-        else ActiveTurnResponse(
-            turn_id=state.turn_id,
-            status=state.status,
-            executing=state.executing,
-            last_event_offset=state.last_event_offset,
-        )
+    # 会话还没有任何轮次时返回 data=null。
+    if state is None:
+        return ok(None, request)
+
+    data = ActiveTurnResponse(
+        turn_id=state.turn_id,
+        status=state.status,
+        executing=state.executing,
+        last_event_offset=state.last_event_offset,
     )
     return ok(data, request)
 

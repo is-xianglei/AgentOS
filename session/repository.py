@@ -122,18 +122,20 @@ class SessionRepository:
         group_ids: list[int],
     ) -> list[SessionRecord]:
         """按调用方已解析的组织范围查询当前用户可读会话。"""
+        # 满足任一条件即可读：本人创建、工作区/公开可见、直接共享给本人、
+        # 共享给本人直属部门或其有效祖先部门、共享给本人所在的任一群组。
         access_conditions = [
             SessionRecord.user_id == user_id,
             SessionRecord.visibility.in_(("workspace", "public")),
             SessionRecord.shared_with.contains([user_id]),
         ]
-        access_conditions.extend(
-            SessionRecord.shared_with_departments.contains([department_id])
-            for department_id in department_scope_ids
-        )
-        access_conditions.extend(
-            SessionRecord.shared_with_groups.contains([group_id]) for group_id in group_ids
-        )
+        for department_id in department_scope_ids:
+            access_conditions.append(
+                SessionRecord.shared_with_departments.contains([department_id])
+            )
+        for group_id in group_ids:
+            access_conditions.append(SessionRecord.shared_with_groups.contains([group_id]))
+
         stmt = (
             select(SessionRecord)
             .where(
@@ -282,10 +284,13 @@ class SessionRepository:
         limit: int,
     ) -> list[SessionMessage]:
         """读取提取窗口，并固定保留当前 Turn 的起止消息。"""
-        if limit < len(set(required_message_ids)):
+        # 起止消息可能是同一条，按去重后的数量占用名额。
+        required_count = len(set(required_message_ids))
+        if limit < required_count:
             raise ValueError("提取消息上限不能小于必选消息数量")
 
-        remaining = limit - len(set(required_message_ids))
+        # 必选消息之外的名额留给水位之前最近的消息。
+        remaining = limit - required_count
         recent_stmt = (
             select(SessionMessage)
             .where(
@@ -301,10 +306,16 @@ class SessionRepository:
             SessionMessage.id.in_(required_message_ids),
             SessionMessage.id <= through_message_id,
         )
-        recent = list(await self.db.scalars(recent_stmt)) if remaining else []
+        recent: list[SessionMessage] = []
+        if remaining > 0:
+            recent = list(await self.db.scalars(recent_stmt))
         required = list(await self.db.scalars(required_stmt))
-        by_id = {message.id: message for message in [*recent, *required]}
-        return [by_id[message_id] for message_id in sorted(by_id)]
+
+        # 两批合并后按消息 ID 升序返回，恢复对话的原始顺序。
+        messages_by_id: dict[int, SessionMessage] = {}
+        for message in recent + required:
+            messages_by_id[message.id] = message
+        return [messages_by_id[message_id] for message_id in sorted(messages_by_id)]
 
     async def bind_message_to_turn(
         self,
@@ -425,7 +436,9 @@ class SessionRepository:
             .values(lease_expires_at=_db_clock() + timedelta(seconds=lease_seconds))
             .execution_options(synchronize_session=False)
         )
-        return ((await self.db.execute(stmt)).rowcount or 0) > 0
+        result = await self.db.execute(stmt)
+        renewed_rows = result.rowcount or 0
+        return renewed_rows > 0
 
     async def reserve_turn_offsets(self, turn_id: UUID, owner: str, count: int) -> int | None:
         """在租约内预留 count 个连续 offset,返回首个;租约不属于 owner 时返回 None。"""
@@ -436,8 +449,11 @@ class SessionRepository:
             .returning(SessionTurnRecord.last_event_offset)
             .execution_options(synchronize_session=False)
         )
-        last = (await self.db.execute(stmt)).scalar_one_or_none()
-        return None if last is None else last - count + 1
+        last_offset = (await self.db.execute(stmt)).scalar_one_or_none()
+        if last_offset is None:
+            return None
+        # 本次预留的区间是 [last_offset - count + 1, last_offset]。
+        return last_offset - count + 1
 
     async def get_turn_lease_owner(self, turn_id: UUID) -> str | None:
         stmt = select(SessionTurnRecord.lease_owner).where(SessionTurnRecord.id == turn_id)
@@ -467,7 +483,10 @@ class SessionRepository:
         if for_update:
             stmt = stmt.with_for_update(of=SessionTurnRecord)
         row = (await self.db.execute(stmt)).first()
-        return None if row is None else (row[0], bool(row[1]))
+        if row is None:
+            return None
+        turn, lease_active = row
+        return turn, bool(lease_active)
 
     async def clear_turn_lease(
         self,
@@ -526,4 +545,7 @@ class SessionRepository:
             .execution_options(populate_existing=True)
         )
         row = (await self.db.execute(stmt)).first()
-        return None if row is None else (row[0], bool(row[1]))
+        if row is None:
+            return None
+        turn, lease_active = row
+        return turn, bool(lease_active)
