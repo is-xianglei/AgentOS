@@ -118,6 +118,9 @@ class DepartmentService:
             if parent_id == department.id:
                 raise AgentException.message("部门不能以自身作为父部门")
             if parent_id is not None:
+                # 并发的反向移动各自通过子孙检查后会成环，按工作区加锁串行化，锁内再检查；
+                # READ COMMITTED 下拿锁后的查询能看到先提交的移动。移到顶级不会成环，不加锁。
+                await self.repo.lock_tree(workspace_id)
                 parent = await self.get_required(workspace_id, parent_id)
                 if not parent.is_active:
                     raise AgentException.message("不能移动到已停用部门下")
