@@ -1,6 +1,5 @@
 import json
-from dataclasses import asdict, dataclass, replace
-from typing import Any
+from dataclasses import asdict, dataclass
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -28,11 +27,6 @@ class SubAgentRunReport:
     error: str | None = None
     verdict: str | None = None
     verdict_note: str | None = None
-
-
-def _dumps(obj: Any) -> str:
-    """把 dataclass 结果序列化为给 LLM 的 JSON 字符串。"""
-    return json.dumps(asdict(obj), ensure_ascii=False)
 
 
 _AGENT_TYPES = ", ".join(item.value for item in AgentType)
@@ -87,29 +81,43 @@ class AgentTool(BaseTool):
             ctx.allowed_tool_names,
             ctx.allowed_skill_names,
         )
-        result = SubAgentRunReport(agent=args.agent_type.value, report=report)
+        verdict: str | None = None
+        verdict_note: str | None = None
         if args.agent_type is AgentType.VERIFICATION:
             # 在返回边界做校验:无证据的 PASS 或缺失 VERDICT 一律降级,
             # 不让"看起来通过"的报告直接进主代理的判断链。
-            verdict, note = validate_verification_report(report)
-            result = replace(result, verdict=verdict, verdict_note=note)
-        return _dumps(result)
+            verdict, verdict_note = validate_verification_report(report)
+        result = SubAgentRunReport(
+            agent=args.agent_type.value,
+            report=report,
+            verdict=verdict,
+            verdict_note=verdict_note,
+        )
+        return json.dumps(asdict(result), ensure_ascii=False)
 
     @staticmethod
     def _compose_prompt(args: AgentToolInput) -> str:
         """把 verification 的结构化输入附在任务描述之后;其余类型原样透传。"""
         if args.agent_type is not AgentType.VERIFICATION:
             return args.prompt
+        changed_files_text = None
+        if args.changed_files:
+            changed_files_text = "\n".join(args.changed_files)
         sections = [
             ("原始用户需求", args.original_request),
-            ("变更文件清单", "\n".join(args.changed_files) if args.changed_files else None),
+            ("变更文件清单", changed_files_text),
             ("实现方法", args.implementation_notes),
             ("已知风险", args.known_risks),
             ("方案文件路径", args.plan_path),
         ]
         parts = [args.prompt]
         for title, value in sections:
-            parts.append(f"## {title}\n{value.strip() if value else '(调用方未提供)'}")
+            # 未提供的项也保留小节标题,并显式标注为未提供。
+            if value:
+                body = value.strip()
+            else:
+                body = "(调用方未提供)"
+            parts.append(f"## {title}\n{body}")
         return "\n\n".join(parts)
 
     async def _dispatch(

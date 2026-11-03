@@ -177,16 +177,19 @@ def _extract_path(entry: str) -> str:
     quoted = _BACKTICK_RE.search(entry)
     if quoted is not None:
         return quoted.group(1).strip()
-    head = entry.split()[0] if entry.split() else ""
-    return head.rstrip(":,;。:,").strip()
+    words = entry.split()
+    if not words:
+        return ""
+    return words[0].rstrip(":,;。:,").strip()
 
 
 def routing_catalog() -> str:
     """给主代理的路由说明:每种类型的用途与实际工具范围。"""
     lines: list[str] = []
     for spec in SUBAGENT_SPECS.values():
-        tools = "除全局禁用外全部工具" if spec.allowed_tools is None else "、".join(
-            spec.resolve_tools_names()
-        )
+        if spec.allowed_tools is None:
+            tools = "除全局禁用外全部工具"
+        else:
+            tools = "、".join(spec.resolve_tools_names())
         lines.append(f"- {spec.agent_type.value}: {spec.when_to_use} 可用工具: {tools}。")
     return "\n".join(lines)

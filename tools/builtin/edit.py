@@ -26,8 +26,7 @@ class EditTool(BaseTool):
             if not path.is_file():
                 raise AgentException.message(f"不是文件: {args.file_path}")
 
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
+            content = path.read_text(encoding="utf-8", errors="replace")
 
             if args.old_string not in content:
                 raise AgentException.message(
@@ -44,9 +43,7 @@ class EditTool(BaseTool):
                 new_content = content.replace(args.old_string, args.new_string)
             else:
                 new_content = content.replace(args.old_string, args.new_string, 1)
-
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(new_content)
+            path.write_text(new_content, encoding="utf-8")
 
             replaced = count if args.replace_all else 1
             return f"已编辑文件: {args.file_path} (替换了 {replaced} 处)"

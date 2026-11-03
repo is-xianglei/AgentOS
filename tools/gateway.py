@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
 from core.events import Actor
-from tools.models import ToolCallRecord
 from tools.context import ToolExecutionContext
+from tools.models import ToolCallRecord
 from tools.policy import ToolCapabilityResolver, ToolProfile
 from tools.registry import ToolRegistry, build_tool_registry
 from tools.service import ToolService
@@ -98,7 +98,7 @@ class ToolGateway:
         allowed_skill_names: frozenset[str] | None = None,
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
-    ) -> "ToolGateway":
+    ) -> ToolGateway:
         """创建网关并在构造期裁剪工具集合。
 
         ``requested_names`` 表示父 Agent 或 Agent 配置给出的硬白名单。显式白名单
@@ -115,7 +115,9 @@ class ToolGateway:
                 profile,
                 strict=strict,
             )
-            unknown = tuple(name for name in dict.fromkeys(requested_names) if name not in registry.names)
+            unknown = [
+                name for name in dict.fromkeys(requested_names) if name not in registry.names
+            ]
             if strict and unknown:
                 raise ValueError(f"工具不存在或未注册: {', '.join(unknown)}")
         else:
@@ -144,7 +146,7 @@ class ToolGateway:
         allowed_skill_names: frozenset[str] | None = None,
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
-    ) -> "ToolGateway":
+    ) -> ToolGateway:
         """从已有注册表构造网关，并严格校验其能力边界。
 
         运行时通常已经根据 Plan Mode、父 Agent 白名单或 Workflow 节点得到一个

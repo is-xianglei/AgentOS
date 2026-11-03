@@ -39,7 +39,7 @@ class ToolExecutionContext:
         if self.shell_tmp_root is not None:
             object.__setattr__(self, "shell_tmp_root", Path(self.shell_tmp_root))
 
-    def with_turn(self, turn_id: UUID | None = None) -> "ToolExecutionContext":
+    def with_turn(self, turn_id: UUID | None = None) -> ToolExecutionContext:
         """保留兼容接口；身份本身不包含 turn，不允许借此变更权限。"""
         del turn_id
         return self

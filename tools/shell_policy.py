@@ -120,8 +120,6 @@ _ALWAYS_DENIED: frozenset[str] = frozenset(
     }
 )
 
-# 依赖安装类子命令。verification 允许跑测试但不得改变依赖树。
-
 # 同一子命令兼具读写用途:`git branch` 列出分支是只读的,`git branch -D x` 删分支,
 # 而 `git branch feature-x` 不带任何标志就能建分支。因此判定条件是
 # 「无额外位置参数且无变更标志」,只放行纯列出形态。
@@ -134,6 +132,7 @@ _GIT_MUTATING_FLAGS: frozenset[str] = frozenset(
     }
 )
 
+# 依赖安装类子命令。verification 允许跑测试但不得改变依赖树。
 _INSTALL_SUBCOMMANDS: frozenset[str] = frozenset(
     {"install", "add", "remove", "uninstall", "sync", "update", "upgrade", "ci"}
 )
@@ -170,13 +169,16 @@ def _strip_wrappers(tokens: list[str]) -> list[str]:
 
 def _check_git(tokens: list[str]) -> ShellVerdict:
     """git 仅放行只读子命令,写操作(add/commit/checkout/reset 等)拒绝。"""
-    subcommand = next((tok for tok in tokens[1:] if not tok.startswith("-")), None)
-    if subcommand is None:
+    # 第一个非 `-` 开头的参数就是子命令;裸 `git` 或只带全局标志时放行。
+    positionals = [tok for tok in tokens[1:] if not tok.startswith("-")]
+    if not positionals:
         return ShellVerdict.ok()
+    subcommand = positionals[0]
+
     if subcommand in _GIT_DUAL_USE_SUBCOMMANDS:
-        positionals = [tok for tok in tokens[1:] if not tok.startswith("-")]
         flags = [tok.split("=", 1)[0] for tok in tokens[1:] if tok.startswith("-")]
-        if len(positionals) > 1 or any(flag in _GIT_MUTATING_FLAGS for flag in flags):
+        has_mutating_flag = any(flag in _GIT_MUTATING_FLAGS for flag in flags)
+        if len(positionals) > 1 or has_mutating_flag:
             return ShellVerdict.reject(f"只读模式禁止 git {subcommand} 的变更用法")
         return ShellVerdict.ok()
     if subcommand not in _GIT_READ_ONLY_SUBCOMMANDS:
@@ -187,10 +189,10 @@ def _check_git(tokens: list[str]) -> ShellVerdict:
 def _check_sed_awk(tokens: list[str]) -> ShellVerdict:
     """sed -i 原地改写、awk 内 system()/print > file 均视为写操作。"""
     name = Path(tokens[0]).name
-    if name == "sed" and any(
-        tok.startswith("-i") or tok.startswith("--in-place") for tok in tokens[1:]
-    ):
-        return ShellVerdict.reject("只读模式禁止 sed -i 原地改写文件")
+    if name == "sed":
+        in_place = any(tok.startswith(("-i", "--in-place")) for tok in tokens[1:])
+        if in_place:
+            return ShellVerdict.reject("只读模式禁止 sed -i 原地改写文件")
     if name in ("awk", "gawk"):
         script = " ".join(tokens[1:])
         if "system(" in script or ">" in script or "print >" in script:
@@ -200,11 +202,12 @@ def _check_sed_awk(tokens: list[str]) -> ShellVerdict:
 
 def _check_find(tokens: list[str]) -> ShellVerdict:
     """find 的 -delete / -exec 系列可执行任意变更,拒绝。"""
-    dangerous = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint",
-                 "-fprintf", "-fls"}
-    hit = next((tok for tok in tokens[1:] if tok in dangerous), None)
-    if hit is not None:
-        return ShellVerdict.reject(f"只读模式禁止 find {hit}")
+    dangerous = {
+        "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
+    }
+    for tok in tokens[1:]:
+        if tok in dangerous:
+            return ShellVerdict.reject(f"只读模式禁止 find {tok}")
     return ShellVerdict.ok()
 
 

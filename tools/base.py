@@ -47,8 +47,8 @@ class BaseTool(ABC):
         )
 
     async def run_with_dict(self, data: dict[str, Any], ctx: ToolContext) -> str:
+        # 参数校验失败不抛异常，把错误作为工具结果回给模型，让它修正参数后重试。
         try:
-            # 将大模型返回的字典类型转为实体对象类型
             args = self.input_model.model_validate(data)
         except ValidationError as err:
             return f"error: {err}. hint: Please fix the parameters and try again"

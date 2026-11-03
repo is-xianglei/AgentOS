@@ -1,5 +1,5 @@
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -9,26 +9,15 @@ from tools.base import BaseTool, ToolContext
 
 
 # ---------------------------------------------------------------------------
-# 共享 helper:任务序列化与列表文本渲染,供下方 4 个工具复用
+# 共享 helper:TaskCreate / TaskGet / TaskUpdate 都返回同一份任务 JSON
 # ---------------------------------------------------------------------------
-def _task_data(task) -> dict:
+def _task_data(task) -> dict[str, Any]:
     """将任务实体序列化为可直接 json.dumps 的字典。"""
     return TaskResponse.model_validate(task).model_dump(mode="json")
 
 
+# TaskList 文本中的状态标记;未知状态显示为 [?]。
 _STATUS_MARKERS = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-
-
-def _render_task_list(tasks) -> str:
-    """将任务列表渲染为带状态标记的多行文本。"""
-    if not tasks:
-        return "(no tasks)"
-    lines = []
-    for task in tasks:
-        marker = _STATUS_MARKERS.get(task.status, "[?]")
-        blocked = f" (blocked by: {list(task.blocked_by)})" if task.blocked_by else ""
-        lines.append(f"{marker} #{task.id}: {task.subject}{blocked}")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +103,8 @@ class TaskUpdateInput(BaseModel):
     @model_validator(mode="after")
     def validate_blocked_by(self):
         # blocked_by(整体替换)与 add/remove(增量)互斥
-        if self.blocked_by is not None and (
-            self.add_blocked_by is not None or self.remove_blocked_by is not None
-        ):
+        uses_incremental = self.add_blocked_by is not None or self.remove_blocked_by is not None
+        if self.blocked_by is not None and uses_incremental:
             raise ValueError("blocked_by 与 add_blocked_by/remove_blocked_by 不能同时使用")
         return self
 
@@ -128,6 +116,7 @@ class TaskUpdateTool(BaseTool):
 
     async def run(self, args: TaskUpdateInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db, bus=ctx.bus)
+        # 调用方提交了 owner 才改负责人,且只能改成当前运行身份;未提交则不改。
         task = await service.update(
             session_id=ctx.session_id,
             task_id=args.id,
@@ -157,4 +146,12 @@ class TaskListTool(BaseTool):
     async def run(self, args: TaskListInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db)
         tasks = await service.list_by_session(ctx.session_id)
-        return _render_task_list(tasks)
+        if not tasks:
+            return "(no tasks)"
+
+        lines = []
+        for task in tasks:
+            marker = _STATUS_MARKERS.get(task.status, "[?]")
+            blocked = f" (blocked by: {list(task.blocked_by)})" if task.blocked_by else ""
+            lines.append(f"{marker} #{task.id}: {task.subject}{blocked}")
+        return "\n".join(lines)

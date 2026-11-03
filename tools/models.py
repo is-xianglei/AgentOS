@@ -5,8 +5,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, fun
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
-from database.base import Base
-from database.base import json_type
+from database.base import Base, json_type
 
 
 class ToolRecord(Base):

@@ -11,8 +11,8 @@ from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from hooks import HookContext, HookEvent, get_hook_registry
-from tools.context import ToolExecutionContext
 from tools.base import ToolContext
+from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord, ToolRecord
 from tools.policy import (
     ToolProfile,
@@ -134,22 +134,23 @@ class ToolCatalogService:
                 {"tool_ids": missing_runtime},
                 status_code=409,
             )
-        if profile is not None:
-            forbidden = [
-                record
-                for record in records
-                if not can_bind_tool(record.runtime_name, profile)
-            ]
-            if forbidden:
-                raise AgentException.message(
-                    "当前Agent类型不允许绑定这些工具",
-                    {
-                        "profile": profile,
-                        "tool_ids": [record.id for record in forbidden],
-                        "tool_names": [record.runtime_name for record in forbidden],
-                    },
-                    status_code=403,
-                )
+        # 未指定 profile 时不做档位过滤。
+        if profile is None:
+            return normalized
+
+        forbidden = [
+            record for record in records if not can_bind_tool(record.runtime_name, profile)
+        ]
+        if forbidden:
+            raise AgentException.message(
+                "当前Agent类型不允许绑定这些工具",
+                {
+                    "profile": profile,
+                    "tool_ids": [record.id for record in forbidden],
+                    "tool_names": [record.runtime_name for record in forbidden],
+                },
+                status_code=403,
+            )
         return normalized
 
     async def get_runtime_names(
@@ -168,13 +169,12 @@ class ToolCatalogService:
         records = await self.repo.list_by_runtime_names(normalized)
         records_by_name = {record.runtime_name: record for record in records}
         registry_names = build_tool_registry().names
-        unavailable = [
-            name
-            for name in normalized
-            if name not in records_by_name
-            or not records_by_name[name].is_enabled
-            or name not in registry_names
-        ]
+        # 目录中不存在、已停用、或代码注册表中没有实现，任一情况都视为不可用。
+        unavailable: list[str] = []
+        for name in normalized:
+            record = records_by_name.get(name)
+            if record is None or not record.is_enabled or name not in registry_names:
+                unavailable.append(name)
         if unavailable:
             raise AgentException.message(
                 "Agent绑定的Skill基础工具不可用",
@@ -221,6 +221,29 @@ class ToolService:
         record = await self.tool_repo.get(tool_call_id)
         if record is None or record.session_id != session_id:
             raise AgentException.message("人工交互关联的工具调用不存在")
+        return record
+
+    async def _open_call_record(
+        self,
+        record: ToolCallRecord | None,
+        session_id: int,
+        tool_name: str,
+        input_args: dict[str, Any],
+        message_id: int | None,
+        agent_id: int | None,
+    ) -> ToolCallRecord:
+        """新建 running 调用记录；已有记录（如审批后恢复）则回到 running 并覆盖入参。"""
+        if record is None:
+            return await self.start_call(
+                session_id,
+                tool_name,
+                input_args,
+                message_id=message_id,
+                agent_id=agent_id,
+            )
+        record.input_args = input_args
+        record.status = "running"
+        await self.db.flush()
         return record
 
     async def run(
@@ -272,10 +295,9 @@ class ToolService:
         policy = get_tool_policy(tool_name)
         # 未声明策略的自定义工具保留旧的直接 ToolService 兼容路径；一旦
         # 运行时显式携带 profile，则未知工具也必须先登记策略才能调用。
+        capability_check_required = profile is not None or policy.category != "unknown"
         denied: str | None = None
-        if (profile is not None or policy.category != "unknown") and not can_call_tool(
-            tool_name, resolved_profile
-        ):
+        if capability_check_required and not can_call_tool(tool_name, resolved_profile):
             denied = f"工具能力策略拒绝执行: tool={tool_name}, profile={resolved_profile}"
         elif policy.requires_bound_skill and requires_skill_allowlist(resolved_profile):
             # Skill 的参数名是 ``name``，SkillResource / SkillRun 使用
@@ -293,19 +315,17 @@ class ToolService:
                     "工具能力策略拒绝执行: 当前运行身份只能访问已绑定的 skill"
                     f" (skill={requested_skill!r})"
                 )
+        # 被策略拒绝的调用同样落一条失败记录并触发 PostToolUse，便于审计；
+        # 拒绝理由作为工具结果回给模型，不抛异常。
         if denied is not None:
-            if record is None:
-                record = await self.start_call(
-                    session_id,
-                    tool_name,
-                    input_args,
-                    message_id=message_id,
-                    agent_id=agent_id,
-                )
-            else:
-                record.input_args = input_args
-                record.status = "running"
-                await self.db.flush()
+            record = await self._open_call_record(
+                record,
+                session_id,
+                tool_name,
+                input_args,
+                message_id,
+                agent_id,
+            )
             await self.tool_repo.fail(record, denied)
             await self.db.flush()
             await hooks.trigger(
@@ -334,23 +354,23 @@ class ToolService:
                 tool_input=input_args,
             )
         )
+        # 多个 hook 的结果按注册顺序合并：updated_input 依次覆盖，block 取第一个。
+        blocked: str | None = None
         for outcome in pre_outcomes:
             if outcome.updated_input is not None:
                 input_args = outcome.updated_input
-        blocked = next((o.block for o in pre_outcomes if o.block is not None), None)
+            if blocked is None and outcome.block is not None:
+                blocked = outcome.block
 
-        if record is None:
-            record = await self.start_call(
-                session_id,
-                tool_name,
-                input_args,
-                message_id=message_id,
-                agent_id=agent_id,
-            )
-        else:
-            record.input_args = input_args
-            record.status = "running"
-            await self.db.flush()
+        # 先落库再判断拦截，被拦截的调用也留有记录。
+        record = await self._open_call_record(
+            record,
+            session_id,
+            tool_name,
+            input_args,
+            message_id,
+            agent_id,
+        )
 
         if blocked is not None:
             # 被 PreToolUse hook 拦截:不执行工具,把拦截理由作为结果回给模型。
@@ -384,7 +404,6 @@ class ToolService:
                 shell_access=shell_access,
                 shell_tmp_root=shell_tmp_root,
             )
-            # 开始执行工具
             output = await tool.run_with_dict(input_args, ctx)
         except Exception as exc:
             # 失败先记日志再落库,避免后续落库或 hook 抛错吞掉现场;不改变原有 raise 时序。

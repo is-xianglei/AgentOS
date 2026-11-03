@@ -1,11 +1,11 @@
-"""Skill 工具层(PRD §14):三个工具经 Anthropic 原生 tool-calling 暴露。
+"""Skill 工具层(PRD §14):三个工具经模型原生 tool-calling 暴露。
 
 - SkillTool(Skill):加载指定 skill 的正文 + 附属文件清单。
 - SkillResourceTool(SkillResource):读取单个资源文件(文本内联,二进制只给描述)。
 - SkillRunTool(SkillRun):执行 scripts/ 下脚本,返回退出码 + 截断后的 stdout/stderr。
 
 均继承 tools.base.BaseTool,run async 返回 str;经 ctx.db 构造 SkillService(ctx.db);
-领域错误在 run 内捕获转可读中文文本,不抛给框架(风格同 tools/builtin/task.py)。
+领域错误在 run 内捕获转可读中文文本,不抛给框架。
 禁用的 skill 由 SkillService 拒绝访问,与不存在报同一条错误。
 """
 
@@ -22,14 +22,15 @@ def _unknown_skill(name: str) -> str:
 
 def _human_size(n: int) -> str:
     """字节数转人类可读(供资源清单展示,如 8.4KB)。"""
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            if unit == "B":
-                return f"{int(size)}{unit}"
+    if n < 1024:
+        return f"{n}B"
+    # 逐级除以 1024,直到不足 1024 或已到最大单位 GB。
+    size = n / 1024
+    for unit in ("KB", "MB"):
+        if size < 1024:
             return f"{size:.1f}{unit}"
         size /= 1024
-    return f"{n}B"
+    return f"{size:.1f}GB"
 
 
 def _can_access_skill(name: str, ctx: ToolContext) -> bool:

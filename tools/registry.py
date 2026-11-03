@@ -69,15 +69,15 @@ class ToolRegistry:
         """返回稳定快照，供数据库目录同步使用。"""
         return tuple(self._tools.values())
 
-    def without(self, *names: str) -> "ToolRegistry":
+    def without(self, *names: str) -> ToolRegistry:
         excluded = set(names)
         return ToolRegistry([tool for name, tool in self._tools.items() if name not in excluded])
 
-    def only(self, *names: str) -> "ToolRegistry":
+    def only(self, *names: str) -> ToolRegistry:
         included = set(names)
         return ToolRegistry([tool for name, tool in self._tools.items() if name in included])
 
-    def with_tools(self, *tools: BaseTool) -> "ToolRegistry":
+    def with_tools(self, *tools: BaseTool) -> ToolRegistry:
         """在现有工具集基础上追加 / 覆盖若干工具,返回新注册表(不改原实例)。
 
         用于 teammate 场景:把被黑名单剔除的 Team 以受限实例补回。同名工具以新传入的为准。

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
@@ -154,7 +154,7 @@ class ToolRepository:
     async def succeed(self, record: ToolCallRecord, output_data: Any) -> ToolCallRecord:
         record.status = "succeeded"
         record.output_data = output_data
-        record.finished_at = datetime.now(timezone.utc)
+        record.finished_at = datetime.now(UTC)
         await self.db.flush()
         await self.db.refresh(record)
         return record
@@ -162,7 +162,7 @@ class ToolRepository:
     async def fail(self, record: ToolCallRecord, error_message: str) -> ToolCallRecord:
         record.status = "failed"
         record.error_message = error_message
-        record.finished_at = datetime.now(timezone.utc)
+        record.finished_at = datetime.now(UTC)
         await self.db.flush()
         await self.db.refresh(record)
         return record
@@ -178,7 +178,7 @@ class ToolRepository:
         """把等待交互的工具调用标记为拒绝。"""
         record.status = "rejected"
         record.error_message = message
-        record.finished_at = datetime.now(timezone.utc)
+        record.finished_at = datetime.now(UTC)
         await self.db.flush()
         await self.db.refresh(record)
         return record

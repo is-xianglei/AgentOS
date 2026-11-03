@@ -10,7 +10,7 @@
 """
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,19 +18,18 @@ from team.schemas import TeamMemberResponse, TeamMessageResponse, TeamResponse
 from team.service import TeamService
 from tools.base import BaseTool, ToolContext
 
+# ----- 序列化 helper:复用 team 域的 Response Schema 输出 JSON -----
 
-# ----- 模块内共享序列化 helper(保留一份) -----
 
-
-def _team_data(team) -> dict:
+def _team_data(team) -> dict[str, Any]:
     return TeamResponse.model_validate(team).model_dump(mode="json")
 
 
-def _member_data(member) -> dict:
+def _member_data(member) -> dict[str, Any]:
     return TeamMemberResponse.model_validate(member).model_dump(mode="json")
 
 
-def _message_data(message) -> dict:
+def _message_data(message) -> dict[str, Any]:
     return TeamMessageResponse.model_validate(message).model_dump(mode="json")
 
 
@@ -43,6 +42,7 @@ class TeamCreateInput(BaseModel):
         default=None,
         description="兼容字段,系统使用当前运行身份,忽略调用方提交的值",
     )
+
 
 class TeamCreateTool(BaseTool):
     name = "TeamCreate"
@@ -115,7 +115,7 @@ class TeamListTool(BaseTool):
 
 # ----- SendMessage(聚合:普通消息 / 广播 / 关停握手 / 计划批复) -----
 
-# recipient="*" 表士广播;type 区分普通消息与握手类消息,握手类同样落库为
+# recipient="*" 表示广播;type 区分普通消息与握手类消息,握手类同样落库为
 # 一条 team_messages 记录(message_type 用 type 值),不放内存。
 _MessageType = Literal[
     "message",

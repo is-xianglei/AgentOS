@@ -4,8 +4,8 @@
 第一阶段使用代码策略，后续可将策略同步到工具目录表。
 """
 
-from dataclasses import dataclass
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Literal
 
 ToolProfile = Literal[
