@@ -229,12 +229,14 @@ class ToolGateway:
         shell_tmp_root: Path | None = None,
         agent_id: int | None = None,
         allowed_skill_names: frozenset[str] | None = None,
+        round_tool_names: frozenset[str] | None = None,
     ) -> str:
         """执行工具，profile、身份和资源边界只能来自网关自身。
 
         参数中的 ``allowed_skill_names``、``shell_access``、``shell_tmp_root``
         和 ``agent_id`` 仅为迁移期兼容保留，不能用来扩大网关创建时的能力。
         否则持有一个受限网关的内部调用方可以在执行时临时换成更宽权限。
+        ``round_tool_names`` 只会进一步收窄委派出去的子 Agent 的工具，不扩大本网关的能力。
         """
         return await self.service.run(
             session_id,
@@ -256,4 +258,5 @@ class ToolGateway:
             shell_access=self.context.shell_access,
             shell_tmp_root=self.context.shell_tmp_root,
             execution_context=self.context,
+            round_tool_names=round_tool_names,
         )

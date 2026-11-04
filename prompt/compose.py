@@ -1,14 +1,15 @@
 """system prompt 组装。
 
 段序按易失性单调排列：恒定文案 → 环境 → Memory 规则 → skills catalog →
-会话指令 → Memory Catalog。把最易失的 Memory Catalog 放在末尾，可让其前的
-稳定前缀跨 turn 复用。Memory 正文（rendered_memories）走 messages 而非
-system，见 session/service.py。
+可委派 Agent 目录 → 会话指令 → Memory Catalog。把最易失的 Memory Catalog
+放在末尾，可让其前的稳定前缀跨 turn 复用。Memory 正文（rendered_memories）
+走 messages 而非 system，见 session/service.py。
 """
 
 from llm.types import PromptBlock
 from prompt.context import PromptContext
 from prompt.sections import (
+    DELEGATE_CATALOG_HEADER,
     LEAD_SYSTEM_PROMPT,
     MEMORY_CATALOG_HEADER,
     MEMORY_TRUST_RULES,
@@ -18,7 +19,7 @@ from prompt.sections import (
 
 
 def _stable_sections(ctx: PromptContext) -> list[str]:
-    """跨 turn 稳定的段：恒定文案、环境、Memory 规则、skills、会话指令。"""
+    """跨 turn 稳定的段：恒定文案、环境、Memory 规则、skills、可委派目录、会话指令。"""
     sections = [
         LEAD_SYSTEM_PROMPT,
         render_environment(ctx.cwd, ctx.today),
@@ -26,6 +27,8 @@ def _stable_sections(ctx: PromptContext) -> list[str]:
     ]
     if ctx.skills_catalog and ctx.skills_catalog.strip():
         sections.append(f"{SKILLS_CATALOG_HEADER}\n{ctx.skills_catalog.strip()}")
+    if ctx.delegate_catalog and ctx.delegate_catalog.strip():
+        sections.append(f"{DELEGATE_CATALOG_HEADER}\n{ctx.delegate_catalog.strip()}")
     if ctx.session_prompt and ctx.session_prompt.strip():
         sections.append(ctx.session_prompt.strip())
     return sections

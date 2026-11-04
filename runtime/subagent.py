@@ -5,11 +5,13 @@ import json
 import logging
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.service import AgentRuntimeConfig
 from core.config import settings
 from core.errors import AgentException
 from core.event_bus import StreamBus
@@ -43,13 +45,16 @@ from tools.registry import ToolRegistry, build_tool_registry
 
 # 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
 from tools.service import ToolService  # noqa: F401
-from tools.subagents.definition import SubAgentSpec
+from tools.subagents.definition import AgentType, SubAgentSpec
 
 logger = logging.getLogger(__name__)
 
 # teammate ReAct 轮次上限。比一次性子代理默认值略放宽,因为 teammate 还要
 # 处理收件箱与认领任务;但仍设硬上限以防失控空转。
 TEAMMATE_MAX_ROUNDS = 12
+
+# 被拒摘要里每次调用入参预览的最大字符数:够默认 Agent 认出是哪一步,又不把大段写入内容塞回上下文。
+DENIED_INPUT_PREVIEW_MAX_CHARS = 200
 
 # 子代理并发闸门。进程级信号量,按配置的并发上限做背压:
 # 超额的 Agent 调用在此排队而非直接失败,避免一次派发过多子代理打满上游速率限制。
@@ -62,6 +67,59 @@ def _get_concurrency_gate() -> asyncio.Semaphore:
     if _concurrency_gate is None:
         _concurrency_gate = asyncio.Semaphore(max(1, settings.subagent_max_concurrency))
     return _concurrency_gate
+
+
+def build_agent_spec(
+    config: AgentRuntimeConfig,
+    *,
+    display_name: str,
+    tool_profile: ToolProfile,
+) -> SubAgentSpec:
+    """把数据库 Agent 的运行配置桥接成 SubAgentSpec,Workflow 成员与默认 Agent 委派共用。
+
+    agent_type 只表示能力档位,display_name 才是运行标识(落运行记录、发事件、判权限);
+    tool_profile 决定工具按 workflow_node 还是 delegate 档位裁决。模型取 Agent 自身配置,
+    是否生效由 _configure_model 按会话模型选项决定,两条调用路径规则一致。
+    """
+    return SubAgentSpec(
+        agent_type=AgentType.GENERAL_PURPOSE,
+        display_name=display_name,
+        agent_id=config.agent_id,
+        system_prompt=config.system_prompt,
+        allowed_tools=config.tool_runtime_names,
+        model=config.model_name,
+        tool_profile=tool_profile,
+    )
+
+
+@dataclass(frozen=True)
+class DeniedToolCall:
+    """被委派 Agent 一次被权限裁决拒绝的工具调用,用于在结果末尾生成被拒摘要。"""
+
+    tool_name: str
+    input_args: dict[str, Any]
+    # 动态权限层的判定:ask(需审批,无审批通道而坍缩为拒绝)或 deny。
+    behavior: str
+    reason: str
+
+
+def _render_denied_summary(denied_calls: list[DeniedToolCall]) -> str:
+    """把实际拒绝记录渲染成追加在报告末尾的摘要,不依赖子模型自述。"""
+    header = (
+        "[运行时附注] 以下工具调用被拒绝,未执行(依据运行时的实际拒绝记录生成)。"
+        "如确需这些操作,请在主会话中自行重新调用,按正常流程审批:"
+    )
+    lines = [header]
+    for call in denied_calls:
+        preview = json.dumps(call.input_args, ensure_ascii=False, default=str)
+        if len(preview) > DENIED_INPUT_PREVIEW_MAX_CHARS:
+            preview = preview[:DENIED_INPUT_PREVIEW_MAX_CHARS] + "…(已截断)"
+        if call.behavior == "ask":
+            reason = "需要用户审批,被委派的 Agent 没有审批通道"
+        else:
+            reason = call.reason
+        lines.append(f"- {call.tool_name} {preview}:{reason}")
+    return "\n".join(lines)
 
 
 class SubAgentRunner:
@@ -163,19 +221,28 @@ class SubAgentRunner:
                 "agent_type": member_name,
             },
         )
-        # 保持旧的二参数调用形态，便于上层替换/测试 _resolve_tools；工作流节点
-        # 在默认子代理边界基础上再做一次 workflow_node 能力解析。
-        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
-        if spec.agent_id is not None and hasattr(tool_registry, "names"):
-            workflow_names = ToolCapabilityResolver().resolve_names(
-                tool_registry.names,
-                "workflow_node",
-            )
-            tool_registry = tool_registry.only(*workflow_names)
-        # 带 agent_id 的 spec 是工作流节点，工具调用按 workflow_node 档位裁决。
-        profile: ToolProfile = "subagent"
-        if spec.agent_id is not None:
+        # 工具裁决档位:spec 显式声明的优先(workflow_node / delegate);带 agent_id 但未声明
+        # 档位的旧调用按工作流节点处理,保持原行为;内置子代理用 subagent 档位。
+        if spec.tool_profile is not None:
+            profile: ToolProfile = spec.tool_profile
+        elif spec.agent_id is not None:
             profile = "workflow_node"
+        else:
+            profile = "subagent"
+        # 保持旧的二参数调用形态，便于上层替换/测试 _resolve_tools；数据库 Agent
+        # 在默认子代理边界基础上再按自身档位做一次能力解析。
+        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
+        if profile != "subagent" and hasattr(tool_registry, "names"):
+            profile_names = ToolCapabilityResolver().resolve_names(
+                tool_registry.names,
+                profile,
+            )
+            tool_registry = tool_registry.only(*profile_names)
+        # 被委派的自建 Agent 没有审批通道:被拒的工具调用由运行时记下,结束时汇总给默认 Agent,
+        # 由它在主会话里按正常审批重做。其余档位不收集,输出保持原样。
+        denied_calls: list[DeniedToolCall] | None = None
+        if profile == "delegate":
+            denied_calls = []
         # omit_inherited_memory 的 spec(如 Explore)不继承父 Turn 记忆:
         # 它只做代码检索,注入用户偏好等长期记忆既无用又占满上下文预算。
         if spec.omit_inherited_memory:
@@ -233,7 +300,10 @@ class SubAgentRunner:
                         user_id,
                         workspace_id,
                         allowed_skill_names=allowed_skill_names,
+                        denied_calls=denied_calls,
                     )
+                if denied_calls:
+                    report = f"{report}\n\n{_render_denied_summary(denied_calls)}"
                 await self.run_repo.succeed(run, report)
                 await self.db.commit()
                 result = assembler.last_result
@@ -374,12 +444,14 @@ class SubAgentRunner:
         *,
         allowed_skill_names: frozenset[str] | None = None,
         budget: ToolCallBudget | None = None,
+        denied_calls: list[DeniedToolCall] | None = None,
     ) -> None:
         """裁决并执行一轮 tool_use,把结果追加回 messages。
 
         子代理没有人工交互挂起通道(无法像主代理那样发布请求后等待用户回包),
         因此 ask 在此坍缩为拒绝,并把原因作为 tool_result 回给模型,让它自行改道;
         不能沿用"未裁决直接执行"的旧行为,否则子代理成为绕过审批的提权路径。
+        denied_calls 非空时,每次被权限裁决拒绝的调用都会追加进去,供调用方生成被拒摘要。
         """
         agent_type = spec.runtime_name
         if budget is None:
@@ -441,6 +513,15 @@ class SubAgentRunner:
                     behavior,
                     extra={"session_id": session_id, "agent_type": agent_type},
                 )
+                if denied_calls is not None:
+                    denied_calls.append(
+                        DeniedToolCall(
+                            tool_name=tool_use.name,
+                            input_args=tool_use.input,
+                            behavior=behavior,
+                            reason=decision.reason or "权限策略拒绝执行该工具调用",
+                        )
+                    )
             await self._emit_tool_result(actor, session_id, tool_use, output, is_error=is_error)
             # 中立协议下工具结果是独立的 tool 角色消息,编成各家 wire(Anthropic 的
             # tool_result 块 / OpenAI 的 role="tool" 消息)由客户端出站翻译负责。
@@ -483,8 +564,12 @@ class SubAgentRunner:
         workspace_id: int | None,
         *,
         allowed_skill_names: frozenset[str] | None = None,
+        denied_calls: list[DeniedToolCall] | None = None,
     ) -> tuple[str, int]:
-        """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示、工具集与轮次上限均取自 spec。"""
+        """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示、工具集与轮次上限均取自 spec。
+
+        denied_calls 原样透传给 _execute_tool_uses,用于收集被拒的工具调用。
+        """
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         model = await self._configure_model(session_id, spec, workspace_id, user_id)
         budget = ToolCallBudget(
@@ -527,6 +612,7 @@ class SubAgentRunner:
                 workspace_id,
                 allowed_skill_names=allowed_skill_names,
                 budget=budget,
+                denied_calls=denied_calls,
             )
             await self.db.flush()
 

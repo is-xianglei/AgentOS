@@ -45,11 +45,10 @@ from runtime.execution import (
 from runtime.orchestrator import OrchestrationContext, Orchestrator
 from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
-from runtime.subagent import SubAgentRunner
+from runtime.subagent import SubAgentRunner, build_agent_spec
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from tools.registry import ToolRegistry
-from tools.subagents.definition import AgentType, SubAgentSpec
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
 
@@ -201,17 +200,13 @@ class BaseOrchestrator(Orchestrator):
     ) -> str:
         """把数据库 Agent 桥接成 SubAgentSpec 交给 SubAgentRunner 执行,返回其最终报告。
 
-        agent_type 只表示能力档位,display_name 才是运行标识(落运行记录、发事件、判权限),
-        形如 wf-<name>,不会命中内置子代理的权限规则。失败详情由 SubAgentRunner 与
-        上层 logger.exception 记录,这里只抛不含内部细节的中文业务异常。
+        运行标识形如 wf-<name>,不会命中内置子代理的权限规则;工具按 workflow_node 档位裁决。
+        失败详情由 SubAgentRunner 与上层 logger.exception 记录,这里只抛不含内部细节的中文业务异常。
         """
-        spec = SubAgentSpec(
-            agent_type=AgentType.GENERAL_PURPOSE,
+        spec = build_agent_spec(
+            config,
             display_name=build_member_display_name(config.name),
-            agent_id=config.agent_id,
-            system_prompt=config.system_prompt,
-            allowed_tools=config.tool_runtime_names,
-            model=config.model_name,
+            tool_profile="workflow_node",
         )
         try:
             return await SubAgentRunner(db, bus=self.bus).run(

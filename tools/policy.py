@@ -15,13 +15,15 @@ ToolProfile = Literal[
     "subagent",
     "teammate",
     "orchestrator",
+    # 默认 Agent 委派给用户自建 Agent 时，被委派方使用的档位。
+    "delegate",
 ]
 
 # 主 Agent 使用工作区级 Skill 目录；其余运行身份必须携带由父运行时裁剪后的
 # Skill 白名单。这样即使某个子运行器忘记传入 allowed_skill_names，也不会默认
 # 获得整个工作区的 Skill 资产。
 _SKILL_ALLOWLIST_PROFILES: frozenset[ToolProfile] = frozenset(
-    {"user_agent", "workflow_node", "subagent", "teammate", "orchestrator"}
+    {"user_agent", "workflow_node", "subagent", "teammate", "orchestrator", "delegate"}
 )
 
 
@@ -109,6 +111,8 @@ class ToolCapabilityResolver:
         )
 
 
+# 工具策略的默认档位集合。注意这里故意不含 delegate：新增工具沿用默认值时，
+# 不会自动对被委派的自建 Agent 开放，必须在下方逐个工具显式加上。
 _ALL_PROFILES: frozenset[ToolProfile] = frozenset(
     {
         "lead",
@@ -119,6 +123,9 @@ _ALL_PROFILES: frozenset[ToolProfile] = frozenset(
         "orchestrator",
     }
 )
+# 默认档位再加上 delegate。delegate 的初始可调范围逐个工具对齐 workflow_node：
+# workflow_node 能调用的工具，在下方都改用这个集合声明 callable_profiles。
+_ALL_PROFILES_AND_DELEGATE: frozenset[ToolProfile] = _ALL_PROFILES | {"delegate"}
 _LEAD_ONLY: frozenset[ToolProfile] = frozenset({"lead", "orchestrator"})
 _LEAD_AND_TEAM: frozenset[ToolProfile] = frozenset(
     {"lead", "orchestrator", "teammate"}
@@ -147,7 +154,12 @@ def _policy(
 def _build_policies() -> dict[str, ToolPolicy]:
     policies = {
         # 普通业务与只读工具:用户自建 Agent 可以显式绑定。
-        name: _policy(name, "leaf", bindable_profiles=_ALL_PROFILES)
+        name: _policy(
+            name,
+            "leaf",
+            bindable_profiles=_ALL_PROFILES,
+            callable_profiles=_ALL_PROFILES_AND_DELEGATE,
+        )
         for name in (
             # 工具注册表中的运行时名称区分大小写，EchoTool.name 为小写
             # ``echo``；策略键必须与它完全一致，否则目录同步后的用户
@@ -170,12 +182,14 @@ def _build_policies() -> dict[str, ToolPolicy]:
                 "Write",
                 "mutation",
                 bindable_profiles=_ALL_PROFILES,
+                callable_profiles=_ALL_PROFILES_AND_DELEGATE,
                 requires_approval=True,
             ),
             "Edit": _policy(
                 "Edit",
                 "mutation",
                 bindable_profiles=_ALL_PROFILES,
+                callable_profiles=_ALL_PROFILES_AND_DELEGATE,
                 requires_approval=True,
             ),
             "Bash": _policy(
@@ -199,6 +213,7 @@ def _build_policies() -> dict[str, ToolPolicy]:
                         "workflow_node",
                         "subagent",
                         "teammate",
+                        "delegate",
                     }
                 ),
                 requires_approval=True,
@@ -210,6 +225,7 @@ def _build_policies() -> dict[str, ToolPolicy]:
                 bindable_profiles=frozenset(
                     {"lead", "orchestrator", "workflow_node", "subagent", "teammate"}
                 ),
+                callable_profiles=_ALL_PROFILES_AND_DELEGATE,
                 requires_bound_skill=True,
             ),
             "SkillResource": _policy(
@@ -218,6 +234,7 @@ def _build_policies() -> dict[str, ToolPolicy]:
                 bindable_profiles=frozenset(
                     {"lead", "orchestrator", "workflow_node", "subagent", "teammate"}
                 ),
+                callable_profiles=_ALL_PROFILES_AND_DELEGATE,
                 requires_bound_skill=True,
             ),
             "SkillRun": _policy(
@@ -228,7 +245,7 @@ def _build_policies() -> dict[str, ToolPolicy]:
                 bindable_profiles=frozenset(
                     {"lead", "orchestrator", "workflow_node", "subagent", "teammate"}
                 ),
-                callable_profiles=_ALL_PROFILES,
+                callable_profiles=_ALL_PROFILES_AND_DELEGATE,
                 requires_approval=True,
                 requires_bound_skill=True,
             ),

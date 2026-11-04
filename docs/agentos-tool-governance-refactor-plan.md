@@ -147,7 +147,9 @@ ExitPlanMode
 WritePlan
 ```
 
-子 Agent 没有人工审批恢复通道，所以危险工具的 `ask` 结果会转换成拒绝信息并回灌模型。当前运行时已经把 SubAgent、Workflow 成员和 teammate 分别标记为 `subagent`、`workflow_node`、`teammate` profile，并在父 Agent 白名单、SubAgentSpec 和 ToolPolicy 三层取交集。
+子 Agent 没有人工审批恢复通道，所以危险工具的 `ask` 结果会转换成拒绝信息并回灌模型。当前运行时已经把 SubAgent、Workflow 成员、被默认 Agent 委派的自建 Agent 和 teammate 分别标记为 `subagent`、`workflow_node`、`delegate`、`teammate` profile，并在父 Agent 白名单、SubAgentSpec 和 ToolPolicy 三层取交集。
+
+默认 Agent（会话未绑定自建 Agent）的系统提示会注入「可委派 Agent 目录」（当前工作区全部已启用 Agent），模型调用 `Agent` 工具时只传 `agent_id`（与 `agent_type` 二选一）即可委派。被委派方经 `AgentService.get_runtime_config` 校验后转成 `SubAgentSpec`，有效工具为「Agent 白名单（含随 Skill 自动补的工具）∩ `delegate` 档位 ∩ 父 Agent 本轮实际生效的工具」，后者含 Plan Mode 裁剪（Plan Mode 原有守卫只放行 Explore/Plan，委派在该模式下会先被拒绝，交集是第二道边界）；`ask` 同样坍缩为拒绝，运行时依据实际拒绝记录在报告末尾追加被拒摘要，供默认 Agent 在主会话中走正常审批重做。委派深度为 1：被委派方不能再调用 `Agent`，绑定了自建 Agent 的会话也不注入目录。
 
 ### 2.3 当前各类工具的事实分类
 
@@ -296,7 +298,7 @@ SYSTEM        仅运行时内部使用，不暴露给模型
 
 ```python
 ToolProfile = Literal[
-    "lead", "user_agent", "workflow_node", "subagent", "teammate", "orchestrator"
+    "lead", "user_agent", "workflow_node", "subagent", "teammate", "orchestrator", "delegate"
 ]
 ```
 
@@ -307,6 +309,7 @@ ToolProfile = Literal[
 | `LEAD` | 业务工具、任务、Team、Agent、交互、计划 | 仅内部系统工具 |
 | `USER_AGENT` | 只读工具、任务查询、显式绑定的普通业务工具 | `Agent`、`TeamCreate`、`TeamSpawn`、`AskUserQuestion`、计划控制面、`RunWorkflow` |
 | `WORKFLOW_NODE` | 用户显式绑定的普通业务工具，按成员预算执行 | 所有编排、交互和 Team 创建能力 |
+| `DELEGATE` | 初始可调范围逐个工具对齐 `WORKFLOW_NODE`；新增工具默认不对它开放，须在 `tools/policy.py` 显式声明 | 所有编排、交互和 Team 能力 |
 | `EXPLORE` | `Read`、`Glob`、`Grep`、受限 `Bash` | 写文件、SkillRun、任务写入、交互、派发 |
 | `PLAN` | `Read`、`Glob`、`Grep`、受限 `Bash` | 写文件、任务写入、交互、派发 |
 | `VERIFICATION` | 只读工具、受限临时目录 `Bash` | 写工程目录、交互、派发 |
@@ -629,7 +632,7 @@ Checkpoint
 ### 9.1 Skill 白名单必须随运行身份收紧
 
 `Skill`、`SkillResource` 和 `SkillRun` 属于 Skill 资产访问工具。`lead` 运行身份可以按工作区
-目录访问已启用 Skill；`user_agent`、`workflow_node`、`subagent`、`teammate` 和
+目录访问已启用 Skill；`user_agent`、`workflow_node`、`subagent`、`teammate`、`delegate` 和
 `orchestrator` 必须由父运行时显式传入 `allowed_skill_names`。缺少白名单、白名单为空或名称不
 在白名单中时，工具网关和工具实现都会拒绝调用。这样可以防止子代理在调用方漏传参数时默认读到
 整个工作区的 Skill。

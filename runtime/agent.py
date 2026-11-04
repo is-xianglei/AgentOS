@@ -169,6 +169,8 @@ class AgentRuntime:
         self.active_model_name: str | None = None
         self.active_skill_ids: tuple[int, ...] | None = None
         self.allowed_skill_names: frozenset[str] | None = None
+        # 可委派 Agent 目录,只有默认 Agent(会话未绑定自建 Agent)才会在 _configure_agent 中加载。
+        self.delegate_catalog: str | None = None
         # 执行之外(准入、交互取消)没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
         # 当前执行的租约持有者;提交终态前据此隔离已被取消或回收的执行。
@@ -725,6 +727,11 @@ class AgentRuntime:
             else:
                 skill_ids = None
             skills_catalog = await SkillService(self.db).get_catalog(self.workspace_id, skill_ids)
+        # 可委派 Agent 目录已在 _configure_agent 的 lead 分支加载;极速模式没有 Agent 工具,不注入。
+        if turbo:
+            delegate_catalog = None
+        else:
+            delegate_catalog = self.delegate_catalog
 
         if turbo:
             memory_context = None
@@ -749,6 +756,7 @@ class AgentRuntime:
         system_prompt: list[PromptBlock] = compose_lead_blocks(
             PromptContext.create(
                 skills_catalog=skills_catalog,
+                delegate_catalog=delegate_catalog,
                 session_prompt=session_prompt,
                 memory_catalog=memory_catalog,
             )
@@ -1259,12 +1267,16 @@ class AgentRuntime:
                 )
                 done_ids.append(tool_use.id)
                 continue
+            # 本轮实际生效的工具名单按刚读到的 Plan 状态计算;委派自建 Agent 时,
+            # 被委派方的工具不能超出它,否则 Plan Mode 下可借子 Agent 绕过只读限制。
+            round_tool_names = self._registry_for_mode(active_plan is not None).names
             await self._execute_one(
                 session_id,
                 turn.id,
                 actor,
                 assistant_message_id,
                 tool_use,
+                round_tool_names=round_tool_names,
             )
             done_ids.append(tool_use.id)
         return None
@@ -1277,11 +1289,13 @@ class AgentRuntime:
         assistant_message_id: int,
         tool_use: ToolUse,
         record: ToolCallRecord | None = None,
+        round_tool_names: frozenset[str] | None = None,
     ) -> str:
         """执行单个工具:调用 tool_service、emit tool_result、落 tool 消息。
 
         record 非空时复用该 tool_calls 记录(审批通过后复用之前的 awaiting 记录),
-        避免同一调用留下两条记录。
+        避免同一调用留下两条记录。round_tool_names 是本轮实际生效的工具名单,
+        透传给工具上下文,供 Agent 工具委派自建 Agent 时裁剪工具。
         """
         output = await self.tool_gateway.run(
             session_id,
@@ -1296,6 +1310,7 @@ class AgentRuntime:
             workspace_id=self.workspace_id,
             agent_id=self.active_agent_id,
             allowed_skill_names=self.allowed_skill_names,
+            round_tool_names=round_tool_names,
         )
         await self.bus.emit(
             StreamEvent.tool_result(
@@ -1604,6 +1619,9 @@ class AgentRuntime:
                 response.get("always_scope", "session"),
                 workspace_id=self.workspace_id,
             )
+        # 审批通过后执行的若是委派,同样按此刻的 Plan 状态计算本轮生效的工具名单。
+        active_plan = await self.plan_service.get_active(session_id)
+        round_tool_names = self._registry_for_mode(active_plan is not None).names
         await self._execute_one(
             session_id,
             turn.id,
@@ -1611,6 +1629,7 @@ class AgentRuntime:
             assistant_message_id,
             target,
             record=record,
+            round_tool_names=round_tool_names,
         )
 
     async def _apply_user_question(
@@ -1832,6 +1851,8 @@ class AgentRuntime:
             self.active_skill_ids = None
             self.allowed_skill_names = None
             self.tool_registry = base_registry
+            # 只有默认 Agent 能委派,可委派目录只在这个分支加载。
+            self.delegate_catalog = await self._load_delegate_catalog()
         else:
             if self.workspace_id is None:
                 raise AgentException.message("缺少可信工作区上下文")
@@ -1853,6 +1874,8 @@ class AgentRuntime:
             self.active_skill_ids = config.skill_ids
             self.allowed_skill_names = frozenset(config.skill_names)
             self.tool_registry = base_registry.only(*runtime_names)
+            # 绑定了自建 Agent 的会话不能再委派(委派深度为 1),不注入目录。
+            self.delegate_catalog = None
         if self.mode_slug == "turbo":
             self.tool_registry = self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
             self.allowed_skill_names = frozenset()
@@ -1865,6 +1888,30 @@ class AgentRuntime:
             allowed_skill_names=self.allowed_skill_names,
         )
         self.tool_service = self.tool_gateway.service
+
+    async def _load_delegate_catalog(self) -> str | None:
+        """渲染默认 Agent 的可委派 Agent 目录:当前工作区每个已启用的 Agent 占一行。
+
+        没有可信工作区或工作区里没有已启用的 Agent 时返回 None,系统提示不注入该段。
+        """
+        if self.workspace_id is None:
+            return None
+        entries = await AgentService(self.db).list_delegate_catalog(self.workspace_id)
+        lines: list[str] = []
+        for entry in entries:
+            # 描述可能含换行,压成一行,保证目录里一个 Agent 只占一行。
+            description = "(无描述)"
+            if entry.description and entry.description.strip():
+                description = " ".join(entry.description.split())
+            tools = "(无)"
+            if entry.tool_names:
+                tools = "、".join(entry.tool_names)
+            lines.append(
+                f"- agent_id={entry.agent_id} 名称:{entry.name} 描述:{description} 工具:{tools}"
+            )
+        if not lines:
+            return None
+        return "\n".join(lines)
 
     async def _get_pending_interaction(self, session_id: int) -> SuspendedInteraction:
         """读取已提交的唯一待处理请求，用于幂等重放 SSE 通知。"""

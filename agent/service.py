@@ -41,6 +41,17 @@ class AgentRuntimeConfig:
     description: str | None
 
 
+@dataclass(frozen=True)
+class DelegateCatalogEntry:
+    """默认 Agent 系统提示里「可委派 Agent 目录」的一项。"""
+
+    agent_id: int
+    name: str
+    description: str | None
+    # 只作给模型看的能力摘要;委派时 get_runtime_config 会对绑定重新做严格校验。
+    tool_names: tuple[str, ...]
+
+
 class AgentService:
     """Agent 定义、工作区权限和 Tool/Skill 绑定的业务入口。"""
 
@@ -227,6 +238,38 @@ class AgentService:
             name=agent.name,
             description=agent.description,
         )
+
+    async def list_delegate_catalog(self, workspace_id: int) -> tuple[DelegateCatalogEntry, ...]:
+        """返回工作区内全部已启用的 Agent,供默认 Agent 的可委派目录使用;不分页、不检索。
+
+        工具摘要只列仍启用的工具:个别 Agent 的绑定失效时不能让整份目录失败,
+        否则默认 Agent 的整轮对话都会被拖垮;失效绑定留到委派时由运行配置校验报错。
+        """
+        records = await self.repo.list_enabled(workspace_id)
+        tool_ids: list[int] = []
+        for record in records:
+            for binding in record.tool_bindings:
+                tool_ids.append(binding.tool_id)
+        tool_names_by_id = await self.tool_catalog_service.get_enabled_runtime_names_by_ids(
+            tool_ids
+        )
+        entries: list[DelegateCatalogEntry] = []
+        for record in records:
+            # 与 get_runtime_config 一致按工具 ID 排序,摘要顺序与运行时白名单一致。
+            tool_names: list[str] = []
+            for tool_id in sorted(binding.tool_id for binding in record.tool_bindings):
+                tool_name = tool_names_by_id.get(tool_id)
+                if tool_name is not None:
+                    tool_names.append(tool_name)
+            entries.append(
+                DelegateCatalogEntry(
+                    agent_id=record.id,
+                    name=record.name,
+                    description=record.description,
+                    tool_names=tuple(tool_names),
+                )
+            )
+        return tuple(entries)
 
     async def remove_skill_bindings(self, workspace_id: int, skill_id: int) -> None:
         """供Skill域删除资产时清理本域绑定。"""

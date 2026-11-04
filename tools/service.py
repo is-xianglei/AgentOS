@@ -164,6 +164,15 @@ class ToolCatalogService:
         names_by_id = {record.id: record.runtime_name for record in records}
         return tuple(names_by_id[tool_id] for tool_id in normalized)
 
+    async def get_enabled_runtime_names_by_ids(self, tool_ids: list[int]) -> dict[int, str]:
+        """按工具 ID 取运行时名称,只含仍启用的工具;不做绑定校验也不抛错,仅供只读展示。"""
+        records = await self.repo.list_by_ids(list(dict.fromkeys(tool_ids)))
+        names_by_id: dict[int, str] = {}
+        for record in records:
+            if record.is_enabled:
+                names_by_id[record.id] = record.runtime_name
+        return names_by_id
+
     async def require_runtime_names(self, runtime_names: list[str]) -> tuple[str, ...]:
         normalized = list(dict.fromkeys(runtime_names))
         records = await self.repo.list_by_runtime_names(normalized)
@@ -265,6 +274,7 @@ class ToolService:
         profile: ToolProfile | None = None,
         principal_name: str | None = None,
         execution_context: ToolExecutionContext | None = None,
+        round_tool_names: frozenset[str] | None = None,
     ) -> str:
         """执行工具并记录调用状态。
 
@@ -400,6 +410,7 @@ class ToolService:
                 principal_name=resolved_principal,
                 profile=resolved_profile,
                 allowed_tool_names=self.registry.names,
+                round_tool_names=round_tool_names,
                 allowed_skill_names=allowed_skill_names,
                 shell_access=shell_access,
                 shell_tmp_root=shell_tmp_root,

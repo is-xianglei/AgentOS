@@ -26,6 +26,9 @@ class ToolContext:
     # 能力档位由运行时显式注入,不从模型输入或显示名称推断。
     profile: ToolProfile | None = None
     allowed_tool_names: frozenset[str] | None = None
+    # 调用方本轮实际生效的工具名单(含 Plan Mode 等模式裁剪),由主运行时逐次注入;
+    # Agent 工具委派自建 Agent 时据此裁剪被委派方的工具,其余工具不读。
+    round_tool_names: frozenset[str] | None = None
     allowed_skill_names: frozenset[str] | None = None
     # shell 访问级别与可写临时目录:由 SubAgent 规格下发,Bash 工具据此自校验。
     # 主代理路径不设置,等价于 FULL。

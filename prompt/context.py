@@ -20,6 +20,8 @@ class PromptContext:
     cwd: str
     today: date
     skills_catalog: str | None = None
+    # 可委派的自建 Agent 目录;只有未绑定自建 Agent 的默认 Agent 会传入。
+    delegate_catalog: str | None = None
     session_prompt: str | None = None
     memory_catalog: str | None = None
 
@@ -28,6 +30,7 @@ class PromptContext:
         cls,
         *,
         skills_catalog: str | None = None,
+        delegate_catalog: str | None = None,
         session_prompt: str | None = None,
         memory_catalog: str | None = None,
         cwd: str | None = None,
@@ -38,6 +41,7 @@ class PromptContext:
             cwd=cwd if cwd is not None else str(Path.cwd()),
             today=today if today is not None else date.today(),
             skills_catalog=skills_catalog,
+            delegate_catalog=delegate_catalog,
             session_prompt=session_prompt,
             memory_catalog=memory_catalog,
         )

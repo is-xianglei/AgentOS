@@ -12,11 +12,12 @@
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from team.schemas import TeamMemberResponse, TeamMessageResponse, TeamResponse
 from team.service import TeamService
 from tools.base import BaseTool, ToolContext
+from tools.subagents.definition import AgentType
 
 # ----- 序列化 helper:复用 team 域的 Response Schema 输出 JSON -----
 
@@ -66,11 +67,26 @@ class TeamCreateTool(BaseTool):
 # ----- TeamSpawn -----
 
 
+_TEAMMATE_AGENT_TYPES: tuple[str, ...] = tuple(item.value for item in AgentType)
+
+
 class TeamSpawnInput(BaseModel):
     name: str = Field(description="队友名称,会话内唯一")
     role: str = Field(description="队友角色描述")
     prompt: str = Field(description="队友的初始任务提示")
-    agent_type: str = Field(default="general-purpose", description="队友对应的子代理类型")
+    agent_type: str = Field(
+        default="general-purpose",
+        description=f"队友对应的子代理类型,可选: {', '.join(_TEAMMATE_AGENT_TYPES)}",
+    )
+
+    @field_validator("agent_type")
+    @classmethod
+    def check_agent_type(cls, value: str) -> str:
+        """唤醒队友时按内置 AgentType 解析,派遣时就校验,避免非法值落库后在唤醒时才失败。"""
+        if value not in _TEAMMATE_AGENT_TYPES:
+            allowed = "、".join(_TEAMMATE_AGENT_TYPES)
+            raise ValueError(f"队友子代理类型无效:{value}。可选值(区分大小写):{allowed}")
+        return value
 
 
 class TeamSpawnTool(BaseTool):

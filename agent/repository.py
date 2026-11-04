@@ -98,6 +98,18 @@ class AgentRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_enabled(self, workspace_id: int) -> list[AgentRecord]:
+        """列出工作区内全部已启用的 Agent(含绑定),按 ID 升序,让目录文本跨轮次保持稳定。"""
+        stmt = self._with_bindings(
+            select(AgentRecord)
+            .where(
+                AgentRecord.workspace_id == workspace_id,
+                AgentRecord.is_enabled.is_(True),
+            )
+            .order_by(AgentRecord.id)
+        )
+        return list(await self.db.scalars(stmt))
+
     async def list_and_count(
         self,
         workspace_id: int,

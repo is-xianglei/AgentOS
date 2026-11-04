@@ -31,6 +31,11 @@ SKILLS_CATALOG_HEADER = """\
 ## 可用 skills
 以下 skill 可按需加载(调用 Skill 工具取回完整说明后再执行):"""
 
+DELEGATE_CATALOG_HEADER = """\
+## 可委派 Agent 目录
+以下是当前工作区里用户自建的 Agent。需要时调用 Agent 工具、只传 agent_id(不传 agent_type)
+把任务委派给它;它按自己的提示词、工具与 Skill 独立运行,完成后把报告交回给你:"""
+
 MEMORY_CATALOG_HEADER = "## Memory Catalog"
 
 
