@@ -49,6 +49,10 @@ class SubAgentRunResponse(BaseModel):
     id: int = Field(description="运行ID")
     session_id: int = Field(description="所属会话ID")
     member_name: str = Field(description="成员名称")
+    agent_id: int | None = Field(
+        default=None,
+        description="成员对应的Agent ID，委派自建Agent与Workflow成员填写，内置子代理与团队成员为空",
+    )
     status: str = Field(description="运行状态")
     prompt: str = Field(description="任务提示")
     report: str | None = Field(default=None, description="运行报告")
