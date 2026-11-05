@@ -98,6 +98,16 @@ class AgentRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_existing_ids(self, agent_ids: list[int]) -> list[int]:
+        """不限工作区，返回其中未软删除的 Agent ID；只查 ID 列，不加载整行。"""
+        if not agent_ids:
+            return []
+        stmt = select(AgentRecord.id).where(
+            AgentRecord.id.in_(agent_ids),
+            AgentRecord.is_deleted.is_(False),
+        )
+        return list(await self.db.scalars(stmt))
+
     async def list_enabled(self, workspace_id: int) -> list[AgentRecord]:
         """列出工作区内全部已启用的 Agent(含绑定),按 ID 升序,让目录文本跨轮次保持稳定。"""
         stmt = self._with_bindings(

@@ -62,6 +62,16 @@ class WorkspaceRepository:
         stmt = select(WorkspaceRecord).where(WorkspaceRecord.id.in_(workspace_ids))
         return list(await self.db.scalars(stmt))
 
+    async def list_existing_ids(self, workspace_ids: list[int]) -> list[int]:
+        """返回其中未软删除的工作区 ID；只查 ID 列，不加载整行。"""
+        if not workspace_ids:
+            return []
+        stmt = select(WorkspaceRecord.id).where(
+            WorkspaceRecord.id.in_(workspace_ids),
+            WorkspaceRecord.is_deleted.is_(False),
+        )
+        return list(await self.db.scalars(stmt))
+
     async def list_all(self, limit: int = 100, offset: int = 0) -> list[WorkspaceRecord]:
         stmt = (
             select(WorkspaceRecord)

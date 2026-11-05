@@ -103,6 +103,16 @@ class SkillRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_existing_ids(self, skill_ids: list[int]) -> list[int]:
+        """不限工作区，返回其中未软删除的 Skill ID；只查 ID 列，不加载整行。"""
+        if not skill_ids:
+            return []
+        stmt = select(SkillRecord.id).where(
+            SkillRecord.id.in_(skill_ids),
+            SkillRecord.is_deleted.is_(False),
+        )
+        return list(await self.db.scalars(stmt))
+
     async def save(
         self,
         record: SkillRecord | None,

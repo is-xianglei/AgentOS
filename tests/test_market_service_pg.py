@@ -65,7 +65,7 @@ async def pg():
     session = AsyncSession(bind=conn, expire_on_commit=False)
     suffix = uuid.uuid4().hex[:10]
     users = {}
-    for role in ("author", "installer", "member", "admin"):
+    for role in ("author", "installer", "member", "admin", "outsider"):
         users[role] = UserRecord(
             email=f"mk-{role}-{suffix}@test.local",
             username=f"mk-{role}-{suffix}",
@@ -78,7 +78,11 @@ async def pg():
     installer = WorkspaceRecord(
         name=f"mk-ins-{suffix}", slug=f"mk-ins-{suffix}", display_name=f"安装工作区{suffix}"
     )
-    session.add_all([*users.values(), publisher, installer])
+    # 与条目无关的工作区：既不发布也不安装。
+    other = WorkspaceRecord(
+        name=f"mk-oth-{suffix}", slug=f"mk-oth-{suffix}", display_name=f"无关工作区{suffix}"
+    )
+    session.add_all([*users.values(), publisher, installer, other])
     await session.flush()
     now = datetime.now(UTC)
     memberships = [
@@ -86,6 +90,7 @@ async def pg():
         (installer, users["installer"], "owner"),
         (installer, users["member"], "member"),
         (installer, users["admin"], "member"),
+        (other, users["outsider"], "owner"),
     ]
     for workspace, user, role in memberships:
         session.add(
@@ -102,8 +107,10 @@ async def pg():
             installer_id=users["installer"].id,
             member_id=users["member"].id,
             admin_id=users["admin"].id,
+            outsider_id=users["outsider"].id,
             publisher_ws=publisher.id,
             installer_ws=installer.id,
+            other_ws=other.id,
             tool_ids=await _enabled_tool_ids(session),
         )
     finally:
@@ -420,7 +427,7 @@ async def test_removed_listing_accepts_new_version_and_relists_on_approval(pg) -
     assert (listing.current_version_number, listing.summary) == (2, "修正后的描述")
 
 
-async def test_delisted_listing_rejects_detail_install_and_upgrade(pg) -> None:
+async def test_delisted_listing_is_visible_to_installer_but_not_installable(pg) -> None:
     skill = await _save_skill(pg, f"delta-{pg.suffix}")
     listing_id = await _publish(pg, "skill", skill.id)
     service = MarketService(pg.db)
@@ -441,16 +448,28 @@ async def test_delisted_listing_rejects_detail_install_and_upgrade(pg) -> None:
     delisted = await service.delist_listing(pg.publisher_ws, pg.author_id, listing_id)
     assert delisted.status == "delisted"
 
-    detail = await _expect_error(pg, lambda: _installer_detail(pg, listing_id))
+    # 装过的工作区仍能看到详情，好从「已安装」里点开；但没有安装预览，也不算有更新。
+    detail = await _installer_detail(pg, listing_id)
+    assert (detail.status, detail.status_reason) == ("delisted", None)
+    assert detail.install_preview is None
+    assert detail.listing.has_update is False
+    # 安装和升级照旧被拒绝。
     install = await _expect_error(
         pg, lambda: service.install_listing(pg.installer_ws, pg.installer_id, listing_id)
     )
     upgrade = await _expect_error(
         pg, lambda: service.upgrade_listing(pg.installer_ws, pg.installer_id, listing_id)
     )
-    assert detail.status_code == 404
     assert install.status_code == 409
     assert upgrade.status_code == 409
+    # 与条目无关的工作区按不存在处理。
+    unrelated = await _expect_error(
+        pg,
+        lambda: service.get_listing_detail(
+            pg.other_ws, pg.outsider_id, listing_id, is_platform_admin=False
+        ),
+    )
+    assert unrelated.status_code == 404
     browse = await service.list_listings(
         pg.installer_ws,
         pg.installer_id,

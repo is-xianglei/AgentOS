@@ -6,7 +6,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Row, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
@@ -138,20 +138,48 @@ class MarketRepository:
         )
         return list(await self.db.scalars(stmt))
 
-    async def list_listed(
+    async def get_listing_by_publisher_and_source(
+        self,
+        workspace_id: int,
+        kind: str,
+        source_id: int,
+    ) -> MarketListingRecord | None:
+        """按发布工作区和源 Agent 或源 Skill 取条目；源对象的部分唯一索引保证最多一行。"""
+        if kind == "agent":
+            source_condition = MarketListingRecord.source_agent_id == source_id
+        else:
+            source_condition = MarketListingRecord.source_skill_id == source_id
+        stmt = select(MarketListingRecord).where(
+            MarketListingRecord.publisher_workspace_id == workspace_id,
+            source_condition,
+        )
+        return (await self.db.scalars(stmt)).first()
+
+    async def list_for_browse(
         self,
         *,
         kind: str | None,
         category: str | None,
         keyword: str | None,
+        is_official: bool | None,
+        installed: bool | None,
+        installed_listing_ids: list[int],
+        has_update: bool | None,
+        updatable_listing_ids: list[int],
         limit: int,
         offset: int,
     ) -> tuple[list[MarketListingRecord], int]:
-        """分页列出已上架的条目，官方的在前，其余按更新时间倒序。"""
-        filters: list[Any] = [
-            MarketListingRecord.status == "listed",
-            MarketListingRecord.is_deleted.is_(False),
-        ]
+        """分页列出浏览页的条目，官方的在前，其余按更新时间倒序。
+
+        installed=true 时返回 installed_listing_ids 里的全部条目，不论状态：条目下架后，
+        装过它的工作区仍要能在「已安装」里看到它。其他筛选组合只返回已上架的条目。
+        安装状态涉及 agent、skill 两个域的表，这里不拼它们的 SQL：
+        由 Service 先算好「有效安装的条目 ID」和「有更新的条目 ID」，这里只做 IN / NOT IN。
+        所有条件之间是 AND，总数和分页都按同一组条件在库里完成。
+        """
+        filters: list[Any] = [MarketListingRecord.is_deleted.is_(False)]
+        if installed is not True:
+            filters.append(MarketListingRecord.status == "listed")
         if kind is not None:
             filters.append(MarketListingRecord.kind == kind)
         if category is not None:
@@ -164,6 +192,18 @@ class MarketRepository:
                     MarketListingRecord.summary.ilike(pattern),
                 )
             )
+        if is_official is not None:
+            filters.append(MarketListingRecord.is_official.is_(is_official))
+        # 集合为空时，SQLAlchemy 把 IN 渲染成恒假、把 NOT IN 渲染成恒真，结果仍然正确。
+        if installed is True:
+            filters.append(MarketListingRecord.id.in_(installed_listing_ids))
+        elif installed is False:
+            filters.append(MarketListingRecord.id.not_in(installed_listing_ids))
+        # 有更新的条目只会是已上架的（非 listed 不能升级），所以 has_update=true 也只命中 listed。
+        if has_update is True:
+            filters.append(MarketListingRecord.id.in_(updatable_listing_ids))
+        elif has_update is False:
+            filters.append(MarketListingRecord.id.not_in(updatable_listing_ids))
         total = await self.db.scalar(select(func.count(MarketListingRecord.id)).where(*filters))
         stmt = (
             select(MarketListingRecord)
@@ -365,19 +405,34 @@ class MarketRepository:
         )
         return list(await self.db.scalars(stmt))
 
-    async def count_installs_by_listing_ids(self, listing_ids: list[int]) -> dict[int, int]:
-        """按条目统计未软删除的安装记录数；没有安装的条目不出现在结果中。"""
-        if not listing_ids:
-            return {}
+    async def list_all_installs_of_workspace(self, workspace_id: int) -> list[MarketInstallRecord]:
+        """列出工作区的全部安装记录，按 ID 排序；每个条目最多一条，数量不大。"""
         stmt = (
-            select(MarketInstallRecord.listing_id, func.count(MarketInstallRecord.id))
-            .where(
-                MarketInstallRecord.listing_id.in_(listing_ids),
-                MarketInstallRecord.is_deleted.is_(False),
-            )
-            .group_by(MarketInstallRecord.listing_id)
+            select(MarketInstallRecord)
+            .where(MarketInstallRecord.workspace_id == workspace_id)
+            .order_by(MarketInstallRecord.id)
         )
-        counts: dict[int, int] = {}
-        for listing_id, install_count in await self.db.execute(stmt):
-            counts[listing_id] = install_count
-        return counts
+        return list(await self.db.scalars(stmt))
+
+    async def list_install_targets_by_listing_ids(
+        self,
+        listing_ids: list[int],
+    ) -> list[Row[tuple[int, int, int | None, int | None]]]:
+        """列出这些条目在所有工作区的未软删除安装记录，供统计有效安装数。
+
+        只取 listing_id、workspace_id、target_agent_id、target_skill_id 四列，
+        不建 ORM 对象，避免和会话里已加载的完整安装记录互相影响。
+        """
+        if not listing_ids:
+            return []
+        stmt = select(
+            MarketInstallRecord.listing_id,
+            MarketInstallRecord.workspace_id,
+            MarketInstallRecord.target_agent_id,
+            MarketInstallRecord.target_skill_id,
+        ).where(
+            MarketInstallRecord.listing_id.in_(listing_ids),
+            MarketInstallRecord.is_deleted.is_(False),
+        )
+        result = await self.db.execute(stmt)
+        return list(result.all())

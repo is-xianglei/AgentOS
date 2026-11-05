@@ -35,7 +35,9 @@
   - 加锁是为了防止两个人同时注册时都被判成第一个用户。
   - 这条规则属于 user 域，写成 UserService 的公开方法，由 auth 的注册流程调用。现有注册流程直接使用 UserRepository，这是历史遗留问题，本次不重构。
 - **迁移回填**：把 id 最小且未软删除的用户设为平台管理员；没有用户就不设。
-- **字段只读**：不提供修改这个字段的接口，现有的用户创建、更新请求也不能接收它。在「当前用户」的响应里增加只读字段 `is_platform_admin`，前端据此决定是否显示审核页。
+- **字段只读**：不提供修改这个字段的接口，现有的用户创建、更新、注册请求也不能接收它。以下响应带只读字段 `is_platform_admin`，前端据此决定是否显示审核页：
+  - 「当前用户」`GET /api/users/me`；
+  - 登录 `POST /api/auth/login` 和注册 `POST /api/auth/register` 响应里的 `user`。刷新 Token 和切换工作区只返回 Token，不带用户信息。
 - **权限依赖**：`api/deps.py` 新增 `get_current_platform_admin`，要求用户有效且 `is_platform_admin=true`，否则返回 403「需要平台管理员权限」。这个依赖不看工作区。
 
 ## 2. 表结构（market 域，迁移 0028）
@@ -70,6 +72,9 @@
 | snapshot_hash | 快照的 sha256。计算方式：先把快照规范化为 JSON（`sort_keys`、紧凑分隔符、`ensure_ascii=False`），再取哈希 |
 | submitted_by_user_id | 提交人；官方条目为空 |
 | reviewed_by_user_id / reviewed_at / review_comment | 审核人、审核时间、审核意见。驳回时必须填写理由 |
+
+- 版本名称不单独存列：ORM 上的 `name` 是 `column_property`，查询时在库里用 JSONB 路径表达式
+  `coalesce(snapshot #>> '{agent,name}', snapshot #>> '{skill,name}')` 取值。不加载快照全文的查询（如「我的上架」）也能拿到名称，最大 32MB 的快照不会传回应用。
 
 ### market_installs 安装记录
 
@@ -144,12 +149,16 @@ Agent 条目的快照：
 
 1. 源对象必须属于当前工作区，且未被删除。
 2. 生成快照，然后依次校验快照大小、凭据文件和分类。
-3. 锁定这个源对象对应的条目；条目不存在就新建一个，状态为 `unlisted`。
-4. 条目下已有 `pending` 版本时，返回 409。
-5. 快照哈希与当前已通过的版本相同时，返回 409「内容与当前上架版本相同」。
-6. 新建一个 `pending` 版本，版本号取该条目现有最大版本号加 1。
-7. 并发提交时可能撞上部分唯一索引（新建条目时撞源对象索引，或撞「每个条目只能有一个待审版本」的索引），这时同样返回 409，不能报 500。
-8. 条目状态为 `removed` 时也允许提交新版本，审核通过后重新上架。
+3. 源对象是从市场装来的，返回 409「从市场安装的内容不能上架」，`details` 为 `{"listing_id": 来源条目ID}`。满足任一条即算：
+   - 它是当前工作区某条**有效安装**的 `target_agent_id` 或 `target_skill_id`；
+   - 它在当前工作区某条有效安装的 `managed_skill_ids` 里，即随 Agent 一起装来的托管 Skill。
+   有效安装的口径见第 7 节。这条规则和下面的「按安装对象查来源条目」接口共用同一个判定。
+4. 锁定这个源对象对应的条目；条目不存在就新建一个，状态为 `unlisted`。
+5. 条目下已有 `pending` 版本时，返回 409。
+6. 快照哈希与当前已通过的版本相同时，返回 409「内容与当前上架版本相同」。
+7. 新建一个 `pending` 版本，版本号取该条目现有最大版本号加 1。
+8. 并发提交时可能撞上部分唯一索引（新建条目时撞源对象索引，或撞「每个条目只能有一个待审版本」的索引），这时同样返回 409，不能报 500。
+9. 条目状态为 `removed` 时也允许提交新版本，审核通过后重新上架。
 
 ### 撤回待审版本：`POST /api/market/versions/{version_id}/withdraw`
 
@@ -169,6 +178,36 @@ Agent 条目的快照：
 ### 我的上架：`GET /api/market/mine`
 
 返回当前工作区的全部条目，每个条目附带全部版本，包括审核意见和驳回理由。
+
+- 每个版本带 `name`，取自该版本的快照。条目的 `name` 要等首次审核通过才有值，在那之前（包括版本被撤回、驳回后）前端用最新版本的 `name` 展示。
+- 所有返回版本的接口（提交、撤回、通过、驳回、审核队列、详情里的当前版本）都带这个字段。
+
+### 按源对象查条目：`GET /api/market/mine/by-source?kind&source_id`
+
+- 前端据此决定按钮显示「申请上架」还是「提交新版本」。
+- 参数：`kind` 必填，取 `agent` / `skill`，其他值返回 422；`source_id` 必填，正整数。
+- 权限与「我的上架」相同。只查当前工作区作为发布方、源对象为指定 Agent 或 Skill 的条目，查不到别的工作区的条目。
+- 找到时返回与「我的上架」单个条目相同的结构（`listing` 加全部 `versions`），条目是任何状态都返回。
+- 找不到时返回 200，`data` 为 `null`，不返回 404：没有条目是正常情况。
+- 不放在 `/listings/by-source`，否则会和 `/listings/{listing_id}` 的路由冲突。
+
+### 按安装对象查来源条目：`GET /api/market/installs/by-target?kind&target_id`
+
+- 前端据此决定 Agent、Skill 详情页的按钮：从市场装来的不显示「申请上架」。
+- 参数：`kind` 必填，取 `agent` / `skill`；`target_id` 必填，正整数。不合法时返回 422。
+- 权限：当前工作区的有效成员即可，不要求 owner/admin。
+- 命中范围与上面提交时的拒绝规则完全相同，包括随 Agent 装来的托管 Skill。直接安装出来的对象优先于托管 Skill。
+- 命中时返回：
+  - `listing_id`：来源条目 ID；
+  - `listing_name`：条目当前的名称；
+  - `listing_status`：条目当前的状态，下架后照样命中，状态为 `delisted` 或 `removed`；
+  - `installed_version_number`：已安装的版本号；
+  - `installed_with_agent`：为 true 表示这是随 Agent 条目一起装来的托管 Skill，此时 `listing_id` 指向那个 Agent 条目。
+- 找不到时返回 200，`data` 为 `null`：不是从市场装来的是正常情况。
+
+### 已知限制
+
+提交时的「从市场安装」拒绝规则有两种绕过方式，目前不封堵：已安装的 Agent 删除后，随它装来的托管 Skill 不再算有效安装，可以单独上架；把从市场装来的 Skill 绑定到自己的 Agent 上，可以随这个 Agent 再上架。这两种情况都依赖平台管理员审核时人工把关。
 
 ## 6. 平台管理员审核
 
@@ -190,20 +229,47 @@ Agent 条目的快照：
 ## 7. 浏览
 
 - 浏览接口要求用户已登录、且是当前工作区的有效成员。
-- **分页列表**：`GET /api/market/listings?kind&category&keyword&limit&offset`
-  - 只返回 `listed` 状态的条目。
+- **分页列表**：`GET /api/market/listings?kind&category&keyword&installed&has_update&is_official&limit&offset`
+  - 默认只返回 `listed` 状态的条目。唯一的例外是 `installed=true`：返回当前工作区有有效安装的全部条目，不论状态是 `listed`、`delisted` 还是 `removed`，让条目下架后装过它的工作区仍能在「已安装」里看到它。
   - `limit` 默认 20，取值范围 1–100。
   - 按 `is_official desc, updated_at desc, id desc` 排序。
   - `keyword` 对 name 和 summary 做 ilike 匹配。
+  - 三个可选的布尔筛选，都不传时与不筛选完全一致：
+    - `installed`：true 返回当前工作区有有效安装的条目（含非 listed），false 只返回没有有效安装的 listed 条目；
+    - `has_update`：true 只返回能升级的条目，即已有效安装、条目为 `listed`、且已安装版本低于当前版本；false 排除这类条目。非 listed 的条目不能升级，所以永远不算有更新；
+    - `is_official`：按是否官方条目筛选。
+  - 所有条件之间是 AND。`installed=true&has_update=true` 取交集，只会有 listed 条目；`installed=true&has_update=false` 会包含已安装的非 listed 条目。
+  - `total` 是筛选之后的总数，分页在数据库里完成。
+  - 当前工作区有效安装的口径：安装记录未软删除，且安装出来的 Agent 或 Skill 仍然存在。当前工作区已通过成员校验，必然未删除，所以不必再查工作区；这与下文 install_count 的口径一致。
+  - 判断安装对象是否存在要请 agent 域、skill 域确认，不能跨域拼 SQL。做法是：
+    1. 先查出当前工作区的全部安装记录（每个条目最多一条，数量很小）；
+    2. 用 `AgentService` / `SkillService` 的 `filter_existing_ids` 留下仍然有效的；
+    3. 得到「有效安装的条目 ID」和「有更新的条目 ID」两个集合，作为 IN / NOT IN 条件交给分页查询。
+  - 不按安装状态筛选时不做上面这几步。
   - 每个列表项包含以下字段：
     - id、kind、name、summary、category、is_official、current_version_number；
+    - status、status_reason：条目状态和下架原因，前端据此显示「已下架」及原因；
     - publisher_name：官方条目显示「官方」，社区条目显示发布工作区的展示名，展示名通过 WorkspaceService 获取；
-    - install_count：未软删除的安装记录数；
+    - install_count：**有效安装数**，见下文；
     - installed：当前工作区是否有有效安装；
     - installed_version_number；
-    - has_update：已安装、且已安装版本低于当前版本时为 true。
+    - has_update：可以升级时为 true，口径与 `has_update` 筛选相同。
+  - **install_count 的口径**：一条安装记录同时满足以下三条才计入：
+    1. 安装记录未软删除；
+    2. 所在工作区未删除；
+    3. 安装出来的 Agent 或 Skill 仍然存在。
+  - 后两条分属 workspace、agent、skill 三个域，market 不能拼它们的 SQL。做法是只为当前页的条目计算：
+    1. 一次查询取出这些条目在所有工作区的未软删除安装记录，只取 listing_id、workspace_id、target_agent_id、target_skill_id 四列；
+    2. 用 `WorkspaceService.filter_existing_ids`、`AgentService.filter_existing_ids_across_workspaces`、`SkillService.filter_existing_ids_across_workspaces` 三个不限工作区的批量方法确认工作区和目标对象还在，集合为空时不查；
+    3. 在内存里按条目计数。
+  - 因此每页固定是 1 次安装记录查询加至多 3 次批量确认，与页大小无关；传输的行数等于这一页条目的安装总数。安装量很大时，IN 列表会随之变长（PostgreSQL 单条语句的绑定参数上限是 65535），届时应改成写入时维护的计数。
+  - 详情接口的 install_count 用同一个计算函数，口径一致。
 - **详情**：`GET /api/market/listings/{listing_id}`
-  - `listed` 状态的条目所有人可见；不是 `listed` 的，只有发布工作区的成员和平台管理员能看到。
+  - `listed` 状态的条目所有人可见；不是 `listed` 的，只有以下三类能看到，其他人返回 404：
+    - 发布工作区的成员；
+    - 平台管理员；
+    - 当前工作区对该条目有有效安装的成员，让「已安装」里已下架的条目仍能点开。
+  - 不是 `listed` 的条目不返回安装预览（`install_preview` 为 `null`），`listing.has_update` 为 false；安装和升级接口照旧返回 409。
   - 返回当前版本的完整快照，包括系统提示词和 Skill 全文。用户应该在安装前看清 Skill 里的脚本。
   - 同时返回当前工作区的**安装预览**：
     - 没装过：安装时会发生什么，包括 Agent 是否撞名、每个工具是绑定还是丢弃（及原因）、每个 Skill 是新建、恢复、复用还是冲突；
@@ -300,10 +366,10 @@ Agent 预置的 `tools` 必须都在工具目录里，`skills` 必须都在 `pre
 | `market/`（新域） | 包含 `models.py`、`schemas.py`、`repository.py`、`service.py`、`api.py`、`presets.py`（读取预置目录并同步），以及存放预置内容的 `presets/` 目录 |
 | `user/`、`auth/` | 新增 `is_platform_admin` 列和「是否第一个注册用户」的判定；当前用户的响应里加上这个字段 |
 | `api/deps.py` | 新增依赖 `get_current_platform_admin` |
-| `agent/service.py` | 新增四个公开方法：生成 Agent 快照、判断同名、按 ID 批量判断是否存在、用于升级的覆盖（尽量复用现有的更新和绑定替换方法） |
-| `skill/service.py` | 新增公开方法：生成 Skill 快照；按快照判定新建、恢复、复用还是冲突，并执行；按快照覆盖内容；按 ID 批量判断是否存在 |
+| `agent/service.py` | 新增公开方法：生成 Agent 快照、判断同名、按 ID 批量判断是否存在（工作区内 / 不限工作区两个版本，后者供统计安装次数）、用于升级的覆盖（尽量复用现有的更新和绑定替换方法） |
+| `skill/service.py` | 新增公开方法：生成 Skill 快照；按快照判定新建、恢复、复用还是冲突，并执行；按快照覆盖内容；按 ID 批量判断是否存在（工作区内 / 不限工作区两个版本） |
 | `tools/service.py` | 新增 tool_key 与工具 ID 的双向转换，同时给出不可用原因，判定口径与 `require_bindable_tool_ids` 一致 |
-| `workspace/service.py` | 新增按 ID 批量获取展示名 |
+| `workspace/service.py` | 新增按 ID 批量获取展示名、按 ID 批量判断工作区是否未删除 |
 | 注册入口 | `database/registry.py` 登记三张新表；`api/router.py` 挂载 `/market` |
 | 迁移 `0028` | 包括 `users.is_platform_admin`、回填、三张新表，并写显式的 downgrade |
 

@@ -470,6 +470,14 @@ class SkillService:
             existing_ids.add(record.id)
         return existing_ids
 
+    async def filter_existing_ids_across_workspaces(self, skill_ids: list[int]) -> set[int]:
+        """不限工作区，返回其中仍存在（未软删除）的 Skill ID，已禁用的也算存在。
+
+        供市场统计安装次数：安装记录分布在各个工作区，要一次批量确认装出来的 Skill 还在。
+        """
+        existing_ids = await self.repo.list_existing_ids(list(dict.fromkeys(skill_ids)))
+        return set(existing_ids)
+
     async def delete_skill(
         self,
         workspace_id: int,

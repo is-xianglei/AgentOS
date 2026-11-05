@@ -48,6 +48,8 @@ class UserInfo(BaseModel):
     phone: str | None = Field(default=None, description="手机号")
     email_verified: bool = Field(default=False, description="邮箱是否验证")
     suspended: bool = Field(default=False, description="是否被暂停使用")
+    # 只读：只出现在登录、注册的响应里，任何请求 Schema 都不接收这个字段。
+    is_platform_admin: bool = Field(default=False, description="是否平台管理员")
     auth_provider: str = Field(default="local", description="认证提供商")
     last_login_at: datetime | None = Field(default=None, description="最后登录时间")
     created_at: datetime = Field(description="创建时间")

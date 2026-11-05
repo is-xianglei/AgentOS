@@ -11,10 +11,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.ext.mutable import MutableList
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, column_property, mapped_column
 
 from database.base import Base, json_type
 
@@ -146,6 +147,16 @@ class MarketVersionRecord(Base):
     release_note: Mapped[str | None] = mapped_column(Text, nullable=True, comment="版本说明")
     # 快照创建后不可变，所以不用 MutableDict 跟踪原地修改。
     snapshot: Mapped[dict[str, Any]] = mapped_column(json_type(), comment="提交时生成的内容快照")
+    # 版本名称不是表里的列，而是每次查询时在库里从快照取出的计算值（不需要迁移）：
+    # Agent 快照取 agent.name，Skill 快照取 skill.name，两种快照只会有其中一个键。
+    # 用 JSONB 路径表达式 snapshot #>> '{agent,name}' 取值，「我的上架」等不加载快照全文的查询
+    # 也能拿到名称，最大 32MB 的快照不必传回应用。
+    name: Mapped[str] = column_property(
+        func.coalesce(
+            snapshot[("agent", "name")].astext,
+            snapshot[("skill", "name")].astext,
+        )
+    )
     snapshot_hash: Mapped[str] = mapped_column(String(64), comment="规范化快照JSON的sha256")
     submitted_by_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"),

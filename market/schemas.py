@@ -98,6 +98,9 @@ class MarketVersionResponse(BaseModel):
     id: int = Field(description="版本ID")
     listing_id: int = Field(description="所属市场条目ID")
     version_number: int = Field(description="版本号")
+    name: str = Field(
+        description="该版本快照里的名称；条目的 name 在首次审核通过前为空，可用最新版本的名称展示"
+    )
     status: str = Field(description="审核状态: pending/approved/rejected/withdrawn")
     category: str = Field(description="提交时选择的分类")
     release_note: str | None = Field(default=None, description="版本说明")
@@ -141,12 +144,18 @@ class MarketBrowseItem(BaseModel):
     summary: str | None = Field(default=None, description="简介")
     category: str | None = Field(default=None, description="分类")
     is_official: bool = Field(description="是否官方预置")
+    status: str = Field(
+        description="条目状态: unlisted/listed/delisted/removed；列表只在按已安装筛选时有非 listed"
+    )
+    status_reason: str | None = Field(default=None, description="下架原因")
     current_version_number: int | None = Field(default=None, description="当前版本号")
     publisher_name: str | None = Field(default=None, description="发布方：官方条目为「官方」")
-    install_count: int = Field(description="安装次数")
+    install_count: int = Field(
+        description="有效安装数：安装记录未删除、所在工作区未删除、安装出来的对象仍存在"
+    )
     installed: bool = Field(description="当前工作区是否已安装")
     installed_version_number: int | None = Field(default=None, description="当前工作区已安装的版本")
-    has_update: bool = Field(description="已安装且有更新的版本")
+    has_update: bool = Field(description="已安装、条目仍在上架且有更新的版本，即可以升级")
     updated_at: datetime = Field(description="更新时间")
 
 
@@ -219,6 +228,21 @@ class MarketInstallResponse(BaseModel):
     updated_at: datetime = Field(description="更新时间")
 
     model_config = {"from_attributes": True}
+
+
+class MarketInstalledTargetResponse(BaseModel):
+    """当前工作区里的 Agent 或 Skill 是从哪个市场条目装来的。"""
+
+    listing_id: int = Field(description="市场条目ID")
+    listing_name: str | None = Field(
+        default=None,
+        description="条目当前的名称；装过的条目都审核通过过，实际总有值",
+    )
+    listing_status: str = Field(description="条目状态: listed/delisted/removed")
+    installed_version_number: int = Field(description="已安装的版本号")
+    installed_with_agent: bool = Field(
+        description="为 true 表示这是随 Agent 条目一起装来的托管 Skill，不是直接安装的对象"
+    )
 
 
 class MarketInstallResult(BaseModel):

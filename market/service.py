@@ -28,6 +28,7 @@ from market.schemas import (
     MarketInstallReport,
     MarketInstallResponse,
     MarketInstallResult,
+    MarketInstalledTargetResponse,
     MarketListingDetailResponse,
     MarketListingResponse,
     MarketMyListingItem,
@@ -218,6 +219,19 @@ def check_listing_installable(listing: MarketListingRecord) -> None:
         )
 
 
+def has_newer_version(listing: MarketListingRecord, install: MarketInstallRecord) -> bool:
+    """条目仍在上架、且已安装的版本低于条目的当前版本时算有更新，也就是可以升级。
+
+    不是 listed 的条目不能升级，即使有更高的版本也不算有更新。
+    浏览列表的 has_update 字段和 has_update 筛选都用它，保证两边口径一致。
+    """
+    if listing.status != "listed":
+        return False
+    if listing.current_version_number is None:
+        return False
+    return install.installed_version_number < listing.current_version_number
+
+
 # ---------- 安装与升级的判定结果 ----------
 
 
@@ -289,18 +303,29 @@ class MarketService:
         check_category(category)
         snapshot_hash = compute_snapshot_hash(snapshot)
 
-        # 3. 锁住源对象对应的条目，同一条目的提交、撤回和审核由这把行锁串行化。
+        # 3. 从市场装来的 Agent、Skill（含随 Agent 装来的托管 Skill）是别人的内容，
+        #    不能当成自己的重新上架。口径与「按安装对象查条目」接口相同。
+        installed_from = await self._find_install_of_target(workspace_id, kind, source_id)
+        if installed_from is not None:
+            install, _installed_with_agent = installed_from
+            raise AgentException.message(
+                "从市场安装的内容不能上架",
+                {"listing_id": install.listing_id},
+                status_code=409,
+            )
+
+        # 4. 锁住源对象对应的条目，同一条目的提交、撤回和审核由这把行锁串行化。
         listing = await self.repo.get_listing_by_source_for_update(kind, source_id)
         if listing is None:
             listing = await self._create_community_listing(
                 workspace_id, actor_user_id, kind, source_id
             )
 
-        # 4. 每个条目最多只有一个待审版本。
+        # 5. 每个条目最多只有一个待审版本。
         if await self.repo.has_pending_version(listing.id):
             raise _pending_version_exists()
 
-        # 5. 内容与当前上架版本完全相同，没有必要再审一次。
+        # 6. 内容与当前上架版本完全相同，没有必要再审一次。
         if listing.current_version_number is not None:
             current_hash = await self.repo.get_snapshot_hash(
                 listing.id, listing.current_version_number
@@ -308,7 +333,7 @@ class MarketService:
             if current_hash == snapshot_hash:
                 raise AgentException.message("内容与当前上架版本相同", status_code=409)
 
-        # 6. 新建待审版本，版本号取现有最大版本号加 1。
+        # 7. 新建待审版本，版本号取现有最大版本号加 1。
         # 行锁之外还有「每个条目最多一个待审版本」的部分唯一索引兜底，撞上时同样按 409 处理。
         version_number = await self.repo.get_max_version_number(listing.id) + 1
         try:
@@ -360,7 +385,10 @@ class MarketService:
         actor_user_id: int,
         listing_id: int,
     ) -> MarketListingRecord:
-        """作者下架：已上架的条目改为 delisted，之后详情、安装和升级都会被拒绝。"""
+        """作者下架：已上架的条目改为 delisted，之后不能再安装和升级。
+
+        详情只对发布方、平台管理员和已有有效安装的工作区可见，已装出去的副本不受影响。
+        """
         await self._require_write_access(workspace_id, actor_user_id)
         listing = await self._lock_listing_for_author(workspace_id, listing_id)
         check_can_delist(listing)
@@ -390,28 +418,26 @@ class MarketService:
         """当前工作区发布的全部条目，每个条目附带全部版本（含审核意见和驳回理由）。"""
         await self._require_write_access(workspace_id, actor_user_id)
         listings = await self.repo.list_listings_by_publisher(workspace_id)
-        listing_ids: list[int] = []
-        for listing in listings:
-            listing_ids.append(listing.id)
-        versions = await self.repo.list_versions_by_listing_ids(listing_ids)
+        return await self._build_my_listing_items(listings)
 
-        versions_by_listing: dict[int, list[MarketVersionResponse]] = {}
-        for version in versions:
-            if version.listing_id not in versions_by_listing:
-                versions_by_listing[version.listing_id] = []
-            versions_by_listing[version.listing_id].append(
-                MarketVersionResponse.model_validate(version)
-            )
+    async def get_my_listing_by_source(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        *,
+        kind: str,
+        source_id: int,
+    ) -> MarketMyListingItem | None:
+        """按源 Agent 或源 Skill 查当前工作区发布的条目，结构与「我的上架」里的单个条目相同。
 
-        items: list[MarketMyListingItem] = []
-        for listing in listings:
-            items.append(
-                MarketMyListingItem(
-                    listing=MarketListingResponse.model_validate(listing),
-                    versions=versions_by_listing.get(listing.id, []),
-                )
-            )
-        return items
+        前端据此决定显示「申请上架」还是「提交新版本」，没有条目是正常情况，返回 None 而不是 404。
+        """
+        await self._require_write_access(workspace_id, actor_user_id)
+        listing = await self.repo.get_listing_by_publisher_and_source(workspace_id, kind, source_id)
+        if listing is None:
+            return None
+        items = await self._build_my_listing_items([listing])
+        return items[0]
 
     # ---------- 平台管理员审核（权限由 API 层的 get_current_platform_admin 把关） ----------
 
@@ -542,13 +568,39 @@ class MarketService:
         keyword: str | None,
         limit: int,
         offset: int,
+        installed: bool | None = None,
+        has_update: bool | None = None,
+        is_official: bool | None = None,
     ) -> MarketBrowsePage:
-        """分页列出已上架的条目，并带上当前工作区的安装状态。"""
+        """分页列出条目，并带上当前工作区的安装状态。
+
+        默认只列已上架的条目；installed=true 时列出当前工作区有有效安装的全部条目，
+        下架的也在内，让「已安装」页能显示「已下架」。多个条件之间是 AND。
+        """
         await self.workspace_service.require_active_membership(workspace_id, actor_user_id)
-        listings, total = await self.repo.list_listed(
+
+        # 按安装状态筛选时，先算出当前工作区「有效安装」和「有更新」的条目 ID，再交给分页查询。
+        # 安装对象是否还在要请 agent 域、skill 域确认，不能在 market 的 SQL 里关联它们的表。
+        installed_listing_ids: list[int] = []
+        updatable_listing_ids: list[int] = []
+        if installed is not None or has_update is not None:
+            installs = await self.repo.list_all_installs_of_workspace(workspace_id)
+            active_installs = await self._filter_active_installs(workspace_id, installs)
+            installed_listings = await self.repo.list_listings_by_ids(list(active_installs.keys()))
+            for listing in installed_listings:
+                installed_listing_ids.append(listing.id)
+                if has_newer_version(listing, active_installs[listing.id]):
+                    updatable_listing_ids.append(listing.id)
+
+        listings, total = await self.repo.list_for_browse(
             kind=kind,
             category=category,
             keyword=keyword,
+            is_official=is_official,
+            installed=installed,
+            installed_listing_ids=installed_listing_ids,
+            has_update=has_update,
+            updatable_listing_ids=updatable_listing_ids,
             limit=limit,
             offset=offset,
         )
@@ -568,10 +620,14 @@ class MarketService:
         listing = await self.repo.get_listing(listing_id)
         if listing is None:
             raise _listing_not_found()
-        # 不是 listed 的条目只有发布工作区的成员和平台管理员能看，其他人按不存在处理。
+        install = await self.repo.get_install(listing.id, workspace_id)
+        active_install = await self._get_active_install(workspace_id, install)
+        # 不是 listed 的条目只有三类人能看：发布工作区的成员、平台管理员、有有效安装的工作区成员。
+        # 最后一类是为了让装过的工作区在条目下架后，仍能从「已安装」点开它；其他人按不存在处理。
         if listing.status != "listed":
             is_publisher = listing.publisher_workspace_id == workspace_id
-            if not is_publisher and not is_platform_admin:
+            has_active_install = active_install is not None
+            if not is_publisher and not is_platform_admin and not has_active_install:
                 raise _listing_not_found()
 
         browse_items = await self._build_browse_items(workspace_id, [listing])
@@ -591,13 +647,41 @@ class MarketService:
         # 不是 listed 的条目不能安装也不能升级，没有预览。
         if listing.status != "listed":
             return detail
-        install = await self.repo.get_install(listing.id, workspace_id)
-        active_install = await self._get_active_install(workspace_id, install)
         plan = await self._build_plan(
             workspace_id, actor_user_id, listing, version, active_install
         )
         detail.install_preview = _plan_preview(plan)
         return detail
+
+    async def get_install_by_target(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        *,
+        kind: str,
+        target_id: int,
+    ) -> MarketInstalledTargetResponse | None:
+        """查当前工作区的某个 Agent 或 Skill 是不是从市场装来的，以及来自哪个条目。
+
+        前端据此决定详情页显示「申请上架」还是「来自市场」。命中范围与上架时的拒绝规则相同，
+        包括随 Agent 一起装来的托管 Skill。不是从市场装来的是正常情况，返回 None 而不是 404。
+        """
+        await self.workspace_service.require_active_membership(workspace_id, actor_user_id)
+        installed_from = await self._find_install_of_target(workspace_id, kind, target_id)
+        if installed_from is None:
+            return None
+        install, installed_with_agent = installed_from
+        listing = await self.repo.get_listing(install.listing_id)
+        # 安装记录随条目级联删除，条目一定在；这里只防御数据不一致。
+        if listing is None:
+            return None
+        return MarketInstalledTargetResponse(
+            listing_id=listing.id,
+            listing_name=listing.name,
+            listing_status=listing.status,
+            installed_version_number=install.installed_version_number,
+            installed_with_agent=installed_with_agent,
+        )
 
     # ---------- 安装与升级 ----------
 
@@ -1120,6 +1204,75 @@ class MarketService:
                 active_installs[install.listing_id] = install
         return active_installs
 
+    async def _find_install_of_target(
+        self,
+        workspace_id: int,
+        kind: str,
+        target_id: int,
+    ) -> tuple[MarketInstallRecord, bool] | None:
+        """找出当前工作区里装出这个 Agent 或 Skill 的有效安装记录。
+
+        命中时返回 (安装记录, 是否随 Agent 装来的托管 Skill)；不是从市场装来的返回 None。
+        上架时的拒绝规则和「按安装对象查条目」接口共用它，保证两边口径一致。
+        """
+        installs = await self.repo.list_all_installs_of_workspace(workspace_id)
+        active_installs = await self._filter_active_installs(workspace_id, installs)
+
+        # 先找直接装出来的对象：同一个 Skill 既是 Skill 条目装出来的、又被某个 Agent 安装托管时，
+        # 按直接安装算。
+        for install in active_installs.values():
+            if kind == "agent" and install.target_agent_id == target_id:
+                return install, False
+            if kind == "skill" and install.target_skill_id == target_id:
+                return install, False
+
+        # 再找随 Agent 一起装来的托管 Skill。
+        if kind == "skill":
+            for install in active_installs.values():
+                if target_id in install.managed_skill_ids:
+                    return install, True
+        return None
+
+    async def _count_active_installs(self, listing_ids: list[int]) -> dict[int, int]:
+        """按条目统计有效安装数；没有有效安装的条目不出现在结果中。
+
+        有效安装要同时满足：安装记录未软删除、所在工作区未删除、安装出来的 Agent 或 Skill 仍存在。
+        后两条分属 workspace、agent、skill 三个域，不能在 market 的 SQL 里关联它们的表，
+        所以先取出这些条目的全部安装记录，再请各域批量确认，最后在内存里计数。
+        无论这一页有多少条目，都是一次安装记录查询加至多三次批量确认。
+        """
+        install_rows = await self.repo.list_install_targets_by_listing_ids(listing_ids)
+
+        workspace_ids: list[int] = []
+        agent_ids: list[int] = []
+        skill_ids: list[int] = []
+        for row in install_rows:
+            workspace_ids.append(row.workspace_id)
+            if row.target_agent_id is not None:
+                agent_ids.append(row.target_agent_id)
+            if row.target_skill_id is not None:
+                skill_ids.append(row.target_skill_id)
+        existing_workspace_ids = await self.workspace_service.filter_existing_ids(workspace_ids)
+        existing_agent_ids = await self.agent_service.filter_existing_ids_across_workspaces(
+            agent_ids
+        )
+        existing_skill_ids = await self.skill_service.filter_existing_ids_across_workspaces(
+            skill_ids
+        )
+
+        counts: dict[int, int] = {}
+        for row in install_rows:
+            if row.workspace_id not in existing_workspace_ids:
+                continue
+            target_exists = (
+                row.target_agent_id in existing_agent_ids
+                or row.target_skill_id in existing_skill_ids
+            )
+            if not target_exists:
+                continue
+            counts[row.listing_id] = counts.get(row.listing_id, 0) + 1
+        return counts
+
     async def _publisher_names(
         self,
         listings: list[MarketListingRecord],
@@ -1142,16 +1295,47 @@ class MarketService:
                 names[listing.id] = None
         return names
 
+    async def _build_my_listing_items(
+        self,
+        listings: list[MarketListingRecord],
+    ) -> list[MarketMyListingItem]:
+        """给每个条目附上全部版本（含审核意见和驳回理由），「我的上架」和按源对象查询共用。"""
+        listing_ids: list[int] = []
+        for listing in listings:
+            listing_ids.append(listing.id)
+        versions = await self.repo.list_versions_by_listing_ids(listing_ids)
+
+        versions_by_listing: dict[int, list[MarketVersionResponse]] = {}
+        for version in versions:
+            if version.listing_id not in versions_by_listing:
+                versions_by_listing[version.listing_id] = []
+            versions_by_listing[version.listing_id].append(
+                MarketVersionResponse.model_validate(version)
+            )
+
+        items: list[MarketMyListingItem] = []
+        for listing in listings:
+            items.append(
+                MarketMyListingItem(
+                    listing=MarketListingResponse.model_validate(listing),
+                    versions=versions_by_listing.get(listing.id, []),
+                )
+            )
+        return items
+
     async def _build_browse_items(
         self,
         workspace_id: int,
         listings: list[MarketListingRecord],
     ) -> list[MarketBrowseItem]:
-        """给条目补上发布方名称、安装次数，以及当前工作区的安装状态。"""
+        """给条目补上发布方名称、安装次数，以及当前工作区的安装状态。
+
+        浏览列表和详情都用它，安装次数的口径因此一致。
+        """
         listing_ids: list[int] = []
         for listing in listings:
             listing_ids.append(listing.id)
-        install_counts = await self.repo.count_installs_by_listing_ids(listing_ids)
+        install_counts = await self._count_active_installs(listing_ids)
         workspace_installs = await self.repo.list_installs_of_workspace(workspace_id, listing_ids)
         active_installs = await self._filter_active_installs(workspace_id, workspace_installs)
         publisher_names = await self._publisher_names(listings)
@@ -1163,9 +1347,7 @@ class MarketService:
             has_update = False
             if install is not None:
                 installed_version_number = install.installed_version_number
-                current_version_number = listing.current_version_number
-                if current_version_number is not None:
-                    has_update = installed_version_number < current_version_number
+                has_update = has_newer_version(listing, install)
             items.append(
                 MarketBrowseItem(
                     id=listing.id,
@@ -1174,6 +1356,8 @@ class MarketService:
                     summary=listing.summary,
                     category=listing.category,
                     is_official=listing.is_official,
+                    status=listing.status,
+                    status_reason=listing.status_reason,
                     current_version_number=listing.current_version_number,
                     publisher_name=publisher_names[listing.id],
                     install_count=install_counts.get(listing.id, 0),

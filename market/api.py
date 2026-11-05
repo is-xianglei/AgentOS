@@ -22,6 +22,7 @@ from market.schemas import (
     MarketBrowsePage,
     MarketCategoryResponse,
     MarketInstallResult,
+    MarketInstalledTargetResponse,
     MarketListingDetailResponse,
     MarketListingResponse,
     MarketMyListingItem,
@@ -142,6 +143,29 @@ async def list_my_listings(
     return ok(items, request)
 
 
+@router.get(
+    "/mine/by-source",
+    summary="按源 Agent 或 Skill 查询当前工作区的上架条目",
+    response_model=ApiResponse[MarketMyListingItem],
+)
+async def get_my_listing_by_source(
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+    kind: Annotated[ListingKind, Query()],
+    source_id: Annotated[int, Query(gt=0)],
+):
+    # 没有条目是正常情况（前端据此显示「申请上架」），data 返回 null，不报 404。
+    item = await MarketService(db).get_my_listing_by_source(
+        workspace_id,
+        current_user.id,
+        kind=kind,
+        source_id=source_id,
+    )
+    return ok(item, request)
+
+
 # ---------- 平台管理员审核 ----------
 
 
@@ -223,7 +247,7 @@ async def remove_listing(
 
 @router.get(
     "/listings",
-    summary="分页浏览已上架的条目",
+    summary="分页浏览条目：默认只有已上架的，按已安装筛选时含已下架的",
     response_model=ApiResponse[MarketBrowsePage],
 )
 async def list_listings(
@@ -234,6 +258,9 @@ async def list_listings(
     kind: Annotated[ListingKind | None, Query()] = None,
     category: str | None = Query(default=None, max_length=32),
     keyword: str | None = Query(default=None, max_length=128),
+    installed: bool | None = Query(default=None, description="按当前工作区是否有有效安装筛选"),
+    has_update: bool | None = Query(default=None, description="按是否已安装且有新版本筛选"),
+    is_official: bool | None = Query(default=None, description="按是否官方条目筛选"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
@@ -245,6 +272,9 @@ async def list_listings(
         keyword=keyword,
         limit=limit,
         offset=offset,
+        installed=installed,
+        has_update=has_update,
+        is_official=is_official,
     )
     return ok(page, request)
 
@@ -271,6 +301,29 @@ async def get_listing_detail(
 
 
 # ---------- 安装与升级 ----------
+
+
+@router.get(
+    "/installs/by-target",
+    summary="查询当前工作区的 Agent 或 Skill 是否从市场安装",
+    response_model=ApiResponse[MarketInstalledTargetResponse],
+)
+async def get_install_by_target(
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+    kind: Annotated[ListingKind, Query()],
+    target_id: Annotated[int, Query(gt=0)],
+):
+    # 不是从市场装来的是正常情况（前端据此显示「申请上架」），data 返回 null，不报 404。
+    installed_from = await MarketService(db).get_install_by_target(
+        workspace_id,
+        current_user.id,
+        kind=kind,
+        target_id=target_id,
+    )
+    return ok(installed_from, request)
 
 
 @router.post(

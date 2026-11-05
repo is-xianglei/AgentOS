@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 import database.registry  # noqa: F401  构造 ORM 实例前需全部映射在册
-from market.models import MarketListingRecord
+from market.models import MarketInstallRecord, MarketListingRecord
 from market.repository import MarketRepository
 from market.service import MarketService
 from workspace.service import WorkspaceService
@@ -123,7 +123,12 @@ async def test_detail_of_unlisted_listing_is_404_for_other_workspace(
     async def fake_get_listing(self: MarketRepository, listing_id: int) -> MarketListingRecord:
         return _listing(status)
 
+    # 当前工作区在这个条目上没有安装记录，也不是发布方：和这个条目无关。
+    async def fake_get_install(self: MarketRepository, listing_id: int, workspace_id: int) -> None:
+        return None
+
     monkeypatch.setattr(MarketRepository, "get_listing", fake_get_listing)
+    monkeypatch.setattr(MarketRepository, "get_install", fake_get_install)
     client = client_factory(_user(is_platform_admin=False))
 
     response = await client.get("/api/market/listings/9")
@@ -177,6 +182,12 @@ async def test_unique_violation_on_submit_becomes_409_without_leaking(
         content = "---\nname: data-cleaning\ndescription: 清洗\n---\n\n正文\n"
         return {"name": "data-cleaning", "content": content, "extra_files": {}, "skill_hash": "h"}
 
+    # 当前工作区没有任何安装记录，源对象不是从市场装来的，提交才会走到锁定条目这一步。
+    async def fake_list_all_installs(
+        self: MarketRepository, workspace_id: int
+    ) -> list[MarketInstallRecord]:
+        return []
+
     async def fake_lock(self: MarketRepository, kind: str, source_id: int) -> None:
         return None
 
@@ -186,6 +197,7 @@ async def test_unique_violation_on_submit_becomes_409_without_leaking(
         )
 
     monkeypatch.setattr(SkillService, "build_snapshot", fake_build_snapshot)
+    monkeypatch.setattr(MarketRepository, "list_all_installs_of_workspace", fake_list_all_installs)
     monkeypatch.setattr(MarketRepository, "get_listing_by_source_for_update", fake_lock)
     monkeypatch.setattr(MarketRepository, "create_listing", fake_create_listing)
     client = client_factory(_user(is_platform_admin=False))

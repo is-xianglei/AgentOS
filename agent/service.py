@@ -341,6 +341,14 @@ class AgentService:
             existing_ids.add(record.id)
         return existing_ids
 
+    async def filter_existing_ids_across_workspaces(self, agent_ids: list[int]) -> set[int]:
+        """不限工作区，返回其中仍存在（未软删除）的 Agent ID，已停用的也算存在。
+
+        供市场统计安装次数：安装记录分布在各个工作区，要一次批量确认装出来的 Agent 还在。
+        """
+        existing_ids = await self.repo.list_existing_ids(list(dict.fromkeys(agent_ids)))
+        return set(existing_ids)
+
     async def overwrite_for_upgrade(
         self,
         workspace_id: int,
