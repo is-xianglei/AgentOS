@@ -36,6 +36,20 @@ class SkillRepository:
         )
         return (await self.db.scalars(stmt)).first()
 
+    async def get_by_name_including_deleted(
+        self,
+        workspace_id: int,
+        name: str,
+    ) -> SkillRecord | None:
+        """按 name 读取元数据，含已软删行，不加锁；供只读的安装预览判定。"""
+        stmt = (
+            select(SkillRecord)
+            .options(*_metadata_only())
+            .where(SkillRecord.workspace_id == workspace_id, SkillRecord.name == name)
+            .execution_options(include_deleted=True)
+        )
+        return (await self.db.scalars(stmt)).first()
+
     async def lock_by_name(self, workspace_id: int, name: str) -> SkillRecord | None:
         """按 name 加行锁读取,含已软删行;供新建前判重与复活。
 

@@ -55,6 +55,13 @@ class WorkspaceRepository:
         stmt = select(WorkspaceRecord).where(WorkspaceRecord.slug == slug)
         return (await self.db.scalars(stmt)).first()
 
+    async def list_by_ids(self, workspace_ids: list[int]) -> list[WorkspaceRecord]:
+        """按 ID 批量查询未软删除的工作区。"""
+        if not workspace_ids:
+            return []
+        stmt = select(WorkspaceRecord).where(WorkspaceRecord.id.in_(workspace_ids))
+        return list(await self.db.scalars(stmt))
+
     async def list_all(self, limit: int = 100, offset: int = 0) -> list[WorkspaceRecord]:
         stmt = (
             select(WorkspaceRecord)

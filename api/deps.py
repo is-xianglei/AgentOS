@@ -100,9 +100,19 @@ async def get_current_admin_user(
     return current_user
 
 
+async def get_current_platform_admin(
+    current_user: Annotated[UserRecord, Depends(get_current_active_user)],
+) -> UserRecord:
+    """校验当前用户是平台管理员；这是平台级权限，不看当前工作区。"""
+    if not current_user.is_platform_admin:
+        raise AgentException.message("需要平台管理员权限", status_code=403)
+    return current_user
+
+
 __all__ = [
     "get_current_active_user",
     "get_current_admin_user",
+    "get_current_platform_admin",
     "get_current_user",
     "get_current_workspace_id",
     "get_db",

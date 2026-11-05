@@ -8,6 +8,7 @@ from core.config import settings
 from core.errors import AgentException
 from user.models import UserRecord
 from user.repository import UserRepository
+from user.service import UserService
 from workspace.models import WorkspaceRecord
 from workspace.service import WorkspaceService
 
@@ -49,12 +50,17 @@ class AuthService:
         if existing_email:
             raise AgentException.message("邮箱已被注册")
 
+        # 平台首个注册用户自动成为平台管理员。判定规则属于 user 域，
+        # 方法内会加咨询锁，必须在插入用户之前调用。
+        is_first_user = await UserService(self.db).lock_and_check_first_user()
+
         hashed_password = self._hash_password(password)
         user = await self.repo.create(
             username=username,
             email=email,
             password=hashed_password,
             full_name=full_name,
+            is_platform_admin=is_first_user,
         )
         # 不在此 commit:user 的 INSERT 已由 repo.create 内的 flush 落到事务中,
         # user.id 可用;整体提交交给请求边界(get_db),与下面的工作区创建同事务,

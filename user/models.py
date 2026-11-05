@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Index, String
+from sqlalchemy import Boolean, DateTime, Index, String, false
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,6 +45,14 @@ class UserRecord(Base):
     )
     suspended: Mapped[bool] = mapped_column(
         Boolean, default=False, index=True, comment="是否被暂停使用"
+    )
+    # 注册时由 UserService.lock_and_check_first_user 判定写入，存量用户由迁移 0028 回填；
+    # 没有任何接口可以修改它。
+    is_platform_admin: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        comment="是否平台管理员（平台首个注册用户）",
     )
 
     # OAuth 字段

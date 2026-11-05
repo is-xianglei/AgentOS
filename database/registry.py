@@ -8,6 +8,11 @@ from agent.models import AgentRecord, AgentSkillRecord, AgentToolRecord  # noqa:
 from department.models import DepartmentRecord  # noqa: F401
 from group.models import GroupMemberRecord, GroupRecord  # noqa: F401
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord  # noqa: F401
+from market.models import (  # noqa: F401
+    MarketInstallRecord,
+    MarketListingRecord,
+    MarketVersionRecord,
+)
 from memory.models import (  # noqa: F401
     MemoryItemRecord,
     MemoryJobRecord,

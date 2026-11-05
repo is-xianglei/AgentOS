@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -296,6 +296,73 @@ class AgentService:
                 status_code=404,
             )
         return normalized
+
+    async def build_snapshot(self, workspace_id: int, agent_id: int) -> dict[str, Any]:
+        """生成 Agent 快照，供市场上架使用。
+
+        tool_keys 取绑定的工具（目录里已删除的工具不再出现）；skills 取绑定的全部 Skill
+        的完整快照，已禁用的也算。不带 model_name、is_enabled 和各类 ID。
+        两个列表都排好序，同样的内容总是得到同样的快照。
+        """
+        agent = await self._get_required(workspace_id, agent_id)
+
+        tool_ids: list[int] = []
+        for binding in agent.tool_bindings:
+            tool_ids.append(binding.tool_id)
+        tool_keys_by_id = await self.tool_catalog_service.get_tool_keys_by_ids(tool_ids)
+        tool_keys = sorted(tool_keys_by_id.values())
+
+        skills: list[dict[str, Any]] = []
+        for binding in agent.skill_bindings:
+            skill = await self.skill_service.build_snapshot(workspace_id, binding.skill_id)
+            skills.append(skill)
+        skills.sort(key=lambda skill: skill["name"])
+
+        return {
+            "agent": {
+                "name": agent.name,
+                "description": agent.description,
+                "system_prompt": agent.system_prompt,
+                "tool_keys": tool_keys,
+            },
+            "skills": skills,
+        }
+
+    async def is_name_taken(self, workspace_id: int, name: str) -> bool:
+        """工作区内是否已有同名的有效 Agent；已停用的算，已软删除的不算，与唯一索引口径一致。"""
+        existing = await self.repo.get_by_name(workspace_id, name)
+        return existing is not None
+
+    async def filter_existing_ids(self, workspace_id: int, agent_ids: list[int]) -> set[int]:
+        """返回其中仍存在（未软删除）的 Agent ID，已停用的也算存在；不存在的不报错。"""
+        records = await self.repo.list_by_ids(workspace_id, list(dict.fromkeys(agent_ids)))
+        existing_ids: set[int] = set()
+        for record in records:
+            existing_ids.add(record.id)
+        return existing_ids
+
+    async def overwrite_for_upgrade(
+        self,
+        workspace_id: int,
+        agent_id: int,
+        actor_user_id: int,
+        *,
+        description: str | None,
+        system_prompt: str,
+        tool_ids: list[int],
+        skill_ids: list[int],
+    ) -> AgentRecord:
+        """市场升级时覆盖描述、系统提示词和全部工具、Skill 绑定；名称、启用状态和模型保留本地设置。
+
+        直接组合现有的更新方法和绑定替换方法，权限、行锁和绑定校验都沿用它们的。
+        """
+        updates: AgentUpdateFields = {
+            "description": description,
+            "system_prompt": system_prompt,
+        }
+        await self.update_agent(workspace_id, agent_id, actor_user_id, updates)
+        await self.replace_tool_bindings(workspace_id, agent_id, actor_user_id, tool_ids)
+        return await self.replace_skill_bindings(workspace_id, agent_id, actor_user_id, skill_ids)
 
     async def _get_required(self, workspace_id: int, agent_id: int) -> AgentRecord:
         agent = await self.repo.get(workspace_id, agent_id)

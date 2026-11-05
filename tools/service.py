@@ -2,7 +2,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +52,21 @@ class ToolCatalogPage:
     total: int
     limit: int
     offset: int
+
+
+# 按 tool_key 解析时工具不可用的原因：not_found 目录里没有或代码里已没有实现，
+# disabled 已停用，not_bindable 当前档位不允许绑定。
+ToolUnavailableReason = Literal["not_found", "disabled", "not_bindable"]
+
+
+@dataclass(frozen=True)
+class ToolKeyResolution:
+    """tool_key 的解析结果，两个字典的键都是 tool_key。"""
+
+    # 可以绑定的工具：tool_key -> 工具 ID
+    tool_ids: dict[str, int]
+    # 不可用的工具：tool_key -> 原因
+    unavailable: dict[str, ToolUnavailableReason]
 
 
 class ToolCatalogService:
@@ -172,6 +187,47 @@ class ToolCatalogService:
             if record.is_enabled:
                 names_by_id[record.id] = record.runtime_name
         return names_by_id
+
+    async def resolve_tool_keys(
+        self,
+        tool_keys: list[str],
+        *,
+        profile: ToolProfile,
+    ) -> ToolKeyResolution:
+        """把 tool_key 解析为可绑定的工具 ID；不可用的不抛错，而是连同原因一起返回。
+
+        判定口径与 require_bindable_tool_ids 一致，并按同样的先后顺序检查：
+        目录里没有（含已软删除）、已停用、代码注册表里没有实现、档位不允许绑定。
+        “没有实现”对使用方来说和“目录里没有”一样，都归为 not_found。
+        """
+        normalized = list(dict.fromkeys(tool_keys))
+        records = await self.repo.list_by_tool_keys(normalized)
+        records_by_key = {record.tool_key: record for record in records}
+        registry_names = build_tool_registry().names
+
+        tool_ids: dict[str, int] = {}
+        unavailable: dict[str, ToolUnavailableReason] = {}
+        for tool_key in normalized:
+            record = records_by_key.get(tool_key)
+            if record is None:
+                unavailable[tool_key] = "not_found"
+            elif not record.is_enabled:
+                unavailable[tool_key] = "disabled"
+            elif record.runtime_name not in registry_names:
+                unavailable[tool_key] = "not_found"
+            elif not can_bind_tool(record.runtime_name, profile):
+                unavailable[tool_key] = "not_bindable"
+            else:
+                tool_ids[tool_key] = record.id
+        return ToolKeyResolution(tool_ids=tool_ids, unavailable=unavailable)
+
+    async def get_tool_keys_by_ids(self, tool_ids: list[int]) -> dict[int, str]:
+        """按工具 ID 取 tool_key，已停用的也返回；目录里已删除的工具不出现在结果中。"""
+        records = await self.repo.list_by_ids(list(dict.fromkeys(tool_ids)))
+        tool_keys: dict[int, str] = {}
+        for record in records:
+            tool_keys[record.id] = record.tool_key
+        return tool_keys
 
     async def require_runtime_names(self, runtime_names: list[str]) -> tuple[str, ...]:
         normalized = list(dict.fromkeys(runtime_names))

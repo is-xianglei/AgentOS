@@ -20,6 +20,7 @@ from core.run_events import check_run_event_store, close_run_event_store
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
 from hooks.builtin import register_builtin_hooks
+from market.presets import sync_official_presets
 from runtime.execution import shutdown_executions
 from runtime.recovery import reap_orphan_turns, run_reaper_loop
 from tools.service import ToolCatalogService
@@ -35,6 +36,14 @@ async def lifespan(app: FastAPI):
     async with AsyncSessionLocal() as db:
         try:
             await ToolCatalogService(db).sync_builtins()
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    # 官方预置同步要校验 tool_key，必须排在工具目录同步之后；同样自行提交，失败则回滚并中止启动。
+    async with AsyncSessionLocal() as db:
+        try:
+            await sync_official_presets(db)
             await db.commit()
         except Exception:
             await db.rollback()

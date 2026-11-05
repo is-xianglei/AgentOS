@@ -31,6 +31,8 @@ class UserResponse(BaseModel):
     phone: str | None = Field(default=None, description="手机号")
     email_verified: bool = Field(default=False, description="邮箱是否验证")
     suspended: bool = Field(default=False, description="是否被暂停使用")
+    # 只读：任何请求 Schema 都不接收这个字段，前端据此决定是否显示审核页。
+    is_platform_admin: bool = Field(default=False, description="是否平台管理员")
     auth_provider: str = Field(default="local", description="认证提供商")
     preferences: dict = Field(default_factory=dict, description="用户偏好设置")
     last_login_at: datetime | None = Field(default=None, description="最后登录时间")

@@ -88,6 +88,12 @@ class ToolCatalogRepository:
         stmt = select(ToolRecord).where(ToolRecord.runtime_name.in_(runtime_names))
         return list(await self.db.scalars(stmt))
 
+    async def list_by_tool_keys(self, tool_keys: list[str]) -> list[ToolRecord]:
+        if not tool_keys:
+            return []
+        stmt = select(ToolRecord).where(ToolRecord.tool_key.in_(tool_keys))
+        return list(await self.db.scalars(stmt))
+
     async def list_page(
         self,
         *,

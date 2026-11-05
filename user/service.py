@@ -52,6 +52,17 @@ class UserService:
         )
         return user
 
+    async def lock_and_check_first_user(self) -> bool:
+        """判断即将注册的用户是否为平台首个用户，是则应设为平台管理员。
+
+        必须在注册事务里、插入新用户之前调用。先取咨询锁再查表：并发注册会在锁上排队，
+        后到者拿到锁时先到者已提交，能查到对方的用户，不会两人都被判成首个用户。
+        软删除的用户也算已有用户，平台管理员不会因为删号而转给后来者。
+        """
+        await self.repo.lock_first_user_check()
+        has_user = await self.repo.has_any_user()
+        return not has_user
+
     async def get_user(self, user_id: int) -> UserRecord:
         """获取用户详情"""
         user = await self.repo.get_by_id(user_id)

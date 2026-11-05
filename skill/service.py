@@ -4,7 +4,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,7 @@ from skill.parser import (
     SkillBundle,
     build_skill_md,
     build_skill_zip,
+    compute_skill_hash,
     decode_file,
     guess_mime,
     normalize_relative_path,
@@ -48,6 +49,24 @@ class SkillArchive:
 
     name: str
     data: bytes
+
+
+# 按快照安装 Skill 时的处理方式：create 新建，restore 恢复同名的软删记录，
+# reuse 复用内容相同的同名记录，conflict 同名记录内容不同。
+SkillInstallAction = Literal["create", "restore", "reuse", "conflict"]
+
+
+@dataclass(frozen=True)
+class SkillInstallDecision:
+    """按快照安装 Skill 的判定结果。
+
+    skill_id 是处理后对应的 Skill：恢复、复用、冲突时为同名记录的 ID；
+    新建时预览阶段还没有 ID 所以为空，实际安装后为新记录的 ID。
+    """
+
+    name: str
+    action: SkillInstallAction
+    skill_id: int | None
 
 
 class SkillService:
@@ -372,6 +391,85 @@ class SkillService:
         enabled = {record.id: record.name for record in records if record.is_enabled}
         return tuple(enabled[skill_id] for skill_id in normalized if skill_id in enabled)
 
+    async def build_snapshot(self, workspace_id: int, skill_id: int) -> dict[str, Any]:
+        """生成 Skill 快照，字段与 SkillBundle 一致；已禁用的也能生成，不含 ID 和启用状态。"""
+        record = await self._require_skill(workspace_id, skill_id)
+        extra_files: dict[str, dict[str, str]] = {}
+        for relative_path, entry in record.extra_files.items():
+            extra_files[relative_path] = dict(entry)
+        return {
+            "name": record.name,
+            "content": record.content,
+            "extra_files": extra_files,
+            # 按内容现算，不依赖库里可能为空的 skill_hash 列。
+            "skill_hash": compute_skill_hash(record.content, extra_files),
+        }
+
+    async def preview_install_from_snapshot(
+        self,
+        workspace_id: int,
+        snapshot: dict[str, Any],
+    ) -> SkillInstallDecision:
+        """判定按快照安装时会怎么处理；只读，不写库也不加锁，安装预览只调这个方法。"""
+        bundle = _bundle_from_snapshot(snapshot)
+        existing = await self.repo.get_by_name_including_deleted(workspace_id, bundle.name)
+        return _decide_install(bundle, existing)
+
+    async def install_from_snapshot(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        snapshot: dict[str, Any],
+    ) -> SkillInstallDecision:
+        """按快照安装 Skill：新建或恢复时写库，复用时不写库，冲突时报 409。
+
+        判定与预览用同一个 _decide_install，区别只是这里先加行锁再判定，
+        防止判定之后、写库之前同名记录被并发请求改掉。
+        """
+        await self._require_write_access(workspace_id, actor_user_id)
+        bundle = _bundle_from_snapshot(snapshot)
+        existing = await self.repo.lock_by_name(workspace_id, bundle.name)
+        decision = _decide_install(bundle, existing)
+        if decision.action == "conflict":
+            raise AgentException.message(
+                f"skill 名称已存在且内容不同: {bundle.name}",
+                {"name": bundle.name},
+                status_code=409,
+            )
+        if decision.action == "reuse":
+            return decision
+
+        # 新建和恢复都交给 _create：同名软删记录由 repo.save 原地复活，沿用原 ID。
+        record = await self._create(workspace_id, actor_user_id, bundle)
+        return SkillInstallDecision(name=record.name, action=decision.action, skill_id=record.id)
+
+    async def overwrite_from_snapshot(
+        self,
+        workspace_id: int,
+        skill_id: int,
+        actor_user_id: int,
+        snapshot: dict[str, Any],
+    ) -> SkillRecord:
+        """用快照覆盖指定 Skill；名称必须与记录一致，内容哈希不变时不写库。"""
+        await self._require_write_access(workspace_id, actor_user_id)
+        record = await self._require_skill(workspace_id, skill_id)
+        bundle = _bundle_from_snapshot(snapshot)
+        if bundle.name != record.name:
+            raise AgentException.message(
+                f"快照的 name 与目标 skill 不一致: 目标为 {record.name},快照为 {bundle.name}",
+                {"name": record.name, "snapshot_name": bundle.name},
+                status_code=400,
+            )
+        return await self._update(workspace_id, actor_user_id, record, bundle)
+
+    async def filter_existing_ids(self, workspace_id: int, skill_ids: list[int]) -> set[int]:
+        """返回其中仍存在（未软删除）的 Skill ID，已禁用的也算存在；不存在的不报错。"""
+        records = await self.repo.list_by_ids(workspace_id, list(dict.fromkeys(skill_ids)))
+        existing_ids: set[int] = set()
+        for record in records:
+            existing_ids.add(record.id)
+        return existing_ids
+
     async def delete_skill(
         self,
         workspace_id: int,
@@ -448,6 +546,29 @@ def _name_conflict(name: str) -> AgentException:
         {"name": name},
         status_code=409,
     )
+
+
+def _bundle_from_snapshot(snapshot: dict[str, Any]) -> SkillBundle:
+    """把 Skill 快照还原成 SkillBundle：走与上传相同的 SKILL.md 校验，并核对名称和哈希。"""
+    bundle = SkillBundle.from_content(snapshot["content"], snapshot["extra_files"])
+    if bundle.name != snapshot["name"] or bundle.skill_hash != snapshot["skill_hash"]:
+        raise AgentException.message(
+            f"Skill 快照的名称或哈希与内容不一致: {snapshot['name']}",
+            {"name": snapshot["name"]},
+            status_code=400,
+        )
+    return bundle
+
+
+def _decide_install(bundle: SkillBundle, existing: SkillRecord | None) -> SkillInstallDecision:
+    """按同名记录的状态判定处理方式；预览和实际安装共用这一个函数，保证两者结果一致。"""
+    if existing is None:
+        return SkillInstallDecision(name=bundle.name, action="create", skill_id=None)
+    if existing.is_deleted:
+        return SkillInstallDecision(name=bundle.name, action="restore", skill_id=existing.id)
+    if existing.skill_hash == bundle.skill_hash:
+        return SkillInstallDecision(name=bundle.name, action="reuse", skill_id=existing.id)
+    return SkillInstallDecision(name=bundle.name, action="conflict", skill_id=existing.id)
 
 
 def _resource_items(extra_files: dict[str, dict[str, str]]) -> list[SkillResourceItem]:

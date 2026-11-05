@@ -69,6 +69,14 @@ class WorkspaceService:
             raise AgentException.message("工作区不存在")
         return workspace
 
+    async def get_display_names_by_ids(self, workspace_ids: list[int]) -> dict[int, str]:
+        """按 ID 批量取工作区展示名；已删除或不存在的工作区不出现在结果中，由调用方决定怎么显示。"""
+        workspaces = await self.repo.list_by_ids(list(dict.fromkeys(workspace_ids)))
+        display_names: dict[int, str] = {}
+        for workspace in workspaces:
+            display_names[workspace.id] = workspace.display_name
+        return display_names
+
     async def list_workspaces(
         self,
         limit: int = 100,
