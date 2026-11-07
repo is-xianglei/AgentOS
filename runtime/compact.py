@@ -102,7 +102,7 @@ class CompactService:
     def _micro_compact(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """L1 微压缩:把最近 3 条以外的旧工具结果原地替换为占位符。
 
-        遍历的是中立上下文:工具结果是 role="tool" 的 ToolResultMessage dict,
+        遍历的是中立上下文:工具结果是 role="tool" 的 ToolResult dict,
         自带 tool_name,无需再从 assistant 的 tool_use 块反查;语义不随 provider 变。
         - 仅当历史工具结果超过 3 条时才动手;
         - 跳过最近 3 条工具结果(保留近期上下文完整);

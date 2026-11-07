@@ -49,7 +49,7 @@ class TurnEventAssembler:
     def last_result(self) -> LLMTurnResult:
         """最近一次 consume 收到的终局结果;尚未消费任何流时抛错。
 
-        返回空结果会被 runtime 读成「无 tool_uses」导致 ReAct 静默截断,故必须抛。
+        返回空结果会被 runtime 读成「无 tool_calls」导致 ReAct 静默截断,故必须抛。
         """
         if self._last_result is None:
             raise AgentException.message("尚未消费任何 LLM 流,无终局结果可读")

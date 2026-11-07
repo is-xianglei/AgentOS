@@ -13,7 +13,8 @@ import pytest
 
 from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
 from core.events import ORCHESTRATOR_ACTOR
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, ToolUse
+from harness.domain.messages import ToolCall
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from prompt import PromptContext, compose_lead_blocks
 from prompt.sections import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
@@ -211,7 +212,7 @@ async def test_no_workspace_or_no_enabled_agent_means_no_catalog(
     assert runtime.delegate_catalog is None
 
 
-# ---------- _execute_tool_uses:透传本轮实际生效的工具名单 ----------
+# ---------- _execute_tool_calls:透传本轮实际生效的工具名单 ----------
 
 
 def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[AgentRuntime, list]:
@@ -234,13 +235,13 @@ def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[Ag
 
 
 async def _execute(runtime: AgentRuntime, tool_input: dict[str, Any]) -> None:
-    await runtime._execute_tool_uses(
+    await runtime._execute_tool_calls(
         1,
         SimpleNamespace(),
         SimpleNamespace(id=uuid4()),
         ORCHESTRATOR_ACTOR,
         99,
-        [ToolUse(id="t1", name="Agent", input=tool_input)],
+        [ToolCall(id="t1", tool_name="Agent", arguments=tool_input)],
         done_ids=[],
         additional_context=None,
     )

@@ -5,8 +5,9 @@ from typing import Any
 
 import pytest
 
-from core.events import BlockType, ORCHESTRATOR_ACTOR, ToolInfo
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, ToolUse
+from core.events import ORCHESTRATOR_ACTOR, BlockType, ToolInfo
+from harness.domain.messages import ToolCall
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
@@ -80,8 +81,8 @@ async def test_agent_step_assembles_stream_and_neutral_blocks() -> None:
 
 @pytest.mark.anyio
 async def test_agent_step_returns_tool_uses_in_result() -> None:
-    tool_use = ToolUse(id="call-1", name="Read", input={"path": "a.py"})
-    result = LLMTurnResult(text="", tool_uses=[tool_use])
+    tool_call = ToolCall(id="call-1", tool_name="Read", arguments={"path": "a.py"})
+    result = LLMTurnResult(text="", tool_calls=[tool_call])
     events = [
         LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TOOL_USE),
         LLMStreamEvent(
@@ -102,7 +103,7 @@ async def test_agent_step_returns_tool_uses_in_result() -> None:
         emit,
     ).run(StepRequest([], None, ToolRegistry([])))
 
-    assert actual.tool_uses == [tool_use]
+    assert actual.tool_calls == [tool_call]
     assert actual.assistant_blocks == [
         {"kind": "tool_use", "id": "call-1", "name": "Read", "input": {"path": "a.py"}}
     ]

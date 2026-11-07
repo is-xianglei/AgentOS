@@ -28,7 +28,8 @@ import database.engine  # noqa: F401  副作用注册全部映射与全局软删
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, build_assistant_blocks
+from harness.domain.messages import AssistantMessage
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from memory.jobs.dream import MemoryDreamService
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.models import MemoryItemRecord, MemoryJobRecord
@@ -214,7 +215,7 @@ async def _extract_turn(shared: _Shared, ids, session_id: int, llm: _FakeLLM) ->
         reply = await service.add_message(
             session_id,
             "assistant",
-            build_assistant_blocks("好的，已记住。", []),
+            AssistantMessage.from_turn("好的，已记住。", []).to_content(),
             turn_id=turn.id,
         )
         await service.mark_turn_status(turn, "completed", completed_message_id=reply.id)

@@ -409,7 +409,7 @@ class ToolService:
             return denied
 
         # PreToolUse:可拦截(block)或改写入参(updated_input)。permission 已在
-        # 更高层(orchestrator _execute_tool_uses)裁决过,此处 hook 只能更严,不能提权。
+        # 更高层(orchestrator _execute_tool_calls)裁决过,此处 hook 只能更严,不能提权。
         pre_outcomes = await hooks.trigger(
             HookContext(
                 event=HookEvent.PRE_TOOL_USE,

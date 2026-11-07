@@ -19,7 +19,7 @@ from typing import Any
 
 from core.events import ActorRole
 from core.run_state import ActorState, Block, TurnState
-from llm.types import ToolResultMessage, ToolUse, build_assistant_blocks
+from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from session.service import MessageDraft
 
 CANCELLED_TOOL_OUTPUT = "用户取消了本轮执行，该工具调用未完成，结果未知。"
@@ -80,26 +80,26 @@ def _round_messages(blocks: list[Block]) -> list[MessageDraft]:
     if not text.strip():
         text = ""
 
-    tool_blocks: list[tuple[Block, ToolUse]] = []
+    tool_blocks: list[tuple[Block, ToolCall]] = []
     for block in blocks:
         if block.kind != "tool_use":
             continue
-        tool_use = _complete_tool_use(block)
-        if tool_use is not None:
-            tool_blocks.append((block, tool_use))
+        tool_call = _complete_tool_use(block)
+        if tool_call is not None:
+            tool_blocks.append((block, tool_call))
 
     if not text and not tool_blocks:
         return []
 
-    tool_uses = [tool_use for _, tool_use in tool_blocks]
-    drafts = [MessageDraft("assistant", build_assistant_blocks(text, tool_uses))]
-    for block, tool_use in tool_blocks:
-        result = _tool_result(tool_use, block.result)
-        drafts.append(MessageDraft("tool", result.to_content_dict()))
+    tool_calls = [tool_call for _, tool_call in tool_blocks]
+    drafts = [MessageDraft("assistant", AssistantMessage.from_turn(text, tool_calls).to_content())]
+    for block, tool_call in tool_blocks:
+        result = _tool_result(tool_call, block.result)
+        drafts.append(MessageDraft("tool", result.to_content()))
     return drafts
 
 
-def _complete_tool_use(block: Block) -> ToolUse | None:
+def _complete_tool_use(block: Block) -> ToolCall | None:
     """tool_use 事件在入参完整后才发出;只见 block_start 的块没有可回放的调用。"""
     tool = block.tool or {}
     tool_id = tool.get("id")
@@ -114,22 +114,22 @@ def _complete_tool_use(block: Block) -> ToolUse | None:
         tool_input = raw_input
     else:
         tool_input = {}
-    return ToolUse(id=tool_id, name=name, input=tool_input)
+    return ToolCall(id=tool_id, tool_name=name, arguments=tool_input)
 
 
-def _tool_result(tool_use: ToolUse, result: dict[str, Any] | None) -> ToolResultMessage:
+def _tool_result(tool_call: ToolCall, result: dict[str, Any] | None) -> ToolResult:
     if result is None:
-        return ToolResultMessage(
-            tool_use_id=tool_use.id,
-            tool_name=tool_use.name,
-            input_args=tool_use.input,
-            output=CANCELLED_TOOL_OUTPUT,
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.tool_name,
+            arguments=tool_call.arguments,
+            content=CANCELLED_TOOL_OUTPUT,
             is_error=True,
         )
-    return ToolResultMessage(
-        tool_use_id=tool_use.id,
-        tool_name=tool_use.name,
-        input_args=tool_use.input,
-        output=str(result.get("output") or ""),
+    return ToolResult(
+        tool_call_id=tool_call.id,
+        tool_name=tool_call.tool_name,
+        arguments=tool_call.arguments,
+        content=str(result.get("output") or ""),
         is_error=bool(result.get("is_error")),
     )

@@ -40,9 +40,9 @@ async def redis_test_clients():
 @pytest.fixture
 def assert_replayable():
     """断言中立消息历史可直接作为下一轮请求:两家出站编码都不报错,tool_use 与结果一一配对。"""
+    from harness.domain.messages import AssistantMessage
     from llm.anthropic_client import AnthropicClient
     from llm.openai_client import OpenAIClient
-    from llm.types import ToolUseBlock, parse_assistant_blocks
 
     def check(messages: list[dict]) -> None:
         pending: set[str] = set()
@@ -51,9 +51,8 @@ def assert_replayable():
                 assert not pending, f"tool_use 缺少对应结果: {pending}"
                 assert all("type" not in block for block in message["content"])
                 pending = {
-                    block.id
-                    for block in parse_assistant_blocks(message["content"])
-                    if isinstance(block, ToolUseBlock)
+                    tool_call.id
+                    for tool_call in AssistantMessage.from_content(message["content"]).tool_calls
                 }
             elif message["role"] == "tool":
                 assert message["content"]["tool_use_id"] in pending

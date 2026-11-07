@@ -10,7 +10,8 @@ from typing import Any, Self
 import pytest
 
 from agent.service import AgentRuntimeConfig
-from llm.types import LLMTurnResult, ToolUse
+from harness.domain.messages import ToolCall
+from llm.types import LLMTurnResult
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from tools.base import ToolContext
@@ -222,10 +223,10 @@ async def test_delegate_run_record_and_events_carry_agent_id(
 # ---------- ask 坍缩为拒绝,结果末尾追加被拒摘要 ----------
 
 
-def _script_llm(runner: SubAgentRunner, tool_uses: list[ToolUse]) -> None:
+def _script_llm(runner: SubAgentRunner, tool_calls: list[ToolCall]) -> None:
     """第一轮按给定 tool_use 调工具,第二轮给出最终文本。"""
     results = [
-        LLMTurnResult(tool_uses=tool_uses, stop_reason="tool_use"),
+        LLMTurnResult(tool_calls=tool_calls, stop_reason="tool_use"),
         LLMTurnResult(text="子 Agent 结论", stop_reason="end_turn"),
     ]
 
@@ -258,10 +259,10 @@ def _script_permissions(
 
 
 _DENIAL_SCRIPT = [
-    ToolUse(id="t1", name="Read", input={"file_path": "a.py"}),
-    ToolUse(id="t2", name="Write", input={"file_path": "b.py", "content": "x" * 500}),
-    ToolUse(id="t3", name="Bash", input={"command": "ls"}),
-    ToolUse(id="t4", name="Agent", input={"prompt": "再派一个"}),
+    ToolCall(id="t1", tool_name="Read", arguments={"file_path": "a.py"}),
+    ToolCall(id="t2", tool_name="Write", arguments={"file_path": "b.py", "content": "x" * 500}),
+    ToolCall(id="t3", tool_name="Bash", arguments={"command": "ls"}),
+    ToolCall(id="t4", tool_name="Agent", arguments={"prompt": "再派一个"}),
 ]
 
 
@@ -295,7 +296,7 @@ async def test_denied_calls_are_summarized_at_end_of_delegate_report(
 
 async def test_no_denial_means_no_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     runner, _, _, _ = _stub_runner(monkeypatch, fake_loop=False)
-    _script_llm(runner, [ToolUse(id="t1", name="Read", input={"file_path": "a.py"})])
+    _script_llm(runner, [ToolCall(id="t1", tool_name="Read", arguments={"file_path": "a.py"})])
     _script_permissions(monkeypatch, runner, {"Read": "allow"})
 
     report = await runner.run(_SID, "审稿", _delegate_spec())
@@ -308,7 +309,7 @@ async def test_workflow_member_report_is_unchanged_even_with_denials(
 ) -> None:
     """被拒摘要只属于委派路径,Workflow 成员的输出保持原样。"""
     runner, _, _, _ = _stub_runner(monkeypatch, fake_loop=False)
-    _script_llm(runner, [ToolUse(id="t2", name="Write", input={"file_path": "b.py"})])
+    _script_llm(runner, [ToolCall(id="t2", tool_name="Write", arguments={"file_path": "b.py"})])
     _script_permissions(monkeypatch, runner, {"Write": "ask"})
     spec = build_agent_spec(_config(), display_name="wf-审稿人", tool_profile="workflow_node")
 

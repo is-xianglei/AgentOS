@@ -169,19 +169,19 @@ async def test_turn_result_exposes_usage_and_stop_reason() -> None:
     )
     # 终局解析收归客户端:text 由 TURN_RESULT 带出,不再透传 provider 形状内容。
     assert result.text == "你好，世界"
-    assert result.tool_uses == []
+    assert result.tool_calls == []
 
 
 async def test_turn_result_carries_tool_uses() -> None:
-    """runtime 不再自行解析 message_final:tool_uses 由 TURN_RESULT 带出。"""
+    """runtime 不再自行解析 message_final:tool_calls 由 TURN_RESULT 带出。"""
     assembler = _new_assembler()
     await _run_call(assembler, CHUNKS_TEXT_AND_TOOL_USE)
     result = assembler.last_result
-    assert len(result.tool_uses) == 1
-    tool_use = result.tool_uses[0]
-    assert tool_use.id == "toolu_01"
-    assert tool_use.name == "file_read"
-    assert tool_use.input == {"path": "a.txt"}
+    assert len(result.tool_calls) == 1
+    tool_call = result.tool_calls[0]
+    assert tool_call.id == "toolu_01"
+    assert tool_call.tool_name == "file_read"
+    assert tool_call.arguments == {"path": "a.txt"}
     assert result.stop_reason == "tool_use"
 
 

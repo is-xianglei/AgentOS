@@ -12,14 +12,8 @@ from typing import Any
 
 import pytest
 
-from llm.types import (
-    LLMEventKind,
-    LLMStreamEvent,
-    LLMTurnResult,
-    ToolResultMessage,
-    ToolUse,
-    build_assistant_blocks,
-)
+from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from memory.jobs.extraction import MemoryExtractionService
 from runtime.compact import CompactService
 from session.service import SessionService
@@ -32,13 +26,13 @@ def _msg(message_id: int, role: str, content: Any) -> Any:
 
 
 def _tool_content(tool_use_id: str, tool_name: str, output: str, is_error: bool = False) -> dict:
-    return ToolResultMessage(
-        tool_use_id=tool_use_id,
+    return ToolResult(
+        tool_call_id=tool_use_id,
         tool_name=tool_name,
-        input_args={},
-        output=output,
+        arguments={},
+        content=output,
         is_error=is_error,
-    ).to_content_dict()
+    ).to_content()
 
 
 def _service() -> SessionService:
@@ -48,13 +42,13 @@ def _service() -> SessionService:
 
 def test_messages_to_context_passes_neutral_shapes_through() -> None:
     """步 10:三类角色原样透出中立形状,不再编 tool_result 块、不再合并。"""
-    assistant_blocks = build_assistant_blocks(
+    assistant_blocks = AssistantMessage.from_turn(
         "读两个文件",
         [
-            ToolUse(id="t1", name="file_read", input={"path": "a.txt"}),
-            ToolUse(id="t2", name="file_read", input={"path": "b.txt"}),
+            ToolCall(id="t1", tool_name="file_read", arguments={"path": "a.txt"}),
+            ToolCall(id="t2", tool_name="file_read", arguments={"path": "b.txt"}),
         ],
-    )
+    ).to_content()
     messages = [
         _msg(1, "user", "看下 a 和 b"),
         _msg(2, "assistant", assistant_blocks),
@@ -70,7 +64,7 @@ def test_messages_to_context_passes_neutral_shapes_through() -> None:
     assert context[1]["content"] == assistant_blocks
     assert context[2]["content"]["output"] == "内容A"
     assert context[3]["content"]["is_error"] is True
-    # 上下文中无任何 provider wire 判别键(tool_use_id 属 ToolResultMessage 自有协议,不算)。
+    # 上下文中无任何 provider wire 判别键(tool_use_id 属 ToolResult 自有协议,不算)。
     serialized = json.dumps(context, ensure_ascii=False)
     assert '"type"' not in serialized
     # deepcopy 隔离:改上下文不得写回落库对象。
@@ -138,9 +132,9 @@ async def test_auto_compact_snapshot_stores_neutral_shape() -> None:
         {"role": "user", "content": "查一下日志"},
         {
             "role": "assistant",
-            "content": build_assistant_blocks(
-                "", [ToolUse(id="t1", name="grep", input={"pattern": "error"})]
-            ),
+            "content": AssistantMessage.from_turn(
+                "", [ToolCall(id="t1", tool_name="grep", arguments={"pattern": "error"})]
+            ).to_content(),
         },
         {"role": "tool", "content": _tool_content("t1", "grep", "X" * 600)},
     ]
@@ -159,9 +153,10 @@ def test_verification_trigger_matches_neutral_kind() -> None:
     neutral = [
         {
             "role": "assistant",
-            "content": build_assistant_blocks(
-                "", [ToolUse(id="t1", name="Write", input={"file_path": "user/service.py"})]
-            ),
+            "content": AssistantMessage.from_turn(
+                "",
+                [ToolCall(id="t1", tool_name="Write", arguments={"file_path": "user/service.py"})],
+            ).to_content(),
         }
     ]
     assessment = assess(neutral)
@@ -186,9 +181,9 @@ def test_verification_trigger_matches_neutral_kind() -> None:
 
 def test_extraction_projects_neutral_assistant_text() -> None:
     """步 14:记忆抽取按 kind == "text" 取 assistant 文本,不再拿到空串。"""
-    blocks = build_assistant_blocks(
-        "结论在这", [ToolUse(id="t1", name="grep", input={})]
-    )
+    blocks = AssistantMessage.from_turn(
+        "结论在这", [ToolCall(id="t1", tool_name="grep", arguments={})]
+    ).to_content()
     projected = MemoryExtractionService._project_message(
         _msg(11, "assistant", blocks)
     )

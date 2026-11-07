@@ -31,9 +31,9 @@ from core.events import (
 )
 from core.run_events import LocalRunEventStore
 from core.run_state import restore
+from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from interaction.schemas import InteractionRequestCreate
 from interaction.service import InteractionService
-from llm.types import ToolResultMessage, ToolUse, build_assistant_blocks
 from runtime import execution, recovery, turn_follow
 from runtime.agent import AgentRuntime
 from runtime.cancel_partial import CANCELLED_TOOL_OUTPUT
@@ -146,18 +146,18 @@ async def _write_uncommitted(shared: _Shared, session_id: int, turn_id, rows) ->
             await service.add_message(session_id, role, content, turn_id=turn_id)
 
 
-def _use(tool_id: str) -> ToolUse:
-    return ToolUse(id=tool_id, name="Read", input={"path": f"{tool_id}.txt"})
+def _use(tool_id: str) -> ToolCall:
+    return ToolCall(id=tool_id, tool_name="Read", arguments={"path": f"{tool_id}.txt"})
 
 
 def _result(tool_id: str, output: str, *, is_error: bool = False) -> dict[str, Any]:
-    return ToolResultMessage(
-        tool_use_id=tool_id,
+    return ToolResult(
+        tool_call_id=tool_id,
         tool_name="Read",
-        input_args={"path": f"{tool_id}.txt"},
-        output=output,
+        arguments={"path": f"{tool_id}.txt"},
+        content=output,
         is_error=is_error,
-    ).to_content_dict()
+    ).to_content()
 
 
 async def _emit_text(bus, sid: int, index: int, *chunks: str, close: bool = True) -> None:
@@ -244,9 +244,9 @@ async def test_local_cancel_during_tool_saves_partial_atomically(
             session_id,
             turn_id,
             [
-                ("assistant", build_assistant_blocks("先读文件", [_use("a")])),
+                ("assistant", AssistantMessage.from_turn("先读文件", [_use("a")]).to_content()),
                 ("tool", _result("a", "内容A")),
-                ("assistant", build_assistant_blocks("再读一个", [_use("b")])),
+                ("assistant", AssistantMessage.from_turn("再读一个", [_use("b")]).to_content()),
             ],
         )
         blocked.set()
@@ -266,9 +266,9 @@ async def test_local_cancel_during_tool_saves_partial_atomically(
     assert (termination.status, termination.session_status) == ("interrupted", "idle")
     assert await _rows(shared, session_id) == [
         ("user", "问题"),
-        ("assistant", build_assistant_blocks("先读文件", [_use("a")])),
+        ("assistant", AssistantMessage.from_turn("先读文件", [_use("a")]).to_content()),
         ("tool", _result("a", "内容A")),
-        ("assistant", build_assistant_blocks("再读一个", [_use("b")])),
+        ("assistant", AssistantMessage.from_turn("再读一个", [_use("b")]).to_content()),
         ("tool", _result("b", CANCELLED_TOOL_OUTPUT, is_error=True)),
     ]
     turn = await _turn(shared, turn_id)
@@ -380,7 +380,7 @@ async def test_cross_process_cancel_restores_partial_from_snapshot(
     assert (termination.status, termination.session_status) == ("interrupted", "idle")
     assert await _rows(shared, session_id) == [
         ("user", "问题"),
-        ("assistant", build_assistant_blocks("查一下", [_use("a")])),
+        ("assistant", AssistantMessage.from_turn("查一下", [_use("a")]).to_content()),
         ("tool", _result("a", "内容A")),
         ("assistant", [{"kind": "text", "text": "跨进程写了一半"}]),
     ]
@@ -556,7 +556,7 @@ async def _suspend(shared: _Shared, ids, store) -> tuple[int, uuid.UUID, uuid.UU
             message = await service.add_message(
                 session_id,
                 "assistant",
-                build_assistant_blocks("需要审批", [_use("w")]),
+                AssistantMessage.from_turn("需要审批", [_use("w")]).to_content(),
                 turn_id=turn_id,
             )
             record = await ToolService(db, build_tool_registry()).start_call(

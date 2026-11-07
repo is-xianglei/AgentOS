@@ -9,8 +9,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from harness.domain.messages import AssistantMessage, ToolCall
 from llm import BaseLLMClient
-from llm.types import LLMTurnResult, PromptBlock, ToolUse, build_assistant_blocks
+from llm.types import LLMTurnResult, PromptBlock
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
 
@@ -33,8 +34,8 @@ class StepResult:
     assistant_blocks: list[dict[str, Any]]
 
     @property
-    def tool_uses(self) -> list[ToolUse]:
-        return self.llm_result.tool_uses
+    def tool_calls(self) -> list[ToolCall]:
+        return self.llm_result.tool_calls
 
     @property
     def text(self) -> str:
@@ -72,9 +73,9 @@ class AgentStep:
         result = self._assembler.last_result
         return StepResult(
             llm_result=result,
-            assistant_blocks=build_assistant_blocks(
+            assistant_blocks=AssistantMessage.from_turn(
                 result.text,
-                result.tool_uses,
+                result.tool_calls,
                 result.thinking,
-            ),
+            ).to_content(),
         )

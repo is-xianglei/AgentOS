@@ -14,18 +14,12 @@ from anthropic import NOT_GIVEN
 
 from core.errors import AgentException
 from core.events import BlockType
+from harness.domain.messages import AssistantMessage, ThinkingBlock, ToolCall
 from llm import anthropic_client as anthropic_module
 from llm import openai_client as openai_module
 from llm.anthropic_client import AnthropicClient, _AnthropicChunkAdapter, _thinking_param
 from llm.openai_client import OpenAIClient, _OpenAIChunkAdapter
-from llm.types import (
-    LLMEventKind,
-    LLMTurnResult,
-    ThinkingSegment,
-    ToolUse,
-    build_assistant_blocks,
-    parse_assistant_blocks,
-)
+from llm.types import LLMEventKind, LLMTurnResult
 from tests.fixtures.anthropic_chunks import (
     CHUNKS_REDACTED_THINKING,
     CHUNKS_THINKING_TEXT_INTERLEAVED,
@@ -53,8 +47,8 @@ def test_anthropic_terminal_thinking_ordered_with_signatures() -> None:
     result = _final_result(_AnthropicChunkAdapter(), CHUNKS_THINKING_TEXT_INTERLEAVED)
 
     assert result.thinking == [
-        ThinkingSegment(text="先分析需求", signature="sig_abc"),
-        ThinkingSegment(text="再核对边界", signature="sig_def"),
+        ThinkingBlock(text="先分析需求", signature="sig_abc"),
+        ThinkingBlock(text="再核对边界", signature="sig_def"),
     ]
     # 思考不混进正文:text 只含 text 块内容。
     assert result.text == "初步结论"
@@ -64,7 +58,7 @@ def test_anthropic_redacted_thinking_extracted() -> None:
     """AC6:redacted_thinking 进终局段,加密载荷落在 redacted_data。"""
     result = _final_result(_AnthropicChunkAdapter(), CHUNKS_REDACTED_THINKING)
 
-    assert result.thinking == [ThinkingSegment(redacted_data="encrypted_payload_xyz")]
+    assert result.thinking == [ThinkingBlock(redacted_data="encrypted_payload_xyz")]
     assert result.text == "换个说法回答"
 
 
@@ -98,14 +92,14 @@ def test_anthropic_unknown_block_type_raises() -> None:
 
 def test_build_blocks_puts_thinking_first_in_order() -> None:
     """AC2:思考块排在最前且保持原序,文本块随后。"""
-    blocks = build_assistant_blocks(
+    blocks = AssistantMessage.from_turn(
         "初步结论",
         [],
         [
-            ThinkingSegment(text="先分析需求", signature="sig_abc"),
-            ThinkingSegment(text="再核对边界", signature="sig_def"),
+            ThinkingBlock(text="先分析需求", signature="sig_abc"),
+            ThinkingBlock(text="再核对边界", signature="sig_def"),
         ],
-    )
+    ).to_content()
 
     assert [b["kind"] for b in blocks] == ["thinking", "thinking", "text"]
     assert [b.get("signature") for b in blocks[:2]] == ["sig_abc", "sig_def"]
@@ -113,31 +107,31 @@ def test_build_blocks_puts_thinking_first_in_order() -> None:
 
 def test_build_blocks_skips_empty_thinking() -> None:
     """既无文本也无加密载荷的思考段不产出空块。"""
-    blocks = build_assistant_blocks("答案", [], [ThinkingSegment()])
+    blocks = AssistantMessage.from_turn("答案", [], [ThinkingBlock()]).to_content()
 
     assert [b["kind"] for b in blocks] == ["text"]
 
 
 def test_thinking_blocks_round_trip_through_persistence() -> None:
     """AC2:落库形状 → parse → 再落库,签名与顺序逐字段不变。"""
-    original = build_assistant_blocks(
+    original = AssistantMessage.from_turn(
         "结论",
         [],
         [
-            ThinkingSegment(text="思考一", signature="sig_1"),
-            ThinkingSegment(redacted_data="enc_2"),
-            ThinkingSegment(text="思考三", signature="sig_3"),
+            ThinkingBlock(text="思考一", signature="sig_1"),
+            ThinkingBlock(redacted_data="enc_2"),
+            ThinkingBlock(text="思考三", signature="sig_3"),
         ],
-    )
+    ).to_content()
 
-    parsed = parse_assistant_blocks(original)
-    assert [b.to_dict() for b in parsed] == original
+    parsed = AssistantMessage.from_content(original)
+    assert [b.to_dict() for b in parsed.blocks] == original
 
 
 def test_legacy_thinking_wire_shape_raises() -> None:
     """残留的 Anthropic wire 形状(带 type 而非 kind)当场抛错,不静默误读。"""
     with pytest.raises(AgentException) as excinfo:
-        parse_assistant_blocks([{"type": "thinking", "thinking": "x", "signature": "s"}])
+        AssistantMessage.from_content([{"type": "thinking", "thinking": "x", "signature": "s"}])
 
     assert "kind 未知或缺失" in str(excinfo.value)
 
@@ -153,14 +147,14 @@ def _encode_assistant(client: Any, blocks: list[dict[str, Any]]) -> dict[str, An
 
 def test_anthropic_encodes_thinking_blocks_in_order() -> None:
     """AC6:思考块与加密块原样编成 wire,顺序不重排。"""
-    blocks = build_assistant_blocks(
+    blocks = AssistantMessage.from_turn(
         "结论",
         [],
         [
-            ThinkingSegment(text="思考一", signature="sig_1"),
-            ThinkingSegment(redacted_data="enc_2"),
+            ThinkingBlock(text="思考一", signature="sig_1"),
+            ThinkingBlock(redacted_data="enc_2"),
         ],
-    )
+    ).to_content()
 
     assert _encode_assistant(_ANTHROPIC, blocks)["content"] == [
         {"type": "thinking", "thinking": "思考一", "signature": "sig_1"},
@@ -174,7 +168,7 @@ def test_anthropic_skips_unsigned_thinking_block() -> None:
 
     签名由 Anthropic 签发且不可伪造,回传缺签名的思考块会被判为篡改。
     """
-    blocks = build_assistant_blocks("结论", [], [ThinkingSegment(text="来自 OpenAI 的思考")])
+    blocks = AssistantMessage.from_turn("结论", [], [ThinkingBlock(text="来自 OpenAI 的思考")]).to_content()
 
     assert _encode_assistant(_ANTHROPIC, blocks)["content"] == [
         {"type": "text", "text": "结论"}
@@ -183,15 +177,15 @@ def test_anthropic_skips_unsigned_thinking_block() -> None:
 
 def test_openai_encodes_thinking_as_reasoning_content() -> None:
     """思考文本拼进 reasoning_content;签名与加密载荷不下发。"""
-    blocks = build_assistant_blocks(
+    blocks = AssistantMessage.from_turn(
         "结论",
         [],
         [
-            ThinkingSegment(text="思考一", signature="sig_1"),
-            ThinkingSegment(redacted_data="enc_2"),
-            ThinkingSegment(text="思考三"),
+            ThinkingBlock(text="思考一", signature="sig_1"),
+            ThinkingBlock(redacted_data="enc_2"),
+            ThinkingBlock(text="思考三"),
         ],
-    )
+    ).to_content()
 
     encoded = _encode_assistant(_OPENAI, blocks)
     assert encoded["reasoning_content"] == "思考一思考三"
@@ -201,7 +195,7 @@ def test_openai_encodes_thinking_as_reasoning_content() -> None:
 
 def test_openai_omits_reasoning_key_without_thinking() -> None:
     """无思考块时不出现 reasoning_content 键,标准端点行为零变化。"""
-    encoded = _encode_assistant(_OPENAI, build_assistant_blocks("结论", [], None))
+    encoded = _encode_assistant(_OPENAI, AssistantMessage.from_turn("结论", [], None).to_content())
 
     assert "reasoning_content" not in encoded
 
@@ -211,7 +205,7 @@ def test_openai_omits_reasoning_key_without_thinking() -> None:
 # F1 的回传约束只在「该回合发生过工具调用」时触发,故 thinking 与 tool_use 同现
 # 才是唯一会触发校验的形状——只测思考块覆盖不到它。
 
-_TOOL_USES = [ToolUse(id="call_1", name="get_weather", input={"city": "上海"})]
+_TOOL_USES = [ToolCall(id="call_1", tool_name="get_weather", arguments={"city": "上海"})]
 _TOOL_WIRE_ANTHROPIC = {
     "type": "tool_use",
     "id": "call_1",
@@ -222,23 +216,23 @@ _TOOL_WIRE_ANTHROPIC = {
 
 def _thinking_text_tool_blocks(signature: str | None = "sig_1") -> list[dict[str, Any]]:
     """构造 thinking + text + tool_use 三块齐全的中立 assistant 消息。"""
-    return build_assistant_blocks(
+    return AssistantMessage.from_turn(
         "上海今天晴",
         _TOOL_USES,
-        [ThinkingSegment(text="先查天气", signature=signature)],
-    )
+        [ThinkingBlock(text="先查天气", signature=signature)],
+    ).to_content()
 
 
 def test_build_blocks_orders_thinking_before_text_and_tool() -> None:
     """AC2:工具块存在时思考块仍排在最前,且两段签名不串位。"""
-    blocks = build_assistant_blocks(
+    blocks = AssistantMessage.from_turn(
         "结论",
         _TOOL_USES,
         [
-            ThinkingSegment(text="先分析", signature="sig_abc"),
-            ThinkingSegment(text="再核对", signature="sig_def"),
+            ThinkingBlock(text="先分析", signature="sig_abc"),
+            ThinkingBlock(text="再核对", signature="sig_def"),
         ],
-    )
+    ).to_content()
 
     assert [b["kind"] for b in blocks] == ["thinking", "thinking", "text", "tool_use"]
     assert [b.get("signature") for b in blocks[:2]] == ["sig_abc", "sig_def"]
@@ -322,18 +316,18 @@ def test_openai_thinking_only_response_closes_at_finish() -> None:
     adapter = _OpenAIChunkAdapter()
     result = _final_result(adapter, _openai_chunks({"reasoning_content": "只想不说"}))
 
-    assert result.thinking == [ThinkingSegment(text="只想不说")]
+    assert result.thinking == [ThinkingBlock(text="只想不说")]
     assert result.text == ""
 
 
 def test_openai_terminal_thinking_merged_without_signature() -> None:
-    """OpenAI 侧无签名概念,整段思考归并为单个无签名 ThinkingSegment。"""
+    """OpenAI 侧无签名概念,整段思考归并为单个无签名 ThinkingBlock。"""
     result = _final_result(
         _OpenAIChunkAdapter(),
         _openai_chunks({"reasoning_content": "先想"}, {"reasoning_content": "再想"}),
     )
 
-    assert result.thinking == [ThinkingSegment(text="先想再想")]
+    assert result.thinking == [ThinkingBlock(text="先想再想")]
 
 
 # ---- 开关与预算校验(AC8、AC9) ----

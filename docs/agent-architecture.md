@@ -10,7 +10,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 
 | 层 | 位置 | 可以依赖 | 不得依赖 |
 |---|---|---|---|
-| 领域层 | harness/domain/ | 标准库、pydantic | app、adapters、feature 包、SQLAlchemy、FastAPI、各家 SDK（类型标注可放 TYPE_CHECKING） |
+| 领域层 | harness/domain/ | 标准库、pydantic、`core.errors`（统一业务异常）、`core.events`（纯值类型） | app、adapters、其余 feature 包、SQLAlchemy、FastAPI、各家 SDK（类型标注可放 TYPE_CHECKING） |
 | 应用层 | harness/app/ | domain、core（配置、错误、事件）、feature 域的 Service | adapters、任何 Repository 和 ORM 查询、各家 SDK |
 | 适配层 | harness/adapters/ | 以上全部、各家 SDK | 被 domain、app 导入 |
 | 组装根 | main.py（进程级单例）、harness/bootstrap.py（按数据库会话装配） | 全部 | — |
@@ -18,13 +18,15 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 - 只有组装根实例化适配器，应用层只认端口。
 - 端口只为两类东西设立：已有或已规划多种实现的外部能力，以及测试需要替身的 I/O。
   其余 feature 域照 CLAUDE.md 继续「Service 调 Service」，不额外造端口。
-- 分层规则由 tests/test_import_isolation.py 做静态检查。
+- 分层规则由 tests/test_import_isolation.py 做静态检查（目前覆盖领域层，按阶段扩展到 app、adapters）。
+  已知缺口：`core.errors` 在模块顶部导入了 fastapi（异常处理器），领域层经它间接依赖 FastAPI；
+  静态检查只看直接导入。阶段 7 把 AgentException 和 HTTP 异常处理器拆到两个模块。
 
 ## 2. 领域层（harness/domain/）
 
 | 文件 | 内容 |
 |---|---|
-| messages.py | `Message = UserMessage \| AssistantMessage \| ToolResult`、`ToolCall(id, tool_name, arguments)`、`ThinkingBlock` |
+| messages.py | 已落地（阶段 1）。`Message = UserMessage \| AssistantMessage \| ToolResult`；`AssistantMessage(blocks)` 的块为 `AssistantBlock = ThinkingBlock \| TextBlock \| ToolCall`；`ToolCall(id, tool_name, arguments)`；`ToolResult(tool_call_id, tool_name, arguments, content, is_error)`；`message_from_row(role, content)` 按角色还原 |
 | session.py | `Session(id, messages, append)`：一次上下文加载得到的会话视图，不是 ORM |
 | context.py | `Context[O](instruction, tools, messages, output_type, memory, project_instructions)` |
 | tool.py | `Tool`、`ToolPolicy`、`ToolContext` |
@@ -34,9 +36,16 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | prompts/ | 各角色的提示文案，逐字保持现状 |
 
 与视频有意不同的地方：
-- AssistantMessage 多带 thinking 块（Anthropic 要求签名原样回传）；ToolResult 多带 tool_name、
-  input_args、is_error（落库和审计要用）。
-- 落库 JSON 形状不变，assistant 块数组的判别键仍是 `kind`；领域类型只负责构造和解析。
+- AssistantMessage 存块序列，不是 `(text, tool_calls)`：思考块必须保持原序并带签名原样回传
+  （Anthropic 要求）。text、tool_calls、thinking 是从块序列派生的只读视图。
+- ToolResult 多带 tool_name、arguments、is_error，落库排障和审计要用，不发给模型。
+- 落库 JSON 形状不变，assistant 块数组的判别键仍是 `kind`。字段名用领域语言，JSON 键名是落库契约，
+  两者有意不同：
+
+  | 类型 | 字段名 | JSON 键名 |
+  |---|---|---|
+  | ToolCall | tool_name / arguments | name / input |
+  | ToolResult | tool_call_id / arguments / content | tool_use_id / input_args / output |
 - Decision 是三态，ask 表示需要人工审批，本轮挂起，等审批后恢复。
 - Tool 用 JSON Schema 描述参数（`parameters: dict[str, Any]`），不再以 Pydantic 类为准：
   内置工具由 `input_model` 派生 schema，MCP 工具直接用 server 下发的 inputSchema。

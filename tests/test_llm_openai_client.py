@@ -2,7 +2,7 @@
 
 驱动方式对标 test_stream_baseline.py:手写裸 chunk 经适配器出中立事件,
 再经 TurnEventAssembler 出协议事件,不建真实 SDK 连接。覆盖 AC2(坏 JSON
-抛中文异常)与 AC3(usage / stop_reason / tool_uses 正确填充),另固化
+抛中文异常)与 AC3(usage / stop_reason / tool_calls 正确填充),另固化
 block_ref 分配规则(思考 0 / 文本 1 / 工具 2+i)与「工具块不发 BLOCK_STOP、
 由装配器补发」的分层行为,以及与 Anthropic 侧的协议事件逐字段等价(AC1)。
 """
@@ -213,7 +213,7 @@ def test_no_thinking_delta_without_reasoning_content() -> None:
         assert result.thinking == []
 
 
-# ---- 终局:usage / stop_reason / tool_uses(AC3) ----
+# ---- 终局:usage / stop_reason / tool_calls(AC3) ----
 
 
 def test_turn_result_usage_and_stop_reason() -> None:
@@ -231,18 +231,18 @@ def test_turn_result_usage_and_stop_reason() -> None:
         cache_creation_input_tokens=0,
         cache_read_input_tokens=90,
     )
-    assert result.tool_uses == []
+    assert result.tool_calls == []
 
 
 def test_turn_result_carries_tool_uses() -> None:
-    """AC3:tool_uses 由 TURN_RESULT 带出,stop_reason 原样为 tool_calls 不归一。"""
+    """AC3:tool_calls 由 TURN_RESULT 带出,stop_reason 原样为 tool_calls 不归一。"""
     events = _adapt_all(CHUNKS_TEXT_AND_TOOL_USE)
     result = events[-1].result
     assert result is not None
     assert result.stop_reason == "tool_calls"
-    assert len(result.tool_uses) == 1
-    tool_use = result.tool_uses[0]
-    assert (tool_use.id, tool_use.name, tool_use.input) == (
+    assert len(result.tool_calls) == 1
+    tool_call = result.tool_calls[0]
+    assert (tool_call.id, tool_call.tool_name, tool_call.arguments) == (
         "call_01",
         "file_read",
         {"path": "a.txt"},

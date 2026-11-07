@@ -24,8 +24,9 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
+from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from llm import BaseLLMClient
-from llm.types import LLMTurnResult, ToolResultMessage, ToolUse, build_assistant_blocks
+from llm.types import LLMTurnResult
 from memory.recall.repository import MemoryRecallRepository
 from prompt import compose_subagent_prompt, compose_teammate_prompt
 from runtime.budget import ToolCallBudget
@@ -416,7 +417,7 @@ class SubAgentRunner:
         self,
         actor: Actor,
         session_id: int,
-        tool_use: ToolUse,
+        tool_call: ToolCall,
         output: str,
         *,
         is_error: bool = False,
@@ -426,15 +427,17 @@ class SubAgentRunner:
             StreamEvent.tool_result(
                 actor,
                 session_id,
-                ToolInfo(id=tool_use.id, name=tool_use.name, output=output, is_error=is_error),
+                ToolInfo(
+                    id=tool_call.id, name=tool_call.tool_name, output=output, is_error=is_error
+                ),
             )
         )
 
-    async def _execute_tool_uses(
+    async def _execute_tool_calls(
         self,
         session_id: int,
         actor: Actor,
-        tool_uses: list[Any],
+        tool_calls: list[Any],
         messages: list[dict[str, Any]],
         tool_gateway: ToolGateway,
         spec: SubAgentSpec,
@@ -459,32 +462,32 @@ class SubAgentRunner:
                 total_limit=max(1, spec.max_rounds * 4),
                 per_tool_limit=max(1, spec.max_rounds * 2),
             )
-        for tool_use in tool_uses:
+        for tool_call in tool_calls:
             # 预算耗尽不执行工具，原因作为错误结果回给模型。
-            allowed, budget_error = budget.try_consume(tool_use.name)
+            allowed, budget_error = budget.try_consume(tool_call.tool_name)
             if not allowed:
                 output = budget_error or "error: 工具调用预算不足。"
                 await self._emit_tool_result(
-                    actor, session_id, tool_use, output, is_error=True
+                    actor, session_id, tool_call, output, is_error=True
                 )
                 messages.append(
                     {
                         "role": "tool",
-                        "content": ToolResultMessage(
-                            tool_use_id=tool_use.id,
-                            tool_name=tool_use.name,
-                            input_args=tool_use.input,
-                            output=output,
+                        "content": ToolResult(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.tool_name,
+                            arguments=tool_call.arguments,
+                            content=output,
                             is_error=True,
-                        ).to_content_dict(),
+                        ).to_content(),
                     }
                 )
                 continue
             decision = await self.policy_engine.authorize(
                 session_id,
-                tool_use.name,
+                tool_call.tool_name,
                 tool_gateway.context.profile,
-                input_args=tool_use.input,
+                input_args=tool_call.arguments,
                 allowed_skill_names=tool_gateway.context.allowed_skill_names,
                 agent_type=agent_type,
                 workspace_id=workspace_id,
@@ -493,8 +496,8 @@ class SubAgentRunner:
             if behavior == "allow":
                 output = await tool_gateway.run(
                     session_id,
-                    tool_use.name,
-                    tool_use.input,
+                    tool_call.tool_name,
+                    tool_call.arguments,
                     actor=actor,
                     turn_id=parent_turn_id,
                     user_id=user_id,
@@ -503,38 +506,38 @@ class SubAgentRunner:
                 )
                 is_error = False
             else:
-                output = self._denied_message(tool_use.name, behavior)
+                output = self._denied_message(tool_call.tool_name, behavior)
                 is_error = True
                 logger.warning(
                     "子代理工具调用被权限策略拒绝,会话 ID=%s 类型=%s 工具=%s 判定=%s",
                     session_id,
                     agent_type,
-                    tool_use.name,
+                    tool_call.tool_name,
                     behavior,
                     extra={"session_id": session_id, "agent_type": agent_type},
                 )
                 if denied_calls is not None:
                     denied_calls.append(
                         DeniedToolCall(
-                            tool_name=tool_use.name,
-                            input_args=tool_use.input,
+                            tool_name=tool_call.tool_name,
+                            input_args=tool_call.arguments,
                             behavior=behavior,
                             reason=decision.reason or "权限策略拒绝执行该工具调用",
                         )
                     )
-            await self._emit_tool_result(actor, session_id, tool_use, output, is_error=is_error)
+            await self._emit_tool_result(actor, session_id, tool_call, output, is_error=is_error)
             # 中立协议下工具结果是独立的 tool 角色消息,编成各家 wire(Anthropic 的
             # tool_result 块 / OpenAI 的 role="tool" 消息)由客户端出站翻译负责。
             messages.append(
                 {
                     "role": "tool",
-                    "content": ToolResultMessage(
-                        tool_use_id=tool_use.id,
-                        tool_name=tool_use.name,
-                        input_args=tool_use.input,
-                        output=output,
+                    "content": ToolResult(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.tool_name,
+                        arguments=tool_call.arguments,
+                        content=output,
                         is_error=is_error,
-                    ).to_content_dict(),
+                    ).to_content(),
                 }
             )
 
@@ -586,24 +589,26 @@ class SubAgentRunner:
                 rendered_memories,
                 model=model,
             )
-            tool_uses = result.tool_uses
+            tool_calls = result.tool_calls
             messages.append(
                 {
                     "role": "assistant",
-                    "content": build_assistant_blocks(result.text, tool_uses, result.thinking),
+                    "content": AssistantMessage.from_turn(
+                        result.text, tool_calls, result.thinking
+                    ).to_content(),
                 }
             )
             # 记住最近一次非空文本，轮次耗尽时作为截断报告的正文。
             if result.text:
                 last_text = result.text
 
-            if not tool_uses:
+            if not tool_calls:
                 return result.text, round_index + 1
 
-            await self._execute_tool_uses(
+            await self._execute_tool_calls(
                 session_id,
                 actor,
-                tool_uses,
+                tool_calls,
                 messages,
                 tool_gateway,
                 spec,
@@ -772,7 +777,7 @@ class SubAgentRunner:
         """从 member.history(JSON 字符串)反序列化历史 messages。
 
         history 为空时用 member.prompt 初始化首条 user 消息。历史里的每个元素都是
-        中立消息(assistant 块由 to_dict() 产出,tool 结果由 to_content_dict() 产出),
+        中立消息(assistant 块由 to_dict() 产出,tool 结果由 to_content() 产出),
         均为 JSON 原生结构,可直接 round-trip 后继续发给任一 provider。
         """
         raw = (member.history or "").strip()
@@ -854,23 +859,25 @@ class SubAgentRunner:
                 rendered_memories,
                 model=model,
             )
-            tool_uses = result.tool_uses
+            tool_calls = result.tool_calls
             # 中立块由 to_dict() 产出,均为 JSON 原生结构,可直接随 messages 落
             # team_members.history 并由 _load_history() 原样 round-trip。
             messages.append(
                 {
                     "role": "assistant",
-                    "content": build_assistant_blocks(result.text, tool_uses, result.thinking),
+                    "content": AssistantMessage.from_turn(
+                        result.text, tool_calls, result.thinking
+                    ).to_content(),
                 }
             )
 
-            if not tool_uses:
+            if not tool_calls:
                 return result.text
 
-            await self._execute_tool_uses(
+            await self._execute_tool_calls(
                 session_id,
                 actor,
-                tool_uses,
+                tool_calls,
                 messages,
                 tool_gateway,
                 spec,

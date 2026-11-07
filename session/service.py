@@ -667,7 +667,7 @@ class SessionService:
         """把持久化消息转换为中立上下文，可对指定消息创建临时请求副本。
 
         三类角色均原样透出库中的中立形状（user 纯文本、assistant 中立块数组、
-        tool 为 ToolResultMessage dict），不做任何 provider wire 编码——
+        tool 为 ToolResult dict），不做任何 provider wire 编码——
         编码（含 Anthropic 的连续工具结果合并）由各 LLM Client 的出站翻译私有完成。
         deepcopy 隔离 ORM 可变字段：下游压缩会原地改写上下文，不得写回落库对象。
         """

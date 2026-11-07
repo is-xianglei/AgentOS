@@ -101,6 +101,26 @@ def _ancestors(module: str) -> set[str]:
     return {".".join(parts[:i]) for i in range(1, len(parts))}
 
 
+def _imported_names(
+    node: ast.Import | ast.ImportFrom,
+    source_package: str,
+    known: set[str],
+) -> set[str]:
+    """把一条 import 语句解析为绝对模块名：相对导入按所在包展开，第三方模块原样保留。"""
+    if isinstance(node, ast.Import):
+        return {alias.name for alias in node.names}
+    base = node.module or ""
+    if node.level:
+        anchor = source_package.split(".")
+        anchor = anchor[: len(anchor) - (node.level - 1)]
+        base = ".".join([*anchor, base]) if base else ".".join(anchor)
+    names: set[str] = set()
+    for alias in node.names:
+        candidate = f"{base}.{alias.name}" if base else alias.name
+        names.add(candidate if candidate in known else base)
+    return names
+
+
 def _resolve_targets(
     node: ast.Import | ast.ImportFrom,
     source: str,
@@ -113,18 +133,7 @@ def _resolve_targets(
     但 source 自身及其祖先不算：子模块回引父包时父包必已在 ``sys.modules``，
     这正是 llm/plan/prompt 包内"自环"不构成加载期问题的原因。
     """
-    raw: set[str] = set()
-    if isinstance(node, ast.Import):
-        raw.update(alias.name for alias in node.names)
-    else:
-        base = node.module or ""
-        if node.level:
-            anchor = source_package.split(".")
-            anchor = anchor[: len(anchor) - (node.level - 1)]
-            base = ".".join([*anchor, base]) if base else ".".join(anchor)
-        for alias in node.names:
-            candidate = f"{base}.{alias.name}" if base else alias.name
-            raw.add(candidate if candidate in known else base)
+    raw = _imported_names(node, source_package, known)
     targets: set[str] = set()
     excluded = _ancestors(source) | {source}
     for name in raw:
@@ -240,3 +249,84 @@ def test_all_first_party_modules_import_cleanly() -> None:
     ]
     summary = f"{len(failures)}/{len(modules)} 个模块作为首个导入失败:"
     assert not failures, "\n".join([summary, *failures])
+
+
+# 领域层（harness.domain）加载期允许触达的项目内模块：统一业务异常与纯值事件类型。
+_DOMAIN_ALLOWED_FIRST_PARTY = frozenset({"core", "core.errors", "core.events"})
+# 领域层加载期禁止导入的外部框架与 SDK（按顶层包名匹配）。
+_DOMAIN_FORBIDDEN_THIRD_PARTY = frozenset({"sqlalchemy", "fastapi", "anthropic", "openai"})
+
+
+def _domain_layer_violations(
+    module: str,
+    tree: ast.Module,
+    is_package: bool,
+    known: set[str],
+) -> list[str]:
+    """返回 harness.domain 下某模块违反分层规则的加载期导入名。
+
+    禁止三类：harness.app / harness.adapters（含其余 harness 子包，领域层只认自身）、
+    SQLAlchemy / FastAPI / 各家 SDK、core.errors 与 core.events 以外的项目内包。
+    ``if TYPE_CHECKING:`` 块与函数体内的导入不在加载期执行，不计入。
+    """
+    source_package = module if is_package else module.rpartition(".")[0]
+    first_party_tops = {name.split(".")[0] for name in known}
+    violations: list[str] = []
+    for node in _iter_load_time_imports(tree):
+        for name in sorted(_imported_names(node, source_package, known)):
+            top = name.split(".")[0]
+            if top in _DOMAIN_FORBIDDEN_THIRD_PARTY:
+                violations.append(name)
+            elif top == "harness":
+                if not (name == "harness" or name.startswith("harness.domain")):
+                    violations.append(name)
+            elif top in first_party_tops and name not in _DOMAIN_ALLOWED_FIRST_PARTY:
+                violations.append(name)
+    return violations
+
+
+def test_domain_layer_imports_respect_layering() -> None:
+    """分层防线：harness.domain 加载期只能依赖标准库、pydantic、core.errors 与 core.events。"""
+    files = _first_party_module_files()
+    known = set(files)
+    domain_modules = sorted(
+        m for m in files if m == "harness.domain" or m.startswith("harness.domain.")
+    )
+    assert "harness.domain.messages" in domain_modules, (
+        f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"
+    )
+    failures: list[str] = []
+    for module in domain_modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        bad = _domain_layer_violations(module, tree, path.name == "__init__.py", known)
+        failures.extend(f"  - {module} 导入了 {name}" for name in bad)
+    assert not failures, "领域层存在违反分层规则的加载期导入:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from harness.app import ports", ["harness.app"]),
+        ("import harness.adapters.models", ["harness.adapters.models"]),
+        ("from sqlalchemy.orm import Mapped", ["sqlalchemy.orm"]),
+        ("import fastapi", ["fastapi"]),
+        ("from anthropic.types import ToolUseBlock", ["anthropic.types"]),
+        ("import openai", ["openai"]),
+        ("from session.service import SessionService", ["session.service"]),
+        ("from core.config import settings", ["core.config"]),
+        ("from ..app import ports", ["harness.app"]),
+        ("from core.errors import AgentException", []),
+        ("from core.events import ToolInfo", []),
+        ("from harness.domain.messages import ToolCall", []),
+        ("from typing import Any\nimport pydantic", []),
+        ("from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import anthropic", []),
+        ("def f():\n    import sqlalchemy", []),
+    ],
+)
+def test_domain_layer_checker_reports_violations(source: str, expected: list[str]) -> None:
+    """检查器自测：合成模块的违规导入必须被报出，允许项不得误报。"""
+    known = set(_first_party_module_files())
+    tree = ast.parse(source)
+
+    assert _domain_layer_violations("harness.domain.sample", tree, False, known) == expected

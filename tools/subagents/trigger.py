@@ -55,7 +55,7 @@ def _iter_tool_uses(messages: list[dict[str, Any]] | None):
     """从中立消息上下文里取出所有 tool_use 块,忽略结构不符的条目。
 
     判别键是中立协议的 kind(而非 provider wire 的 type):本函数消费的
-    messages 来自送进 LLM 的中立上下文,assistant 块形状见 llm/types.py。
+    messages 来自送进 LLM 的中立上下文,assistant 块形状见 harness/domain/messages.py。
     """
     for message in messages or []:
         content = message.get("content")

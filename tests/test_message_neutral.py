@@ -17,9 +17,9 @@ from typing import Any
 import pytest
 
 from core.errors import AgentException
+from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from llm.anthropic_client import AnthropicClient
 from llm.openai_client import _TOOL_ERROR_PREFIX, OpenAIClient
-from llm.types import ToolResultMessage, ToolUse, build_assistant_blocks
 
 # 完整会话:文本 + 两个并发工具调用 + 两个工具结果(一个失败)+ 纯文本 + 追问。
 # 刻意用两个连续工具结果:Anthropic 侧必须合并进同一条 user 消息,
@@ -28,34 +28,37 @@ _SESSION: list[dict[str, Any]] = [
     {"role": "user", "content": "读一下 a.txt 和 b.txt"},
     {
         "role": "assistant",
-        "content": build_assistant_blocks(
+        "content": AssistantMessage.from_turn(
             "我来读这两个文件",
             [
-                ToolUse(id="toolu_01", name="file_read", input={"path": "a.txt"}),
-                ToolUse(id="toolu_02", name="file_read", input={"path": "b.txt"}),
+                ToolCall(id="toolu_01", tool_name="file_read", arguments={"path": "a.txt"}),
+                ToolCall(id="toolu_02", tool_name="file_read", arguments={"path": "b.txt"}),
             ],
-        ),
+        ).to_content(),
     },
     {
         "role": "tool",
-        "content": ToolResultMessage(
-            tool_use_id="toolu_01",
+        "content": ToolResult(
+            tool_call_id="toolu_01",
             tool_name="file_read",
-            input_args={"path": "a.txt"},
-            output="内容A",
-        ).to_content_dict(),
+            arguments={"path": "a.txt"},
+            content="内容A",
+        ).to_content(),
     },
     {
         "role": "tool",
-        "content": ToolResultMessage(
-            tool_use_id="toolu_02",
+        "content": ToolResult(
+            tool_call_id="toolu_02",
             tool_name="file_read",
-            input_args={"path": "b.txt"},
-            output="文件不存在",
+            arguments={"path": "b.txt"},
+            content="文件不存在",
             is_error=True,
-        ).to_content_dict(),
+        ).to_content(),
     },
-    {"role": "assistant", "content": build_assistant_blocks("a.txt 有内容，b.txt 缺失", [])},
+    {
+        "role": "assistant",
+        "content": AssistantMessage.from_turn("a.txt 有内容，b.txt 缺失", []).to_content(),
+    },
     {"role": "user", "content": "那就只用 a.txt"},
 ]
 
@@ -72,17 +75,17 @@ def _strip_untransmitted(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
         if message["role"] != "tool":
             normalized.append(message)
             continue
-        tool_result = ToolResultMessage.from_content_dict(message["content"])
+        tool_result = ToolResult.from_dict(message["content"])
         normalized.append(
             {
                 "role": "tool",
-                "content": ToolResultMessage(
-                    tool_use_id=tool_result.tool_use_id,
+                "content": ToolResult(
+                    tool_call_id=tool_result.tool_call_id,
                     tool_name="",
-                    input_args={},
-                    output=tool_result.output,
+                    arguments={},
+                    content=tool_result.content,
                     is_error=tool_result.is_error,
-                ).to_content_dict(),
+                ).to_content(),
             }
         )
     return normalized
@@ -115,13 +118,13 @@ def _decode_anthropic(wire: list[dict[str, Any]]) -> list[dict[str, Any]]:
             decoded.extend(
                 {
                     "role": "tool",
-                    "content": ToolResultMessage(
-                        tool_use_id=block["tool_use_id"],
+                    "content": ToolResult(
+                        tool_call_id=block["tool_use_id"],
                         tool_name="",
-                        input_args={},
-                        output=block["content"],
+                        arguments={},
+                        content=block["content"],
                         is_error=bool(block.get("is_error", False)),
-                    ).to_content_dict(),
+                    ).to_content(),
                 }
                 for block in content
             )
@@ -156,13 +159,13 @@ def _decode_openai(wire: list[dict[str, Any]]) -> list[dict[str, Any]]:
             decoded.append(
                 {
                     "role": "tool",
-                    "content": ToolResultMessage(
-                        tool_use_id=message["tool_call_id"],
+                    "content": ToolResult(
+                        tool_call_id=message["tool_call_id"],
                         tool_name="",
-                        input_args={},
-                        output=output.removeprefix(_TOOL_ERROR_PREFIX),
+                        arguments={},
+                        content=output.removeprefix(_TOOL_ERROR_PREFIX),
                         is_error=is_error,
-                    ).to_content_dict(),
+                    ).to_content(),
                 }
             )
     return decoded
@@ -257,7 +260,9 @@ def test_assistant_without_text_keeps_content_null_on_openai() -> None:
     messages = [
         {
             "role": "assistant",
-            "content": build_assistant_blocks("", [ToolUse(id="t1", name="echo", input={})]),
+            "content": AssistantMessage.from_turn(
+                "", [ToolCall(id="t1", tool_name="echo", arguments={})]
+            ).to_content(),
         }
     ]
     assert OpenAIClient._encode_messages(messages)[0]["content"] is None

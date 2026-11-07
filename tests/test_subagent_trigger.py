@@ -8,25 +8,30 @@ from typing import Any
 
 import pytest
 
-from llm.types import ToolUse, build_assistant_blocks
+from harness.domain.messages import AssistantMessage, ToolCall
 from tools.builtin.agent import AgentToolInput
 from tools.subagents.definition import AgentType
 from tools.subagents.trigger import assess, compose_hint, verification_already_ran
 
 
-def _assistant(*tool_uses: ToolUse) -> dict[str, Any]:
+def _assistant(*tool_calls: ToolCall) -> dict[str, Any]:
     """按运行时落库路径构造中立 assistant 消息。"""
-    return {"role": "assistant", "content": build_assistant_blocks("", list(tool_uses))}
+    return {
+        "role": "assistant",
+        "content": AssistantMessage.from_turn("", list(tool_calls)).to_content(),
+    }
 
 
-def _agent_call(agent_type: AgentType) -> ToolUse:
+def _agent_call(agent_type: AgentType) -> ToolCall:
     """用真实入参模型序列化 Agent 调用,字段名随 AgentToolInput 变化而变化。"""
     args = AgentToolInput(agent_type=agent_type, prompt="复核本次改动")
-    return ToolUse(id="t-agent", name="Agent", input=args.model_dump(mode="json"))
+    return ToolCall(id="t-agent", tool_name="Agent", arguments=args.model_dump(mode="json"))
 
 
 # 单个后端文件即命中阈值,用于观察去重是否压住提示。
-_BACKEND_WRITE = ToolUse(id="t-write", name="Write", input={"file_path": "user/service.py"})
+_BACKEND_WRITE = ToolCall(
+    id="t-write", tool_name="Write", arguments={"file_path": "user/service.py"}
+)
 
 
 def test_verification_dispatched_suppresses_hint() -> None:
@@ -59,10 +64,10 @@ def test_no_agent_call_still_requires_verification() -> None:
 
 def test_wrong_field_name_is_not_verification() -> None:
     """subagent_type 不是 Agent 工具字段,这样的调用实际按默认类型执行,不算验收。"""
-    wrong_field = ToolUse(
+    wrong_field = ToolCall(
         id="t-agent",
-        name="Agent",
-        input={"subagent_type": "verification", "prompt": "复核本次改动"},
+        tool_name="Agent",
+        arguments={"subagent_type": "verification", "prompt": "复核本次改动"},
     )
     messages = [_assistant(_BACKEND_WRITE), _assistant(wrong_field)]
 

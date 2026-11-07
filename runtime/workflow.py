@@ -34,8 +34,8 @@ from core.events import (
     WorkflowProgressStatus,
 )
 from database.engine import AsyncSessionLocal
+from harness.domain.messages import AssistantMessage
 from llm import BaseLLMClient, create_llm_client
-from llm.types import build_assistant_blocks
 from runtime.execution import (
     ExecutionHandle,
     launch_turn_execution,
@@ -707,7 +707,7 @@ class WorkflowRuntime:
             assistant_message = await self.session_service.add_message(
                 session.id,
                 "assistant",
-                build_assistant_blocks(result.text, []),
+                AssistantMessage.from_turn(result.text, []).to_content(),
                 turn_id=turn.id,
                 provider=result.provider,
                 model=result.model,

@@ -20,24 +20,19 @@ from pydantic import BaseModel, ValidationError
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
-from llm.base import BaseLLMClient
-from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
-from llm.types import (
+from harness.domain.messages import (
     AssistantBlock,
-    LLMEventKind,
-    LLMStreamEvent,
-    LLMTurnResult,
-    PromptBlock,
+    AssistantMessage,
     TextBlock,
     ThinkingBlock,
-    ThinkingSegment,
-    ToolResultMessage,
-    ToolSpec,
-    ToolUse,
-    parse_assistant_blocks,
-    parse_tool_result,
-    parse_user_text,
+    ToolCall,
+    ToolResult,
+    UserMessage,
+    message_from_row,
 )
+from llm.base import BaseLLMClient
+from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -109,37 +104,37 @@ def _chunk_type(chunk: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _extract_tool_uses(content: list[dict[str, Any]] | None) -> list[ToolUse]:
-    """从完整消息内容中提取 tool_use 块,返回类型化的 ToolUse 列表。"""
-    tool_uses: list[ToolUse] = []
+def _extract_tool_calls(content: list[dict[str, Any]] | None) -> list[ToolCall]:
+    """从完整消息内容中提取 tool_use 块,返回类型化的 ToolCall 列表。"""
+    tool_calls: list[ToolCall] = []
     for block in content or []:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
-        tool_uses.append(
-            ToolUse(id=block["id"], name=block["name"], input=block.get("input") or {})
+        tool_calls.append(
+            ToolCall(id=block["id"], tool_name=block["name"], arguments=block.get("input") or {})
         )
-    return tool_uses
+    return tool_calls
 
 
-def _extract_thinking(content: list[dict[str, Any]] | None) -> list[ThinkingSegment]:
+def _extract_thinking(content: list[dict[str, Any]] | None) -> list[ThinkingBlock]:
     """从完整消息内容中按序提取思考段(含 redacted_thinking)。
 
     保序是硬约束:Anthropic 要求带签名的思考块原样回传,不得修改、重排或过滤,
     同一回合的多段思考签名互不相同,合并成一段即签名失效。
     """
-    segments: list[ThinkingSegment] = []
+    segments: list[ThinkingBlock] = []
     for block in content or []:
         if not isinstance(block, dict):
             continue
         if block.get("type") == "thinking":
             segments.append(
-                ThinkingSegment(
+                ThinkingBlock(
                     text=block.get("thinking", "") or "",
                     signature=block.get("signature") or None,
                 )
             )
         elif block.get("type") == "redacted_thinking":
-            segments.append(ThinkingSegment(redacted_data=block.get("data") or None))
+            segments.append(ThinkingBlock(redacted_data=block.get("data") or None))
     return segments
 
 
@@ -170,20 +165,20 @@ def _encode_assistant_block(block: AssistantBlock) -> dict[str, Any] | None:
     return {
         "type": "tool_use",
         "id": block.id,
-        "name": block.name,
-        "input": block.input,
+        "name": block.tool_name,
+        "input": block.arguments,
     }
 
 
-def _encode_tool_result(tool_result: ToolResultMessage) -> dict[str, Any]:
+def _encode_tool_result(tool_result: ToolResult) -> dict[str, Any]:
     """把中立工具结果编成 Anthropic 的 tool_result 块。
 
     is_error 仅在为真时下发:Anthropic 该字段缺省即 false,恒发会让 wire 变噪。
     """
     block: dict[str, Any] = {
         "type": "tool_result",
-        "tool_use_id": tool_result.tool_use_id,
-        "content": tool_result.output,
+        "tool_use_id": tool_result.tool_call_id,
+        "content": tool_result.content,
     }
     if tool_result.is_error:
         block["is_error"] = True
@@ -330,7 +325,7 @@ class _AnthropicChunkAdapter:
         content = chunk.get("content") or []
         result = LLMTurnResult(
             text=_text_from_content(content),
-            tool_uses=_extract_tool_uses(content),
+            tool_calls=_extract_tool_calls(content),
             thinking=_extract_thinking(content),
             usage=usage,
             stop_reason=chunk.get("stop_reason"),
@@ -460,19 +455,19 @@ class AnthropicClient(BaseLLMClient):
           连续的工具结果必须合并进同一条 user 消息,否则会出现连续 user 消息而
           违反角色交替约束(该合并逻辑原在 session/service.py,随出站翻译一并迁入)。
 
-        ToolResultMessage 的 tool_name / input_args 是 AgentOS 自有的排障字段,
+        ToolResult 的 tool_name / arguments 是 AgentOS 自有的排障字段,
         Anthropic 协议无对应位置,不发给模型。
         """
         encoded: list[dict[str, Any]] = []
         for message in messages:
-            role = message.get("role")
-            content = message.get("content")
-            if role == "user":
-                encoded.append({"role": "user", "content": parse_user_text(content)})
-            elif role == "assistant":
+            # 角色分派与形状校验由领域层完成,未知角色在此抛中文异常。
+            domain_message = message_from_row(message.get("role"), message.get("content"))
+            if isinstance(domain_message, UserMessage):
+                encoded.append({"role": "user", "content": domain_message.text})
+            elif isinstance(domain_message, AssistantMessage):
                 # 原样遍历不重排:思考块的落库序即 Anthropic 要求的回传序。
                 blocks: list[dict[str, Any]] = []
-                for neutral_block in parse_assistant_blocks(content):
+                for neutral_block in domain_message.blocks:
                     encoded_block = _encode_assistant_block(neutral_block)
                     if encoded_block is not None:
                         blocks.append(encoded_block)
@@ -480,14 +475,12 @@ class AnthropicClient(BaseLLMClient):
                     encoded.append({"role": "assistant", "content": blocks})
                 else:
                     encoded.append({"role": "assistant", "content": ""})
-            elif role == "tool":
-                block = _encode_tool_result(parse_tool_result(content))
+            else:
+                block = _encode_tool_result(domain_message)
                 if encoded and _is_tool_result_carrier(encoded[-1]):
                     encoded[-1]["content"].append(block)
                 else:
                     encoded.append({"role": "user", "content": [block]})
-            else:
-                raise AgentException.message("未知的消息角色", {"role": role})
         # 接口层用 dict[str, Any] 承载动态 JSON,此处收窄为 SDK 的 TypedDict。
         return cast("list[MessageParam]", encoded)
 

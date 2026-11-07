@@ -168,10 +168,11 @@ API、错误与日志：
     session_snapshots.messages 一律是中立形状，不得写入或读取任何一家的 wire 形状。
 12. assistant 消息 content 为块数组，判别键用 kind 而非 type：
     {"kind": "text", "text": ...} 和 {"kind": "tool_use", "id": ..., "name": ..., "input": ...}，
-    经 llm/types.py 的 build_assistant_blocks() 构造、parse_assistant_blocks() 解析。
+    经 harness/domain/messages.py 的 AssistantMessage.from_turn() 构造、
+    AssistantMessage.from_content() 解析。
     不要改用 type——两家 wire 的 type 取值恰好都叫 tool_use、入参字段也都叫 input，
     用 type 会让残留的 provider 形状数据被静默误读并潜伏到运行时。
-13. tool 消息沿用 ToolResultMessage，本身即自有协议，形状不变。
+13. tool 消息沿用 ToolResult，本身即自有协议，形状不变。
 14. 出站编码是 stream() 的内部步骤，_encode_messages / _encode_system / _encode_tools
     是各家客户端的私有方法，不要提升到 BaseLLMClient 抽象成员（维持 provider、stream、
     complete_structured 三个）；也不要在调用方翻译消息形状。

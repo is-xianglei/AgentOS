@@ -33,8 +33,8 @@ class BaseLLMClient(ABC):
         messages 契约：中立消息形状，而非任何 provider 的 wire 形状。三类角色：
         - {"role": "user", "content": "纯文本"}
         - {"role": "assistant", "content": [中立块数组]}，块以 kind 判别
-          （见 llm.types 的 TextBlock / ToolUseBlock）
-        - {"role": "tool", "content": ToolResultMessage.to_content_dict()}
+          （见 harness.domain.messages 的 AssistantMessage）
+        - {"role": "tool", "content": ToolResult.to_content()}
 
         出站翻译刻意收在实现内部而非调用方：stream() 有多个调用点（主 Agent、
         SubAgent、Compact），且快照与落库一律只存中立形状，翻译放在调用方则每处

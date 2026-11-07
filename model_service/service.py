@@ -319,7 +319,7 @@ class ModelService:
             async for event in stream:
                 if event.kind.value == "turn_result":
                     result = event.result
-        if result is None or not (result.text or result.tool_uses):
+        if result is None or not (result.text or result.tool_calls):
             raise ValueError("模型流未产出有效终局结果")
 
     async def _probe_http(self, record: ModelProviderRecord) -> None:

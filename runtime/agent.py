@@ -27,13 +27,14 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
+from harness.domain.messages import ToolCall, ToolResult
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
 from llm import BaseLLMClient
 from llm.errors import LLMConnectionError, LLMStatusError
-from llm.types import PromptBlock, ToolResultMessage, ToolUse
+from llm.types import PromptBlock
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
 from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
@@ -842,7 +843,7 @@ class AgentRuntime:
             )
             result = step_result.llm_result
             stop_reason = result.stop_reason
-            tool_uses = result.tool_uses
+            tool_calls = result.tool_calls
             # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
             final_content = step_result.assistant_blocks
 
@@ -856,7 +857,7 @@ class AgentRuntime:
                 model=effective_model,
             )
 
-            if not tool_uses:
+            if not tool_calls:
                 # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
                 # (作为一条 user 消息注入),否则正常结束本回合。
                 if turbo:
@@ -879,13 +880,13 @@ class AgentRuntime:
                     continue
                 break
 
-            interaction = await self._execute_tool_uses(
+            interaction = await self._execute_tool_calls(
                 session_id,
                 session,
                 turn,
                 actor,
                 assistant_message.id,
-                tool_uses,
+                tool_calls,
                 done_ids=[],
                 additional_context=additional_context,
                 budget=budget,
@@ -1047,14 +1048,14 @@ class AgentRuntime:
             )
         return True
 
-    async def _execute_tool_uses(
+    async def _execute_tool_calls(
         self,
         session_id: int,
         session: SessionRecord,
         turn: SessionTurnRecord,
         actor: Actor,
         assistant_message_id: int,
-        tool_uses: list[ToolUse],
+        tool_calls: list[ToolCall],
         done_ids: list[str],
         additional_context: str | None,
         existing_suspension: RuntimeSuspensionRecord | None = None,
@@ -1066,22 +1067,22 @@ class AgentRuntime:
                 total_limit=max(1, settings.max_tool_iterations * 4),
                 per_tool_limit=max(1, settings.max_tool_iterations),
             )
-        for idx, tool_use in enumerate(tool_uses):
+        for idx, tool_call in enumerate(tool_calls):
             # 恢复人工交互时，挂起前已完成的工具不再重复执行。
-            if tool_use.id in done_ids:
+            if tool_call.id in done_ids:
                 continue
 
-            allowed, budget_error = budget.try_consume(tool_use.name)
+            allowed, budget_error = budget.try_consume(tool_call.tool_name)
             if not allowed:
                 await self._record_tool_response(
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     budget_error or "error: 工具调用预算不足。",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
 
             # 每个工具前重新读取 Plan 状态：同一批工具中前面的 Enter/ExitPlanMode
@@ -1090,22 +1091,22 @@ class AgentRuntime:
                 active_plan = None
             else:
                 active_plan = await self.plan_service.get_active(session_id)
-            if active_plan is not None and tool_use.name not in PLAN_MODE_ALLOWED_TOOLS:
+            if active_plan is not None and tool_call.tool_name not in PLAN_MODE_ALLOWED_TOOLS:
                 await self._record_tool_response(
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     "Plan Mode仅允许只读探索、AskUserQuestion、WritePlan和ExitPlanMode。",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
 
             try:
                 normalized_input = self.tool_registry.validate_input(
-                    tool_use.name,
-                    tool_use.input,
+                    tool_call.tool_name,
+                    tool_call.arguments,
                 )
             except AgentException as exc:
                 # 入参校验失败不中断回合，把错误详情作为工具结果回给模型自行修正。
@@ -1117,21 +1118,21 @@ class AgentRuntime:
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     f"{exc.message}{details}",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
-            tool_use = replace(tool_use, input=normalized_input)
-            tool_uses[idx] = tool_use
+            tool_call = replace(tool_call, arguments=normalized_input)
+            tool_calls[idx] = tool_call
 
             # 交互工具和 Plan Mode 分支在这里会提前挂起，先做 profile 能力检查，
             # 防止历史消息或伪造的 tool_use 绕过 user_agent 的控制面边界。
             capability = self.policy_engine.admit_tool(
-                tool_use.name,
+                tool_call.tool_name,
                 self.active_profile,
-                input_args=tool_use.input,
+                input_args=tool_call.arguments,
                 allowed_skill_names=self.allowed_skill_names,
             )
             if not capability.allowed:
@@ -1139,68 +1140,68 @@ class AgentRuntime:
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     capability.reason
-                    or f"工具能力策略拒绝执行: tool={tool_use.name}, "
+                    or f"工具能力策略拒绝执行: tool={tool_call.tool_name}, "
                     f"profile={self.active_profile}",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
 
             if (
                 active_plan is not None
-                and tool_use.name == "Agent"
-                and tool_use.input.get("agent_type") not in {"Explore", "Plan"}
+                and tool_call.tool_name == "Agent"
+                and tool_call.arguments.get("agent_type") not in {"Explore", "Plan"}
             ):
                 await self._record_tool_response(
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     "Plan Mode只能派发Explore或Plan只读子代理。",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
 
-            if tool_use.name in INTERACTION_TOOL_KINDS:
-                if tool_use.name == "EnterPlanMode" and active_plan is not None:
+            if tool_call.tool_name in INTERACTION_TOOL_KINDS:
+                if tool_call.tool_name == "EnterPlanMode" and active_plan is not None:
                     await self._record_tool_response(
                         session_id,
                         turn.id,
                         actor,
-                        tool_use,
+                        tool_call,
                         "当前会话已经处于Plan Mode。",
                         is_error=True,
                     )
-                    done_ids.append(tool_use.id)
+                    done_ids.append(tool_call.id)
                     continue
-                if tool_use.name == "ExitPlanMode":
+                if tool_call.tool_name == "ExitPlanMode":
                     if active_plan is None:
                         await self._record_tool_response(
                             session_id,
                             turn.id,
                             actor,
-                            tool_use,
+                            tool_call,
                             "当前会话未处于Plan Mode，不能调用ExitPlanMode。",
                             is_error=True,
                         )
-                        done_ids.append(tool_use.id)
+                        done_ids.append(tool_call.id)
                         continue
                     if not active_plan.content.strip():
                         await self._record_tool_response(
                             session_id,
                             turn.id,
                             actor,
-                            tool_use,
+                            tool_call,
                             "计划正文为空。请先使用WritePlan保存计划，再请求退出。",
                             is_error=True,
                         )
-                        done_ids.append(tool_use.id)
+                        done_ids.append(tool_call.id)
                         continue
 
-                remaining = [item for item in tool_uses[idx:] if item.id not in done_ids]
+                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
                 return await self._suspend_for_interaction(
                     session_id,
                     session,
@@ -1209,16 +1210,16 @@ class AgentRuntime:
                     remaining,
                     done_ids,
                     additional_context,
-                    INTERACTION_TOOL_KINDS[tool_use.name],
+                    INTERACTION_TOOL_KINDS[tool_call.tool_name],
                     existing_suspension,
                     budget,
                 )
 
             decision = await self.policy_engine.authorize(
                 session_id,
-                tool_use.name,
+                tool_call.tool_name,
                 self.active_profile,
-                input_args=tool_use.input,
+                input_args=tool_call.arguments,
                 agent_type=self.active_profile,
                 workspace_id=self.workspace_id,
                 allowed_skill_names=self.allowed_skill_names,
@@ -1230,11 +1231,11 @@ class AgentRuntime:
                     extra={
                         "session_id": session_id,
                         "turn_id": str(turn.id),
-                        "tool_name": tool_use.name,
+                        "tool_name": tool_call.tool_name,
                         "decision": "ask",
                     },
                 )
-                remaining = [item for item in tool_uses[idx:] if item.id not in done_ids]
+                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
                 return await self._suspend_for_interaction(
                     session_id,
                     session,
@@ -1253,7 +1254,7 @@ class AgentRuntime:
                     extra={
                         "session_id": session_id,
                         "turn_id": str(turn.id),
-                        "tool_name": tool_use.name,
+                        "tool_name": tool_call.tool_name,
                         "decision": "deny",
                     },
                 )
@@ -1261,11 +1262,11 @@ class AgentRuntime:
                     session_id,
                     turn.id,
                     actor,
-                    tool_use,
+                    tool_call,
                     "权限策略拒绝执行该工具调用。",
                     is_error=True,
                 )
-                done_ids.append(tool_use.id)
+                done_ids.append(tool_call.id)
                 continue
             # 本轮实际生效的工具名单按刚读到的 Plan 状态计算;委派自建 Agent 时,
             # 被委派方的工具不能超出它,否则 Plan Mode 下可借子 Agent 绕过只读限制。
@@ -1275,10 +1276,10 @@ class AgentRuntime:
                 turn.id,
                 actor,
                 assistant_message_id,
-                tool_use,
+                tool_call,
                 round_tool_names=round_tool_names,
             )
-            done_ids.append(tool_use.id)
+            done_ids.append(tool_call.id)
         return None
 
     async def _execute_one(
@@ -1287,7 +1288,7 @@ class AgentRuntime:
         turn_id: UUID,
         actor: Actor,
         assistant_message_id: int,
-        tool_use: ToolUse,
+        tool_call: ToolCall,
         record: ToolCallRecord | None = None,
         round_tool_names: frozenset[str] | None = None,
     ) -> str:
@@ -1299,8 +1300,8 @@ class AgentRuntime:
         """
         output = await self.tool_gateway.run(
             session_id,
-            tool_use.name,
-            tool_use.input,
+            tool_call.tool_name,
+            tool_call.arguments,
             message_id=assistant_message_id,
             bus=self.bus,
             record=record,
@@ -1317,8 +1318,8 @@ class AgentRuntime:
                 actor,
                 session_id,
                 ToolInfo(
-                    id=tool_use.id,
-                    name=tool_use.name,
+                    id=tool_call.id,
+                    name=tool_call.tool_name,
                     output=output,
                     is_error=False,
                 ),
@@ -1327,13 +1328,13 @@ class AgentRuntime:
         await self.session_service.add_message(
             session_id,
             "tool",
-            ToolResultMessage(
-                tool_use_id=tool_use.id,
-                tool_name=tool_use.name,
-                input_args=tool_use.input,
-                output=output,
+            ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.tool_name,
+                arguments=tool_call.arguments,
+                content=output,
                 is_error=False,
-            ).to_content_dict(),
+            ).to_content(),
             turn_id=turn_id,
         )
         return output
@@ -1343,7 +1344,7 @@ class AgentRuntime:
         session_id: int,
         turn_id: UUID,
         actor: Actor,
-        tool_use: ToolUse,
+        tool_call: ToolCall,
         output: str,
         *,
         is_error: bool,
@@ -1360,8 +1361,8 @@ class AgentRuntime:
                 actor,
                 session_id,
                 ToolInfo(
-                    id=tool_use.id,
-                    name=tool_use.name,
+                    id=tool_call.id,
+                    name=tool_call.tool_name,
                     output=output,
                     is_error=is_error,
                 ),
@@ -1370,13 +1371,13 @@ class AgentRuntime:
         await self.session_service.add_message(
             session_id,
             "tool",
-            ToolResultMessage(
-                tool_use_id=tool_use.id,
-                tool_name=tool_use.name,
-                input_args=tool_use.input,
-                output=output,
+            ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.tool_name,
+                arguments=tool_call.arguments,
+                content=output,
                 is_error=is_error,
-            ).to_content_dict(),
+            ).to_content(),
             turn_id=turn_id,
         )
 
@@ -1386,7 +1387,7 @@ class AgentRuntime:
         session: SessionRecord,
         turn: SessionTurnRecord,
         assistant_message_id: int,
-        remaining: list[ToolUse],
+        remaining: list[ToolCall],
         done_ids: list[str],
         additional_context: str | None,
         kind: str,
@@ -1397,8 +1398,8 @@ class AgentRuntime:
         target = remaining[0]
         record = await self.tool_gateway.start_call(
             session_id,
-            target.name,
-            target.input,
+            target.tool_name,
+            target.arguments,
             message_id=assistant_message_id,
             agent_id=self.active_agent_id,
         )
@@ -1408,8 +1409,8 @@ class AgentRuntime:
             "pending": [
                 {
                     "tool_use_id": tu.id,
-                    "tool_name": tu.name,
-                    "input": tu.input,
+                    "tool_name": tu.tool_name,
+                    "input": tu.arguments,
                     "tool_call_id": record.id if tu.id == target.id else None,
                 }
                 for tu in remaining
@@ -1472,21 +1473,21 @@ class AgentRuntime:
         self,
         session_id: int,
         kind: str,
-        target: ToolUse,
+        target: ToolCall,
     ) -> dict[str, Any]:
         if kind == "tool_approval":
             return {
                 "tool": {
                     "id": target.id,
-                    "name": target.name,
-                    "input": target.input,
+                    "name": target.tool_name,
+                    "input": target.arguments,
                 },
-                "reason": self._ask_reason(target.name),
+                "reason": self._ask_reason(target.tool_name),
                 "allowed_decisions": ["allow_once", "always_allow", "deny"],
                 "can_update_input": True,
             }
         if kind == "user_question":
-            return AskUserQuestionRequestPayload.model_validate(target.input).model_dump(
+            return AskUserQuestionRequestPayload.model_validate(target.arguments).model_dump(
                 mode="json",
                 by_alias=True,
                 exclude_none=True,
@@ -1499,7 +1500,7 @@ class AgentRuntime:
                 "plan_id": str(plan.id),
                 "plan": plan.content,
                 "plan_version": plan.version,
-                "allowedPrompts": target.input.get("allowedPrompts", []),
+                "allowedPrompts": target.arguments.get("allowedPrompts", []),
             }
         raise AgentException.message("不支持的人工交互类型")
 
@@ -1530,12 +1531,14 @@ class AgentRuntime:
         if not isinstance(assistant_message_id, int):
             raise AgentException.message("运行暂停点缺少关联的助手消息")
         done_ids = list(pending.get("done_tool_use_ids", []))
-        tool_uses = [
-            ToolUse(id=it["tool_use_id"], name=it["tool_name"], input=it.get("input") or {})
+        tool_calls = [
+            ToolCall(
+                id=it["tool_use_id"], tool_name=it["tool_name"], arguments=it.get("input") or {}
+            )
             for it in pending_items
         ]
         target_item = pending_items[0]
-        target = tool_uses[0]
+        target = tool_calls[0]
         # 复用挂起时建的 awaiting 记录(避免同一调用留两条)。
         record: ToolCallRecord | None = None
         tool_call_id = target_item.get("tool_call_id")
@@ -1555,7 +1558,7 @@ class AgentRuntime:
                 actor,
                 assistant_message_id,
                 target,
-                tool_uses,
+                tool_calls,
                 record,
                 response,
             )
@@ -1569,13 +1572,13 @@ class AgentRuntime:
             raise AgentException.message("不支持的人工交互类型")
         done_ids.append(target.id)
 
-        return await self._execute_tool_uses(
+        return await self._execute_tool_calls(
             session_id,
             session,
             turn,
             actor,
             assistant_message_id,
-            tool_uses,
+            tool_calls,
             done_ids,
             additional_context=pending.get("additional_context"),
             existing_suspension=suspension,
@@ -1588,8 +1591,8 @@ class AgentRuntime:
         turn: SessionTurnRecord,
         actor: Actor,
         assistant_message_id: int,
-        target: ToolUse,
-        tool_uses: list[ToolUse],
+        target: ToolCall,
+        tool_calls: list[ToolCall],
         record: ToolCallRecord,
         response: dict[str, Any],
     ) -> None:
@@ -1609,13 +1612,13 @@ class AgentRuntime:
 
         updated_input = response.get("updated_input")
         if updated_input is not None:
-            normalized = self.tool_registry.validate_input(target.name, updated_input)
-            target = replace(target, input=normalized)
-            tool_uses[0] = target
+            normalized = self.tool_registry.validate_input(target.tool_name, updated_input)
+            target = replace(target, arguments=normalized)
+            tool_calls[0] = target
         if decision == "always_allow":
             await self.permission_service.add_always_allow(
                 session_id,
-                target.name,
+                target.tool_name,
                 response.get("always_scope", "session"),
                 workspace_id=self.workspace_id,
             )
@@ -1636,7 +1639,7 @@ class AgentRuntime:
         self,
         turn: SessionTurnRecord,
         actor: Actor,
-        target: ToolUse,
+        target: ToolCall,
         record: ToolCallRecord,
         request: InteractionRequestRecord,
         response: dict[str, Any],
@@ -1684,7 +1687,7 @@ class AgentRuntime:
         self,
         turn: SessionTurnRecord,
         actor: Actor,
-        target: ToolUse,
+        target: ToolCall,
         record: ToolCallRecord,
         response: dict[str, Any],
     ) -> None:
@@ -1712,7 +1715,7 @@ class AgentRuntime:
         self,
         turn: SessionTurnRecord,
         actor: Actor,
-        target: ToolUse,
+        target: ToolCall,
         record: ToolCallRecord,
         request: InteractionRequestRecord,
         response: dict[str, Any],
@@ -1955,10 +1958,10 @@ class AgentRuntime:
                         session.id,
                         turn.id,
                         ORCHESTRATOR_ACTOR,
-                        ToolUse(
+                        ToolCall(
                             id=request.tool_use_id,
-                            name=record.tool_name,
-                            input=dict(record.input_args),
+                            tool_name=record.tool_name,
+                            arguments=dict(record.input_args),
                         ),
                         message,
                         is_error=True,

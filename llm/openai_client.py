@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -13,24 +13,17 @@ from pydantic import BaseModel
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.domain.messages import (
+    AssistantMessage,
+    ThinkingBlock,
+    ToolCall,
+    ToolResult,
+    UserMessage,
+    message_from_row,
+)
 from llm.base import BaseLLMClient
 from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
-from llm.types import (
-    LLMEventKind,
-    LLMStreamEvent,
-    LLMTurnResult,
-    PromptBlock,
-    TextBlock,
-    ThinkingBlock,
-    ThinkingSegment,
-    ToolResultMessage,
-    ToolSpec,
-    ToolUse,
-    ToolUseBlock,
-    parse_assistant_blocks,
-    parse_tool_result,
-    parse_user_text,
-)
+from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +35,7 @@ logger = logging.getLogger(__name__)
 _TOOL_ERROR_PREFIX = "[工具执行失败] "
 
 
-def _encode_tool_calls(blocks: list[ToolUseBlock]) -> list[dict[str, Any]]:
+def _encode_tool_calls(blocks: Sequence[ToolCall]) -> list[dict[str, Any]]:
     """把中立工具调用块编成 OpenAI 的 tool_calls 数组。
 
     OpenAI 的入参是 JSON 字符串(Anthropic 是原生对象),故此处需序列化。
@@ -52,26 +45,26 @@ def _encode_tool_calls(blocks: list[ToolUseBlock]) -> list[dict[str, Any]]:
             "id": block.id,
             "type": "function",
             "function": {
-                "name": block.name,
-                "arguments": json.dumps(block.input, ensure_ascii=False),
+                "name": block.tool_name,
+                "arguments": json.dumps(block.arguments, ensure_ascii=False),
             },
         }
         for block in blocks
     ]
 
 
-def _encode_tool_result(tool_result: ToolResultMessage) -> dict[str, Any]:
+def _encode_tool_result(tool_result: ToolResult) -> dict[str, Any]:
     """把中立工具结果编成 OpenAI 独立的 role="tool" 消息。
 
     与 Anthropic 的结构性差异:OpenAI 每个工具结果是一条独立消息并以
     tool_call_id 与调用配对,不合并、也不塞进 user 消息。
     """
-    content = tool_result.output
+    content = tool_result.content
     if tool_result.is_error:
         content = f"{_TOOL_ERROR_PREFIX}{content}"
     return {
         "role": "tool",
-        "tool_call_id": tool_result.tool_use_id,
+        "tool_call_id": tool_result.tool_call_id,
         "content": content,
     }
 
@@ -159,7 +152,7 @@ class _OpenAIChunkAdapter:
         self._usage: Usage | None = None
         self._stop_reason: str | None = None
         self._finished = False
-        self._tool_uses: list[ToolUse] = []
+        self._finished_tool_calls: list[ToolCall] = []
 
     def adapt(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
         """适配单个裸 chunk 为零或多个中立事件。
@@ -197,10 +190,10 @@ class _OpenAIChunkAdapter:
         thinking_text = "".join(self._thinking_parts)
         result = LLMTurnResult(
             text="".join(self._text_parts),
-            tool_uses=self._tool_uses,
-            # OpenAI 侧无签名概念,整段思考归并为单个 ThinkingSegment;
+            tool_calls=self._finished_tool_calls,
+            # OpenAI 侧无签名概念,整段思考归并为单个 ThinkingBlock;
             # 保持列表形状是为了与 Anthropic 的多段带签名思考共用中立结构。
-            thinking=[ThinkingSegment(text=thinking_text)] if thinking_text else [],
+            thinking=[ThinkingBlock(text=thinking_text)] if thinking_text else [],
             usage=self._usage,
             stop_reason=self._stop_reason,
         )
@@ -319,8 +312,8 @@ class _OpenAIChunkAdapter:
         for tc_index in sorted(self._tool_calls):
             pending = self._tool_calls[tc_index]
             tool_input = self._parse_tool_input(pending)
-            self._tool_uses.append(
-                ToolUse(id=pending.tool_id, name=pending.tool_name, input=tool_input)
+            self._finished_tool_calls.append(
+                ToolCall(id=pending.tool_id, tool_name=pending.tool_name, arguments=tool_input)
             )
             events.append(
                 LLMStreamEvent(
@@ -455,26 +448,21 @@ class OpenAIClient(BaseLLMClient):
           配对——**不像** Anthropic 那样合并成块塞进 user 消息。
 
         多个文本块拼接成单段:OpenAI 的 assistant content 是单一字符串,
-        无多块概念(build_assistant_blocks 本就最多产一个文本块)。
-        ToolResultMessage 的 tool_name / input_args 是 AgentOS 自有排障字段,
+        无多块概念(AssistantMessage.from_turn 本就最多产一个文本块)。
+        ToolResult 的 tool_name / arguments 是 AgentOS 自有排障字段,
         OpenAI 协议无对应位置,不发给模型。签名与 redacted_data 同理:
         属 Anthropic 专有,OpenAI 侧无处安放,不下发。
         """
         encoded: list[dict[str, Any]] = []
         for message in messages:
-            role = message.get("role")
-            content = message.get("content")
-            if role == "user":
-                encoded.append({"role": "user", "content": parse_user_text(content)})
-            elif role == "assistant":
-                blocks = parse_assistant_blocks(content)
-                text = "".join(block.text for block in blocks if isinstance(block, TextBlock))
-                tool_calls = _encode_tool_calls(
-                    [block for block in blocks if isinstance(block, ToolUseBlock)]
-                )
-                reasoning = "".join(
-                    block.text for block in blocks if isinstance(block, ThinkingBlock)
-                )
+            # 角色分派与形状校验由领域层完成,未知角色在此抛中文异常。
+            domain_message = message_from_row(message.get("role"), message.get("content"))
+            if isinstance(domain_message, UserMessage):
+                encoded.append({"role": "user", "content": domain_message.text})
+            elif isinstance(domain_message, AssistantMessage):
+                text = domain_message.text
+                tool_calls = _encode_tool_calls(domain_message.tool_calls)
+                reasoning = "".join(block.text for block in domain_message.thinking)
                 # 只有工具调用、没有文本时 content 必须显式为 None。
                 if text or not tool_calls:
                     assistant_content: str | None = text
@@ -487,10 +475,8 @@ class OpenAIClient(BaseLLMClient):
                 if tool_calls:
                     assistant["tool_calls"] = tool_calls
                 encoded.append(assistant)
-            elif role == "tool":
-                encoded.append(_encode_tool_result(parse_tool_result(content)))
             else:
-                raise AgentException.message("未知的消息角色", {"role": role})
+                encoded.append(_encode_tool_result(domain_message))
         # 接口层用 dict[str, Any] 承载动态 JSON,此处收窄为 SDK 的 TypedDict。
         return cast("list[ChatCompletionMessageParam]", encoded)
 
