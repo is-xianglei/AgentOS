@@ -24,11 +24,14 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import Effort, ModelClient, ModelSettings, ModelTurnResult, ResolvedModel
+from harness.app.tool_set import ToolSet
+from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
+from harness.domain.tool import ToolProfile
 from memory.recall.repository import MemoryRecallRepository
 from prompt import compose_subagent_prompt, compose_teammate_prompt
-from runtime.budget import ToolCallBudget
 from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
 from team.isolation import (
@@ -39,9 +42,7 @@ from team.isolation import (
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
 from tools.gateway import ToolGateway
-from tools.policy import ToolCapabilityResolver, ToolProfile
 from tools.policy_engine import PolicyEngine
-from tools.registry import ToolRegistry, build_tool_registry
 
 # 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
 from tools.service import ToolService  # noqa: F401
@@ -147,13 +148,13 @@ class SubAgentRunner:
         spec: SubAgentSpec,
         parent_allowed_tool_names: frozenset[str] | None,
         profile: ToolProfile = "subagent",
-    ) -> ToolRegistry:
+    ) -> ToolSet:
         """先继承父 Agent 工具边界，再叠加子代理自身规则。"""
-        registry = build_tool_registry()
+        registry = builtin_tool_set()
         if parent_allowed_tool_names is not None:
             registry = registry.only(*parent_allowed_tool_names)
         registry = spec.resolve_tools(registry)
-        names = ToolCapabilityResolver().resolve_names(registry.names, profile)
+        names = builtin_tool_set().callable_names(registry.names, profile)
         return registry.only(*names)
 
     async def _configure_model(
@@ -244,7 +245,7 @@ class SubAgentRunner:
         # 在默认子代理边界基础上再按自身档位做一次能力解析。
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         if profile != "subagent" and hasattr(tool_registry, "names"):
-            profile_names = ToolCapabilityResolver().resolve_names(
+            profile_names = builtin_tool_set().callable_names(
                 tool_registry.names,
                 profile,
             )
@@ -405,7 +406,7 @@ class SubAgentRunner:
         self,
         messages: list[dict[str, Any]],
         system_prompt: str,
-        tool_registry: ToolRegistry,
+        tool_registry: ToolSet,
         assembler: TurnEventAssembler,
         rendered_memories: str | None = None,
         *,
@@ -570,7 +571,7 @@ class SubAgentRunner:
         prompt: str,
         system_prompt: str,
         rendered_memories: str | None,
-        tool_registry: ToolRegistry,
+        tool_registry: ToolSet,
         tool_gateway: ToolGateway,
         spec: SubAgentSpec,
         parent_turn_id: UUID | None,
@@ -842,7 +843,7 @@ class SubAgentRunner:
         messages: list[dict[str, Any]],
         system_prompt: str,
         rendered_memories: str | None,
-        tool_registry: ToolRegistry,
+        tool_registry: ToolSet,
         tool_gateway: ToolGateway,
         spec: SubAgentSpec,
         parent_turn_id: UUID | None,

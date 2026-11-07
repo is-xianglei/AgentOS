@@ -31,7 +31,9 @@ from core.events import ORCHESTRATOR_ACTOR
 from harness.adapters.models import anthropic_client as anthropic_module
 from harness.adapters.models import openai_client as openai_module
 from harness.adapters.models.resolver import DatabaseModelResolver
+from harness.adapters.tools.builtin.echo import EchoTool
 from harness.app.ports import Effort, ResolvedModel
+from harness.app.tool_set import ToolSet
 from harness.domain.context import Context, PromptBlock, messages_from_rows
 from harness.domain.messages import AssistantMessage, ThinkingBlock, ToolCall, ToolResult
 from memory.jobs.dream import MemoryDreamService
@@ -47,8 +49,6 @@ from runtime.subagent import SubAgentRunner
 from runtime.workflow import LlmRoutingOrchestrator, ParallelOrchestrator
 from session.service import SessionService
 from tests.fixtures.model_request_golden import EXPECTED
-from tools.builtin.echo import EchoTool
-from tools.registry import ToolRegistry
 from tools.subagents.definition import AgentType
 from tools.subagents.registry import get_subagent_spec
 
@@ -695,7 +695,7 @@ async def _configured_agent(session: Any) -> AgentRuntime:
     """经真实 __init__ 与 _configure_agent 解析主 Agent 与压缩客户端，再换掉数据库依赖。"""
     runtime = AgentRuntime(object(), user_id=3, workspace_id=2)
     await runtime._configure_agent(session)
-    runtime.tool_registry = ToolRegistry([EchoTool()])
+    runtime.tool_registry = ToolSet([EchoTool()])
     runtime.bus = SimpleNamespace(emit=AsyncMock())
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [_USER], 1)),
@@ -745,7 +745,7 @@ def _subagent_case(world: str, effort: str, agent_type: AgentType, spec_model: s
         settings = await runner._configure_model(1, spec, 2, 3)
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, 1, turn_id=_TURN_ID)
         await runner._stream_and_collect(
-            [_USER], "子代理系统提示", ToolRegistry([EchoTool()]), assembler, settings=settings
+            [_USER], "子代理系统提示", ToolSet([EchoTool()]), assembler, settings=settings
         )
 
     return run

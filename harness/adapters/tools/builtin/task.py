@@ -3,9 +3,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 from task.schemas import TaskResponse
 from task.service import TaskService
-from tools.base import BaseTool, ToolContext
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +42,16 @@ class TaskCreateInput(BaseModel):
     )
 
 
-class TaskCreateTool(BaseTool):
+class TaskCreateTool(PydanticTool):
     name = "TaskCreate"
     description = "在当前会话中创建一个新任务,返回该任务的详细信息。"
     input_model = TaskCreateInput
+    policy = tool_policy(
+        "TaskCreate",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: TaskCreateInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db, bus=ctx.bus)
@@ -60,10 +72,16 @@ class TaskGetInput(BaseModel):
     id: int = Field(description="要查询的任务ID(必填)")
 
 
-class TaskGetTool(BaseTool):
+class TaskGetTool(PydanticTool):
     name = "TaskGet"
     description = "按任务ID查询当前会话中某个任务的详细信息;任务不存在时返回提示。"
     input_model = TaskGetInput
+    policy = tool_policy(
+        "TaskGet",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: TaskGetInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db)
@@ -109,10 +127,16 @@ class TaskUpdateInput(BaseModel):
         return self
 
 
-class TaskUpdateTool(BaseTool):
+class TaskUpdateTool(PydanticTool):
     name = "TaskUpdate"
     description = "更新当前会话中某个任务的字段、状态或阻塞关系,返回更新后的任务详情。"
     input_model = TaskUpdateInput
+    policy = tool_policy(
+        "TaskUpdate",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: TaskUpdateInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db, bus=ctx.bus)
@@ -138,10 +162,16 @@ class TaskListInput(BaseModel):
     """TaskList 无需任何入参。"""
 
 
-class TaskListTool(BaseTool):
+class TaskListTool(PydanticTool):
     name = "TaskList"
     description = "列出当前会话中的所有任务,以带状态标记的文本形式返回。"
     input_model = TaskListInput
+    policy = tool_policy(
+        "TaskList",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: TaskListInput, ctx: ToolContext) -> str:
         service = TaskService(ctx.db)

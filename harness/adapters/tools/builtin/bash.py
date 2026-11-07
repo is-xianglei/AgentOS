@@ -6,8 +6,8 @@ from pydantic import BaseModel, Field
 
 from core.errors import AgentException
 from core.executor import get_executor
-from tools.base import BaseTool, ToolContext
-from tools.shell_policy import ShellAccess, check_shell_command
+from harness.adapters.tools.builtin.shell_policy import check_shell_command
+from harness.domain.tool import PydanticTool, ShellAccess, ToolContext, tool_policy
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,36 @@ class BashInput(BaseModel):
     timeout: int = Field(default=30, description="超时时间(秒)")
 
 
-class BashTool(BaseTool):
+class BashTool(PydanticTool):
     name = "Bash"
     description = "执行 shell 命令并返回输出。支持设置工作目录和超时时间。"
     input_model = BashInput
+    policy = tool_policy(
+        "Bash",
+        "mutation",
+        # Shell 是高风险能力，普通用户 Agent 必须由更高层 profile
+        # 显式授予；旧绑定在运行时也会再次被拒绝。
+        bindable_profiles=frozenset(
+            {
+                "lead",
+                "orchestrator",
+                "workflow_node",
+                "subagent",
+                "teammate",
+            }
+        ),
+        callable_profiles=frozenset(
+            {
+                "lead",
+                "orchestrator",
+                "workflow_node",
+                "subagent",
+                "teammate",
+                "delegate",
+            }
+        ),
+        requires_approval=True,
+    )
 
     @staticmethod
     def _resolve_workdir(cwd: str | None, ctx: ToolContext) -> Path:

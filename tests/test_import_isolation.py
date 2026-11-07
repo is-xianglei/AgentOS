@@ -36,8 +36,8 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "memory.jobs.extraction",
     "runtime.agent",
     "runtime.workflow",
-    "tools.registry",
-    "tools.builtin.agent",
+    "harness.adapters.tools.builtin_provider",
+    "harness.adapters.tools.builtin.agent",
     "database.registry",
     "api.router",
     "main",
@@ -292,7 +292,13 @@ def test_domain_layer_imports_respect_layering() -> None:
     domain_modules = sorted(
         m for m in files if m == "harness.domain" or m.startswith("harness.domain.")
     )
-    assert {"harness.domain.messages", "harness.domain.context"} <= set(domain_modules), (
+    expected_domain = {
+        "harness.domain.messages",
+        "harness.domain.context",
+        "harness.domain.tool",
+        "harness.domain.budget",
+    }
+    assert expected_domain <= set(domain_modules), (
         f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"
     )
     failures: list[str] = []
@@ -363,7 +369,7 @@ def test_app_layer_imports_respect_layering() -> None:
     files = _first_party_module_files()
     known = set(files)
     app_modules = sorted(m for m in files if m == "harness.app" or m.startswith("harness.app."))
-    assert "harness.app.ports" in app_modules, (
+    assert {"harness.app.ports", "harness.app.tool_set"} <= set(app_modules), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
     )
     failures: list[str] = []

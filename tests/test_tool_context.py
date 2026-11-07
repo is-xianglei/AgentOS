@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from harness.domain.tool import ShellAccess
 from tools.context import ToolExecutionContext
 from tools.gateway import ToolGateway
-from tools.shell_policy import ShellAccess
 
 
 def test_execution_context_freezes_resource_boundaries(tmp_path: Path) -> None:

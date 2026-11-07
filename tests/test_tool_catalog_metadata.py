@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi import Request
 
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from tools import api
-from tools.policy import get_tool_policy
 from tools.schemas import ToolDetailResponse, ToolResponse
 
 pytestmark = pytest.mark.anyio
@@ -35,7 +35,7 @@ def test_catalog_metadata_comes_from_binding_policy(runtime_name: str) -> None:
     response = ToolResponse.model_validate(_record(runtime_name))
     profiles = response.model_dump()["bindable_profiles"]
 
-    assert profiles == sorted(get_tool_policy(runtime_name).bindable_profiles)
+    assert profiles == sorted(builtin_tool_set().policy_for(runtime_name).bindable_profiles)
     assert ("user_agent" in profiles) == (runtime_name == "Read")
 
 

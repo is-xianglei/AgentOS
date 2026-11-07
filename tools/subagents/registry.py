@@ -5,7 +5,7 @@
 
 工具权限用黑名单而非白名单表达能力边界(与参考实现一致):Explore / Plan /
 verification 都需要 shell 跑 git diff、find 与测试,禁 shell 会直接废掉它们的
-核心能力,因此只读由 tools/shell_policy.py 在执行边界按命令强制。
+核心能力,因此只读由 harness/adapters/tools/builtin/shell_policy.py 在执行边界按命令强制。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import re
 
 from core.config import settings
 from core.errors import AgentException
-from tools.shell_policy import ShellAccess
+from harness.domain.tool import ShellAccess
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.prompts import (
     EXPLORE_PROMPT,

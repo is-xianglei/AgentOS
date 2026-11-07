@@ -1,4 +1,4 @@
-from runtime.budget import ToolCallBudget
+from harness.domain.budget import ToolCallBudget
 
 
 def test_budget_limits_total_and_each_tool() -> None:

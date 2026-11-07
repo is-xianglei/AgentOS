@@ -3,7 +3,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 
 
 class ReadInput(BaseModel):
@@ -12,10 +18,16 @@ class ReadInput(BaseModel):
     limit: int | None = Field(default=None, description="读取的行数")
 
 
-class ReadTool(BaseTool):
+class ReadTool(PydanticTool):
     name = "Read"
     description = "读取文件内容,带行号输出。支持按行偏移和限制读取行数。"
     input_model = ReadInput
+    policy = tool_policy(
+        "Read",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: ReadInput, ctx: ToolContext) -> str:
         try:

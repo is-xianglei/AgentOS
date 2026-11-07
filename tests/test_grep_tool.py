@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from core.errors import AgentException
-from tools.base import ToolContext
-from tools.builtin.grep import GrepInput, GrepTool
+from harness.adapters.tools.builtin.grep import GrepInput, GrepTool
+from harness.domain.tool import ToolContext
 
 pytestmark = pytest.mark.anyio
 

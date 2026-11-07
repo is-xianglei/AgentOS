@@ -10,14 +10,14 @@ from typing import Any, Self
 import pytest
 
 from agent.service import AgentRuntimeConfig
+from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelTurnResult
 from harness.domain.messages import ToolCall
+from harness.domain.tool import ToolContext
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
 from runtime.subagent import SubAgentRunner, build_agent_spec
-from tools.base import ToolContext
-from tools.builtin.agent import AgentTool, AgentToolInput
 from tools.gateway import ToolGateway
-from tools.registry import build_tool_registry
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import get_subagent_spec
 
@@ -27,8 +27,8 @@ _SID = 42
 # 白名单故意混入 delegate 不可调的 TeamList 与全局禁用的 Agent,
 # 用来验证有效工具 = 白名单 ∩ delegate 档位 ∩ 父 Agent 本轮生效集。
 _WHITELIST = ("Read", "Write", "Grep", "Bash", "Skill", "SkillRun", "TeamList", "Agent")
-_NORMAL_ROUND = build_tool_registry().without("ExitPlanMode", "WritePlan").names
-_PLAN_ROUND = build_tool_registry().only(*PLAN_MODE_ALLOWED_TOOLS).names
+_NORMAL_ROUND = builtin_tool_set().without("ExitPlanMode", "WritePlan").names
+_PLAN_ROUND = builtin_tool_set().only(*PLAN_MODE_ALLOWED_TOOLS).names
 
 
 def _config(**overrides: Any) -> AgentRuntimeConfig:
@@ -358,7 +358,7 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
         db=object(),
         workspace_id=3,
         profile="lead",
-        allowed_tool_names=build_tool_registry().names,
+        allowed_tool_names=builtin_tool_set().names,
         round_tool_names=_PLAN_ROUND,
     )
 

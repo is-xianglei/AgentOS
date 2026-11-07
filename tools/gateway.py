@@ -1,6 +1,6 @@
 """统一工具网关。
 
-``ToolRegistry`` 只表示某个运行时可见的工具集合，``ToolService`` 负责持久化、
+``ToolSet`` 只表示某个运行时可见的工具集合，``ToolService`` 负责持久化、
 Hook 和实际执行。本模块把 profile、可信身份和这两个对象绑定成一个不可绕过的
 运行时入口，避免主 Agent、SubAgent 和 Workflow 节点各自拼接执行参数。
 """
@@ -14,12 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
 from core.events import Actor
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.tool_set import ToolSet
+from harness.domain.tool import ShellAccess, ToolProfile
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord
-from tools.policy import ToolCapabilityResolver, ToolProfile
-from tools.registry import ToolRegistry, build_tool_registry
 from tools.service import ToolService
-from tools.shell_policy import ShellAccess
 
 
 @dataclass
@@ -32,7 +32,7 @@ class ToolGateway:
     """
 
     db: AsyncSession
-    registry: ToolRegistry
+    registry: ToolSet
     profile: ToolProfile
     principal_name: str
     agent_id: int | None = None
@@ -43,10 +43,10 @@ class ToolGateway:
     service: ToolService = field(init=False)
 
     @staticmethod
-    def _ordered_registry_names(registry: ToolRegistry) -> tuple[str, ...] | None:
+    def _ordered_registry_names(registry: ToolSet) -> tuple[str, ...] | None:
         """读取注册表工具名并尽量保留注册顺序。
 
-        ``ToolRegistry.names`` 是 ``frozenset``，适合做集合判断却不适合直接
+        ``ToolSet.names`` 是 ``frozenset``，适合做集合判断却不适合直接
         生成发给模型的工具 schema：集合迭代顺序可能变化，进而破坏请求缓存、
         测试快照和不同运行时之间的可重复性。正式注册表优先使用 ``tools``
         的插入顺序；旧扩展点只有 ``names`` 时再按名称排序，保证安全降级也
@@ -76,9 +76,10 @@ class ToolGateway:
         if registry_names is None:
             # 旧扩展点可能传入只实现了部分接口的替身注册表。无法读取工具名时，
             # 安全降级为空注册表，避免把未知对象当成完整能力集合而绕过 profile。
-            self.registry = ToolRegistry([])
+            self.registry = ToolSet()
         else:
-            allowed_names = ToolCapabilityResolver().resolve_names(
+            # 能力策略按完整的内置工具集查，与原按名查策略表的口径一致。
+            allowed_names = builtin_tool_set().callable_names(
                 registry_names,
                 self.profile,
             )
@@ -105,12 +106,11 @@ class ToolGateway:
         中出现当前 profile 不允许调用的工具时直接报错，避免静默丢失配置导致模型
         以为自己拥有某个工具却在运行时才发现不存在。
         """
-        registry = build_tool_registry()
-        resolver = ToolCapabilityResolver()
+        registry = builtin_tool_set()
         if requested_names is not None:
             # 显式配置属于“绑定”动作，必须使用 bindable 策略；Skill 工具只能由
             # 运行时根据已绑定 Skill 自动注入，不能把 SkillRun 直接写进用户 Agent 配置。
-            names = resolver.resolve_bindable_names(
+            names = registry.bindable_names(
                 requested_names,
                 profile,
                 strict=strict,
@@ -121,7 +121,7 @@ class ToolGateway:
             if strict and unknown:
                 raise ValueError(f"工具不存在或未注册: {', '.join(unknown)}")
         else:
-            names = resolver.resolve_names(registry.names, profile)
+            names = registry.callable_names(registry.names, profile)
         return cls(
             db,
             registry.only(*names),
@@ -137,7 +137,7 @@ class ToolGateway:
     def from_registry(
         cls,
         db: AsyncSession,
-        registry: ToolRegistry,
+        registry: ToolSet,
         profile: ToolProfile,
         *,
         principal_name: str,
@@ -150,15 +150,15 @@ class ToolGateway:
         """从已有注册表构造网关，并严格校验其能力边界。
 
         运行时通常已经根据 Plan Mode、父 Agent 白名单或 Workflow 节点得到一个
-        裁剪后的 ``ToolRegistry``，此方法避免重新创建注册表，同时保证正式入口
+        裁剪后的 ``ToolSet``，此方法避免重新创建工具集，同时保证正式入口
         不会静默吞掉 profile 不允许的工具。
         """
         registry_names = cls._ordered_registry_names(registry)
         if registry_names is None:
             # 兼容旧的 _resolve_tools 替身；没有可审计的 names 时不暴露任何工具。
-            safe_registry = ToolRegistry([])
+            safe_registry = ToolSet()
         else:
-            names = ToolCapabilityResolver().resolve_names(
+            names = builtin_tool_set().callable_names(
                 registry_names,
                 profile,
                 strict=strict,

@@ -36,6 +36,7 @@ from core.events import (
 from database.engine import AsyncSessionLocal
 from harness.adapters.models.factory import create_model_client
 from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.app.tool_set import ToolSet
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
@@ -50,7 +51,6 @@ from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
-from tools.registry import ToolRegistry
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
 
@@ -512,7 +512,7 @@ class ParallelOrchestrator(BaseOrchestrator):
             StepRequest(
                 messages=[{"role": "user", "content": prompt}],
                 system_prompt=PARALLEL_MERGE_SYSTEM_PROMPT,
-                tool_registry=ToolRegistry([]),
+                tool_registry=ToolSet(),
                 settings=self.model_settings,
             )
         )

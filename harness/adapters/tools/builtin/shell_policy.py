@@ -19,16 +19,10 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 
-
-class ShellAccess(str, Enum):
-    """shell 访问级别。值用于落库与日志,保持稳定。"""
-
-    FULL = "full"
-    READ_ONLY = "read_only"
-    TMP_WRITABLE = "tmp_writable"
+# 访问级别枚举被 ToolContext 引用，属于领域类型；本模块只放具体的命令校验逻辑。
+from harness.domain.tool import ShellAccess
 
 
 @dataclass(frozen=True)

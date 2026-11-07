@@ -4,7 +4,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 
 
 class GrepInput(BaseModel):
@@ -16,10 +22,16 @@ class GrepInput(BaseModel):
     context_lines: int = Field(default=0, description="显示匹配行前后的上下文行数")
 
 
-class GrepTool(BaseTool):
+class GrepTool(PydanticTool):
     name = "Grep"
     description = "在文件中搜索匹配的内容,支持正则表达式和递归搜索。"
     input_model = GrepInput
+    policy = tool_policy(
+        "Grep",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: GrepInput, ctx: ToolContext) -> str:
         try:

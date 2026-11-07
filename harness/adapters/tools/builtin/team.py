@@ -14,9 +14,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from harness.domain.tool import LEAD_AND_TEAM, LEAD_ONLY, PydanticTool, ToolContext, tool_policy
 from team.schemas import TeamMemberResponse, TeamMessageResponse, TeamResponse
 from team.service import TeamService
-from tools.base import BaseTool, ToolContext
 from tools.subagents.definition import AgentType
 
 # ----- 序列化 helper:复用 team 域的 Response Schema 输出 JSON -----
@@ -45,13 +45,20 @@ class TeamCreateInput(BaseModel):
     )
 
 
-class TeamCreateTool(BaseTool):
+class TeamCreateTool(PydanticTool):
     name = "TeamCreate"
     description = (
         "为当前会话创建(或获取已存在的)团队。团队与会话 1:1,后续派遣队友、"
         "收发消息都归属在此团队下。通常在组建多人协作前先调用一次。"
     )
     input_model = TeamCreateInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "TeamCreate",
+        "orchestration",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: TeamCreateInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
@@ -89,13 +96,20 @@ class TeamSpawnInput(BaseModel):
         return value
 
 
-class TeamSpawnTool(BaseTool):
+class TeamSpawnTool(PydanticTool):
     name = "TeamSpawn"
     description = (
         "派遣一个持久的队友(teammate)进入当前团队:落地成员记录并写入其角色、"
         "子代理类型与初始任务提示,置为 working。name/role/prompt 必填。"
     )
     input_model = TeamSpawnInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "TeamSpawn",
+        "orchestration",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: TeamSpawnInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
@@ -118,10 +132,17 @@ class TeamListInput(BaseModel):
     pass
 
 
-class TeamListTool(BaseTool):
+class TeamListTool(PydanticTool):
     name = "TeamList"
     description = "列出当前会话团队的所有成员(含状态、角色、子代理类型)。"
     input_model = TeamListInput
+    # 团队消息只允许专门的 teammate 上下文或主编排者使用。
+    policy = tool_policy(
+        "TeamList",
+        "team_message",
+        bindable_profiles=LEAD_AND_TEAM,
+        callable_profiles=LEAD_AND_TEAM,
+    )
 
     async def run(self, args: TeamListInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
@@ -161,7 +182,7 @@ class SendMessageInput(BaseModel):
     )
 
 
-class SendMessageTool(BaseTool):
+class SendMessageTool(PydanticTool):
     name = "SendMessage"
     description = (
         "向团队成员发送消息。一个工具聚合四种发送场景:\n"
@@ -173,6 +194,13 @@ class SendMessageTool(BaseTool):
         "读取自己的收件箱用 ReadInbox;查看全会话消息流用 ListMessages。"
     )
     input_model = SendMessageInput
+    # 团队消息只允许专门的 teammate 上下文或主编排者使用。
+    policy = tool_policy(
+        "SendMessage",
+        "team_message",
+        bindable_profiles=LEAD_AND_TEAM,
+        callable_profiles=LEAD_AND_TEAM,
+    )
 
     async def run(self, args: SendMessageInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
@@ -216,13 +244,20 @@ class ReadInboxInput(BaseModel):
     )
 
 
-class ReadInboxTool(BaseTool):
+class ReadInboxTool(PydanticTool):
     name = "ReadInbox"
     description = (
         "读取并清空指定收件人的收件箱:返回其全部未读消息(含他人发来的普通消息、"
         "广播、关停请求与计划批复),并标记为已读。队友轮询自身消息时使用。"
     )
     input_model = ReadInboxInput
+    # 团队消息只允许专门的 teammate 上下文或主编排者使用。
+    policy = tool_policy(
+        "ReadInbox",
+        "team_message",
+        bindable_profiles=LEAD_AND_TEAM,
+        callable_profiles=LEAD_AND_TEAM,
+    )
 
     async def run(self, args: ReadInboxInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)
@@ -236,13 +271,20 @@ class ListMessagesInput(BaseModel):
     pass
 
 
-class ListMessagesTool(BaseTool):
+class ListMessagesTool(PydanticTool):
     name = "ListMessages"
     description = (
         "列出当前会话的全部团队消息(不区分收件人、不改读取状态),用于审视整个"
         "协作消息流;只想取自己的未读消息请改用 ReadInbox。"
     )
     input_model = ListMessagesInput
+    # 团队消息只允许专门的 teammate 上下文或主编排者使用。
+    policy = tool_policy(
+        "ListMessages",
+        "team_message",
+        bindable_profiles=LEAD_AND_TEAM,
+        callable_profiles=LEAD_AND_TEAM,
+    )
 
     async def run(self, args: ListMessagesInput, ctx: ToolContext) -> str:
         service = TeamService(ctx.db)

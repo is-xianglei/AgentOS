@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
-from tools.policy import ToolProfile
-from tools.shell_policy import ShellAccess
+from harness.domain.tool import ShellAccess, ToolProfile
 
 
 @dataclass(frozen=True)

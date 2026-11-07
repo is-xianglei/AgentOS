@@ -17,12 +17,12 @@ from sqlalchemy.exc import IntegrityError
 import database.registry  # noqa: F401  构造 ORM 实例前需全部映射在册
 from core.errors import AgentException
 from core.executor import ExecResult, Executor
+from harness.adapters.tools.builtin.skill import SkillResourceTool, SkillTool
+from harness.domain.tool import ToolContext
 from skill import service as skill_service_module
 from skill.models import SkillRecord
 from skill.parser import SkillBundle, encode_file, parse_skill_zip
 from skill.service import SkillService
-from tools.base import ToolContext
-from tools.builtin.skill import SkillResourceTool, SkillTool
 
 pytestmark = pytest.mark.anyio
 
@@ -626,7 +626,7 @@ def _tool_ctx() -> ToolContext:
 
 async def test_skill_tools_report_disabled_skill(monkeypatch):
     service = _service(_FakeRepo(_record(is_enabled=False)))
-    monkeypatch.setattr("tools.builtin.skill.SkillService", lambda db: service)
+    monkeypatch.setattr("harness.adapters.tools.builtin.skill.SkillService", lambda db: service)
 
     text = await SkillTool().run(SkillTool.input_model(name="demo"), _tool_ctx())
 
@@ -639,7 +639,7 @@ async def test_skill_tools_render_body_and_resources(monkeypatch):
         "assets/a.bin": encode_file(b"\xff\x00"),
     }
     service = _service(_FakeRepo(_record(extra_files=extra)))
-    monkeypatch.setattr("tools.builtin.skill.SkillService", lambda db: service)
+    monkeypatch.setattr("harness.adapters.tools.builtin.skill.SkillService", lambda db: service)
     resource_input = SkillResourceTool.input_model
 
     loaded = await SkillTool().run(SkillTool.input_model(name="demo"), _tool_ctx())

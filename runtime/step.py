@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from harness.app.ports import ModelClient, ModelSettings, ModelTurnResult
+from harness.app.tool_set import ToolSet
 from harness.domain.context import Context, PromptBlock, messages_from_rows
 from harness.domain.messages import AssistantMessage, ToolCall
 from runtime.stream_assembler import TurnEventAssembler
-from tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class StepRequest:
 
     messages: list[dict[str, Any]]
     system_prompt: str | Sequence[PromptBlock] | None
-    tool_registry: ToolRegistry
+    tool_registry: ToolSet
     settings: ModelSettings
 
     def context(self) -> Context[None]:

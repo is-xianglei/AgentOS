@@ -1,4 +1,4 @@
-"""应用层端口：模型客户端、调用参数、模型解析器，以及中立流事件与调用异常。
+"""应用层端口：模型客户端、调用参数、模型解析器、工具来源，以及中立流事件与调用异常。
 
 全部类型不含任何 provider 的 wire 形状；各家 SDK 的适配在 harness.adapters.models 内部完成。
 """
@@ -15,6 +15,7 @@ from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from harness.domain.context import Context
 from harness.domain.messages import ThinkingBlock, ToolCall
+from harness.domain.tool import Tool
 
 
 class ModelEventKind(str, Enum):
@@ -277,3 +278,16 @@ class ModelResolver(Protocol):
     ) -> ResolvedModel:
         """按后台任务入队时冻结的模型解析：旧任务只存了 .env 模型名，不迁往后来新增的数据库端点。"""
         ...
+
+
+class ToolProvider(ABC):
+    """工具来源：一个 provider 产出一组工具，由 ToolSet 聚合、做重名校验并保持顺序。
+
+    目前只有内置工具一种来源，全部是静态的，所以签名同步、不带参数。之后接入 MCP 时，
+    远端工具要按工作区读取 server 配置并经网络连接解析，届时把签名扩展为按工作区异步解析
+    （形如 ``async list_tools(scope) -> list[Tool]``），内置 provider 一并跟进。
+    """
+
+    @abstractmethod
+    def list_tools(self) -> list[Tool]:
+        """按稳定顺序返回本来源的全部工具；顺序决定发给模型的工具顺序，提示缓存依赖它。"""

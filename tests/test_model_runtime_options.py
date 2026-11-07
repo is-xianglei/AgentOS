@@ -1,21 +1,22 @@
 """模型选项贯穿会话、子代理、记忆任务和出站参数。"""
-from contextlib import asynccontextmanager
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
-import pytest
 import httpx
+import pytest
 from pydantic import BaseModel, ValidationError
 
 from core.errors import AgentException
 from harness.adapters.models import anthropic_client as anthropic_module
 from harness.adapters.models import openai_client as openai_module
+from harness.adapters.models import resolver as resolver_module
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
-from harness.adapters.models import resolver as resolver_module
 from harness.adapters.models.resolver import DatabaseModelResolver
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import (
     Effort,
     ModelEventKind,
@@ -25,14 +26,13 @@ from harness.app.ports import (
     ResolvedModel,
 )
 from model_service.models import ModelProviderRecord
-from model_service.service import ModelService
 from model_service.policy import TURBO_PROMPT
+from model_service.service import ModelService
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
 from session.schemas import SessionRenameRequest, SessionSendMessageRequest
 from session.service import SessionService
 from tests.fixtures.model_calls import structured, thinking_off, thinking_on
-from tools.registry import build_tool_registry
 
 pytestmark = pytest.mark.anyio
 
@@ -329,7 +329,7 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
     runtime._database_model = True
     runtime.llm = _LLM()
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.tool_registry = build_tool_registry()
+    runtime.tool_registry = builtin_tool_set()
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),

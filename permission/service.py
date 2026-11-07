@@ -3,9 +3,9 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from permission.models import PermissionRuleRecord
 from permission.repository import PermissionRepository
-from tools.policy import TOOL_POLICIES, get_tool_policy
 
 Scope = Literal["global", "session"]
 
@@ -17,9 +17,9 @@ Behavior = Literal["allow", "ask", "deny"]
 # Write/Edit:写入/修改文件有副作用,需审批。
 # Skill / SkillResource / Read / Glob / Grep 为只读能力,默认放行(未知工具默认 allow),不纳入本集合。
 # 审批默认值由工具能力策略派生，避免 PermissionService 与 ToolPolicy 各维护一份
-# 危险工具名单。新增工具只需在 ToolPolicy 声明 requires_approval=True。
+# 危险工具名单。新增工具只需在自己的 policy 声明 requires_approval=True。
 DANGEROUS_TOOLS: frozenset[str] = frozenset(
-    name for name, policy in TOOL_POLICIES.items() if policy.requires_approval
+    tool.name for tool in builtin_tool_set().tools if tool.policy.requires_approval
 )
 DEFAULT_ALLOW: Behavior = "allow"
 DEFAULT_ASK: Behavior = "ask"
@@ -47,7 +47,7 @@ class PermissionService:
             builtin = BUILTIN_AGENT_DEFAULTS.get((agent_type, tool_name))
             if builtin is not None:
                 return builtin
-        if get_tool_policy(tool_name).requires_approval:
+        if builtin_tool_set().policy_for(tool_name).requires_approval:
             return DEFAULT_ASK
         return DEFAULT_ALLOW
 

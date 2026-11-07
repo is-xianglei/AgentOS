@@ -12,9 +12,9 @@ from pydantic import ValidationError
 
 from agent.service import AgentRuntimeConfig
 from core.errors import AgentException
-from tools.base import ToolContext
-from tools.builtin.agent import AgentTool, AgentToolInput
-from tools.registry import build_tool_registry
+from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ToolContext
 from tools.subagents.definition import AgentType
 
 pytestmark = pytest.mark.anyio
@@ -45,7 +45,7 @@ def _ctx(**overrides: Any) -> ToolContext:
         "workspace_id": _WORKSPACE_ID,
         "user_id": 2,
         "profile": "lead",
-        "allowed_tool_names": build_tool_registry().names,
+        "allowed_tool_names": builtin_tool_set().names,
         "round_tool_names": _ROUND_TOOL_NAMES,
     }
     values.update(overrides)
@@ -111,7 +111,7 @@ def test_input_rejects_explicit_agent_type_and_agent_id() -> None:
 
 def test_runtime_validation_reports_conflict_as_tool_error() -> None:
     """主运行时先经注册表校验入参:冲突转成「工具参数校验失败」,作为工具结果回给模型。"""
-    registry = build_tool_registry()
+    registry = builtin_tool_set()
 
     with pytest.raises(AgentException) as exc_info:
         registry.validate_input(
@@ -124,7 +124,7 @@ def test_runtime_validation_reports_conflict_as_tool_error() -> None:
 
 def test_only_agent_id_survives_runtime_normalization() -> None:
     """规范化后不能凭空带上 agent_type 默认值,否则执行时会被误判为两者都传。"""
-    normalized = build_tool_registry().validate_input("Agent", {"agent_id": 7, "prompt": "审一下"})
+    normalized = builtin_tool_set().validate_input("Agent", {"agent_id": 7, "prompt": "审一下"})
 
     assert normalized == {"agent_id": 7, "prompt": "审一下"}
     assert AgentToolInput.model_validate(normalized).agent_type is None
@@ -138,7 +138,7 @@ async def test_agent_id_delegates_with_agent_runtime_config(
 ) -> None:
     config_requests, dispatches = _install_fakes(monkeypatch)
 
-    output = await AgentTool().run_with_dict({"agent_id": 7, "prompt": "审一下"}, _ctx())
+    output = await AgentTool().execute({"agent_id": 7, "prompt": "审一下"}, _ctx())
 
     assert config_requests == [(_WORKSPACE_ID, 7)]
     (dispatch,) = dispatches
@@ -237,7 +237,7 @@ async def test_without_agent_id_keeps_builtin_subagent_path(
     config_requests, dispatches = _install_fakes(monkeypatch)
     ctx = _ctx()
 
-    output = await AgentTool().run_with_dict(payload, ctx)
+    output = await AgentTool().execute(payload, ctx)
 
     spec = dispatches[0]["spec"]
     assert spec.agent_type is expected_type

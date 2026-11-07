@@ -43,7 +43,7 @@ def render_environment(cwd: str, today: date) -> str:
     """渲染环境段。
 
     cwd 是服务进程的当前工作目录，也是 Bash / Read / Write 等工具解析相对
-    路径的真实基准（见 tools/builtin/bash.py、read.py）。它不是用户工作区
+    路径的真实基准（见 harness/adapters/tools/builtin/bash.py、read.py）。它不是用户工作区
     的路径——workspace 表是 SaaS 租户，不含文件系统路径。
     只放按天变化的日期，不放时刻，否则每次请求都会击穿缓存前缀。
     """

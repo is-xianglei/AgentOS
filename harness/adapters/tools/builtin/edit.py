@@ -3,7 +3,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 
 
 class EditInput(BaseModel):
@@ -13,10 +19,18 @@ class EditInput(BaseModel):
     replace_all: bool = Field(default=False, description="是否替换所有匹配项")
 
 
-class EditTool(BaseTool):
+class EditTool(PydanticTool):
     name = "Edit"
     description = "精确字符串替换编辑文件。old_string 必须在文件中完全匹配且唯一(或 replace_all=true)。"
     input_model = EditInput
+    # 有副作用的工具仍需经过 PermissionService 的调用级审批。
+    policy = tool_policy(
+        "Edit",
+        "mutation",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+        requires_approval=True,
+    )
 
     async def run(self, args: EditInput, ctx: ToolContext) -> str:
         try:

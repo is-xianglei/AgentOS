@@ -5,17 +5,24 @@ from types import SimpleNamespace
 import pytest
 
 from core.errors import AgentException
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ToolPolicy, ToolProfile
 from tools.service import ToolCatalogService
-from tools.registry import build_tool_registry
-from tools.policy import (
-    TOOL_POLICIES,
-    ToolCapabilityResolver,
-    can_bind_tool,
-    can_call_tool,
-    get_tool_policy,
-)
 
 pytestmark = pytest.mark.anyio
+
+
+# 原 tools/policy.py 的按名查询函数已并入 ToolSet；这里保留同名辅助函数，断言不变。
+def get_tool_policy(tool_name: str) -> ToolPolicy:
+    return builtin_tool_set().policy_for(tool_name)
+
+
+def can_bind_tool(tool_name: str, profile: ToolProfile) -> bool:
+    return get_tool_policy(tool_name).can_bind(profile)
+
+
+def can_call_tool(tool_name: str, profile: ToolProfile) -> bool:
+    return get_tool_policy(tool_name).can_call(profile)
 
 
 def test_user_agent_cannot_bind_control_plane_tools() -> None:
@@ -39,9 +46,10 @@ def test_user_agent_can_bind_leaf_and_task_tools() -> None:
 
 
 def test_every_registered_tool_has_a_matching_policy() -> None:
-    registry_names = build_tool_registry().names
+    tool_set = builtin_tool_set()
 
-    assert registry_names <= TOOL_POLICIES.keys()
+    assert all(tool_set.policy_for(name).category != "unknown" for name in tool_set.names)
+    assert all(tool.policy.name == tool.name for tool in tool_set.tools)
 
 
 def test_user_agent_cannot_bind_privileged_shell_or_skill_runtime_tools() -> None:
@@ -80,9 +88,9 @@ def test_subagent_cannot_bind_or_call_control_plane_tools() -> None:
     "orchestrator",
 ])
 def test_resolver_preserves_order_deduplicates_and_filters_unknown(profile) -> None:
-    resolver = ToolCapabilityResolver()
+    resolver = builtin_tool_set()
 
-    assert resolver.resolve_names(
+    assert resolver.callable_names(
         ["Read", "AskUserQuestion", "Read", "missing-tool", "TaskList"],
         profile,
     ) == (
@@ -93,10 +101,10 @@ def test_resolver_preserves_order_deduplicates_and_filters_unknown(profile) -> N
 
 
 def test_resolver_strict_mode_reports_denied_names() -> None:
-    resolver = ToolCapabilityResolver()
+    resolver = builtin_tool_set()
 
     with pytest.raises(ValueError, match="profile=user_agent"):
-        resolver.resolve_names(
+        resolver.callable_names(
             ["Read", "TeamCreate", "Unknown"], "user_agent", strict=True
         )
 

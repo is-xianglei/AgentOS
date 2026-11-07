@@ -69,8 +69,9 @@ API、错误与日志：
 2. 所有 ORM 默认继承 Base 的审计字段和软删除机制，不要随意物理删除。
 3. JSON 可变字段使用 MutableDict/MutableList 和 default=dict/list，
    禁止使用可变字面量作为默认值。
-4. 工具继承 BaseTool，用 Pydantic BaseModel 定义输入，通过 ToolContext 获取上下文，
-   实现 async run，并在 tools/builtin/__init__.py 和 ToolRegistry 中登记。
+4. 内置工具继承 PydanticTool（harness/domain/tool.py），用 Pydantic BaseModel 定义输入，
+   声明自身的 policy（ToolPolicy），通过 ToolContext 获取上下文，实现 async run，
+   并在 harness/adapters/tools/builtin/__init__.py 和 BuiltinToolProvider 中登记。
 5. 文件类工具使用 pathlib.Path、显式 UTF-8，并先校验路径和参数。
 
 测试与交付：
@@ -153,8 +154,8 @@ Anthropic SDK 使用规范：
    工具、事件、Hook、Prompt、注册表、依赖注入和跨域调用关系。
 3. 同步清理相关路由注册、模块导出、配置项、`.env`、`.env.example`、Settings 字段、
    常量、依赖包、测试夹具、Mock、示例代码和文档。
-4. 删除工具时，同步清理 BaseTool 实现、Input Schema、builtin 导出、
-   ToolRegistry 注册、权限配置及相关 Prompt 描述。
+4. 删除工具时，同步清理 PydanticTool 实现（含其 policy）、Input Schema、builtin 导出、
+   BuiltinToolProvider 登记、权限配置及相关 Prompt 描述。
 5. 删除 ORM 实体时，同步清理 relationship、外键引用和 database/registry.py 登记，
    并新增 Alembic 迁移删除对应数据库对象。
 6. 已经进入迁移历史的 Alembic 文件不得直接删除或篡改；数据库结构变更应通过新的

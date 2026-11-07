@@ -8,13 +8,9 @@
 from dataclasses import dataclass
 from typing import Any
 
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ToolProfile, requires_skill_allowlist
 from permission.service import Behavior, PermissionService
-from tools.policy import (
-    ToolCapabilityResolver,
-    ToolProfile,
-    get_tool_policy,
-    requires_skill_allowlist,
-)
 
 
 @dataclass(frozen=True)
@@ -38,7 +34,8 @@ class PolicyEngine:
 
     def __init__(self, db: Any):
         self.permission_service = PermissionService(db)
-        self.resolver = ToolCapabilityResolver()
+        # 静态能力按工具名查内置工具集的策略；查不到的工具任何档位都不可调用。
+        self.tool_set = builtin_tool_set()
 
     def resolve_bindable_names(
         self,
@@ -47,7 +44,7 @@ class PolicyEngine:
         *,
         strict: bool = False,
     ) -> tuple[str, ...]:
-        return self.resolver.resolve_bindable_names(tool_names, profile, strict=strict)
+        return self.tool_set.bindable_names(tool_names, profile, strict=strict)
 
     def resolve_callable_names(
         self,
@@ -56,7 +53,7 @@ class PolicyEngine:
         *,
         strict: bool = False,
     ) -> tuple[str, ...]:
-        return self.resolver.resolve_names(tool_names, profile, strict=strict)
+        return self.tool_set.callable_names(tool_names, profile, strict=strict)
 
     def admit_tool(
         self,
@@ -72,7 +69,7 @@ class PolicyEngine:
         ToolService 执行前重复调用。重复调用是有意的防御式边界，而不是新的
         权限来源。
         """
-        policy = get_tool_policy(tool_name)
+        policy = self.tool_set.policy_for(tool_name)
         if not policy.can_call(profile):
             return ToolAccessDecision(
                 tool_name,

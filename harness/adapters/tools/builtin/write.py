@@ -3,7 +3,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 
 
 class WriteInput(BaseModel):
@@ -11,10 +17,18 @@ class WriteInput(BaseModel):
     content: str = Field(description="要写入的内容")
 
 
-class WriteTool(BaseTool):
+class WriteTool(PydanticTool):
     name = "Write"
     description = "创建或覆盖文件,写入指定内容。"
     input_model = WriteInput
+    # 有副作用的工具仍需经过 PermissionService 的调用级审批。
+    policy = tool_policy(
+        "Write",
+        "mutation",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+        requires_approval=True,
+    )
 
     async def run(self, args: WriteInput, ctx: ToolContext) -> str:
         try:

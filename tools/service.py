@@ -10,20 +10,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
-from hooks import HookContext, HookEvent, get_hook_registry
-from tools.base import ToolContext
-from tools.context import ToolExecutionContext
-from tools.models import ToolCallRecord, ToolRecord
-from tools.policy import (
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.tool_set import ToolSet
+from harness.domain.tool import (
+    ShellAccess,
+    ToolContext,
     ToolProfile,
-    can_bind_tool,
-    can_call_tool,
-    get_tool_policy,
     requires_skill_allowlist,
 )
-from tools.registry import ToolRegistry, build_tool_registry
+from hooks import HookContext, HookEvent, get_hook_registry
+from tools.context import ToolExecutionContext
+from tools.models import ToolCallRecord, ToolRecord
 from tools.repository import ToolCatalogRepository, ToolRepository
-from tools.shell_policy import ShellAccess
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +74,17 @@ class ToolCatalogService:
         self.db = db
         self.repo = ToolCatalogRepository(db)
 
-    async def sync_builtins(self, registry: ToolRegistry | None = None) -> None:
-        active_registry = registry or build_tool_registry()
-        for tool in active_registry.tools:
+    async def sync_builtins(self, tool_set: ToolSet | None = None) -> None:
+        active_tool_set = tool_set or builtin_tool_set()
+        for tool in active_tool_set.tools:
             await self.repo.sync_builtin(
                 tool_key=tool.name,
                 name=tool.name,
                 description=tool.description,
                 runtime_name=tool.name,
-                input_schema=tool.input_model.model_json_schema(),
+                input_schema=tool.parameters,
             )
-        await self.repo.mark_missing_deleted(set(active_registry.names))
+        await self.repo.mark_missing_deleted(set(active_tool_set.names))
         await self.db.flush()
 
     async def list_tools(
@@ -139,9 +137,9 @@ class ToolCatalogService:
                 {"tool_ids": unavailable},
                 status_code=409,
             )
-        registry_names = build_tool_registry().names
+        tool_set = builtin_tool_set()
         missing_runtime = [
-            record.id for record in records if record.runtime_name not in registry_names
+            record.id for record in records if record.runtime_name not in tool_set.names
         ]
         if missing_runtime:
             raise AgentException.message(
@@ -154,7 +152,9 @@ class ToolCatalogService:
             return normalized
 
         forbidden = [
-            record for record in records if not can_bind_tool(record.runtime_name, profile)
+            record
+            for record in records
+            if not tool_set.policy_for(record.runtime_name).can_bind(profile)
         ]
         if forbidden:
             raise AgentException.message(
@@ -203,7 +203,7 @@ class ToolCatalogService:
         normalized = list(dict.fromkeys(tool_keys))
         records = await self.repo.list_by_tool_keys(normalized)
         records_by_key = {record.tool_key: record for record in records}
-        registry_names = build_tool_registry().names
+        tool_set = builtin_tool_set()
 
         tool_ids: dict[str, int] = {}
         unavailable: dict[str, ToolUnavailableReason] = {}
@@ -213,9 +213,9 @@ class ToolCatalogService:
                 unavailable[tool_key] = "not_found"
             elif not record.is_enabled:
                 unavailable[tool_key] = "disabled"
-            elif record.runtime_name not in registry_names:
+            elif record.runtime_name not in tool_set.names:
                 unavailable[tool_key] = "not_found"
-            elif not can_bind_tool(record.runtime_name, profile):
+            elif not tool_set.policy_for(record.runtime_name).can_bind(profile):
                 unavailable[tool_key] = "not_bindable"
             else:
                 tool_ids[tool_key] = record.id
@@ -233,8 +233,8 @@ class ToolCatalogService:
         normalized = list(dict.fromkeys(runtime_names))
         records = await self.repo.list_by_runtime_names(normalized)
         records_by_name = {record.runtime_name: record for record in records}
-        registry_names = build_tool_registry().names
-        # 目录中不存在、已停用、或代码注册表中没有实现，任一情况都视为不可用。
+        registry_names = builtin_tool_set().names
+        # 目录中不存在、已停用、或代码里没有实现，任一情况都视为不可用。
         unavailable: list[str] = []
         for name in normalized:
             record = records_by_name.get(name)
@@ -250,10 +250,13 @@ class ToolCatalogService:
 
 
 class ToolService:
-    def __init__(self, db: AsyncSession, registry: ToolRegistry):
+    def __init__(self, db: AsyncSession, registry: ToolSet):
         """初始化工具执行器依赖。"""
         self.db = db
         self.registry = registry
+        # 能力策略按工具名查完整的内置工具集，而不是 registry：registry 是裁剪后的
+        # 可见集合，被裁掉的工具若按它查会变成 unknown，从而跳过下面的能力检查。
+        self.policy_source = builtin_tool_set()
         self.tool_repo = ToolRepository(db)
         self.catalog_repo = ToolCatalogRepository(db)
 
@@ -358,12 +361,12 @@ class ToolService:
 
         # 注册表裁剪只影响模型可见 schema，不能作为最终安全边界。任何旧
         # 配置、直接调用或恢复路径都必须在网关再次经过能力策略。
-        policy = get_tool_policy(tool_name)
+        policy = self.policy_source.policy_for(tool_name)
         # 未声明策略的自定义工具保留旧的直接 ToolService 兼容路径；一旦
         # 运行时显式携带 profile，则未知工具也必须先登记策略才能调用。
         capability_check_required = profile is not None or policy.category != "unknown"
         denied: str | None = None
-        if capability_check_required and not can_call_tool(tool_name, resolved_profile):
+        if capability_check_required and not policy.can_call(resolved_profile):
             denied = f"工具能力策略拒绝执行: tool={tool_name}, profile={resolved_profile}"
         elif policy.requires_bound_skill and requires_skill_allowlist(resolved_profile):
             # Skill 的参数名是 ``name``，SkillResource / SkillRun 使用
@@ -471,7 +474,7 @@ class ToolService:
                 shell_access=shell_access,
                 shell_tmp_root=shell_tmp_root,
             )
-            output = await tool.run_with_dict(input_args, ctx)
+            output = await tool.execute(input_args, ctx)
         except Exception as exc:
             # 失败先记日志再落库,避免后续落库或 hook 抛错吞掉现场;不改变原有 raise 时序。
             logger.exception(

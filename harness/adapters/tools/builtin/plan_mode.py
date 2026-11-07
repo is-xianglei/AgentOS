@@ -3,8 +3,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.errors import AgentException
+from harness.domain.tool import LEAD_ONLY, PydanticTool, ToolContext, tool_policy
 from plan.service import PlanService
-from tools.base import BaseTool, ToolContext
 
 
 class EnterPlanModeInput(BaseModel):
@@ -43,36 +43,57 @@ class WritePlanInput(BaseModel):
     )
 
 
-class EnterPlanModeTool(BaseTool):
+class EnterPlanModeTool(PydanticTool):
     name = "EnterPlanMode"
     description = (
         "在执行复杂或需求不明确的实现任务前，请求用户允许进入只读的计划模式。"
     )
     input_model = EnterPlanModeInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "EnterPlanMode",
+        "interaction",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> str:
         raise AgentException.message("EnterPlanMode必须由主运行时的人工交互流程处理")
 
 
-class ExitPlanModeTool(BaseTool):
+class ExitPlanModeTool(PydanticTool):
     name = "ExitPlanMode"
     description = (
         "向用户展示已持久化的计划以供审批，并请求允许退出计划模式。"
         "仅可在计划编写完成后调用。"
     )
     input_model = ExitPlanModeInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "ExitPlanMode",
+        "interaction",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> str:
         raise AgentException.message("ExitPlanMode必须由主运行时的人工交互流程处理")
 
 
-class WritePlanTool(BaseTool):
+class WritePlanTool(PydanticTool):
     name = "WritePlan"
     description = (
         "创建或完整替换已持久化的 Markdown 实施计划。"
         "这是计划模式生效期间唯一允许的写操作。"
     )
     input_model = WritePlanInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "WritePlan",
+        "interaction",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: BaseModel, ctx: ToolContext) -> str:
         parsed = WritePlanInput.model_validate(args)

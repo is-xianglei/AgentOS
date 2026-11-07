@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from permission.schemas import (
     PermissionRuleCreateRequest,
     PermissionRuleDeleteResult,
@@ -13,7 +14,6 @@ from permission.schemas import (
 )
 from permission.service import PermissionService
 from session.service import SessionService
-from tools.policy import get_tool_policy
 from user.models import UserRecord
 from workspace.service import WorkspaceService
 
@@ -25,7 +25,7 @@ CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 def _validate_tool_name(tool_name: str) -> None:
     """权限规则只能引用已声明能力策略的运行时工具。"""
-    if get_tool_policy(tool_name).category == "unknown":
+    if builtin_tool_set().policy_for(tool_name).category == "unknown":
         raise AgentException.message(
             "工具未注册，不能配置权限规则",
             {"tool_name": tool_name},

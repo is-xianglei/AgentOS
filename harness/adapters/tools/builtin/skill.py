@@ -4,7 +4,7 @@
 - SkillResourceTool(SkillResource):读取单个资源文件(文本内联,二进制只给描述)。
 - SkillRunTool(SkillRun):执行 scripts/ 下脚本,返回退出码 + 截断后的 stdout/stderr。
 
-均继承 tools.base.BaseTool,run async 返回 str;经 ctx.db 构造 SkillService(ctx.db);
+均继承 harness.domain.tool.PydanticTool,run async 返回 str;经 ctx.db 构造 SkillService(ctx.db);
 领域错误在 run 内捕获转可读中文文本,不抛给框架。
 禁用的 skill 由 SkillService 拒绝访问,与不存在报同一条错误。
 """
@@ -12,8 +12,19 @@
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
+from harness.domain.tool import (
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    ToolProfile,
+    tool_policy,
+)
 from skill.service import SkillService
-from tools.base import BaseTool, ToolContext
+
+# Skill 工具由已绑定 Skill 自动注入；不允许普通 Agent 伪造基础工具绑定。
+_SKILL_BINDABLE_PROFILES: frozenset[ToolProfile] = frozenset(
+    {"lead", "orchestrator", "workflow_node", "subagent", "teammate"}
+)
 
 
 def _unknown_skill(name: str) -> str:
@@ -48,13 +59,20 @@ class SkillInput(BaseModel):
     name: str = Field(description="要加载的 skill 名称(取自系统提示中的可用 skill 清单)")
 
 
-class SkillTool(BaseTool):
+class SkillTool(PydanticTool):
     name = "Skill"
     description = (
         "加载指定 skill 的完整说明并注入上下文。"
         "当任务匹配某个可用 skill 时,先调用它取回正文再执行。"
     )
     input_model = SkillInput
+    policy = tool_policy(
+        "Skill",
+        "leaf",
+        bindable_profiles=_SKILL_BINDABLE_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+        requires_bound_skill=True,
+    )
 
     async def run(self, args: SkillInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.name, ctx):
@@ -93,10 +111,17 @@ class SkillResourceInput(BaseModel):
     relative_path: str = Field(description="资源相对路径,如 references/cli.md")
 
 
-class SkillResourceTool(BaseTool):
+class SkillResourceTool(PydanticTool):
     name = "SkillResource"
     description = "读取指定 skill 的某个资源文件(references/scripts/assets),返回其内容。"
     input_model = SkillResourceInput
+    policy = tool_policy(
+        "SkillResource",
+        "leaf",
+        bindable_profiles=_SKILL_BINDABLE_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+        requires_bound_skill=True,
+    )
 
     async def run(self, args: SkillResourceInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):
@@ -129,13 +154,23 @@ class SkillRunInput(BaseModel):
     stdin: str | None = Field(default=None, description="写入脚本标准输入的文本")
 
 
-class SkillRunTool(BaseTool):
+class SkillRunTool(PydanticTool):
     name = "SkillRun"
     description = (
         "执行指定 skill 的脚本(scripts/ 下),返回退出码与截断后的 stdout/stderr。"
         "进程内执行,受超时与输出上限约束。"
     )
     input_model = SkillRunInput
+    policy = tool_policy(
+        "SkillRun",
+        "mutation",
+        # 运行时会在用户 Agent 绑定 Skill 后自动补齐 SkillRun；直接
+        # 把 SkillRun 填进 tool_ids 则拒绝，避免绕过 Skill 资产边界。
+        bindable_profiles=_SKILL_BINDABLE_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+        requires_approval=True,
+        requires_bound_skill=True,
+    )
 
     async def run(self, args: SkillRunInput, ctx: ToolContext) -> str:
         if ctx.workspace_id is None or not _can_access_skill(args.skill_name, ctx):

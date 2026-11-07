@@ -13,13 +13,13 @@ import pytest
 
 from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
 from core.events import ORCHESTRATOR_ACTOR
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import ToolCall
 from prompt import PromptContext, compose_lead_blocks
 from prompt.sections import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
 from tools.policy_engine import ToolAccessDecision
-from tools.registry import build_tool_registry
 
 pytestmark = pytest.mark.anyio
 
@@ -86,7 +86,7 @@ def _loop_runtime(llm: _FakeLLM, delegate_catalog: str | None) -> AgentRuntime:
     runtime._database_model = True
     runtime.llm = llm
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.tool_registry = build_tool_registry()
+    runtime.tool_registry = builtin_tool_set()
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),

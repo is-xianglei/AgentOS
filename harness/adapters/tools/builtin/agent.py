@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.errors import AgentException
 from core.event_bus import StreamBus
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import LEAD_ONLY, PydanticTool, ToolContext, tool_policy
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import (
     get_subagent_spec,
@@ -87,7 +87,7 @@ class AgentToolInput(BaseModel):
         return self
 
 
-class AgentTool(BaseTool):
+class AgentTool(PydanticTool):
     name = "Agent"
     description = (
         "启动一个子代理(SubAgent)处理聚焦的多步任务。"
@@ -99,6 +99,13 @@ class AgentTool(BaseTool):
         "被拒绝的工具调用会附在报告末尾,确需执行时由你在主会话中重新调用。"
     )
     input_model = AgentToolInput
+    # 控制平面能力，只属于主 Agent/Orchestrator。
+    policy = tool_policy(
+        "Agent",
+        "orchestration",
+        bindable_profiles=LEAD_ONLY,
+        callable_profiles=LEAD_ONLY,
+    )
 
     async def run(self, args: AgentToolInput, ctx: ToolContext) -> str:
         if args.agent_id is not None:
@@ -138,7 +145,7 @@ class AgentTool(BaseTool):
         目标不可用(不存在、跨工作区、已停用、工具绑定失效)时,把中文原因作为结果交回模型,
         让默认 Agent 自行改道,而不是让整轮对话失败;被委派方运行中的失败与内置子代理一致,照常上抛。
         """
-        # 局部导入：agent.service -> tools.service -> tools.registry -> 本模块，顶层导入成环。
+        # 局部导入：agent.service -> tools.service -> builtin_provider -> 本模块，顶层导入成环。
         from agent.service import AgentDefinitionService
         from runtime.subagent import build_agent_spec
 
@@ -234,8 +241,8 @@ class AgentTool(BaseTool):
         allowed_skill_names: frozenset[str] | None,
     ) -> str:
         """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
-        # 局部导入：工具反向依赖运行时，改顶层仍成环 runtime.subagent -> tools.registry
-        # -> tools.builtin.agent，待依赖倒置任务处理。
+        # 局部导入：工具反向依赖运行时，改顶层仍成环 runtime.subagent -> builtin_provider
+        # -> harness.adapters.tools.builtin.agent，待依赖倒置任务处理。
         from database.engine import AsyncSessionLocal
         from runtime.subagent import SubAgentRunner
 

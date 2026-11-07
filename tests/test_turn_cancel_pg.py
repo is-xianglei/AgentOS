@@ -31,6 +31,7 @@ from core.events import (
 )
 from core.run_events import LocalRunEventStore
 from core.run_state import restore
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from interaction.schemas import InteractionRequestCreate
 from interaction.service import InteractionService
@@ -39,7 +40,6 @@ from runtime.agent import AgentRuntime
 from runtime.cancel_partial import CANCELLED_TOOL_OUTPUT
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
-from tools.registry import build_tool_registry
 from tools.service import ToolService
 from user.models import UserRecord
 from workspace.models import WorkspaceRecord
@@ -559,10 +559,10 @@ async def _suspend(shared: _Shared, ids, store) -> tuple[int, uuid.UUID, uuid.UU
                 AssistantMessage.from_turn("需要审批", [_use("w")]).to_content(),
                 turn_id=turn_id,
             )
-            record = await ToolService(db, build_tool_registry()).start_call(
+            record = await ToolService(db, builtin_tool_set()).start_call(
                 session_id, "Read", {"path": "w.txt"}, message_id=message.id
             )
-            await ToolService(db, build_tool_registry()).tool_repo.mark_awaiting_interaction(record)
+            await ToolService(db, builtin_tool_set()).tool_repo.mark_awaiting_interaction(record)
             suspension, request = await InteractionService(db).create_suspension_with_request(
                 session_id,
                 turn_id,
@@ -603,7 +603,7 @@ def _interaction_runtime(db: AsyncSession, ids) -> AgentRuntime:
     runtime.user_id, runtime.workspace_id = ids
     runtime.session_service = SessionService(db)
     runtime.interaction_service = InteractionService(db)
-    runtime.tool_service = ToolService(db, build_tool_registry())
+    runtime.tool_service = ToolService(db, builtin_tool_set())
     runtime.bus = NullStreamBus()
     return runtime
 

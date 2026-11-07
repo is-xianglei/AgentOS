@@ -1,12 +1,13 @@
 """ToolGateway 的 profile、身份和工具暴露边界测试。"""
 
-import pytest
 from pathlib import Path
 
+import pytest
+
 from core.events import ORCHESTRATOR_ACTOR
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ShellAccess
 from tools.gateway import ToolGateway
-from tools.registry import build_tool_registry
-from tools.shell_policy import ShellAccess
 
 pytestmark = pytest.mark.anyio
 
@@ -149,7 +150,7 @@ def test_lead_gateway_accepts_explicit_control_plane_allowlist() -> None:
 
 
 def test_user_agent_from_registry_rejects_control_plane_tools() -> None:
-    registry = build_tool_registry().only("Read", "TeamCreate")
+    registry = builtin_tool_set().only("Read", "TeamCreate")
 
     with pytest.raises(ValueError, match="profile=user_agent"):
         ToolGateway.from_registry(
@@ -161,7 +162,7 @@ def test_user_agent_from_registry_rejects_control_plane_tools() -> None:
 
 
 def test_skill_runtime_tool_is_runtime_injected_not_user_bound() -> None:
-    registry = build_tool_registry().only("SkillRun")
+    registry = builtin_tool_set().only("SkillRun")
 
     gateway = ToolGateway.from_registry(
         None,

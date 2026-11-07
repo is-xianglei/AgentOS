@@ -19,10 +19,10 @@ from agent.models import AgentRecord
 from agent.repository import AgentRepository
 from agent.service import AgentDefinitionService
 from core.config import settings
+from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ToolContext
 from runtime.agent import AgentRuntime
-from tools.base import ToolContext
-from tools.builtin.agent import AgentTool, AgentToolInput
-from tools.registry import build_tool_registry
 from tools.repository import ToolCatalogRepository
 from tools.service import ToolCatalogService
 from user.models import UserRecord
@@ -122,7 +122,7 @@ def _ctx(env: SimpleNamespace) -> ToolContext:
         workspace_id=env.workspace_id,
         user_id=env.user_id,
         profile="lead",
-        allowed_tool_names=build_tool_registry().names,
+        allowed_tool_names=builtin_tool_set().names,
     )
 
 

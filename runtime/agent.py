@@ -27,6 +27,7 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import (
     ModelClient,
     ModelConnectionError,
@@ -34,8 +35,11 @@ from harness.app.ports import (
     ModelStatusError,
     ResolvedModel,
 )
+from harness.app.tool_set import ToolSet
+from harness.domain.budget import ToolCallBudget
 from harness.domain.context import PromptBlock
 from harness.domain.messages import ToolCall, ToolResult
+from harness.domain.tool import ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
@@ -47,7 +51,6 @@ from permission.service import DANGEROUS_TOOLS
 from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
-from runtime.budget import ToolCallBudget
 from runtime.compact import CompactService
 from runtime.execution import (
     ExecutionHandle,
@@ -66,9 +69,7 @@ from task.service import TaskService
 from team.service import TeamService
 from tools.gateway import ToolGateway
 from tools.models import ToolCallRecord
-from tools.policy import ToolCapabilityResolver, ToolProfile
 from tools.policy_engine import PolicyEngine
-from tools.registry import ToolRegistry, build_tool_registry
 from tools.service import ToolService
 from tools.subagents.definition import AgentType
 from tools.subagents.registry import get_subagent_spec
@@ -164,7 +165,7 @@ class AgentRuntime:
             self.model_settings = ResolvedModel.from_client(llm).settings
         self.mode_slug = "standard"
         self._database_model = False
-        self.tool_registry = build_tool_registry()
+        self.tool_registry = builtin_tool_set()
         self.tool_service = ToolService(db, self.tool_registry)
         self.tool_gateway = ToolGateway.from_registry(
             db,
@@ -1824,7 +1825,7 @@ class AgentRuntime:
             lines.append(f"用户补充：{message}")
         return "\n".join(lines)
 
-    def _registry_for_mode(self, plan_mode: bool) -> ToolRegistry:
+    def _registry_for_mode(self, plan_mode: bool) -> ToolSet:
         if self.mode_slug == "turbo":
             return self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
         if plan_mode:
@@ -1833,7 +1834,7 @@ class AgentRuntime:
 
     async def _configure_agent(self, session: SessionRecord) -> None:
         """按会话绑定刷新本次运行的提示词、模型、Tool与Skill边界。"""
-        base_registry = build_tool_registry()
+        base_registry = builtin_tool_set()
         self.mode_slug = getattr(session, "mode_slug", "standard")
         if not self._llm_injected:
             # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
@@ -1871,7 +1872,7 @@ class AgentRuntime:
                 self.workspace_id,
                 session_agent_id,
             )
-            runtime_names = ToolCapabilityResolver().resolve_names(
+            runtime_names = base_registry.callable_names(
                 config.tool_runtime_names,
                 "user_agent",
                 strict=True,
@@ -2085,7 +2086,7 @@ class AgentRuntime:
             StepRequest(
                 messages=context,
                 system_prompt=system_prompt,
-                tool_registry=ToolRegistry([]),
+                tool_registry=ToolSet(),
                 settings=round_settings,
             )
         )

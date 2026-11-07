@@ -2,7 +2,8 @@
 
 提示词按项目约定用简体中文,但以下要素是**可解析契约**,不是修辞,改动会破坏
 调用方解析与运行时校验的对应关系:
-- Explore / Plan 的只读约束逐条枚举(与 tools/shell_policy.py 的拒绝项对应);
+- Explore / Plan 的只读约束逐条枚举(与 harness/adapters/tools/builtin/shell_policy.py
+  的拒绝项对应);
 - Plan 结尾的「实施关键文件」清单(由 parse_plan_critical_files 解析);
 - verification 结尾的 VERDICT 单行锚点(由 parse_verdict 解析);
 - verification 每项检查的「执行的命令 / 观察到的输出」块(缺失即视为跳过)。

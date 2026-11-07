@@ -17,11 +17,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from harness.adapters.models.factory import resolve_scenario_model
-from tools.policy import ToolProfile
-from tools.shell_policy import ShellAccess
+from harness.domain.tool import ShellAccess, ToolProfile
 
 if TYPE_CHECKING:
-    from tools.registry import ToolRegistry
+    from harness.app.tool_set import ToolSet
 
 
 def _blank_to_none(value: str | None) -> str | None:
@@ -103,8 +102,8 @@ class SubAgentSpec:
         merged = dict.fromkeys(GLOBAL_SUBAGENT_DENIED_TOOLS + self.disallowed_tools)
         return tuple(merged)
 
-    def resolve_tools(self, registry: ToolRegistry) -> ToolRegistry:
-        """基于全量工具注册表,产出该 SubAgent 实际可用的工具集。
+    def resolve_tools(self, registry: ToolSet) -> ToolSet:
+        """基于全量工具集,产出该 SubAgent 实际可用的工具集。
 
         最终集合是「全局工具集 ∩ 自身白名单 - 全局禁用 - 自身黑名单」,
         permission 裁决在执行时另行进行,二者是叠加而非替代关系。

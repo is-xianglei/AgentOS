@@ -3,7 +3,13 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from core.errors import AgentException
-from tools.base import BaseTool, ToolContext
+from harness.domain.tool import (
+    ALL_PROFILES,
+    ALL_PROFILES_AND_DELEGATE,
+    PydanticTool,
+    ToolContext,
+    tool_policy,
+)
 
 
 class GlobInput(BaseModel):
@@ -12,10 +18,16 @@ class GlobInput(BaseModel):
     max_results: int = Field(default=500, description="返回结果数量上限")
 
 
-class GlobTool(BaseTool):
+class GlobTool(PydanticTool):
     name = "Glob"
     description = "按 glob 模式查找文件。支持 ** 递归通配符。"
     input_model = GlobInput
+    policy = tool_policy(
+        "Glob",
+        "leaf",
+        bindable_profiles=ALL_PROFILES,
+        callable_profiles=ALL_PROFILES_AND_DELEGATE,
+    )
 
     async def run(self, args: GlobInput, ctx: ToolContext) -> str:
         try:

@@ -466,7 +466,8 @@ class SessionService:
         且不允许切换（与 Agent 的锁定规则同构）。不涉及 Workflow 的请求不进入任何新分支。
         """
         # 局部导入：真实双向 Service 依赖，改顶层仍成环
-        # agent.service -> tools.service -> tools.registry -> tools.builtin.task
+        # agent.service -> tools.service -> harness.adapters.tools.builtin_provider
+        # -> harness.adapters.tools.builtin.task
         # -> task.service -> session.service（workflow.service 经 agent.service 同样成环），
         # 待依赖倒置任务处理。
         from agent.service import AgentDefinitionService

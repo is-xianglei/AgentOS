@@ -6,12 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from core.events import ORCHESTRATOR_ACTOR, teammate_actor
+from harness.adapters.tools.builtin import task as task_tools
+from harness.adapters.tools.builtin import team as team_tools
+from harness.domain.tool import ToolContext
 from tools import service as tool_service_module
-from tools.base import ToolContext
-from tools.builtin import task as task_tools
-from tools.builtin import team as team_tools
 from tools.service import ToolService
-
 
 pytestmark = pytest.mark.anyio
 
@@ -133,7 +132,7 @@ async def test_tool_service_injects_actor_identity(monkeypatch) -> None:
             return []
 
     class FakeTool:
-        async def run_with_dict(self, data, ctx):
+        async def execute(self, data, ctx):
             captured.append(ctx.principal_name)
             return "ok"
 
@@ -235,7 +234,7 @@ async def test_user_agent_skill_tools_require_bound_skill(
             pass
 
     class FakeTool:
-        async def run_with_dict(self, data, ctx):
+        async def execute(self, data, ctx):
             called.append(data)
             return "ok"
 
@@ -292,7 +291,7 @@ async def test_non_lead_skill_tools_require_explicit_allowlist(monkeypatch, prof
             pass
 
     class FakeTool:
-        async def run_with_dict(self, data, ctx):
+        async def execute(self, data, ctx):
             called.append(data)
             return "ok"
 
