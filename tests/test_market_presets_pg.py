@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from core.errors import AgentException
 from market.presets import REMOVED_REASON, PresetSyncOutcome, load_presets, sync_official_presets
@@ -242,7 +242,7 @@ async def test_sync_rejects_unbindable_tool_without_writing(pg, tmp_path: Path) 
 
 
 async def test_agent_preset_snapshot_matches_community_snapshot(pg, tmp_path: Path) -> None:
-    """同样的内容，预置生成的 Agent 快照与 AgentService.build_snapshot 完全一致，哈希也一致。"""
+    """同样的内容，预置生成的 Agent 快照与 AgentDefinitionService.build_snapshot 完全一致，哈希也一致。"""
     root = tmp_path / "presets"
     skill_name = f"t{pg.suffix}-notes"
     agent_key = f"t{pg.suffix}-helper"
@@ -258,7 +258,7 @@ async def test_agent_preset_snapshot_matches_community_snapshot(pg, tmp_path: Pa
         pg.workspace_id, pg.user_id, build_skill_zip(bundle)
     )
     agent_snapshot = preset_snapshot["agent"]
-    agent = await AgentService(pg.db).create_agent(
+    agent = await AgentDefinitionService(pg.db).create_agent(
         workspace_id=pg.workspace_id,
         actor_user_id=pg.user_id,
         name=agent_snapshot["name"],
@@ -270,7 +270,9 @@ async def test_agent_preset_snapshot_matches_community_snapshot(pg, tmp_path: Pa
         skill_ids=[skill.id],
     )
 
-    community_snapshot = await AgentService(pg.db).build_snapshot(pg.workspace_id, agent.id)
+    community_snapshot = await AgentDefinitionService(pg.db).build_snapshot(
+        pg.workspace_id, agent.id
+    )
 
     assert community_snapshot == preset_snapshot
     assert compute_snapshot_hash(community_snapshot) == compute_snapshot_hash(preset_snapshot)

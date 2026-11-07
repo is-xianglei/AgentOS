@@ -123,14 +123,14 @@ async def test_run_llm_loop_injects_loaded_catalog_only(
 # ---------- _configure_agent:只在 lead 分支加载目录 ----------
 
 
-def _install_agent_service(
+def _install_agent_definition_service(
     monkeypatch: pytest.MonkeyPatch,
     entries: tuple[DelegateCatalogEntry, ...],
 ) -> list[int]:
     """替换运行时使用的 agent 域 Service,返回目录查询记录(按工作区 ID)。"""
     catalog_requests: list[int] = []
 
-    class _FakeAgentService:
+    class _FakeAgentDefinitionService:
         def __init__(self, db: object) -> None:
             pass
 
@@ -152,7 +152,7 @@ def _install_agent_service(
                 description=None,
             )
 
-    monkeypatch.setattr("runtime.agent.AgentService", _FakeAgentService)
+    monkeypatch.setattr("runtime.agent.AgentDefinitionService", _FakeAgentDefinitionService)
     return catalog_requests
 
 
@@ -171,7 +171,7 @@ def _configure_runtime(workspace_id: int | None) -> AgentRuntime:
 async def test_lead_session_loads_and_renders_delegate_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    requests = _install_agent_service(monkeypatch, _ENTRIES)
+    requests = _install_agent_definition_service(monkeypatch, _ENTRIES)
     runtime = _configure_runtime(2)
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
@@ -185,7 +185,7 @@ async def test_lead_session_loads_and_renders_delegate_catalog(
 
 
 async def test_bound_agent_session_gets_no_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
-    requests = _install_agent_service(monkeypatch, _ENTRIES)
+    requests = _install_agent_definition_service(monkeypatch, _ENTRIES)
     runtime = _configure_runtime(2)
 
     await runtime._configure_agent(SimpleNamespace(agent_id=7, mode_slug="standard"))
@@ -203,7 +203,7 @@ async def test_no_workspace_or_no_enabled_agent_means_no_catalog(
     workspace_id: int | None,
     entries: tuple[DelegateCatalogEntry, ...],
 ) -> None:
-    _install_agent_service(monkeypatch, entries)
+    _install_agent_definition_service(monkeypatch, entries)
     runtime = _configure_runtime(workspace_id)
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))

@@ -116,7 +116,7 @@ class _MemberCall:
 
 
 class _Harness:
-    """把 AgentService / SubAgentRunner 替身接到 runtime.workflow 模块上,并记录调用。"""
+    """把 AgentDefinitionService / SubAgentRunner 替身接到 runtime.workflow 模块上,并记录调用。"""
 
     def __init__(
         self,
@@ -141,7 +141,7 @@ class _Harness:
         arrived = 0
         all_arrived = asyncio.Event()
 
-        class _FakeAgentService:
+        class _FakeAgentDefinitionService:
             def __init__(self, db: object) -> None:
                 pass
 
@@ -185,7 +185,7 @@ class _Harness:
                     raise asyncio.CancelledError()
                 return outputs.get(spec.display_name, f"{spec.display_name}的结论")
 
-        monkeypatch.setattr("runtime.workflow.AgentService", _FakeAgentService)
+        monkeypatch.setattr("runtime.workflow.AgentDefinitionService", _FakeAgentDefinitionService)
         monkeypatch.setattr("runtime.workflow.SubAgentRunner", _FakeSubAgentRunner)
         monkeypatch.setattr("runtime.workflow.AsyncSessionLocal", _FakeSessionScope)
 
@@ -946,7 +946,7 @@ def _session_service(repo: _FakeSessionRepo) -> SessionService:
 
 
 def _install_domain_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """替换 prepare_for_message 内局部导入的 WorkflowService / AgentService,记录复检调用。"""
+    """替换 prepare_for_message 内局部导入的 WorkflowService / AgentDefinitionService,记录复检调用。"""
     calls = SimpleNamespace(workflow=[], agent=[])
 
     class _FakeWorkflowService:
@@ -957,7 +957,7 @@ def _install_domain_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             calls.workflow.append(workflow_id)
             return SimpleNamespace(id=workflow_id)
 
-    class _FakeAgentService:
+    class _FakeAgentDefinitionService:
         def __init__(self, db: object) -> None:
             pass
 
@@ -966,7 +966,7 @@ def _install_domain_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             return SimpleNamespace(id=agent_id)
 
     monkeypatch.setattr("workflow.service.WorkflowService", _FakeWorkflowService)
-    monkeypatch.setattr("agent.service.AgentService", _FakeAgentService)
+    monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
     return calls
 
 

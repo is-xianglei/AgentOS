@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
 from agent.models import AgentRecord
 from agent.repository import AgentRepository
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from runtime.agent import AgentRuntime
 from tools.base import ToolContext
@@ -149,8 +149,8 @@ async def test_catalog_lists_only_enabled_agents_of_current_workspace(pg) -> Non
     await AgentRepository(pg.db).soft_delete(deleted)
     outsider = await _agent(pg, "别家", workspace_id=pg.other_workspace_id, tools=("Read",))
 
-    entries = await AgentService(pg.db).list_delegate_catalog(pg.workspace_id)
-    other_entries = await AgentService(pg.db).list_delegate_catalog(pg.other_workspace_id)
+    entries = await AgentDefinitionService(pg.db).list_delegate_catalog(pg.workspace_id)
+    other_entries = await AgentDefinitionService(pg.db).list_delegate_catalog(pg.other_workspace_id)
 
     assert [entry.agent_id for entry in entries] == [reviewer.id, writer.id]
     assert entries[0].name == "审稿人"
@@ -168,7 +168,7 @@ async def test_catalog_skips_disabled_tool_while_delegation_rejects_it(pg, monke
     await pg.db.flush()
     _patch_dispatch(monkeypatch)
 
-    (entry,) = await AgentService(pg.db).list_delegate_catalog(pg.workspace_id)
+    (entry,) = await AgentDefinitionService(pg.db).list_delegate_catalog(pg.workspace_id)
     output = await AgentTool().run(AgentToolInput(agent_id=searcher.id, prompt="检索"), _ctx(pg))
 
     assert entry.tool_names == ("Read",)

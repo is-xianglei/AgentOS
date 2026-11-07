@@ -12,7 +12,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from core.errors import AgentException, LeaseLostError
 from core.event_bus import NullStreamBus, RunStreamBus, StreamBus
@@ -1856,7 +1856,7 @@ class AgentRuntime:
         else:
             if self.workspace_id is None:
                 raise AgentException.message("缺少可信工作区上下文")
-            config = await AgentService(self.db).get_runtime_config(
+            config = await AgentDefinitionService(self.db).get_runtime_config(
                 self.workspace_id,
                 session_agent_id,
             )
@@ -1896,7 +1896,7 @@ class AgentRuntime:
         """
         if self.workspace_id is None:
             return None
-        entries = await AgentService(self.db).list_delegate_catalog(self.workspace_id)
+        entries = await AgentDefinitionService(self.db).list_delegate_catalog(self.workspace_id)
         lines: list[str] = []
         for entry in entries:
             # 描述可能含换行,压成一行,保证目录里一个 Agent 只占一行。

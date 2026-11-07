@@ -67,7 +67,7 @@ def test_load_presets_builds_snapshots_in_community_format(tmp_path: Path) -> No
         extra_files={"templates/minutes.md": "# 模板\n"},
     )
     _write_skill(tmp_path, "alpha")
-    # tools 有重复且未排序，skills 也未排序：快照里要和 AgentService.build_snapshot 一样排好序。
+    # tools 有重复且未排序，skills 也未排序：快照里要和 AgentDefinitionService.build_snapshot 一样排好序。
     _write_agent(tmp_path, "helper", _agent_md(tools="[Read, Grep, Read]", skills="[notes, alpha]"))
 
     presets = load_presets(tmp_path)

@@ -594,7 +594,7 @@ async def test_delete_skill_soft_deletes_and_clears_bindings(monkeypatch):
     removed: list[tuple[int, int]] = []
     forgotten: list[tuple[int, int]] = []
 
-    class _FakeAgentService:
+    class _FakeAgentDefinitionService:
         def __init__(self, db) -> None:
             pass
 
@@ -608,7 +608,7 @@ async def test_delete_skill_soft_deletes_and_clears_bindings(monkeypatch):
         async def forget_deleted_skill(self, workspace_id, skill_id):
             forgotten.append((workspace_id, skill_id))
 
-    monkeypatch.setattr(agent.service, "AgentService", _FakeAgentService)
+    monkeypatch.setattr(agent.service, "AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr(market.service, "MarketService", _FakeMarketService)
     repo = _FakeRepo(_record(5))
     service = _service(repo)

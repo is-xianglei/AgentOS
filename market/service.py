@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.errors import AgentException
 from market.models import MarketInstallRecord, MarketListingRecord, MarketVersionRecord
 from market.repository import MarketRepository
@@ -268,7 +268,7 @@ class MarketService:
         self.db = db
         self.repo = MarketRepository(db)
         self.workspace_service = WorkspaceService(db)
-        self.agent_service = AgentService(db)
+        self.agent_definition_service = AgentDefinitionService(db)
         self.skill_service = SkillService(db)
         self.tool_catalog_service = ToolCatalogService(db)
 
@@ -292,7 +292,7 @@ class MarketService:
 
         # 1. 生成快照；源对象不属于当前工作区或已删除时，由对应的域返回 404。
         if kind == "agent":
-            snapshot = await self.agent_service.build_snapshot(workspace_id, source_id)
+            snapshot = await self.agent_definition_service.build_snapshot(workspace_id, source_id)
         else:
             skill_snapshot = await self.skill_service.build_snapshot(workspace_id, source_id)
             snapshot = {"skill": skill_snapshot}
@@ -929,7 +929,7 @@ class MarketService:
         # 1. 安装时 Agent 不能同名；升级保留本地名称，不用检查。
         if active_install is None:
             agent_name = agent_snapshot["name"]
-            if await self.agent_service.is_name_taken(workspace_id, agent_name):
+            if await self.agent_definition_service.is_name_taken(workspace_id, agent_name):
                 plan.agent_name_conflict = True
                 plan.blockers.append(f"本工作区已有同名 Agent: {agent_name}")
 
@@ -981,7 +981,7 @@ class MarketService:
             for step in plan.skill_steps:
                 if step.skill_id is not None:
                     new_skill_ids.add(step.skill_id)
-            agent = await self.agent_service.get_agent(
+            agent = await self.agent_definition_service.get_agent(
                 workspace_id, active_install.target_agent_id, actor_user_id
             )
             for binding in agent.skill_bindings:
@@ -1048,7 +1048,7 @@ class MarketService:
 
         # 复用 create_agent 的全部校验；模型留空使用工作区默认模型，作者的模型在别的工作区多半不存在。
         agent_snapshot = snapshot["agent"]
-        agent = await self.agent_service.create_agent(
+        agent = await self.agent_definition_service.create_agent(
             workspace_id=workspace_id,
             actor_user_id=actor_user_id,
             name=agent_snapshot["name"],
@@ -1097,7 +1097,7 @@ class MarketService:
                 managed_skill_ids.append(decision.skill_id)
 
         agent_snapshot = snapshot["agent"]
-        await self.agent_service.overwrite_for_upgrade(
+        await self.agent_definition_service.overwrite_for_upgrade(
             workspace_id,
             agent_id,
             actor_user_id,
@@ -1229,7 +1229,9 @@ class MarketService:
                 agent_ids.append(install.target_agent_id)
             if install.target_skill_id is not None:
                 skill_ids.append(install.target_skill_id)
-        existing_agent_ids = await self.agent_service.filter_existing_ids(workspace_id, agent_ids)
+        existing_agent_ids = await self.agent_definition_service.filter_existing_ids(
+            workspace_id, agent_ids
+        )
         existing_skill_ids = await self.skill_service.filter_existing_ids(workspace_id, skill_ids)
 
         active_installs: dict[int, MarketInstallRecord] = {}
@@ -1291,8 +1293,8 @@ class MarketService:
             if row.target_skill_id is not None:
                 skill_ids.append(row.target_skill_id)
         existing_workspace_ids = await self.workspace_service.filter_existing_ids(workspace_ids)
-        existing_agent_ids = await self.agent_service.filter_existing_ids_across_workspaces(
-            agent_ids
+        existing_agent_ids = (
+            await self.agent_definition_service.filter_existing_ids_across_workspaces(agent_ids)
         )
         existing_skill_ids = await self.skill_service.filter_existing_ids_across_workspaces(
             skill_ids

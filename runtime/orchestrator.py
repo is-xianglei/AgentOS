@@ -9,58 +9,19 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 from core.event_bus import StreamBus
 from core.events import Actor
 
 
-@dataclass(frozen=True)
-class OrchestrationCheckpoint:
-    """可持久化的编排状态快照。
-
-    快照只保存编排控制流需要的身份、游标和业务状态，不保存数据库连接、事件总线
-    或其他运行时对象。这样可以在请求结束后落到现有运行状态存储，恢复时再注入依赖。
-    """
-
-    run_id: UUID
-    session_id: int
-    turn_id: UUID
-    cursor: str | None
-    state: dict[str, Any]
-    revision: int = 0
-
-    def to_dict(self) -> dict[str, Any]:
-        """返回可写入 JSON/JSONB 的副本，避免调用方修改上下文内部状态。"""
-        return {
-            "run_id": str(self.run_id),
-            "session_id": self.session_id,
-            "turn_id": str(self.turn_id),
-            "cursor": self.cursor,
-            "state": deepcopy(self.state),
-            "revision": self.revision,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> OrchestrationCheckpoint:
-        """从 JSON/JSONB 形状恢复快照，保留未知 state 字段以支持前向兼容。"""
-        return cls(
-            run_id=UUID(str(data["run_id"])),
-            session_id=int(data["session_id"]),
-            turn_id=UUID(str(data["turn_id"])),
-            cursor=data.get("cursor"),
-            state=deepcopy(dict(data.get("state", {}))),
-            revision=int(data.get("revision", 0)),
-        )
-
-
 @dataclass
 class OrchestrationContext:
-    """一次编排运行共享的身份、事件和可恢复状态。
+    """一次编排运行共享的身份、事件和状态。
 
     ``state`` 保存节点之间传递的业务数据，``cursor`` 表示最近一次完成的
-    控制流位置。当前版本先以内存对象承载，持久化 checkpoint 由后续阶段接入。
+    控制流位置。当前仅以内存对象承载，不做持久化。
     """
 
     run_id: UUID
@@ -78,45 +39,12 @@ class OrchestrationContext:
         cursor: str | None = None,
         state_updates: Mapping[str, Any] | None = None,
     ) -> None:
-        """原子更新控制流游标和节点状态，并推进快照版本。"""
+        """原子更新控制流游标和节点状态，并推进状态版本。"""
         if cursor is not None:
             self.cursor = cursor
         if state_updates:
             self.state.update(deepcopy(dict(state_updates)))
         self.revision += 1
-
-    def snapshot(self) -> OrchestrationCheckpoint:
-        """生成不携带运行时依赖的快照。"""
-        return OrchestrationCheckpoint(
-            run_id=self.run_id,
-            session_id=self.session_id,
-            turn_id=self.turn_id,
-            cursor=self.cursor,
-            state=deepcopy(self.state),
-            revision=self.revision,
-        )
-
-    def restore(self, checkpoint: OrchestrationCheckpoint) -> None:
-        """恢复同一轮次的快照，拒绝跨运行/跨会话误用。"""
-        if (
-            checkpoint.run_id != self.run_id
-            or checkpoint.session_id != self.session_id
-            or checkpoint.turn_id != self.turn_id
-        ):
-            raise ValueError("编排快照与当前运行上下文不匹配")
-        self.cursor = checkpoint.cursor
-        self.state = deepcopy(checkpoint.state)
-        self.revision = checkpoint.revision
-
-
-class CheckpointStore(Protocol):
-    """编排检查点的最小异步协议，具体实现可在内存或数据库中。"""
-
-    async def save(self, checkpoint: OrchestrationCheckpoint) -> None: ...
-
-    async def load(self, run_id: UUID) -> OrchestrationCheckpoint | None: ...
-
-    async def delete(self, run_id: UUID) -> None: ...
 
 
 class Orchestrator(ABC):

@@ -13,7 +13,7 @@ from agent.schemas import (
     AgentToolBindingsRequest,
     AgentUpdateRequest,
 )
-from agent.service import AgentService, AgentUpdateFields
+from agent.service import AgentDefinitionService, AgentUpdateFields
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.responses import ApiResponse, ok
 from user.models import UserRecord
@@ -44,7 +44,7 @@ async def create_agent(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    record = await AgentService(db).create_agent(
+    record = await AgentDefinitionService(db).create_agent(
         workspace_id=workspace_id,
         actor_user_id=current_user.id,
         **payload.model_dump(),
@@ -67,7 +67,7 @@ async def list_agents(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
-    page = await AgentService(db).list_agents(
+    page = await AgentDefinitionService(db).list_agents(
         workspace_id,
         current_user.id,
         keyword=keyword,
@@ -96,7 +96,7 @@ async def get_agent(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    record = await AgentService(db).get_agent(workspace_id, agent_id, current_user.id)
+    record = await AgentDefinitionService(db).get_agent(workspace_id, agent_id, current_user.id)
     return ok(_agent_response(record), request)
 
 
@@ -114,7 +114,7 @@ async def update_agent(
     workspace_id: CurrentWorkspaceId,
 ):
     updates = cast(AgentUpdateFields, payload.model_dump(exclude_unset=True))
-    record = await AgentService(db).update_agent(
+    record = await AgentDefinitionService(db).update_agent(
         workspace_id,
         agent_id,
         current_user.id,
@@ -135,7 +135,7 @@ async def delete_agent(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    await AgentService(db).delete_agent(workspace_id, agent_id, current_user.id)
+    await AgentDefinitionService(db).delete_agent(workspace_id, agent_id, current_user.id)
     return ok(AgentDeleteResult(deleted=True), request)
 
 
@@ -152,7 +152,7 @@ async def replace_agent_tools(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    record = await AgentService(db).replace_tool_bindings(
+    record = await AgentDefinitionService(db).replace_tool_bindings(
         workspace_id,
         agent_id,
         current_user.id,
@@ -174,7 +174,7 @@ async def replace_agent_skills(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    record = await AgentService(db).replace_skill_bindings(
+    record = await AgentDefinitionService(db).replace_skill_bindings(
         workspace_id,
         agent_id,
         current_user.id,

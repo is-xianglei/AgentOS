@@ -19,7 +19,7 @@ from sqlalchemy.pool import NullPool
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
 from agent.models import AgentRecord
 from agent.repository import AgentRepository
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from core.errors import AgentException
 from market import service as market_service
@@ -181,7 +181,7 @@ async def _create_agent(
     tool_ids: list[int] = []
     for tool in tools:
         tool_ids.append(env.tool_ids[tool])
-    return await AgentService(env.db).create_agent(
+    return await AgentDefinitionService(env.db).create_agent(
         workspace_id=workspace_id,
         actor_user_id=actor_id,
         name=name,
@@ -336,7 +336,7 @@ async def test_same_content_resubmit_and_reject_flow(pg) -> None:
     assert same.status_code == 409
     assert same.message == "内容与当前上架版本相同"
 
-    await AgentService(pg.db).update_agent(
+    await AgentDefinitionService(pg.db).update_agent(
         pg.publisher_ws, agent.id, pg.author_id, {"system_prompt": "新的提示词"}
     )
     second = await _submit(pg, "agent", agent.id)
@@ -744,7 +744,7 @@ async def test_agent_install_rejects_skill_conflict_and_same_name_agent(pg) -> N
     assert clash in conflict.message
     # 整个安装被拒，排在前面的 Skill 也没有建出来。
     assert await SkillRepository(pg.db).get_by_name(pg.installer_ws, fresh) is None
-    assert await AgentService(pg.db).is_name_taken(pg.installer_ws, agent_name) is False
+    assert await AgentDefinitionService(pg.db).is_name_taken(pg.installer_ws, agent_name) is False
 
     # 同名 Agent 被拒。
     await SkillService(pg.db).delete_skill(
@@ -772,7 +772,7 @@ async def test_agent_install_rolls_back_when_failing_midway(pg, monkeypatch) -> 
         raise AgentException.message("模拟创建 Agent 失败", status_code=409)
 
     # Skill 已经新建之后，创建 Agent 这一步失败。
-    monkeypatch.setattr(AgentService, "create_agent", failing_create_agent)
+    monkeypatch.setattr(AgentDefinitionService, "create_agent", failing_create_agent)
     error = await _expect_error(
         pg,
         lambda: MarketService(pg.db).install_listing(pg.installer_ws, pg.installer_id, listing_id),
@@ -830,7 +830,7 @@ async def test_agent_upgrade_overwrites_managed_unbinds_removed_and_keeps_local(
 
     # 安装方修改本地设置；另有一个 Agent 也绑定了托管的 kept。
     local_name = f"我的助手{pg.suffix}"
-    await AgentService(pg.db).update_agent(
+    await AgentDefinitionService(pg.db).update_agent(
         pg.installer_ws,
         target_id,
         pg.installer_id,
@@ -845,7 +845,7 @@ async def test_agent_upgrade_overwrites_managed_unbinds_removed_and_keeps_local(
 
     # 作者发布第二版：改 kept 的内容，去掉 dropped，加上 added，换工具和提示词。
     await _edit_skill(pg, kept_skill.id, "第二版正文")
-    author_agents = AgentService(pg.db)
+    author_agents = AgentDefinitionService(pg.db)
     await author_agents.replace_skill_bindings(
         pg.publisher_ws, agent.id, pg.author_id, [kept_skill.id, added_skill.id]
     )
@@ -932,7 +932,7 @@ async def test_upgrade_failure_paths(pg) -> None:
 
     # 新版本带了一个 Skill，安装方本地已有同名但内容不同的：拒绝整个升级，什么都不改。
     clash_skill = await _save_skill(pg, clash)
-    await AgentService(pg.db).replace_skill_bindings(
+    await AgentDefinitionService(pg.db).replace_skill_bindings(
         pg.publisher_ws, agent.id, pg.author_id, [clash_skill.id]
     )
     await _publish(pg, "agent", agent.id)

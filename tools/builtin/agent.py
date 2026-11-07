@@ -139,7 +139,7 @@ class AgentTool(BaseTool):
         让默认 Agent 自行改道,而不是让整轮对话失败;被委派方运行中的失败与内置子代理一致,照常上抛。
         """
         # 局部导入：agent.service -> tools.service -> tools.registry -> 本模块，顶层导入成环。
-        from agent.service import AgentService
+        from agent.service import AgentDefinitionService
         from runtime.subagent import build_agent_spec
 
         # 只有默认 Agent 能委派,深度为 1。user_agent 等档位本就调不到 Agent 工具,
@@ -149,7 +149,9 @@ class AgentTool(BaseTool):
         if ctx.workspace_id is None:
             return self._delegate_error(agent_id, "缺少可信工作区上下文")
         try:
-            config = await AgentService(ctx.db).get_runtime_config(ctx.workspace_id, agent_id)
+            config = await AgentDefinitionService(ctx.db).get_runtime_config(
+                ctx.workspace_id, agent_id
+            )
         except AgentException as exc:
             logger.warning(
                 "委派自建 Agent 失败,目标不可用,会话 ID=%s agent_id=%s 原因=%s",

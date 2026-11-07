@@ -469,7 +469,7 @@ class SessionService:
         # agent.service -> tools.service -> tools.registry -> tools.builtin.task
         # -> task.service -> session.service（workflow.service 经 agent.service 同样成环），
         # 待依赖倒置任务处理。
-        from agent.service import AgentService
+        from agent.service import AgentDefinitionService
         from workflow.service import WorkflowService
 
         if agent_id is not None and workflow_id is not None:
@@ -478,7 +478,7 @@ class SessionService:
         # 新会话：先校验请求指定的 Agent / Workflow 可运行，再按首条消息建会话。
         if session_id is None:
             if agent_id is not None:
-                await AgentService(self.db).require_runnable(agent_id, workspace_id)
+                await AgentDefinitionService(self.db).require_runnable(agent_id, workspace_id)
             if workflow_id is not None:
                 await WorkflowService(self.db).require_runnable(workflow_id, workspace_id)
             session = await self.create_from_first_message(
@@ -499,7 +499,7 @@ class SessionService:
         if workflow_id is not None and workflow_id != session.workflow_id:
             raise AgentException.message("已有会话不能切换Workflow", status_code=409)
         if session.agent_id is not None:
-            await AgentService(self.db).require_runnable(session.agent_id, workspace_id)
+            await AgentDefinitionService(self.db).require_runnable(session.agent_id, workspace_id)
         if session.workflow_id is not None:
             await WorkflowService(self.db).require_runnable(session.workflow_id, workspace_id)
         # mark_running 加行锁并校验会话状态，模型选项在持锁后写入。

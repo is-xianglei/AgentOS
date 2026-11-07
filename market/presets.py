@@ -138,7 +138,7 @@ def load_agent_preset(agent_dir: Path, skill_bundles: dict[str, SkillBundle]) ->
     """读取一个 Agent 预置。
 
     frontmatter 有 name、description、category、tools、skills，正文是系统提示词。
-    快照的格式和排序规则与 AgentService.build_snapshot 相同：tool_keys 按字母排序，
+    快照的格式和排序规则与 AgentDefinitionService.build_snapshot 相同：tool_keys 按字母排序，
     skills 按名称排序。这样预置内容没变时哈希也不变，不会每次启动都生成一个新版本。
     """
     key = agent_dir.name

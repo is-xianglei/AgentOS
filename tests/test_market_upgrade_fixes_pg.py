@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
 from agent.models import AgentRecord
 from agent.repository import AgentRepository
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from market.service import MarketService
 from skill.models import SkillRecord
@@ -111,7 +111,7 @@ async def _create_author_agent(
     name: str,
     skill_ids: list[int],
 ) -> AgentRecord:
-    return await AgentService(env.db).create_agent(
+    return await AgentDefinitionService(env.db).create_agent(
         workspace_id=env.publisher_ws,
         actor_user_id=env.author_id,
         name=name,
@@ -195,7 +195,7 @@ async def test_reinstall_keeps_reused_managed_skill_and_upgrade_overwrites(pg) -
     assert first.install.managed_skill_ids == [managed_id]
 
     # 删除装出来的 Agent 就相当于卸载；托管 Skill 还留在工作区里。
-    await AgentService(pg.db).delete_agent(
+    await AgentDefinitionService(pg.db).delete_agent(
         pg.installer_ws, first.install.target_agent_id, pg.installer_id
     )
     preview = await _preview(pg, listing_id)
@@ -249,7 +249,7 @@ async def test_upgrade_report_lists_every_skill_that_gets_unbound(pg) -> None:
     # 安装方给装出来的 Agent 额外绑定一个本地 Skill。
     extra = f"extra-{pg.suffix}"
     extra_skill = await _save_skill(pg, extra, workspace_id=pg.installer_ws)
-    await AgentService(pg.db).replace_skill_bindings(
+    await AgentDefinitionService(pg.db).replace_skill_bindings(
         pg.installer_ws,
         target_id,
         pg.installer_id,
@@ -257,7 +257,7 @@ async def test_upgrade_report_lists_every_skill_that_gets_unbound(pg) -> None:
     )
 
     # 作者发布第二版：只保留 kept 和 shared。
-    await AgentService(pg.db).replace_skill_bindings(
+    await AgentDefinitionService(pg.db).replace_skill_bindings(
         pg.publisher_ws,
         agent.id,
         pg.author_id,

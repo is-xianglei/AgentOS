@@ -499,9 +499,9 @@ class SkillService:
         await MarketService(self.db).forget_deleted_skill(workspace_id, record.id)
         await self.repo.soft_delete(record)
         # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> skill.service，待依赖倒置任务处理。
-        from agent.service import AgentService
+        from agent.service import AgentDefinitionService
 
-        await AgentService(self.db).remove_skill_bindings(workspace_id, record.id)
+        await AgentDefinitionService(self.db).remove_skill_bindings(workspace_id, record.id)
         return True
 
     async def _require_records_by_ids(

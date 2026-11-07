@@ -68,9 +68,9 @@ flowchart TD
     A[build_tool_registry] --> B[ToolRegistry]
     B --> C[ToolCatalogService.sync_builtins]
     C --> D[(tools 工具目录)]
-    D --> E[AgentService 创建/修改用户 Agent]
+    D --> E[AgentDefinitionService 创建/修改用户 Agent]
     E --> F[agent_tools 绑定表]
-    F --> G[AgentService.get_runtime_config]
+    F --> G[AgentDefinitionService.get_runtime_config]
     G --> H[AgentRuntime / SubAgentRunner]
     H --> I[ToolCapabilityResolver]
     I --> J[ToolGateway 固定能力快照]
@@ -108,7 +108,7 @@ flowchart TD
 
 ```python
 base_registry = build_tool_registry()
-config = await AgentService(...).get_runtime_config(...)
+config = await AgentDefinitionService(...).get_runtime_config(...)
 self.tool_registry = base_registry.only(*config.tool_runtime_names)
 ```
 
@@ -149,7 +149,7 @@ WritePlan
 
 子 Agent 没有人工审批恢复通道，所以危险工具的 `ask` 结果会转换成拒绝信息并回灌模型。当前运行时已经把 SubAgent、Workflow 成员、被默认 Agent 委派的自建 Agent 和 teammate 分别标记为 `subagent`、`workflow_node`、`delegate`、`teammate` profile，并在父 Agent 白名单、SubAgentSpec 和 ToolPolicy 三层取交集。
 
-默认 Agent（会话未绑定自建 Agent）的系统提示会注入「可委派 Agent 目录」（当前工作区全部已启用 Agent），模型调用 `Agent` 工具时只传 `agent_id`（与 `agent_type` 二选一）即可委派。被委派方经 `AgentService.get_runtime_config` 校验后转成 `SubAgentSpec`，有效工具为「Agent 白名单（含随 Skill 自动补的工具）∩ `delegate` 档位 ∩ 父 Agent 本轮实际生效的工具」，后者含 Plan Mode 裁剪（Plan Mode 原有守卫只放行 Explore/Plan，委派在该模式下会先被拒绝，交集是第二道边界）；`ask` 同样坍缩为拒绝，运行时依据实际拒绝记录在报告末尾追加被拒摘要，供默认 Agent 在主会话中走正常审批重做。委派深度为 1：被委派方不能再调用 `Agent`，绑定了自建 Agent 的会话也不注入目录。
+默认 Agent（会话未绑定自建 Agent）的系统提示会注入「可委派 Agent 目录」（当前工作区全部已启用 Agent），模型调用 `Agent` 工具时只传 `agent_id`（与 `agent_type` 二选一）即可委派。被委派方经 `AgentDefinitionService.get_runtime_config` 校验后转成 `SubAgentSpec`，有效工具为「Agent 白名单（含随 Skill 自动补的工具）∩ `delegate` 档位 ∩ 父 Agent 本轮实际生效的工具」，后者含 Plan Mode 裁剪（Plan Mode 原有守卫只放行 Explore/Plan，委派在该模式下会先被拒绝，交集是第二道边界）；`ask` 同样坍缩为拒绝，运行时依据实际拒绝记录在报告末尾追加被拒摘要，供默认 Agent 在主会话中走正常审批重做。委派深度为 1：被委派方不能再调用 `Agent`，绑定了自建 Agent 的会话也不注入目录。
 
 ### 2.3 当前各类工具的事实分类
 
@@ -252,7 +252,7 @@ owner = ctx.principal.actor_id
 
 ```text
 ToolRegistry / ToolCatalog
-    -> AgentService 或 SubAgentSpec 产生候选工具名
+    -> AgentDefinitionService 或 SubAgentSpec 产生候选工具名
     -> ToolCapabilityResolver 按 profile 裁剪
     -> ToolGateway 固定 profile / principal / agent_id / Skill / Shell
     -> PermissionService 决定 allow / ask / deny
@@ -404,7 +404,7 @@ session 规则 > 当前 workspace 的 global 规则 > 内置 profile 默认值 >
 
 ### 4.4 绑定阶段和执行阶段都要检查
 
-创建或修改用户 Agent 时，`AgentService` 应调用：
+创建或修改用户 Agent 时，`AgentDefinitionService` 应调用：
 
 ```python
 ToolPolicyService.require_bindable(
@@ -540,7 +540,7 @@ flowchart LR
 当前已增加 `test_tool_policy.py`、`test_tool_gateway.py`、`test_tool_identity.py`、
 `test_permission_service.py`、`test_agent_step.py`、`test_budget.py` 和
 `test_orchestrator_context.py`，覆盖工具矩阵、网关快照、权限默认值与规则优先级、身份注入、
-单步执行、预算和 checkpoint 基础行为。后续仍应补充 Agent 删除后的会话行为以及节点级恢复。
+单步执行、预算和编排上下文基础行为。后续仍应补充 Agent 删除后的会话行为以及节点级恢复。
 
 ### 阶段 1：修正身份和枚举（核心路径已完成）
 
@@ -565,7 +565,7 @@ flowchart LR
 
 ### 阶段 4：统一 Agent Protocol 和 OrchestrationContext（第一版已完成）
 
-`runtime/orchestrator.py` 已提供 `Orchestrator` 协议、`OrchestrationContext`、checkpoint 和
+`runtime/orchestrator.py` 已提供 `Orchestrator` 协议、`OrchestrationContext` 和
 `TopLevelOrchestrator`。HTTP 消息入口已经统一由 TopLevelOrchestrator 分发到 AgentRuntime 或
 WorkflowRuntime；Workflow 的 Sequential、Parallel、LLM Routing 仍由 `runtime/workflow.py`
 中的具体编排器负责。Loop、节点级持久化和后台队列尚未完成，不能把当前实现描述成完整的 durable

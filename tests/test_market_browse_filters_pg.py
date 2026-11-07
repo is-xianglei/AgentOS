@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.config import settings
 from market.repository import MarketRepository
@@ -126,7 +126,7 @@ async def _save_skill(env: SimpleNamespace, name: str) -> SkillRecord:
 
 async def _create_agent(env: SimpleNamespace, name: str) -> int:
     """在发布工作区建一个不绑工具和 Skill 的 Agent，返回 Agent ID。"""
-    agent = await AgentService(env.db).create_agent(
+    agent = await AgentDefinitionService(env.db).create_agent(
         workspace_id=env.publisher_ws,
         actor_user_id=env.author_id,
         name=name,
@@ -252,7 +252,7 @@ async def market(pg):
     gone_agent_source_id = await _create_agent(pg, f"已删助手{suffix}")
     agent_target_deleted = await _publish(pg, "agent", gone_agent_source_id)
     gone_agent_install = await install(agent_target_deleted)
-    await AgentService(pg.db).delete_agent(
+    await AgentDefinitionService(pg.db).delete_agent(
         pg.installer_ws, gone_agent_install.install.target_agent_id, pg.installer_id
     )
 

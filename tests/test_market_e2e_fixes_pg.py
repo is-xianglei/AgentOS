@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.config import settings
 from core.errors import AgentException
@@ -173,7 +173,7 @@ async def _save_skill(
 
 async def _create_agent(env: SimpleNamespace, name: str, skill_ids: list[int]) -> int:
     """在发布工作区建一个不绑工具的 Agent，返回 Agent ID。"""
-    agent = await AgentService(env.db).create_agent(
+    agent = await AgentDefinitionService(env.db).create_agent(
         workspace_id=env.publisher_ws,
         actor_user_id=env.author_id,
         name=name,
@@ -578,7 +578,7 @@ async def test_install_count_drops_when_target_or_workspace_deleted(pg) -> None:
     await SkillService(pg.db).delete_skill(
         pg.installer_ws, installer_skill.install.target_skill_id, pg.installer_id
     )
-    await AgentService(pg.db).delete_agent(
+    await AgentDefinitionService(pg.db).delete_agent(
         pg.installer_ws, installer_agent.install.target_agent_id, pg.installer_id
     )
     assert await install_counts() == {skill_listing: 1, agent_listing: 1}
@@ -731,7 +731,9 @@ async def test_by_target_misses_and_validates_query(pg, installed_copies, api) -
     negative_target = await _by_target(client, "skill", -3)
     missing_target = await client.get("/api/market/installs/by-target", params={"kind": "agent"})
     # 装出来的 Agent 删除后，这条安装不再有效，按 Agent 查不再命中。
-    await AgentService(pg.db).delete_agent(pg.installer_ws, copies.agent_id, pg.installer_id)
+    await AgentDefinitionService(pg.db).delete_agent(
+        pg.installer_ws, copies.agent_id, pg.installer_id
+    )
     deleted_agent = await _by_target(client, "agent", copies.agent_id)
 
     for response in (own, from_other_workspace, deleted_agent):

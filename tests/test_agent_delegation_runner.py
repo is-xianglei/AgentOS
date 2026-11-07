@@ -337,7 +337,7 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
     """即使 Agent 绑了 Write,父 Agent 本轮处于 Plan Mode 时,被委派方也拿不到 Write。"""
     capture = _LoopCapture()
 
-    class _FakeAgentService:
+    class _FakeAgentDefinitionService:
         def __init__(self, db: object) -> None:
             pass
 
@@ -347,7 +347,7 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
     async def _fake_loop(self: SubAgentRunner, *args: Any, **kwargs: Any) -> tuple[str, int]:
         return await _capture_loop(capture, args[6], args[7])
 
-    monkeypatch.setattr("agent.service.AgentService", _FakeAgentService)
+    monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr("database.engine.AsyncSessionLocal", _FakeSessionScope)
     monkeypatch.setattr("runtime.subagent.SubAgentRunRepository", lambda db: _RecordingRunRepo())
     monkeypatch.setattr("runtime.subagent.TurnEventAssembler", _FakeAssembler)

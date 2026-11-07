@@ -52,7 +52,7 @@ class DelegateCatalogEntry:
     tool_names: tuple[str, ...]
 
 
-class AgentService:
+class AgentDefinitionService:
     """Agent 定义、工作区权限和 Tool/Skill 绑定的业务入口。"""
 
     def __init__(self, db: AsyncSession):

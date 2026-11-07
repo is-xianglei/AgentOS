@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.config import settings
 from market.models import MarketInstallRecord
@@ -168,7 +168,7 @@ async def _save_skill(env: SimpleNamespace, name: str) -> SkillRecord:
 
 async def _create_agent(env: SimpleNamespace, name: str, skill_ids: list[int]) -> int:
     """在发布工作区建一个不绑工具的 Agent，返回 Agent ID。"""
-    agent = await AgentService(env.db).create_agent(
+    agent = await AgentDefinitionService(env.db).create_agent(
         workspace_id=env.publisher_ws,
         actor_user_id=env.author_id,
         name=name,
@@ -352,7 +352,7 @@ async def test_upgrade_does_not_overwrite_recreated_skill(pg, recreated_skill) -
     snapshot_before = await skill_service.build_snapshot(pg.installer_ws, case.skill_id)
 
     # 作者改了 Agent 的系统提示词，发布第二版；第二版自带的 Skill 仍是作者写的内容。
-    await AgentService(pg.db).update_agent(
+    await AgentDefinitionService(pg.db).update_agent(
         pg.publisher_ws,
         case.agent_id,
         pg.author_id,

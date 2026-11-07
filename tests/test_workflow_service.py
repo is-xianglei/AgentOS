@@ -23,7 +23,7 @@ class _FakeWorkspaceService:
         return None
 
 
-class _FakeAgentService:
+class _FakeAgentDefinitionService:
     def __init__(self, existing_ids: set[int]):
         self.existing_ids = existing_ids
         self.calls: list[list[int]] = []
@@ -57,12 +57,15 @@ class _FakeRepo:
         return self.record
 
 
-def _build_service(repo: _FakeRepo, agent_service: _FakeAgentService) -> WorkflowService:
+def _build_service(
+    repo: _FakeRepo,
+    agent_definition_service: _FakeAgentDefinitionService,
+) -> WorkflowService:
     service = WorkflowService.__new__(WorkflowService)
     service.db = None
     service.repo = repo
     service.workspace_service = _FakeWorkspaceService()
-    service.agent_service = agent_service
+    service.agent_definition_service = agent_definition_service
     return service
 
 
@@ -79,28 +82,28 @@ async def _create(service: WorkflowService, members: list[WorkflowMemberInput]):
 
 
 async def test_create_rejects_empty_members() -> None:
-    service = _build_service(_FakeRepo(), _FakeAgentService({1, 2}))
+    service = _build_service(_FakeRepo(), _FakeAgentDefinitionService({1, 2}))
     with pytest.raises(AgentException, match="至少需要绑定1个成员"):
         await _create(service, [])
 
 
 async def test_create_rejects_duplicated_agent() -> None:
-    agent_service = _FakeAgentService({1, 2})
-    service = _build_service(_FakeRepo(), agent_service)
+    agent_definition_service = _FakeAgentDefinitionService({1, 2})
+    service = _build_service(_FakeRepo(), agent_definition_service)
     with pytest.raises(AgentException, match="重复绑定"):
         await _create(service, [WorkflowMemberInput(1, 0), WorkflowMemberInput(1, 1)])
-    assert agent_service.calls == []
+    assert agent_definition_service.calls == []
 
 
 async def test_create_rejects_agent_outside_workspace() -> None:
-    service = _build_service(_FakeRepo(), _FakeAgentService({1}))
+    service = _build_service(_FakeRepo(), _FakeAgentDefinitionService({1}))
     with pytest.raises(AgentException, match="Agent不存在"):
         await _create(service, [WorkflowMemberInput(1, 0), WorkflowMemberInput(9, 1)])
 
 
 async def test_create_persists_mode_value_and_members() -> None:
     repo = _FakeRepo()
-    service = _build_service(repo, _FakeAgentService({1, 2}))
+    service = _build_service(repo, _FakeAgentDefinitionService({1, 2}))
     record = await _create(service, [WorkflowMemberInput(2, 5), WorkflowMemberInput(1, 0)])
     assert record.id == 7
     assert repo.created[0]["mode"] == "sequential"

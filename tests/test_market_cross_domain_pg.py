@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 
 import database.engine  # noqa: F401  副作用注册全部映射与全局软删过滤
 from agent.models import AgentRecord
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.config import settings
 from core.errors import AgentException
 from skill.models import SkillRecord
@@ -159,7 +159,7 @@ async def _create_agent(
     tool_ids: list[int] = []
     for tool in tools:
         tool_ids.append(env.tool_ids[tool])
-    return await AgentService(env.db).create_agent(
+    return await AgentDefinitionService(env.db).create_agent(
         workspace_id=workspace_id or env.workspace_id,
         actor_user_id=env.owner_id,
         name=name,
@@ -468,7 +468,7 @@ async def test_build_agent_snapshot(pg) -> None:
         model_name="author-model",
     )
 
-    snapshot = await AgentService(pg.db).build_snapshot(pg.workspace_id, agent.id)
+    snapshot = await AgentDefinitionService(pg.db).build_snapshot(pg.workspace_id, agent.id)
 
     # 不带 model_name；已禁用的 Skill 也在内；两个列表都排好序。
     assert snapshot == {
@@ -486,13 +486,13 @@ async def test_build_agent_snapshot_rejects_other_workspace(pg) -> None:
     outsider = await _create_agent(pg, "别家", workspace_id=pg.other_workspace_id)
 
     with pytest.raises(AgentException) as exc_info:
-        await AgentService(pg.db).build_snapshot(pg.workspace_id, outsider.id)
+        await AgentDefinitionService(pg.db).build_snapshot(pg.workspace_id, outsider.id)
 
     assert exc_info.value.status_code == 404
 
 
 async def test_is_name_taken_counts_disabled_but_not_deleted(pg) -> None:
-    service = AgentService(pg.db)
+    service = AgentDefinitionService(pg.db)
     await _create_agent(pg, "在用")
     await _create_agent(pg, "已停用", is_enabled=False)
     deleted = await _create_agent(pg, "已删除")
@@ -506,7 +506,7 @@ async def test_is_name_taken_counts_disabled_but_not_deleted(pg) -> None:
 
 
 async def test_agent_filter_existing_ids(pg) -> None:
-    service = AgentService(pg.db)
+    service = AgentDefinitionService(pg.db)
     live = await _create_agent(pg, "在用")
     disabled = await _create_agent(pg, "已停用", is_enabled=False)
     deleted = await _create_agent(pg, "已删除")
@@ -532,7 +532,7 @@ async def test_overwrite_for_upgrade_keeps_local_settings(pg) -> None:
         is_enabled=False,
     )
 
-    upgraded = await AgentService(pg.db).overwrite_for_upgrade(
+    upgraded = await AgentDefinitionService(pg.db).overwrite_for_upgrade(
         pg.workspace_id,
         agent.id,
         pg.owner_id,
@@ -554,7 +554,7 @@ async def test_overwrite_for_upgrade_keeps_local_settings(pg) -> None:
 
 
 async def test_overwrite_for_upgrade_failure_paths(pg) -> None:
-    service = AgentService(pg.db)
+    service = AgentDefinitionService(pg.db)
     agent = await _create_agent(pg, "被升级")
 
     with pytest.raises(AgentException) as no_access:

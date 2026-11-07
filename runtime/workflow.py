@@ -20,7 +20,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentRuntimeConfig, AgentService
+from agent.service import AgentDefinitionService, AgentRuntimeConfig
 from core.errors import AgentException, LeaseLostError
 from core.event_bus import NullStreamBus, RunStreamBus, StreamBus
 from core.events import (
@@ -178,7 +178,7 @@ class BaseOrchestrator(Orchestrator):
         取消不是节点失败,不发 failed。
         """
         try:
-            return await AgentService(db).get_runtime_config(self.workspace_id, agent_id)
+            return await AgentDefinitionService(db).get_runtime_config(self.workspace_id, agent_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -261,8 +261,7 @@ class BaseOrchestrator(Orchestrator):
         member 阶段优先从 config 取 agent_id 与 Agent 原名;配置期失败没有 config,
         改用显式 agent_id,member_name 留空。
         """
-        # 编排上下文统一记录最近一个可观察游标和节点状态；后续接入持久化
-        # checkpoint 时只需替换上下文快照存储，不必改动三种控制流实现。
+        # 编排上下文统一记录最近一个可观察游标和节点状态。
         cursor = f"{phase.value}:{status.value}"
         state_updates: dict[str, Any] = {}
         if config is not None:

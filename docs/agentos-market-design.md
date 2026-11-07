@@ -243,7 +243,7 @@ Agent 条目的快照：
   - 当前工作区有效安装的口径：安装记录未软删除，且安装出来的 Agent 或 Skill 仍然存在。当前工作区已通过成员校验，必然未删除，所以不必再查工作区；这与下文 install_count 的口径一致。
   - 判断安装对象是否存在要请 agent 域、skill 域确认，不能跨域拼 SQL。做法是：
     1. 先查出当前工作区的全部安装记录（每个条目最多一条，数量很小）；
-    2. 用 `AgentService` / `SkillService` 的 `filter_existing_ids` 留下仍然有效的；
+    2. 用 `AgentDefinitionService` / `SkillService` 的 `filter_existing_ids` 留下仍然有效的；
     3. 得到「有效安装的条目 ID」和「有更新的条目 ID」两个集合，作为 IN / NOT IN 条件交给分页查询。
   - 不按安装状态筛选时不做上面这几步。
   - 每个列表项包含以下字段：
@@ -260,7 +260,7 @@ Agent 条目的快照：
     3. 安装出来的 Agent 或 Skill 仍然存在。
   - 后两条分属 workspace、agent、skill 三个域，market 不能拼它们的 SQL。做法是只为当前页的条目计算：
     1. 一次查询取出这些条目在所有工作区的未软删除安装记录，只取 listing_id、workspace_id、target_agent_id、target_skill_id 四列；
-    2. 用 `WorkspaceService.filter_existing_ids`、`AgentService.filter_existing_ids_across_workspaces`、`SkillService.filter_existing_ids_across_workspaces` 三个不限工作区的批量方法确认工作区和目标对象还在，集合为空时不查；
+    2. 用 `WorkspaceService.filter_existing_ids`、`AgentDefinitionService.filter_existing_ids_across_workspaces`、`SkillService.filter_existing_ids_across_workspaces` 三个不限工作区的批量方法确认工作区和目标对象还在，集合为空时不查；
     3. 在内存里按条目计数。
   - 因此每页固定是 1 次安装记录查询加至多 3 次批量确认，与页大小无关；传输的行数等于这一页条目的安装总数。安装量很大时，IN 列表会随之变长（PostgreSQL 单条语句的绑定参数上限是 65535），届时应改成写入时维护的计数。
   - 详情接口的 install_count 用同一个计算函数，口径一致。
@@ -295,7 +295,7 @@ Agent 条目的快照：
    - 有同名但已软删除的：恢复；
    - 有同名未删除的，且 skill_hash 相同：直接复用；
    - 有同名未删除的，但内容不同：返回 409，拒绝整个安装，并指明是哪个 Skill 冲突。
-4. 调用现有的 `AgentService.create_agent` 创建 Agent，`model_name` 为空，`is_enabled` 为 true。这样能复用它的全部校验。
+4. 调用现有的 `AgentDefinitionService.create_agent` 创建 Agent，`model_name` 为空，`is_enabled` 为 true。这样能复用它的全部校验。
 5. 写入安装记录。`managed_skill_ids` 只记录这次新建或恢复的 Skill。
 
 **返回值**：安装记录加一份报告。报告里有：

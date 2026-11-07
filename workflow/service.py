@@ -5,7 +5,7 @@ from typing import TypedDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentService
+from agent.service import AgentDefinitionService
 from core.errors import AgentException
 from workflow.models import WorkflowMode, WorkflowRecord
 from workflow.repository import WorkflowRepository
@@ -77,7 +77,7 @@ class WorkflowService:
         self.db = db
         self.repo = WorkflowRepository(db)
         self.workspace_service = WorkspaceService(db)
-        self.agent_service = AgentService(db)
+        self.agent_definition_service = AgentDefinitionService(db)
 
     async def create_workflow(
         self,
@@ -198,7 +198,7 @@ class WorkflowService:
     ) -> tuple[WorkflowRunMember, ...]:
         """返回可运行Workflow的成员序列，按 (sort_order, agent_id) 升序。
 
-        成员 Agent 自身是否可运行由运行时逐个经 AgentService.require_runnable 校验，
+        成员 Agent 自身是否可运行由运行时逐个经 AgentDefinitionService.require_runnable 校验，
         这里只负责编排顺序，不重复查询 Agent。
         """
         workflow = await self.require_runnable(workflow_id, workspace_id)
@@ -235,7 +235,7 @@ class WorkflowService:
                 "同一Agent不能在Workflow中重复绑定",
                 {"agent_ids": sorted(duplicated_ids)},
             )
-        await self.agent_service.require_bindable_agent_ids(workspace_id, agent_ids)
+        await self.agent_definition_service.require_bindable_agent_ids(workspace_id, agent_ids)
         # 上面已排除重复 agent_id，转成字典不会丢成员。
         return {member.agent_id: member.sort_order for member in members}
 

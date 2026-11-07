@@ -62,7 +62,7 @@ def _install_fakes(
     config_requests: list[tuple[int, int]] = []
     dispatches: list[dict[str, Any]] = []
 
-    class _FakeAgentService:
+    class _FakeAgentDefinitionService:
         def __init__(self, db: object) -> None:
             pass
 
@@ -95,8 +95,8 @@ def _install_fakes(
         )
         return "委派报告"
 
-    # _delegate 在调用时局部导入 AgentService,替换模块属性即可生效。
-    monkeypatch.setattr("agent.service.AgentService", _FakeAgentService)
+    # _delegate 在调用时局部导入 AgentDefinitionService,替换模块属性即可生效。
+    monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr(AgentTool, "_dispatch", _fake_dispatch)
     return config_requests, dispatches
 
