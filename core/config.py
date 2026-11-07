@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     # --- LLM Provider 全局开关 -----------------------------------------------
     # 工作区数据库没有可用模型时才使用环境配置；启动不要求声明环境模型。
-    # 回退时Provider、密钥或模型无效，create_llm_client()抛中文AgentException。
+    # 回退时Provider、密钥或模型无效，create_model_client()抛中文AgentException。
     llm_provider: str | None = None  # "anthropic" | "openai"
 
     # --- LLM(Anthropic) -----------------------------------------------------
@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     anthropic_max_retries: int = 2  # SDK 内置重试次数(429/5xx/网络超时,指数退避)
     anthropic_timeout_seconds: float | None = None  # None 表示交给 SDK 自动计算
     # 场景覆盖(可选,留空回落 anthropic_model)。字段名必须满足工厂的拼接规则
-    # {provider}_{scenario}_model,见 llm/factory.py 的 _resolve_model()。
+    # {provider}_{scenario}_model,见 harness/adapters/models/factory.py 的 _resolve_model()。
     anthropic_agent_model: str | None = None
     anthropic_subagent_model: str | None = None  # 未声明模型的 SubAgent 类型的兜底
     anthropic_subagent_fast_model: str | None = None  # Explore 用,速度优先档位
@@ -85,7 +85,7 @@ class Settings(BaseSettings):
 
     # --- SubAgent ------------------------------------------------------------
     # 模型档位配置已并入 LLM provider 组({provider}_subagent_model 等),
-    # 解析优先级见 tools/subagents/definition.py 的 resolve_model() 与 llm/factory.py。
+    # 解析优先级见 tools/subagents/definition.py 的 resolve_model() 与 harness/adapters/models/factory.py。
     # ReAct 轮次上限,按类型分档。verification 须跑构建+测试+lint+对抗探测。
     subagent_max_rounds: int = 6
     subagent_plan_max_rounds: int = 12
@@ -123,7 +123,7 @@ class Settings(BaseSettings):
 
     # --- 长期 Memory -----------------------
     # Selector/Extractor/Dream 的模型配置已并入 LLM provider 组
-    # ({provider}_memory_selector_model 等),由 llm/factory.py 统一解析。
+    # ({provider}_memory_selector_model 等),由 harness/adapters/models/factory.py 统一解析。
     memory_selector_timeout_seconds: float = 5.0
     memory_selector_query_max_chars: int = 12_000
     memory_recall_max_items: int = 5

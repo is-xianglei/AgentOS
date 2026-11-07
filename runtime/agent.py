@@ -27,14 +27,12 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
+from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, PromptBlock
 from harness.domain.messages import ToolCall, ToolResult
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
-from llm import BaseLLMClient
-from llm.errors import LLMConnectionError, LLMStatusError
-from llm.types import PromptBlock
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
 from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
@@ -119,8 +117,8 @@ def _turn_failure_info(exc: Exception) -> ErrorInfo:
     """
     if isinstance(exc, AgentException):
         return ErrorInfo(code="TURN_FAILED", message=exc.message, fatal=True)
-    transient = isinstance(exc, LLMConnectionError) or (
-        isinstance(exc, LLMStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
+    transient = isinstance(exc, ModelConnectionError) or (
+        isinstance(exc, ModelStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
     )
     if transient:
         return ErrorInfo(
@@ -138,7 +136,7 @@ class AgentRuntime:
         db: AsyncSession,
         user_id: int | None = None,
         workspace_id: int | None = None,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
     ):
         """初始化 Agent 主运行时依赖。"""
         self.db = db
@@ -2029,7 +2027,7 @@ class AgentRuntime:
     def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
         """返回本次 LLM 调用实际生效的 (provider, model)，用于 assistant 消息成本归因。
 
-        provider 由客户端自报（BaseLLMClient.provider 属性），注入的测试替身若未实现
+        provider 由客户端自报（ModelClient.provider 属性），注入的测试替身若未实现
         该属性则留空。model 取逐调用覆盖值，未覆盖时回落客户端构造时解析好的模型。
         """
         provider = getattr(self.llm, "provider", None)

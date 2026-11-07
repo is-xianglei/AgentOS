@@ -6,15 +6,15 @@ from typing import Any
 import pytest
 
 from core.events import ORCHESTRATOR_ACTOR, BlockType, ToolInfo
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import ToolCall
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
 
 
 class _FakeLLM:
-    def __init__(self, events: list[LLMStreamEvent]) -> None:
+    def __init__(self, events: list[ModelStreamEvent]) -> None:
         self.events = events
         self.calls: list[dict[str, Any]] = []
 
@@ -35,18 +35,18 @@ class _FakeLLM:
         return generate()
 
 
-def _text_events(result: LLMTurnResult) -> list[LLMStreamEvent]:
+def _text_events(result: ModelTurnResult) -> list[ModelStreamEvent]:
     return [
-        LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT),
-        LLMStreamEvent(LLMEventKind.TEXT_DELTA, block_ref=0, text=result.text),
-        LLMStreamEvent(LLMEventKind.BLOCK_STOP, block_ref=0),
-        LLMStreamEvent(LLMEventKind.TURN_RESULT, result=result),
+        ModelStreamEvent(ModelEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT),
+        ModelStreamEvent(ModelEventKind.TEXT_DELTA, block_ref=0, text=result.text),
+        ModelStreamEvent(ModelEventKind.BLOCK_STOP, block_ref=0),
+        ModelStreamEvent(ModelEventKind.TURN_RESULT, result=result),
     ]
 
 
 @pytest.mark.anyio
 async def test_agent_step_assembles_stream_and_neutral_blocks() -> None:
-    result = LLMTurnResult(text="完成")
+    result = ModelTurnResult(text="完成")
     llm = _FakeLLM(_text_events(result))
     emitted = []
 
@@ -82,15 +82,15 @@ async def test_agent_step_assembles_stream_and_neutral_blocks() -> None:
 @pytest.mark.anyio
 async def test_agent_step_returns_tool_uses_in_result() -> None:
     tool_call = ToolCall(id="call-1", tool_name="Read", arguments={"path": "a.py"})
-    result = LLMTurnResult(text="", tool_calls=[tool_call])
+    result = ModelTurnResult(text="", tool_calls=[tool_call])
     events = [
-        LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TOOL_USE),
-        LLMStreamEvent(
-            LLMEventKind.TOOL_USE,
+        ModelStreamEvent(ModelEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TOOL_USE),
+        ModelStreamEvent(
+            ModelEventKind.TOOL_USE,
             block_ref=0,
             tool=ToolInfo(id="call-1", name="Read", input={"path": "a.py"}),
         ),
-        LLMStreamEvent(LLMEventKind.TURN_RESULT, result=result),
+        ModelStreamEvent(ModelEventKind.TURN_RESULT, result=result),
     ]
     llm = _FakeLLM(events)
 

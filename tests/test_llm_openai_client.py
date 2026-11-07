@@ -13,9 +13,9 @@ import pytest
 
 from core.errors import AgentException
 from core.events import ORCHESTRATOR_ACTOR, BlockType, Usage
-from llm.anthropic_client import _AnthropicChunkAdapter
-from llm.openai_client import _OpenAIChunkAdapter
-from llm.types import LLMEventKind, LLMStreamEvent
+from harness.adapters.models.anthropic_client import _AnthropicChunkAdapter
+from harness.adapters.models.openai_client import _OpenAIChunkAdapter
+from harness.app.ports import ModelEventKind, ModelStreamEvent
 from runtime.stream_assembler import TurnEventAssembler
 from tests.fixtures import anthropic_chunks
 from tests.fixtures.openai_chunks import (
@@ -38,10 +38,10 @@ def _ev(event_type: str, **payload: Any) -> dict[str, Any]:
     return {"type": event_type, "session_id": _SID, "actor": _ACTOR, **payload}
 
 
-def _adapt_all(chunks: list[dict[str, Any]]) -> list[LLMStreamEvent]:
+def _adapt_all(chunks: list[dict[str, Any]]) -> list[ModelStreamEvent]:
     """整段 chunk 序列过适配器,返回中立事件列表(含 finalize 产物)。"""
     adapter = _OpenAIChunkAdapter()
-    events: list[LLMStreamEvent] = []
+    events: list[ModelStreamEvent] = []
     for chunk in chunks:
         events.extend(adapter.adapt(chunk))
     events.extend(adapter.finalize())
@@ -152,7 +152,7 @@ async def _run_call_anthropic(
 def test_block_ref_allocation_text_and_tools_offset() -> None:
     """block_ref 自建分配:文本块恒占 1,工具块占 2 + tool_call.index。"""
     events = _adapt_all(CHUNKS_TEXT_AND_TOOL_USE)
-    starts = [e for e in events if e.kind is LLMEventKind.BLOCK_START]
+    starts = [e for e in events if e.kind is ModelEventKind.BLOCK_START]
     assert [(e.block_ref, e.block_type) for e in starts] == [
         (1, BlockType.TEXT),
         (2, BlockType.TOOL_USE),
@@ -162,12 +162,12 @@ def test_block_ref_allocation_text_and_tools_offset() -> None:
 def test_multi_tool_refs_and_payloads() -> None:
     """序列 c:多工具并发,ref 按 2+index 分配,入参交错累积互不串块。"""
     events = _adapt_all(CHUNKS_MULTI_TOOL_USE)
-    starts = [e for e in events if e.kind is LLMEventKind.BLOCK_START]
+    starts = [e for e in events if e.kind is ModelEventKind.BLOCK_START]
     assert [(e.block_ref, e.block_type) for e in starts] == [
         (2, BlockType.TOOL_USE),
         (3, BlockType.TOOL_USE),
     ]
-    tool_events = [e for e in events if e.kind is LLMEventKind.TOOL_USE]
+    tool_events = [e for e in events if e.kind is ModelEventKind.TOOL_USE]
     assert [(e.block_ref, e.tool.id, e.tool.name, e.tool.input) for e in tool_events] == [
         (2, "call_a", "file_read", {"path": "a.txt"}),
         (3, "call_b", "file_write", {"path": "b.txt", "content": "x"}),
@@ -177,10 +177,10 @@ def test_multi_tool_refs_and_payloads() -> None:
 def test_tool_blocks_emit_no_block_stop() -> None:
     """工具块不发 BLOCK_STOP(装配器统一补发);文本块在收束点补发。"""
     events = _adapt_all(CHUNKS_TEXT_AND_TOOL_USE)
-    stops = [e for e in events if e.kind is LLMEventKind.BLOCK_STOP]
+    stops = [e for e in events if e.kind is ModelEventKind.BLOCK_STOP]
     assert [e.block_ref for e in stops] == [1]
     multi_tool_events = _adapt_all(CHUNKS_MULTI_TOOL_USE)
-    assert not [e for e in multi_tool_events if e.kind is LLMEventKind.BLOCK_STOP]
+    assert not [e for e in multi_tool_events if e.kind is ModelEventKind.BLOCK_STOP]
 
 
 def test_noise_chunks_emit_no_events() -> None:
@@ -203,13 +203,13 @@ def test_no_thinking_delta_without_reasoning_content() -> None:
     """
     for chunks in (CHUNKS_SINGLE_TEXT, CHUNKS_TEXT_AND_TOOL_USE, CHUNKS_MULTI_TOOL_USE):
         events = _adapt_all(chunks)
-        assert not [e for e in events if e.kind is LLMEventKind.THINKING_DELTA]
+        assert not [e for e in events if e.kind is ModelEventKind.THINKING_DELTA]
         assert not [
             e
             for e in events
-            if e.kind is LLMEventKind.BLOCK_START and e.block_type is BlockType.THINKING
+            if e.kind is ModelEventKind.BLOCK_START and e.block_type is BlockType.THINKING
         ]
-        result = [e for e in events if e.kind is LLMEventKind.TURN_RESULT][-1].result
+        result = [e for e in events if e.kind is ModelEventKind.TURN_RESULT][-1].result
         assert result.thinking == []
 
 
@@ -219,7 +219,7 @@ def test_no_thinking_delta_without_reasoning_content() -> None:
 def test_turn_result_usage_and_stop_reason() -> None:
     """AC3:TURN_RESULT 携带非空 usage(含缓存读取映射)与 stop_reason。"""
     events = _adapt_all(CHUNKS_SINGLE_TEXT)
-    results = [e for e in events if e.kind is LLMEventKind.TURN_RESULT]
+    results = [e for e in events if e.kind is ModelEventKind.TURN_RESULT]
     assert len(results) == 1
     result = results[0].result
     assert result is not None

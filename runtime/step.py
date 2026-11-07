@@ -9,9 +9,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from harness.app.ports import ModelClient, ModelTurnResult, PromptBlock
 from harness.domain.messages import AssistantMessage, ToolCall
-from llm import BaseLLMClient
-from llm.types import LLMTurnResult, PromptBlock
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
 
@@ -30,7 +29,7 @@ class StepRequest:
 class StepResult:
     """一次 LLM 调用的终局结果和中立助手消息块。"""
 
-    llm_result: LLMTurnResult
+    llm_result: ModelTurnResult
     assistant_blocks: list[dict[str, Any]]
 
     @property
@@ -47,7 +46,7 @@ class AgentStep:
 
     def __init__(
         self,
-        llm: BaseLLMClient,
+        llm: ModelClient,
         assembler: TurnEventAssembler,
         emit: Callable[[Any], Awaitable[None]],
     ) -> None:

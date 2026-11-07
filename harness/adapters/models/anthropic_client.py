@@ -20,6 +20,17 @@ from pydantic import BaseModel, ValidationError
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.app.ports import (
+    ModelCallError,
+    ModelClient,
+    ModelConnectionError,
+    ModelEventKind,
+    ModelStatusError,
+    ModelStreamEvent,
+    ModelTurnResult,
+    PromptBlock,
+    ToolSpec,
+)
 from harness.domain.messages import (
     AssistantBlock,
     AssistantMessage,
@@ -30,9 +41,6 @@ from harness.domain.messages import (
     UserMessage,
     message_from_row,
 )
-from llm.base import BaseLLMClient
-from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -76,22 +84,22 @@ _BLOCK_TYPE_MAP = {
 }
 
 
-def _to_llm_error(exc: AnthropicError) -> LLMCallError:
+def _to_model_error(exc: AnthropicError) -> ModelCallError:
     """把 Anthropic SDK 异常转成中立异常,消息与 SDK 类名原样保留。
 
     APITimeoutError 是 APIConnectionError 的子类,一并归为连接失败;
-    429 仍按状态码归入 LLMStatusError,是否视为「不可用」由调用方决定。
+    429 仍按状态码归入 ModelStatusError,是否视为「不可用」由调用方决定。
     APIResponseValidationError、WorkloadIdentityError 等非状态错误也可能带
-    status_code,原样带上供诊断展示,但不归为 LLMStatusError。
+    status_code,原样带上供诊断展示,但不归为 ModelStatusError。
     """
     sdk_error_type = type(exc).__name__
     if isinstance(exc, APIConnectionError):
-        return LLMConnectionError(str(exc), sdk_error_type=sdk_error_type)
+        return ModelConnectionError(str(exc), sdk_error_type=sdk_error_type)
     if isinstance(exc, APIStatusError):
-        return LLMStatusError(
+        return ModelStatusError(
             str(exc), sdk_error_type=sdk_error_type, status_code=exc.status_code
         )
-    return LLMCallError(
+    return ModelCallError(
         str(exc),
         sdk_error_type=sdk_error_type,
         status_code=getattr(exc, "status_code", None),
@@ -209,7 +217,7 @@ class _OpenBlock:
 
 
 class _AnthropicChunkAdapter:
-    """把 Anthropic 原始 chunk 适配成中立 LLMStreamEvent 序列(模块私有)。
+    """把 Anthropic 原始 chunk 适配成中立 ModelStreamEvent 序列(模块私有)。
 
     生命周期为单次 stream() 调用:流开始时创建,结束即弃。
     block_ref 直接沿用 Anthropic 原始 index(调用内本就唯一),
@@ -221,7 +229,7 @@ class _AnthropicChunkAdapter:
     def __init__(self) -> None:
         self._open: dict[int, _OpenBlock] = {}
 
-    def adapt(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def adapt(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         """适配单个原始 chunk 为零或多个中立事件。"""
         ctype = _chunk_type(chunk)
         if ctype == "content_block_start":
@@ -235,7 +243,7 @@ class _AnthropicChunkAdapter:
         # ping / message_start / message_delta / signature 等噪声不产出事件。
         return []
 
-    def _on_block_start(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def _on_block_start(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         index = int(chunk.get("index", 0))
         content_block = chunk.get("content_block") or {}
         raw_type = content_block.get("type", "text")
@@ -254,10 +262,14 @@ class _AnthropicChunkAdapter:
             tool_name=content_block.get("name", "") or "",
         )
         return [
-            LLMStreamEvent(kind=LLMEventKind.BLOCK_START, block_ref=index, block_type=block_type)
+            ModelStreamEvent(
+                kind=ModelEventKind.BLOCK_START,
+                block_ref=index,
+                block_type=block_type,
+            )
         ]
 
-    def _on_block_delta(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def _on_block_delta(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         index = int(chunk.get("index", 0))
         delta = chunk.get("delta") or {}
         dtype = delta.get("type")
@@ -266,11 +278,11 @@ class _AnthropicChunkAdapter:
             text = delta.get("text")
             if not isinstance(text, str):
                 text = ""
-            return [LLMStreamEvent(kind=LLMEventKind.TEXT_DELTA, block_ref=index, text=text)]
+            return [ModelStreamEvent(kind=ModelEventKind.TEXT_DELTA, block_ref=index, text=text)]
         if dtype == "thinking_delta":
             return [
-                LLMStreamEvent(
-                    kind=LLMEventKind.THINKING_DELTA,
+                ModelStreamEvent(
+                    kind=ModelEventKind.THINKING_DELTA,
                     block_ref=index,
                     text=delta.get("thinking", ""),
                 )
@@ -284,14 +296,14 @@ class _AnthropicChunkAdapter:
         # signature_delta 等:噪声,不产出。
         return []
 
-    def _on_block_stop(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def _on_block_stop(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         index = int(chunk.get("index", 0))
         block = self._open.pop(index, None)
         if block is None:
             # 从没开过的块:原样透传 stop,由装配器判定丢弃并留日志。
-            return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+            return [ModelStreamEvent(kind=ModelEventKind.BLOCK_STOP, block_ref=index)]
         if block.block_type is not BlockType.TOOL_USE:
-            return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=index)]
+            return [ModelStreamEvent(kind=ModelEventKind.BLOCK_STOP, block_ref=index)]
 
         # tool_use 块:入参累积完毕,一次性产出完整 tool_use 事件;
         # 协议层的 block_stop 配对由装配器补发,provider 侧不参与协议决策。
@@ -307,9 +319,9 @@ class _AnthropicChunkAdapter:
                     {"tool_name": block.tool_name, "tool_use_id": block.tool_id},
                 ) from exc
         tool = ToolInfo(id=block.tool_id, name=block.tool_name, input=tool_input)
-        return [LLMStreamEvent(kind=LLMEventKind.TOOL_USE, block_ref=index, tool=tool)]
+        return [ModelStreamEvent(kind=ModelEventKind.TOOL_USE, block_ref=index, tool=tool)]
 
-    def _on_message_final(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def _on_message_final(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         """把合成的 message_final 组装成 TURN_RESULT 终结事件。"""
         usage_dict = chunk.get("usage")
         usage: Usage | None = None
@@ -323,17 +335,17 @@ class _AnthropicChunkAdapter:
                 cache_read_input_tokens=int(usage_dict.get("cache_read_input_tokens", 0) or 0),
             )
         content = chunk.get("content") or []
-        result = LLMTurnResult(
+        result = ModelTurnResult(
             text=_text_from_content(content),
             tool_calls=_extract_tool_calls(content),
             thinking=_extract_thinking(content),
             usage=usage,
             stop_reason=chunk.get("stop_reason"),
         )
-        return [LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=result)]
+        return [ModelStreamEvent(kind=ModelEventKind.TURN_RESULT, result=result)]
 
 
-class AnthropicClient(BaseLLMClient):
+class AnthropicClient(ModelClient):
     def __init__(
         self,
         model: str,
@@ -490,8 +502,8 @@ class AnthropicClient(BaseLLMClient):
         system_prompt: str | list[PromptBlock] | None = None,
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
-    ) -> AsyncIterator[LLMStreamEvent]:
-        """流式调用,产出中立 LLMStreamEvent。system_prompt 传块列表时可携带 cache 断点。
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """流式调用,产出中立 ModelStreamEvent。system_prompt 传块列表时可携带 cache 断点。
 
         中立入参经私有 _encode_system / _encode_tools 编成 SDK 形状;
         SDK 原始事件在内部经 _AnthropicChunkAdapter 消化,不外露;
@@ -553,7 +565,7 @@ class AnthropicClient(BaseLLMClient):
                 for neutral_event in adapter.adapt(message_final):
                     yield neutral_event
         except AnthropicError as exc:
-            raise _to_llm_error(exc) from exc
+            raise _to_model_error(exc) from exc
 
     @staticmethod
     def _log_cache_usage(usage: dict[str, Any]) -> None:
@@ -648,7 +660,7 @@ class AnthropicClient(BaseLLMClient):
                 else:
                     response = await client.messages.create(**request)
             except AnthropicError as exc:
-                raise _to_llm_error(exc) from exc
+                raise _to_model_error(exc) from exc
             # 取第一个调用结构化工具的 tool_use 块。
             tool_block = None
             for block in response.content:

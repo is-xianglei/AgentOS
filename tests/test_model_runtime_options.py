@@ -10,11 +10,11 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from core.errors import AgentException
-from llm import anthropic_client as anthropic_module
-from llm import openai_client as openai_module
-from llm.anthropic_client import AnthropicClient
-from llm.openai_client import OpenAIClient
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
+from harness.adapters.models import anthropic_client as anthropic_module
+from harness.adapters.models import openai_client as openai_module
+from harness.adapters.models.anthropic_client import AnthropicClient
+from harness.adapters.models.openai_client import OpenAIClient
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from model_service.service import ModelService
 from model_service.policy import TURBO_PROMPT
 from runtime import model_selection
@@ -129,7 +129,7 @@ async def test_nonexplicit_workflow_uses_its_role(monkeypatch):
 @pytest.mark.parametrize("scenario", ["memory_extractor", "memory_dream"])
 async def test_legacy_memory_job_keeps_environment_endpoint(monkeypatch, scenario):
     legacy_client = object()
-    monkeypatch.setattr(model_selection, "create_llm_client", lambda **_: legacy_client)
+    monkeypatch.setattr(model_selection, "create_model_client", lambda **_: legacy_client)
     resolve = AsyncMock()
     monkeypatch.setattr(model_selection, "resolve_runtime_client", resolve)
     client = await model_selection.frozen_job_client(
@@ -152,7 +152,7 @@ async def test_new_memory_job_honors_frozen_provider(monkeypatch):
 
 async def test_environment_fast_does_not_emit_unverified_private_protocol(monkeypatch):
     client = OpenAIClient(model="model-a", api_key="test")
-    monkeypatch.setattr(model_selection, "create_llm_client", lambda **_: client)
+    monkeypatch.setattr(model_selection, "create_model_client", lambda **_: client)
     actual, provider = await model_selection.resolve_runtime_client(
         object(), None, None, "agent", effort="fast",
     )
@@ -293,8 +293,9 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
 
         async def stream(self, messages, system_prompt=None, tools=None, model=None):
             requests.append({"system_prompt": system_prompt, "tools": tools})
-            yield LLMStreamEvent(
-                LLMEventKind.TURN_RESULT, result=LLMTurnResult(text="答案", stop_reason="end_turn"),
+            yield ModelStreamEvent(
+                ModelEventKind.TURN_RESULT,
+                result=ModelTurnResult(text="答案", stop_reason="end_turn"),
             )
 
     runtime = AgentRuntime.__new__(AgentRuntime)

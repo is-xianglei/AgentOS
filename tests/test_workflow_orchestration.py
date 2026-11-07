@@ -26,7 +26,7 @@ from core.events import (
     WorkflowProgressInfo,
     WorkflowProgressStatus,
 )
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from runtime.workflow import (
     MEMBER_DISPLAY_NAME_MAX_LENGTH,
     LlmRoutingOrchestrator,
@@ -219,17 +219,17 @@ class _FakeLLM:
         system_prompt: Any = None,
         tools: Any = None,
         model: str | None = None,
-    ) -> AsyncIterator[LLMStreamEvent]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         self.stream_prompts.append(messages[-1]["content"])
         self.stream_bus_len.append(self._bus_len())
         if self.cancel_stream:
             raise asyncio.CancelledError()
-        yield LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)
-        yield LLMStreamEvent(LLMEventKind.TEXT_DELTA, block_ref=0, text=self.merged_text)
-        yield LLMStreamEvent(LLMEventKind.BLOCK_STOP, block_ref=0)
-        yield LLMStreamEvent(
-            LLMEventKind.TURN_RESULT,
-            result=LLMTurnResult(text=self.merged_text, stop_reason="end_turn"),
+        yield ModelStreamEvent(ModelEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)
+        yield ModelStreamEvent(ModelEventKind.TEXT_DELTA, block_ref=0, text=self.merged_text)
+        yield ModelStreamEvent(ModelEventKind.BLOCK_STOP, block_ref=0)
+        yield ModelStreamEvent(
+            ModelEventKind.TURN_RESULT,
+            result=ModelTurnResult(text=self.merged_text, stop_reason="end_turn"),
         )
 
     async def complete_structured[T: BaseModel](

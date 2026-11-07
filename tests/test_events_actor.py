@@ -20,7 +20,7 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
-from llm.types import LLMTurnResult
+from harness.app.ports import ModelTurnResult
 from runtime.subagent import SubAgentRunner
 from tools.subagents.definition import AgentType, SubAgentSpec
 from tools.subagents.registry import get_subagent_spec
@@ -189,7 +189,7 @@ class _FakeAssembler:
     """替身装配器:只提供 turn_end 所需的 last_result。"""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.last_result = LLMTurnResult(text="报告", stop_reason="end_turn")
+        self.last_result = ModelTurnResult(text="报告", stop_reason="end_turn")
 
 
 def _stub_runner(

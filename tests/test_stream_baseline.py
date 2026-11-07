@@ -14,8 +14,8 @@ import pytest
 
 from core.errors import AgentException
 from core.events import ORCHESTRATOR_ACTOR, Usage
-from llm.anthropic_client import _AnthropicChunkAdapter
-from llm.types import LLMStreamEvent
+from harness.adapters.models.anthropic_client import _AnthropicChunkAdapter
+from harness.app.ports import ModelStreamEvent
 from runtime.stream_assembler import TurnEventAssembler
 from tests.fixtures.anthropic_chunks import (
     CHUNKS_SINGLE_TEXT,
@@ -188,7 +188,7 @@ async def test_turn_result_carries_tool_uses() -> None:
 def test_adapter_emits_neutral_events_without_runtime_concepts() -> None:
     """适配器产出的中立事件不含 actor / session_id / 全局 index(分层收口)。"""
     adapter = _AnthropicChunkAdapter()
-    events: list[LLMStreamEvent] = []
+    events: list[ModelStreamEvent] = []
     for chunk in CHUNKS_TEXT_AND_TOOL_USE:
         events.extend(adapter.adapt(chunk))
     assert events, "适配器应产出中立事件"

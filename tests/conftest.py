@@ -40,9 +40,9 @@ async def redis_test_clients():
 @pytest.fixture
 def assert_replayable():
     """断言中立消息历史可直接作为下一轮请求:两家出站编码都不报错,tool_use 与结果一一配对。"""
+    from harness.adapters.models.anthropic_client import AnthropicClient
+    from harness.adapters.models.openai_client import OpenAIClient
     from harness.domain.messages import AssistantMessage
-    from llm.anthropic_client import AnthropicClient
-    from llm.openai_client import OpenAIClient
 
     def check(messages: list[dict]) -> None:
         pending: set[str] = set()

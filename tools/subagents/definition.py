@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from llm.factory import resolve_scenario_model
+from harness.adapters.models.factory import resolve_scenario_model
 from tools.policy import ToolProfile
 from tools.shell_policy import ShellAccess
 

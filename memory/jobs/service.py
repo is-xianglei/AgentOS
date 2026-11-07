@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from core.config import settings
 from core.errors import AgentException
 from database.engine import AsyncSessionLocal
-from llm import BaseLLMClient, resolve_scenario_model
+from harness.adapters.models.factory import resolve_scenario_model
+from harness.app.ports import ModelClient
 from memory.jobs.dream import (
     DreamApplyResult,
     MemoryDreamFailure,
@@ -212,7 +213,7 @@ class MemoryJobRunner:
         self,
         *,
         session_factory: async_sessionmaker[AsyncSession] = AsyncSessionLocal,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
         worker_id: str | None = None,
         claim_scope: tuple[int, int] | None = None,
     ) -> None:

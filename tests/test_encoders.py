@@ -6,9 +6,9 @@ Anthropic 侧 cache_breakpoint 落成 cache_control,OpenAI 侧忽略断点拼纯
 编码是纯静态方法,不建 SDK 连接、不读配置,无需构造客户端实例。
 """
 
-from llm.anthropic_client import AnthropicClient
-from llm.openai_client import OpenAIClient
-from llm.types import PromptBlock, ToolSpec
+from harness.adapters.models.anthropic_client import AnthropicClient
+from harness.adapters.models.openai_client import OpenAIClient
+from harness.app.ports import PromptBlock, ToolSpec
 
 _TOOL_SPECS = [
     ToolSpec(

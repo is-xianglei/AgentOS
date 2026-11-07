@@ -12,8 +12,8 @@ from typing import Any
 
 import pytest
 
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from memory.jobs.extraction import MemoryExtractionService
 from runtime.compact import CompactService
 from session.service import SessionService
@@ -114,9 +114,9 @@ async def test_auto_compact_snapshot_stores_neutral_shape() -> None:
         provider = "anthropic"
 
         async def stream(self, messages: list[dict[str, Any]], **kwargs: Any):
-            yield LLMStreamEvent(
-                kind=LLMEventKind.TURN_RESULT,
-                result=LLMTurnResult(text="历史总结"),
+            yield ModelStreamEvent(
+                kind=ModelEventKind.TURN_RESULT,
+                result=ModelTurnResult(text="历史总结"),
             )
 
     class _FakeRepo:

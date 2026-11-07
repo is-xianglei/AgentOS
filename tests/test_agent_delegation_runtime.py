@@ -13,8 +13,8 @@ import pytest
 
 from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
 from core.events import ORCHESTRATOR_ACTOR
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import ToolCall
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from prompt import PromptContext, compose_lead_blocks
 from prompt.sections import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
@@ -37,9 +37,9 @@ class _FakeLLM:
 
     async def stream(self, messages, system_prompt=None, tools=None, model=None):
         self.system_prompts.append(system_prompt)
-        yield LLMStreamEvent(
-            LLMEventKind.TURN_RESULT,
-            result=LLMTurnResult(text="答案", stop_reason="end_turn"),
+        yield ModelStreamEvent(
+            ModelEventKind.TURN_RESULT,
+            result=ModelTurnResult(text="答案", stop_reason="end_turn"),
         )
 
 

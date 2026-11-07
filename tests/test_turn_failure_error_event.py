@@ -19,7 +19,7 @@ from core.event_bus import RunStreamBus
 from core.events import ORCHESTRATOR_ACTOR, RunEvent
 from core.run_events import LocalRunEventStore
 from core.run_state import TurnState, fold_all, restore
-from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
+from harness.app.ports import ModelCallError, ModelConnectionError, ModelStatusError
 from runtime import agent as agent_module
 from runtime.agent import AgentRuntime, TurnLoopResult
 from runtime.execution import run_end_status
@@ -218,8 +218,8 @@ async def test_business_error_emits_error_before_failed_run_end(
     [
         RuntimeError(f"包含 secret 的内部细节: {_SECRET}"),
         ValueError(f"上游原始响应 {_SECRET}"),
-        LLMCallError(f"响应校验失败 {_SECRET}", sdk_error_type="APIResponseValidationError"),
-        LLMStatusError(
+        ModelCallError(f"响应校验失败 {_SECRET}", sdk_error_type="APIResponseValidationError"),
+        ModelStatusError(
             f"invalid request {_SECRET}",
             sdk_error_type="BadRequestError",
             status_code=400,
@@ -255,13 +255,17 @@ async def test_internal_error_uses_generic_message(
 @pytest.mark.parametrize(
     "exc",
     [
-        LLMConnectionError(f"timeout {_SECRET}", sdk_error_type="APITimeoutError"),
-        LLMStatusError(
+        ModelConnectionError(f"timeout {_SECRET}", sdk_error_type="APITimeoutError"),
+        ModelStatusError(
             f"overloaded {_SECRET}",
             sdk_error_type="InternalServerError",
             status_code=503,
         ),
-        LLMStatusError(f"rate limited {_SECRET}", sdk_error_type="RateLimitError", status_code=429),
+        ModelStatusError(
+            f"rate limited {_SECRET}",
+            sdk_error_type="RateLimitError",
+            status_code=429,
+        ),
     ],
     ids=["connection", "status_503", "status_429"],
 )

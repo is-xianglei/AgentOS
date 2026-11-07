@@ -6,8 +6,8 @@ import time
 from typing import Any
 
 from core.errors import AgentException
-from llm import BaseLLMClient, create_llm_client
-from llm.types import LLMEventKind, LLMTurnResult
+from harness.adapters.models.factory import create_model_client
+from harness.app.ports import ModelClient, ModelEventKind, ModelTurnResult
 from session.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class CompactService:
     def __init__(
         self,
         session_repo: SessionRepository,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
         threshold: int = 50_000,
     ):
         """初始化上下文压缩服务依赖。"""
@@ -144,10 +144,10 @@ class CompactService:
         )
 
         # 压缩只要一段摘要文本,不往 bus 发事件,故不建装配器、直接消费中立流。
-        result: LLMTurnResult | None = None
-        client = self.llm or create_llm_client(scenario="compact")
+        result: ModelTurnResult | None = None
+        client = self.llm or create_model_client(scenario="compact")
         async for event in client.stream(messages=[{"role": "user", "content": compact_prompt}]):
-            if event.kind is LLMEventKind.TURN_RESULT:
+            if event.kind is ModelEventKind.TURN_RESULT:
                 result = event.result
         if result is None:
             raise AgentException.message("自动压缩失败：LLM 流未产出终局结果")

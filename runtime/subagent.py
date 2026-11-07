@@ -24,9 +24,8 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
+from harness.app.ports import ModelClient, ModelTurnResult
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
-from llm import BaseLLMClient
-from llm.types import LLMTurnResult
 from memory.recall.repository import MemoryRecallRepository
 from prompt import compose_subagent_prompt, compose_teammate_prompt
 from runtime.budget import ToolCallBudget
@@ -130,7 +129,7 @@ class SubAgentRunner:
         self,
         db: AsyncSession,
         bus: StreamBus | None = None,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
     ):
         """初始化子代理运行器依赖。"""
         self.db = db
@@ -399,7 +398,7 @@ class SubAgentRunner:
         assembler: TurnEventAssembler,
         rendered_memories: str | None = None,
         model: str | None = None,
-    ) -> LLMTurnResult:
+    ) -> ModelTurnResult:
         """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。"""
         request_messages = self._with_memory_context(messages, rendered_memories)
         step = AgentStep(self.llm, assembler, self._emit_event)

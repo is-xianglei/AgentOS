@@ -7,7 +7,7 @@ from uuid import UUID
 
 from core.errors import AgentException
 from core.events import Actor, StreamEvent
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,10 @@ class TurnEventAssembler:
         # 以下三项均为单次 consume 的调用内状态,进入 consume 时重置。
         self._ref_to_index: dict[int, int] = {}
         self._open: set[int] = set()
-        self._last_result: LLMTurnResult | None = None
+        self._last_result: ModelTurnResult | None = None
 
     @property
-    def last_result(self) -> LLMTurnResult:
+    def last_result(self) -> ModelTurnResult:
         """最近一次 consume 收到的终局结果;尚未消费任何流时抛错。
 
         返回空结果会被 runtime 读成「无 tool_calls」导致 ReAct 静默截断,故必须抛。
@@ -55,7 +55,7 @@ class TurnEventAssembler:
             raise AgentException.message("尚未消费任何 LLM 流,无终局结果可读")
         return self._last_result
 
-    async def consume(self, stream: AsyncIterator[LLMStreamEvent]) -> AsyncIterator[StreamEvent]:
+    async def consume(self, stream: AsyncIterator[ModelStreamEvent]) -> AsyncIterator[StreamEvent]:
         """消费一次 stream() 调用的完整中立事件流,产出协议事件。
 
         包住整个流而非逐事件 stamp:装配器需要「一次调用」的边界才能把
@@ -73,8 +73,8 @@ class TurnEventAssembler:
 
         async for event in stream:
             if not first_delta_logged and event.kind in {
-                LLMEventKind.TEXT_DELTA,
-                LLMEventKind.THINKING_DELTA,
+                ModelEventKind.TEXT_DELTA,
+                ModelEventKind.THINKING_DELTA,
             }:
                 first_delta_logged = True
                 # 只记首个增量的 TTFT;delta 为高频事件,后续不再计时、不打日志。
@@ -87,7 +87,7 @@ class TurnEventAssembler:
                     },
                 )
 
-            if event.kind is LLMEventKind.BLOCK_START:
+            if event.kind is ModelEventKind.BLOCK_START:
                 if event.block_ref is None or event.block_type is None:
                     raise AgentException.message(
                         "LLM 流的 BLOCK_START 事件缺少 block_ref 或 block_type",
@@ -103,19 +103,19 @@ class TurnEventAssembler:
                 )
                 continue
 
-            if event.kind is LLMEventKind.TEXT_DELTA:
+            if event.kind is ModelEventKind.TEXT_DELTA:
                 yield StreamEvent.text_delta(
                     self._actor, self._session_id, self._require_index(event), event.text
                 )
                 continue
 
-            if event.kind is LLMEventKind.THINKING_DELTA:
+            if event.kind is ModelEventKind.THINKING_DELTA:
                 yield StreamEvent.thinking_delta(
                     self._actor, self._session_id, self._require_index(event), event.text
                 )
                 continue
 
-            if event.kind is LLMEventKind.TOOL_USE:
+            if event.kind is ModelEventKind.TOOL_USE:
                 index = self._require_index(event)
                 if event.tool is None:
                     raise AgentException.message(
@@ -128,7 +128,7 @@ class TurnEventAssembler:
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
                 continue
 
-            if event.kind is LLMEventKind.BLOCK_STOP:
+            if event.kind is ModelEventKind.BLOCK_STOP:
                 index = None
                 if event.block_ref is not None:
                     index = self._ref_to_index.get(event.block_ref)
@@ -145,7 +145,7 @@ class TurnEventAssembler:
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
                 continue
 
-            if event.kind is LLMEventKind.TURN_RESULT:
+            if event.kind is ModelEventKind.TURN_RESULT:
                 if event.result is None:
                     raise AgentException.message("LLM 流的 TURN_RESULT 事件缺少终局结果")
                 self._last_result = event.result
@@ -170,7 +170,7 @@ class TurnEventAssembler:
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)
             self._open.clear()
 
-    def _require_index(self, event: LLMStreamEvent) -> int:
+    def _require_index(self, event: ModelStreamEvent) -> int:
         """查 block_ref 的全局 index 映射;无映射时抛错(丢弃等于静默丢内容)。"""
         index = None
         if event.block_ref is not None:

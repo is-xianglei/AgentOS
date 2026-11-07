@@ -142,14 +142,15 @@ API、错误与日志：
    同样遵守上文「配置同步规则」。
 4. token 上限读取 `llm_default_max_tokens`（流式调用）和
    `llm_memory_selector_max_tokens` 等场景专用配置，不要在代码中硬编码 max_tokens。
-5. 新代码一律通过 create_llm_client(scenario=...) 工厂创建客户端，类型注解使用
-   BaseLLMClient，不要直接实例化 AnthropicClient / OpenAIClient；Service 和 Runtime
-   的 __init__ 应接受可选 llm: BaseLLMClient | None = None，未注入时回落工厂，
+5. 新代码一律通过 harness/adapters/models/factory.py 的 create_model_client(scenario=...)
+   工厂创建客户端，类型注解使用 harness/app/ports.py 的 ModelClient，不要直接实例化
+   AnthropicClient / OpenAIClient（位于 harness/adapters/models/）；Service 和 Runtime
+   的 __init__ 应接受可选 llm: ModelClient | None = None，未注入时回落工厂，
    便于测试注入替身；只需模型名而不建客户端时使用 resolve_scenario_model(scenario)。
 6. 无静默兜底：provider 未配置或取值不支持、对应 api_key 缺失、场景名未知、
    模型解析不出，一律抛具体中文 AgentException，不得回落到默认 provider 或硬编码模型。
 7. 需要判断当前使用哪家 provider 时，读客户端实例的 provider 属性
-   （BaseLLMClient 的抽象属性），不要用 isinstance 判断具体客户端类，
+   （ModelClient 的抽象属性），不要用 isinstance 判断具体客户端类，
    也不要直接读 settings.llm_provider，注入测试替身时这两种方式都会失真。
 8. 两家 SDK 对 base_url 的拼接规则相反：Anthropic 的 base_url 不带 /v1，
    SDK 内部路径已是 /v1/messages，多写会拼成 /v1/v1/messages 报 404；
@@ -164,7 +165,7 @@ API、错误与日志：
     不用 SDK 的 .stream() helper：后者会强制校验工具的 strict 字段，在发出请求前就抛
     ValueError，且 get_final_completion() 在截断时抛异常而非返回已生成内容。
 11. LLM 消息体使用中立形状，provider wire 形状只存在于各家客户端 _encode_messages()
-    之后。BaseLLMClient.stream() 的 messages 入参、session_messages.content 和
+    之后。ModelClient.stream() 的 messages 入参、session_messages.content 和
     session_snapshots.messages 一律是中立形状，不得写入或读取任何一家的 wire 形状。
 12. assistant 消息 content 为块数组，判别键用 kind 而非 type：
     {"kind": "text", "text": ...} 和 {"kind": "tool_use", "id": ..., "name": ..., "input": ...}，
@@ -174,7 +175,7 @@ API、错误与日志：
     用 type 会让残留的 provider 形状数据被静默误读并潜伏到运行时。
 13. tool 消息沿用 ToolResult，本身即自有协议，形状不变。
 14. 出站编码是 stream() 的内部步骤，_encode_messages / _encode_system / _encode_tools
-    是各家客户端的私有方法，不要提升到 BaseLLMClient 抽象成员（维持 provider、stream、
+    是各家客户端的私有方法，不要提升到 ModelClient 抽象成员（维持 provider、stream、
     complete_structured 三个）；也不要在调用方翻译消息形状。
 
 Anthropic SDK 使用规范：

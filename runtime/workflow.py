@@ -34,8 +34,9 @@ from core.events import (
     WorkflowProgressStatus,
 )
 from database.engine import AsyncSessionLocal
+from harness.adapters.models.factory import create_model_client
+from harness.app.ports import ModelClient
 from harness.domain.messages import AssistantMessage
-from llm import BaseLLMClient, create_llm_client
 from runtime.execution import (
     ExecutionHandle,
     launch_turn_execution,
@@ -390,9 +391,9 @@ class ParallelOrchestrator(BaseOrchestrator):
     部分容忍,只对成功结果汇总。
     """
 
-    def __init__(self, *, llm: BaseLLMClient | None = None, **kwargs: Any) -> None:
+    def __init__(self, *, llm: ModelClient | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.llm = llm or create_llm_client(scenario="workflow")
+        self.llm = llm or create_model_client(scenario="workflow")
 
     async def run(self, user_content: str) -> OrchestrationResult:
         self._require_min_members(2, "并行编排")
@@ -508,9 +509,9 @@ class ParallelOrchestrator(BaseOrchestrator):
 class LlmRoutingOrchestrator(BaseOrchestrator):
     """智能路由:LLM 依据成员 description 选出唯一成员执行;决策或执行失败均为整体失败(D5)。"""
 
-    def __init__(self, *, llm: BaseLLMClient | None = None, **kwargs: Any) -> None:
+    def __init__(self, *, llm: ModelClient | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.llm = llm or create_llm_client(scenario="workflow")
+        self.llm = llm or create_model_client(scenario="workflow")
 
     async def run(self, user_content: str) -> OrchestrationResult:
         self._require_min_members(2, "智能路由编排")
@@ -551,7 +552,7 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
         )
         try:
             # 结构化输出只有一个整数字段,沿用接口默认的 max_tokens 即可。
-            # 超时不在此处单独设置:客户端由 create_llm_client 构造时已带 SDK 层超时
+            # 超时不在此处单独设置:客户端由 create_model_client 构造时已带 SDK 层超时
             # ({provider}_timeout_seconds,留空则由 SDK 自动计算),此处再叠一层需新增配置项,超出本次范围。
             choice = await self.llm.complete_structured(
                 [{"role": "user", "content": prompt}],
@@ -603,7 +604,7 @@ class WorkflowRuntime:
         db: AsyncSession,
         user_id: int | None = None,
         workspace_id: int | None = None,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
     ):
         """初始化运行时依赖;llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端。"""
         self.db = db

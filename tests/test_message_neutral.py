@@ -17,9 +17,9 @@ from typing import Any
 import pytest
 
 from core.errors import AgentException
+from harness.adapters.models.anthropic_client import AnthropicClient
+from harness.adapters.models.openai_client import _TOOL_ERROR_PREFIX, OpenAIClient
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
-from llm.anthropic_client import AnthropicClient
-from llm.openai_client import _TOOL_ERROR_PREFIX, OpenAIClient
 
 # 完整会话:文本 + 两个并发工具调用 + 两个工具结果(一个失败)+ 纯文本 + 追问。
 # 刻意用两个连续工具结果:Anthropic 侧必须合并进同一条 user 消息,

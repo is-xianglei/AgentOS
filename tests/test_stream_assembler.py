@@ -1,6 +1,6 @@
 """TurnEventAssembler 单元测试(Phase 1)。
 
-用手写 LLMStreamEvent 序列驱动,不碰网络。覆盖 design.md 第十一节边界情况表
+用手写 ModelStreamEvent 序列驱动,不碰网络。覆盖 design.md 第十一节边界情况表
 的全部装配器职责项;表中「tool_use 入参 JSON 解析失败」一项属 Anthropic
 适配器职责,由 test_stream_baseline.py 覆盖。
 """
@@ -13,7 +13,7 @@ import pytest
 
 from core.errors import AgentException
 from core.events import ORCHESTRATOR_ACTOR, BlockType, ToolInfo, Usage, subagent_actor
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from runtime.stream_assembler import TurnEventAssembler
 
 pytestmark = pytest.mark.anyio
@@ -22,41 +22,41 @@ _SID = 42
 _ACTOR = {"role": "orchestrator", "name": "orchestrator"}
 
 
-def _block_start(ref: int, block_type: BlockType = BlockType.TEXT) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.BLOCK_START, block_ref=ref, block_type=block_type)
+def _block_start(ref: int, block_type: BlockType = BlockType.TEXT) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.BLOCK_START, block_ref=ref, block_type=block_type)
 
 
-def _text(ref: int, text: str) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.TEXT_DELTA, block_ref=ref, text=text)
+def _text(ref: int, text: str) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.TEXT_DELTA, block_ref=ref, text=text)
 
 
-def _thinking(ref: int, text: str) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.THINKING_DELTA, block_ref=ref, text=text)
+def _thinking(ref: int, text: str) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.THINKING_DELTA, block_ref=ref, text=text)
 
 
-def _tool_use(ref: int, tool: ToolInfo) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.TOOL_USE, block_ref=ref, tool=tool)
+def _tool_use(ref: int, tool: ToolInfo) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.TOOL_USE, block_ref=ref, tool=tool)
 
 
-def _block_stop(ref: int) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=ref)
+def _block_stop(ref: int) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.BLOCK_STOP, block_ref=ref)
 
 
-def _turn_result(**kwargs: Any) -> LLMStreamEvent:
-    return LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=LLMTurnResult(**kwargs))
+def _turn_result(**kwargs: Any) -> ModelStreamEvent:
+    return ModelStreamEvent(kind=ModelEventKind.TURN_RESULT, result=ModelTurnResult(**kwargs))
 
 
 _TOOL = ToolInfo(id="toolu_01", name="file_read", input={"path": "a.txt"})
 
 
-async def _feed(events: list[LLMStreamEvent]) -> AsyncIterator[LLMStreamEvent]:
+async def _feed(events: list[ModelStreamEvent]) -> AsyncIterator[ModelStreamEvent]:
     """把手写事件列表包装成异步流。"""
     for event in events:
         yield event
 
 
 async def _collect(
-    assembler: TurnEventAssembler, events: list[LLMStreamEvent]
+    assembler: TurnEventAssembler, events: list[ModelStreamEvent]
 ) -> list[dict[str, Any]]:
     """经装配器消费一段流,收集协议事件并序列化。"""
     return [ev.to_dict() async for ev in assembler.consume(_feed(events))]
@@ -235,7 +235,7 @@ async def test_stream_exception_propagates_without_padding() -> None:
     class _Boom(RuntimeError):
         pass
 
-    async def _broken() -> AsyncIterator[LLMStreamEvent]:
+    async def _broken() -> AsyncIterator[ModelStreamEvent]:
         yield _block_start(0)
         yield _text(0, "半截")
         raise _Boom("连接断了")
@@ -252,7 +252,7 @@ async def test_stream_exception_propagates_without_padding() -> None:
 async def test_turn_result_without_payload_raises() -> None:
     """TURN_RESULT 事件缺 result 载荷属 provider 实现错误,立即抛错。"""
     assembler = _new_assembler()
-    bad = LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=None)
+    bad = ModelStreamEvent(kind=ModelEventKind.TURN_RESULT, result=None)
     with pytest.raises(AgentException, match="缺少终局结果"):
         await _collect(assembler, [bad])
 
@@ -275,7 +275,7 @@ async def test_concurrent_actors_have_independent_indexes() -> None:
 
 
 async def test_usage_carried_in_turn_result() -> None:
-    """usage / stop_reason 经 LLMTurnResult 透出,供 runtime 构造 turn_end。"""
+    """usage / stop_reason 经 ModelTurnResult 透出,供 runtime 构造 turn_end。"""
     assembler = _new_assembler()
     usage = Usage(input_tokens=120, output_tokens=7)
     await _collect(

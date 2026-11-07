@@ -14,8 +14,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from llm.base import BaseLLMClient
-from llm.errors import error_type_name
+from harness.app.ports import ModelClient, error_type_name
 from model_service.models import ModelProviderRecord, ModelRoleRecord
 from model_service.policy import (
     MODES,
@@ -547,10 +546,10 @@ class ModelService:
         }
 
     @staticmethod
-    def build_client(record: ModelProviderRecord, effort: str = "fast") -> BaseLLMClient:
+    def build_client(record: ModelProviderRecord, effort: str = "fast") -> ModelClient:
         """按工作区配置构造 LLM 客户端，effort 为请求的思考强度。"""
-        from llm.anthropic_client import AnthropicClient
-        from llm.openai_client import OpenAIClient
+        from harness.adapters.models.anthropic_client import AnthropicClient
+        from harness.adapters.models.openai_client import OpenAIClient
 
         normalized = normalize_effort(record.extra_config or {}, effort)
         # 把档位名换成上游实际接收的值（档位名或思考预算）；fast 没有对应档位，取 None。

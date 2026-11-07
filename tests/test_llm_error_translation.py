@@ -25,12 +25,17 @@ from anthropic._exceptions import (
 from pydantic import BaseModel
 
 from core.errors import AgentException
-from llm import anthropic_client as anthropic_module
-from llm import openai_client as openai_module
-from llm.anthropic_client import AnthropicClient
-from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
-from llm.openai_client import OpenAIClient
-from llm.types import LLMEventKind, LLMStreamEvent
+from harness.adapters.models import anthropic_client as anthropic_module
+from harness.adapters.models import openai_client as openai_module
+from harness.adapters.models.anthropic_client import AnthropicClient
+from harness.adapters.models.openai_client import OpenAIClient
+from harness.app.ports import (
+    ModelCallError,
+    ModelConnectionError,
+    ModelEventKind,
+    ModelStatusError,
+    ModelStreamEvent,
+)
 from memory.jobs.dream import MemoryDreamFailure, MemoryDreamService, PreparedDream
 from memory.jobs.extraction import (
     MemoryExtractionFailure,
@@ -204,15 +209,15 @@ async def test_extraction_classifies_sdk_errors_same_for_both_providers(
 
 # 每类 SDK 异常应转成的中立异常;状态码为 None 表示该中立类型不携带状态码。
 _NEUTRAL = {
-    "timeout": (LLMConnectionError, None),
-    "connection": (LLMConnectionError, None),
-    "rate_limit": (LLMStatusError, 429),
-    "server_503": (LLMStatusError, 503),
-    "overloaded_529": (LLMStatusError, 529),
-    "bad_request_400": (LLMStatusError, 400),
+    "timeout": (ModelConnectionError, None),
+    "connection": (ModelConnectionError, None),
+    "rate_limit": (ModelStatusError, 429),
+    "server_503": (ModelStatusError, 503),
+    "overloaded_529": (ModelStatusError, 529),
+    "bad_request_400": (ModelStatusError, 400),
     # 非状态错误,但 SDK 带了响应状态码,原样带上供诊断展示。
-    "response_invalid": (LLMCallError, 200),
-    "api_error": (LLMCallError, None),
+    "response_invalid": (ModelCallError, 200),
+    "api_error": (ModelCallError, None),
 }
 # 各 SDK 调用边界:结构化输出(Anthropic 思考开启时走 messages.stream)、建流即失败、流中途失败。
 _CALL_PATHS = [
@@ -333,7 +338,7 @@ async def test_sdk_errors_translate_to_neutral_errors(monkeypatch, provider, pat
     sdk_exc = _SDK_ERRORS[provider][kind]()
     neutral_type, status_code = _NEUTRAL[kind]
 
-    with pytest.raises(LLMCallError) as caught:
+    with pytest.raises(ModelCallError) as caught:
         await _invoke(monkeypatch, provider, path, sdk_exc)
 
     error = caught.value
@@ -351,14 +356,14 @@ async def test_stream_mid_failure_keeps_events_before_error(monkeypatch, provide
     """流中途失败:失败前已产出的事件照常交给消费方,随后才抛中立异常。"""
     sdk_exc = _SDK_ERRORS[provider]["timeout"]()
     client = _streaming_client(monkeypatch, provider, sdk_exc, open_fails=False)
-    received: list[LLMStreamEvent] = []
+    received: list[ModelStreamEvent] = []
 
-    with pytest.raises(LLMConnectionError) as caught:
+    with pytest.raises(ModelConnectionError) as caught:
         async for event in client.stream([{"role": "user", "content": "hi"}]):
             received.append(event)
 
     assert caught.value.__cause__ is sdk_exc
-    assert received and received[0].kind is LLMEventKind.BLOCK_START
+    assert received and received[0].kind is ModelEventKind.BLOCK_START
 
 
 def _transport_timeout(provider: str) -> Exception:
@@ -385,7 +390,7 @@ async def test_non_sdk_errors_are_not_translated(monkeypatch, provider, path, ki
         await _invoke(monkeypatch, provider, path, exc)
 
     assert caught.value is exc
-    assert not isinstance(caught.value, LLMCallError)
+    assert not isinstance(caught.value, ModelCallError)
 
 
 class _RaisingLLM:
@@ -401,14 +406,14 @@ class _RaisingLLM:
         raise self._exc
 
 
-def _status(code: int, sdk_type: str = "APIStatusError") -> LLMStatusError:
-    return LLMStatusError(f"Error code: {code}", sdk_error_type=sdk_type, status_code=code)
+def _status(code: int, sdk_type: str = "APIStatusError") -> ModelStatusError:
+    return ModelStatusError(f"Error code: {code}", sdk_error_type=sdk_type, status_code=code)
 
 
 # (中立异常工厂, dream 失败码, extractor 失败码, retryable, Job 记录的消息)。
 _NEUTRAL_CLASSIFICATION = [
     pytest.param(
-        lambda: LLMConnectionError("timed out", sdk_error_type="APITimeoutError"),
+        lambda: ModelConnectionError("timed out", sdk_error_type="APITimeoutError"),
         "dream_unavailable", "extractor_unavailable", True, "APITimeoutError",
         id="connection",
     ),
@@ -433,7 +438,7 @@ _NEUTRAL_CLASSIFICATION = [
         id="stream_error_200",
     ),
     pytest.param(
-        lambda: LLMCallError("length", sdk_error_type="LengthFinishReasonError"),
+        lambda: ModelCallError("length", sdk_error_type="LengthFinishReasonError"),
         "dream_error", "extractor_error", False, "LengthFinishReasonError",
         id="call_error",
     ),

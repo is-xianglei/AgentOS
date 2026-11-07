@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from runtime.agent import AgentRuntime
 from runtime.compact import CompactService
 
@@ -178,17 +178,17 @@ class _FakeCompactLLM:
 
     async def stream(
         self, messages: list[dict[str, Any]], **kwargs: Any
-    ) -> AsyncIterator[LLMStreamEvent]:
-        yield LLMStreamEvent(
-            kind=LLMEventKind.TURN_RESULT,
-            result=LLMTurnResult(text="已完成事项、当前状态与关键决策摘要"),
+    ) -> AsyncIterator[ModelStreamEvent]:
+        yield ModelStreamEvent(
+            kind=ModelEventKind.TURN_RESULT,
+            result=ModelTurnResult(text="已完成事项、当前状态与关键决策摘要"),
         )
 
 
 class _ForbiddenLLM:
     """未触发压缩的用例不允许任何 LLM 调用,一旦调用立即失败。"""
 
-    def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[LLMStreamEvent]:
+    def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[ModelStreamEvent]:
         raise AssertionError("未超阈值不应调用 LLM")
 
 

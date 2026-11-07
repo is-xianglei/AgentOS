@@ -7,9 +7,9 @@ api_key 缺失、模型解析不出时一律抛中文 AgentException,不做静�
 
 from core.config import settings
 from core.errors import AgentException
-from llm.anthropic_client import AnthropicClient
-from llm.base import BaseLLMClient
-from llm.openai_client import OpenAIClient
+from harness.adapters.models.anthropic_client import AnthropicClient
+from harness.adapters.models.openai_client import OpenAIClient
+from harness.app.ports import ModelClient
 
 _SUPPORTED_PROVIDERS = ("anthropic", "openai")
 
@@ -81,12 +81,12 @@ def resolve_scenario_model(scenario: str | None = None) -> str:
     """解析当前 provider 下指定场景最终生效的模型名。
 
     供只需模型名而不新建客户端的调用方使用(如 SubAgent 速度档的逐调用覆盖、
-    Memory Job 入队时冻结模型)。校验规则与 create_llm_client 一致。
+    Memory Job 入队时冻结模型)。校验规则与 create_model_client 一致。
     """
     return _resolve_model(_require_provider(), scenario)
 
 
-def create_llm_client(scenario: str | None = None) -> BaseLLMClient:
+def create_model_client(scenario: str | None = None) -> ModelClient:
     """创建 LLM 客户端,根据全局 provider 和场景选择模型。
 
     Args:
@@ -95,7 +95,7 @@ def create_llm_client(scenario: str | None = None) -> BaseLLMClient:
                   None 表示直接使用 provider 主模型。
 
     Returns:
-        BaseLLMClient 实例(AnthropicClient 或 OpenAIClient)。
+        ModelClient 实例(AnthropicClient 或 OpenAIClient)。
     """
     provider = _require_provider()
     model = _resolve_model(provider, scenario)

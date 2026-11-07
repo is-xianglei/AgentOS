@@ -13,6 +13,17 @@ from pydantic import BaseModel
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.app.ports import (
+    ModelCallError,
+    ModelClient,
+    ModelConnectionError,
+    ModelEventKind,
+    ModelStatusError,
+    ModelStreamEvent,
+    ModelTurnResult,
+    PromptBlock,
+    ToolSpec,
+)
 from harness.domain.messages import (
     AssistantMessage,
     ThinkingBlock,
@@ -21,9 +32,6 @@ from harness.domain.messages import (
     UserMessage,
     message_from_row,
 )
-from llm.base import BaseLLMClient
-from llm.errors import LLMCallError, LLMConnectionError, LLMStatusError
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult, PromptBlock, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +77,22 @@ def _encode_tool_result(tool_result: ToolResult) -> dict[str, Any]:
     }
 
 
-def _to_llm_error(exc: OpenAIError) -> LLMCallError:
+def _to_model_error(exc: OpenAIError) -> ModelCallError:
     """把 OpenAI SDK 异常转成中立异常,消息与 SDK 类名原样保留。
 
     OpenAI 异常与 Anthropic 的没有继承关系,不在此转换就会让调用方的分类全部落空。
     APITimeoutError 是 APIConnectionError 的子类,一并归为连接失败;流中途的错误事件
-    是不带状态码的裸 APIError,与 LengthFinishReasonError 等其余异常一样归入 LLMCallError。
+    是不带状态码的裸 APIError,与 LengthFinishReasonError 等其余异常一样归入 ModelCallError。
     APIResponseValidationError 带 status_code 但不是状态错误,原样带上供诊断展示。
     """
     sdk_error_type = type(exc).__name__
     if isinstance(exc, APIConnectionError):
-        return LLMConnectionError(str(exc), sdk_error_type=sdk_error_type)
+        return ModelConnectionError(str(exc), sdk_error_type=sdk_error_type)
     if isinstance(exc, APIStatusError):
-        return LLMStatusError(
+        return ModelStatusError(
             str(exc), sdk_error_type=sdk_error_type, status_code=exc.status_code
         )
-    return LLMCallError(
+    return ModelCallError(
         str(exc),
         sdk_error_type=sdk_error_type,
         status_code=getattr(exc, "status_code", None),
@@ -116,7 +124,7 @@ class _PendingToolCall:
 
 
 class _OpenAIChunkAdapter:
-    """把 OpenAI 裸 chunk 适配成中立 LLMStreamEvent 序列(模块私有)。
+    """把 OpenAI 裸 chunk 适配成中立 ModelStreamEvent 序列(模块私有)。
 
     生命周期为单次 stream() 调用:流开始时创建,结束即弃。
     OpenAI 没有块索引概念,block_ref 由本类自建:思考块恒占 0、文本块恒占 1
@@ -154,7 +162,7 @@ class _OpenAIChunkAdapter:
         self._finished = False
         self._finished_tool_calls: list[ToolCall] = []
 
-    def adapt(self, chunk: dict[str, Any]) -> list[LLMStreamEvent]:
+    def adapt(self, chunk: dict[str, Any]) -> list[ModelStreamEvent]:
         """适配单个裸 chunk 为零或多个中立事件。
 
         usage 只在末 chunk 出现(choices 为空、需显式开启 include_usage),
@@ -168,7 +176,7 @@ class _OpenAIChunkAdapter:
             return []
         choice = choices[0] or {}
         delta = choice.get("delta") or {}
-        events: list[LLMStreamEvent] = []
+        events: list[ModelStreamEvent] = []
         events.extend(self._on_thinking_delta(delta.get("reasoning_content")))
         events.extend(self._on_text_delta(delta.get("content")))
         events.extend(self._on_tool_calls(delta.get("tool_calls") or []))
@@ -177,7 +185,7 @@ class _OpenAIChunkAdapter:
             events.extend(self._on_finish(finish_reason))
         return events
 
-    def finalize(self) -> list[LLMStreamEvent]:
+    def finalize(self) -> list[ModelStreamEvent]:
         """流耗尽后产出 TURN_RESULT 终结事件。
 
         终局必须晚于收束产出:usage 在 finish_reason 之后的末 chunk 才到达,
@@ -188,7 +196,7 @@ class _OpenAIChunkAdapter:
         if not self._finished:
             return []
         thinking_text = "".join(self._thinking_parts)
-        result = LLMTurnResult(
+        result = ModelTurnResult(
             text="".join(self._text_parts),
             tool_calls=self._finished_tool_calls,
             # OpenAI 侧无签名概念,整段思考归并为单个 ThinkingBlock;
@@ -197,9 +205,9 @@ class _OpenAIChunkAdapter:
             usage=self._usage,
             stop_reason=self._stop_reason,
         )
-        return [LLMStreamEvent(kind=LLMEventKind.TURN_RESULT, result=result)]
+        return [ModelStreamEvent(kind=ModelEventKind.TURN_RESULT, result=result)]
 
-    def _on_thinking_delta(self, content: Any) -> list[LLMStreamEvent]:
+    def _on_thinking_delta(self, content: Any) -> list[ModelStreamEvent]:
         """处理思考增量:首个非空增量开块,空串与非字符串视为噪声。
 
         DeepSeek 未开启思考模式时 reasoning_content 恒为 None/缺失,
@@ -207,32 +215,32 @@ class _OpenAIChunkAdapter:
         """
         if not isinstance(content, str) or not content:
             return []
-        events: list[LLMStreamEvent] = []
+        events: list[ModelStreamEvent] = []
         if not self._thinking_open:
             self._thinking_open = True
             events.append(
-                LLMStreamEvent(
-                    kind=LLMEventKind.BLOCK_START,
+                ModelStreamEvent(
+                    kind=ModelEventKind.BLOCK_START,
                     block_ref=self._THINKING_REF,
                     block_type=BlockType.THINKING,
                 )
             )
         self._thinking_parts.append(content)
         events.append(
-            LLMStreamEvent(
-                kind=LLMEventKind.THINKING_DELTA, block_ref=self._THINKING_REF, text=content
+            ModelStreamEvent(
+                kind=ModelEventKind.THINKING_DELTA, block_ref=self._THINKING_REF, text=content
             )
         )
         return events
 
-    def _close_thinking(self) -> list[LLMStreamEvent]:
+    def _close_thinking(self) -> list[ModelStreamEvent]:
         """思考块收束。思考先于正文下发,首个正文增量即可闭块,无需等到收束点。"""
         if not self._thinking_open:
             return []
         self._thinking_open = False
-        return [LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=self._THINKING_REF)]
+        return [ModelStreamEvent(kind=ModelEventKind.BLOCK_STOP, block_ref=self._THINKING_REF)]
 
-    def _on_text_delta(self, content: Any) -> list[LLMStreamEvent]:
+    def _on_text_delta(self, content: Any) -> list[ModelStreamEvent]:
         """处理文本增量:首个非空增量开块,空串与非字符串视为噪声。
 
         开块前先关思考块:DeepSeek 先发完 reasoning_content 再发 content,
@@ -240,25 +248,25 @@ class _OpenAIChunkAdapter:
         """
         if not isinstance(content, str) or not content:
             return []
-        events: list[LLMStreamEvent] = self._close_thinking()
+        events: list[ModelStreamEvent] = self._close_thinking()
         if not self._text_open:
             self._text_open = True
             events.append(
-                LLMStreamEvent(
-                    kind=LLMEventKind.BLOCK_START,
+                ModelStreamEvent(
+                    kind=ModelEventKind.BLOCK_START,
                     block_ref=self._TEXT_REF,
                     block_type=BlockType.TEXT,
                 )
             )
         self._text_parts.append(content)
         events.append(
-            LLMStreamEvent(kind=LLMEventKind.TEXT_DELTA, block_ref=self._TEXT_REF, text=content)
+            ModelStreamEvent(kind=ModelEventKind.TEXT_DELTA, block_ref=self._TEXT_REF, text=content)
         )
         return events
 
-    def _on_tool_calls(self, tool_calls: list[Any]) -> list[LLMStreamEvent]:
+    def _on_tool_calls(self, tool_calls: list[Any]) -> list[ModelStreamEvent]:
         """处理工具调用增量:首个增量开块并登记 id/name,后续只累积入参字符串。"""
-        events: list[LLMStreamEvent] = []
+        events: list[ModelStreamEvent] = []
         for raw in tool_calls:
             if not isinstance(raw, dict) or not isinstance(raw.get("index"), int):
                 raise AgentException.message(
@@ -284,8 +292,8 @@ class _OpenAIChunkAdapter:
                 )
                 self._tool_calls[tool_call_index] = pending
                 events.append(
-                    LLMStreamEvent(
-                        kind=LLMEventKind.BLOCK_START,
+                    ModelStreamEvent(
+                        kind=ModelEventKind.BLOCK_START,
                         block_ref=pending.ref,
                         block_type=BlockType.TOOL_USE,
                     )
@@ -296,7 +304,7 @@ class _OpenAIChunkAdapter:
                 pending.args_buffer += arguments
         return events
 
-    def _on_finish(self, finish_reason: str) -> list[LLMStreamEvent]:
+    def _on_finish(self, finish_reason: str) -> list[ModelStreamEvent]:
         """收束:文本块补 BLOCK_STOP,各工具块入参一次性解析产出 TOOL_USE。
 
         stop_reason 原样带出不归一成 Anthropic 词汇表:该字段无枚举约束,
@@ -305,10 +313,12 @@ class _OpenAIChunkAdapter:
         self._finished = True
         self._stop_reason = finish_reason
         # 只有思考、无正文也无工具时思考块仍开着,在此兜底闭合。
-        events: list[LLMStreamEvent] = self._close_thinking()
+        events: list[ModelStreamEvent] = self._close_thinking()
         if self._text_open:
             self._text_open = False
-            events.append(LLMStreamEvent(kind=LLMEventKind.BLOCK_STOP, block_ref=self._TEXT_REF))
+            events.append(
+                ModelStreamEvent(kind=ModelEventKind.BLOCK_STOP, block_ref=self._TEXT_REF)
+            )
         for tc_index in sorted(self._tool_calls):
             pending = self._tool_calls[tc_index]
             tool_input = self._parse_tool_input(pending)
@@ -316,8 +326,8 @@ class _OpenAIChunkAdapter:
                 ToolCall(id=pending.tool_id, tool_name=pending.tool_name, arguments=tool_input)
             )
             events.append(
-                LLMStreamEvent(
-                    kind=LLMEventKind.TOOL_USE,
+                ModelStreamEvent(
+                    kind=ModelEventKind.TOOL_USE,
                     block_ref=pending.ref,
                     tool=ToolInfo(id=pending.tool_id, name=pending.tool_name, input=tool_input),
                 )
@@ -339,7 +349,7 @@ class _OpenAIChunkAdapter:
             ) from exc
 
 
-class OpenAIClient(BaseLLMClient):
+class OpenAIClient(ModelClient):
     def __init__(
         self,
         model: str,
@@ -524,7 +534,7 @@ class OpenAIClient(BaseLLMClient):
                 **thinking_kwargs,
             )
         except OpenAIError as exc:
-            raise _to_llm_error(exc) from exc
+            raise _to_model_error(exc) from exc
 
         parsed = response.choices[0].message.parsed
         if parsed is None:
@@ -539,8 +549,8 @@ class OpenAIClient(BaseLLMClient):
         system_prompt: str | list[PromptBlock] | None = None,
         tools: list[ToolSpec] | None = None,
         model: str | None = None,
-    ) -> AsyncIterator[LLMStreamEvent]:
-        """流式调用,产出中立 LLMStreamEvent。
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """流式调用,产出中立 ModelStreamEvent。
 
         走 create(stream=True) 裸 chunk 路径而非 .stream() helper:后者对每个
         工具强制 strict=True 校验(strict 模式倒逼改全部工具 schema,且与
@@ -602,6 +612,6 @@ class OpenAIClient(BaseLLMClient):
                     for neutral_event in adapter.adapt(chunk_dict):
                         yield neutral_event
         except OpenAIError as exc:
-            raise _to_llm_error(exc) from exc
+            raise _to_model_error(exc) from exc
         for neutral_event in adapter.finalize():
             yield neutral_event

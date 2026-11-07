@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
-from llm.errors import LLMConnectionError, LLMStatusError, error_type_name
+from harness.adapters.models.factory import create_model_client, resolve_scenario_model
+from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, error_type_name
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import (
     MemoryItemRecord,
@@ -150,7 +150,7 @@ class PreparedDream:
     prompt_version: str
     base_catalog_version: int
     entries: tuple[MemoryDreamEntry, ...]
-    client: BaseLLMClient | None = field(default=None, repr=False, compare=False)
+    client: ModelClient | None = field(default=None, repr=False, compare=False)
 
     @property
     def revision_ids(self) -> tuple[int, ...]:
@@ -225,7 +225,7 @@ class _DreamAudit(BaseModel):
 class MemoryDreamService:
     """准备、执行、应用和按作用域回滚 Dream 操作集。"""
 
-    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None) -> None:
+    def __init__(self, db: AsyncSession, llm: ModelClient | None = None) -> None:
         self.db = db
         self.llm = llm
         self.job_repo = MemoryJobRepository(db)
@@ -304,10 +304,10 @@ class MemoryDreamService:
     async def complete_with_llm(
         cls,
         prepared: PreparedDream,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
     ) -> MemoryDreamResult:
         """调用结构化输出并执行严格校验。"""
-        client = llm or prepared.client or create_llm_client(scenario="memory_dream")
+        client = llm or prepared.client or create_model_client(scenario="memory_dream")
         try:
             return await client.complete_structured(
                 [
@@ -325,13 +325,13 @@ class MemoryDreamService:
                 max_tokens=settings.llm_memory_dream_max_tokens,
                 timeout=settings.memory_dream_timeout_seconds,
             )
-        except (LLMConnectionError, TimeoutError) as exc:
+        except (ModelConnectionError, TimeoutError) as exc:
             raise MemoryDreamFailure(
                 "dream_unavailable",
                 error_type_name(exc),
                 retryable=True,
             ) from exc
-        except LLMStatusError as exc:
+        except ModelStatusError as exc:
             # 429 限流与传输不可用同归 dream_unavailable,与 Extractor 的失败码口径一致。
             if exc.status_code == 429:
                 raise MemoryDreamFailure(

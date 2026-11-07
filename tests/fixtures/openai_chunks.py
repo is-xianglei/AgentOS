@@ -1,6 +1,6 @@
 """OpenAI 裸流式 chunk 的手写基线样本(阶段 4 新增)。
 
-形状对齐 llm/openai_client.py `stream()` 内部实际消费的结构:
+形状对齐 harness/adapters/models/openai_client.py `stream()` 内部实际消费的结构:
 `chunk.model_dump(mode="json", warnings=False)` 的产物。手写而非真实调用
 录制,避免联网与 API Key 进仓库。适配器只消费 usage 与 choices[0] 的
 delta / finish_reason,其余顶层字段(id / object / created / model 等)

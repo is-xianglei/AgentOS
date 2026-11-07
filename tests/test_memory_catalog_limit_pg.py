@@ -28,8 +28,8 @@ import database.engine  # noqa: F401  副作用注册全部映射与全局软删
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType
+from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import AssistantMessage
-from llm.types import LLMEventKind, LLMStreamEvent, LLMTurnResult
 from memory.jobs.dream import MemoryDreamService
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.models import MemoryItemRecord, MemoryJobRecord
@@ -87,12 +87,12 @@ class _FakeLLM:
     async def stream(self, messages: list[dict[str, Any]], *args: Any, **kwargs: Any):
         self.stream_calls += 1
         text = "好的。"
-        yield LLMStreamEvent(LLMEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)
-        yield LLMStreamEvent(LLMEventKind.TEXT_DELTA, block_ref=0, text=text)
-        yield LLMStreamEvent(LLMEventKind.BLOCK_STOP, block_ref=0)
-        yield LLMStreamEvent(
-            LLMEventKind.TURN_RESULT,
-            result=LLMTurnResult(text=text, stop_reason="end_turn"),
+        yield ModelStreamEvent(ModelEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)
+        yield ModelStreamEvent(ModelEventKind.TEXT_DELTA, block_ref=0, text=text)
+        yield ModelStreamEvent(ModelEventKind.BLOCK_STOP, block_ref=0)
+        yield ModelStreamEvent(
+            ModelEventKind.TURN_RESULT,
+            result=ModelTurnResult(text=text, stop_reason="end_turn"),
         )
 
 

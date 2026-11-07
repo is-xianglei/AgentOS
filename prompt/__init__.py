@@ -1,4 +1,4 @@
-"""提示词组装层：决定向模型发什么，不负责怎么发（传输在 llm/）。"""
+"""提示词组装层：决定向模型发什么，不负责怎么发（传输在 harness/adapters/models/）。"""
 
 from prompt.compose import (
     compose_lead_blocks,

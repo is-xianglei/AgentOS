@@ -1,6 +1,6 @@
 """Anthropic 原始流式 chunk 的手写基线样本(Phase 0 录制,Phase 1 沿用)。
 
-形状严格对齐 llm/anthropic_client.py `stream()` 内部实际产生的结构:
+形状严格对齐 harness/adapters/models/anthropic_client.py `stream()` 内部实际产生的结构:
 SDK 事件的 `event.model_dump(mode="json", warnings=False)`,外加流末尾
 一个合成的 `message_final`。手写而非真实调用录制,避免联网与 API Key 进仓库。
 

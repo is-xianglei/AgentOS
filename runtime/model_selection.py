@@ -3,7 +3,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from llm import BaseLLMClient, create_llm_client
+from harness.adapters.models.factory import create_model_client
+from harness.app.ports import ModelClient
 from model_service.models import ModelProviderRecord
 from model_service.service import ModelService
 
@@ -16,7 +17,7 @@ async def resolve_runtime_client(
     *,
     provider_id: str | None = None,
     effort: str | None = None,
-) -> tuple[BaseLLMClient, ModelProviderRecord | None]:
+) -> tuple[ModelClient, ModelProviderRecord | None]:
     """优先使用工作区的模型服务配置；没有可用配置时回落到 .env 的全局 provider。
 
     返回的 provider 为 None 表示走了 .env 回落路径。
@@ -27,7 +28,7 @@ async def resolve_runtime_client(
         if provider is not None:
             return service.build_client(provider, effort or "fast"), provider
 
-    client = create_llm_client(scenario=scenario)
+    client = create_model_client(scenario=scenario)
     if effort is None:
         return client, None
 
@@ -45,7 +46,7 @@ async def session_client(
     db: AsyncSession,
     session: Any,
     scenario: str,
-) -> tuple[BaseLLMClient, ModelProviderRecord | None]:
+) -> tuple[ModelClient, ModelProviderRecord | None]:
     """按会话保存的模型选项解析客户端。"""
     # agent 场景始终使用会话上的供应商；其余场景只有用户显式指定过供应商时才沿用，
     # 否则交给工作区为该场景配置的角色。
@@ -75,10 +76,10 @@ async def frozen_job_client(
     *,
     model: str | None,
     provider_id: str | None,
-) -> BaseLLMClient:
+) -> ModelClient:
     """旧任务仅存环境模型名，不能迁往后来新增的数据库端点。"""
     if model and not provider_id:
-        return create_llm_client(scenario=scenario)
+        return create_model_client(scenario=scenario)
     client, _ = await resolve_runtime_client(
         db,
         workspace_id,

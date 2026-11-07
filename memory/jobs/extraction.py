@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.errors import AgentException
-from llm import BaseLLMClient, create_llm_client, resolve_scenario_model
-from llm.errors import LLMConnectionError, LLMStatusError, error_type_name
+from harness.adapters.models.factory import create_model_client, resolve_scenario_model
+from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, error_type_name
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import MemoryItemRecord
 from memory.repository import MemoryCatalogEntry, MemoryRepository
@@ -150,7 +150,7 @@ class PreparedMemoryExtraction:
     catalog_version: int
     catalog_entries: tuple[MemoryCatalogEntry, ...]
     messages: tuple[ExtractionMessage, ...]
-    client: BaseLLMClient | None = field(default=None, repr=False, compare=False)
+    client: ModelClient | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -199,9 +199,9 @@ def _classify_extractor_error(exc: Exception) -> tuple[str, bool]:
     SDK 异常已由各家客户端转成中立异常，此处不区分 provider。
     """
     match exc:
-        case LLMConnectionError() | LLMStatusError(status_code=429) | TimeoutError():
+        case ModelConnectionError() | ModelStatusError(status_code=429) | TimeoutError():
             return "extractor_unavailable", True
-        case LLMStatusError():
+        case ModelStatusError():
             return f"extractor_http_{exc.status_code}", exc.status_code >= 500
         case ValidationError() | ValueError():
             return "invalid_extractor_output", False
@@ -212,7 +212,7 @@ def _classify_extractor_error(exc: Exception) -> tuple[str, bool]:
 class MemoryExtractionService:
     """构建原始输入、调用 Extractor，并应用严格校验后的候选。"""
 
-    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None):
+    def __init__(self, db: AsyncSession, llm: ModelClient | None = None):
         self.db = db
         self.llm = llm
         self.job_repo = MemoryJobRepository(db)
@@ -338,10 +338,10 @@ class MemoryExtractionService:
     async def extract_with_llm(
         cls,
         prepared: PreparedMemoryExtraction,
-        llm: BaseLLMClient | None = None,
+        llm: ModelClient | None = None,
     ) -> MemoryExtractionResult:
         """不持有数据库 Session，调用模型并执行严格二次校验。"""
-        client = llm or prepared.client or create_llm_client(scenario="memory_extractor")
+        client = llm or prepared.client or create_model_client(scenario="memory_extractor")
         payload = {
             "messages": [message.to_dict() for message in prepared.messages],
             "memory_catalog": [

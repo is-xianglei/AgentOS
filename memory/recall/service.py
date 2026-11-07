@@ -11,8 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from llm import BaseLLMClient
-from llm.errors import error_type_name
+from harness.app.ports import ModelClient, error_type_name
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from memory.recall.repository import (
     MemoryLexicalCandidate,
@@ -52,7 +51,7 @@ class _SelectionResult:
 
 
 class MemoryRecallService:
-    def __init__(self, db: AsyncSession, llm: BaseLLMClient | None = None):
+    def __init__(self, db: AsyncSession, llm: ModelClient | None = None):
         self.db = db
         self.repo = MemoryRecallRepository(db)
         self.memory_repo = MemoryRepository(db)

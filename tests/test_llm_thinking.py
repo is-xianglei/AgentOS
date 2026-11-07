@@ -14,12 +14,16 @@ from anthropic import NOT_GIVEN
 
 from core.errors import AgentException
 from core.events import BlockType
+from harness.adapters.models import anthropic_client as anthropic_module
+from harness.adapters.models import openai_client as openai_module
+from harness.adapters.models.anthropic_client import (
+    AnthropicClient,
+    _AnthropicChunkAdapter,
+    _thinking_param,
+)
+from harness.adapters.models.openai_client import OpenAIClient, _OpenAIChunkAdapter
+from harness.app.ports import ModelEventKind, ModelTurnResult
 from harness.domain.messages import AssistantMessage, ThinkingBlock, ToolCall
-from llm import anthropic_client as anthropic_module
-from llm import openai_client as openai_module
-from llm.anthropic_client import AnthropicClient, _AnthropicChunkAdapter, _thinking_param
-from llm.openai_client import OpenAIClient, _OpenAIChunkAdapter
-from llm.types import LLMEventKind, LLMTurnResult
 from tests.fixtures.anthropic_chunks import (
     CHUNKS_REDACTED_THINKING,
     CHUNKS_THINKING_TEXT_INTERLEAVED,
@@ -29,12 +33,12 @@ _ANTHROPIC = AnthropicClient(model="claude-x", api_key="k", base_url="https://ex
 _OPENAI = OpenAIClient(model="deepseek-x", api_key="k", base_url="https://example.test/v1")
 
 
-def _final_result(adapter: Any, chunks: list[dict[str, Any]]) -> LLMTurnResult:
+def _final_result(adapter: Any, chunks: list[dict[str, Any]]) -> ModelTurnResult:
     """喂完 chunk 序列,取出终局 TURN_RESULT 的 result。"""
     events = [event for chunk in chunks for event in adapter.adapt(chunk)]
     if hasattr(adapter, "finalize"):
         events.extend(adapter.finalize())
-    results = [e.result for e in events if e.kind is LLMEventKind.TURN_RESULT]
+    results = [e.result for e in events if e.kind is ModelEventKind.TURN_RESULT]
     assert len(results) == 1, "每次调用必须以恰好一个 TURN_RESULT 收尾"
     return results[0]
 
@@ -68,7 +72,7 @@ def test_anthropic_redacted_block_announced_as_thinking() -> None:
     events = adapter.adapt(CHUNKS_REDACTED_THINKING[0])
 
     assert [(e.kind, e.block_type) for e in events] == [
-        (LLMEventKind.BLOCK_START, BlockType.THINKING)
+        (ModelEventKind.BLOCK_START, BlockType.THINKING)
     ]
 
 
@@ -292,9 +296,9 @@ def test_openai_reasoning_content_emits_thinking_events() -> None:
     )
     events = [event for chunk in chunks for event in adapter.adapt(chunk)]
 
-    thinking = [e for e in events if e.kind is LLMEventKind.THINKING_DELTA]
+    thinking = [e for e in events if e.kind is ModelEventKind.THINKING_DELTA]
     assert [(e.block_ref, e.text) for e in thinking] == [(0, "先想一步"), (0, "再想一步")]
-    starts = [e for e in events if e.kind is LLMEventKind.BLOCK_START]
+    starts = [e for e in events if e.kind is ModelEventKind.BLOCK_START]
     assert [(e.block_ref, e.block_type) for e in starts] == [
         (0, BlockType.THINKING),
         (1, BlockType.TEXT),
@@ -308,7 +312,7 @@ def test_openai_thinking_block_closes_when_text_starts() -> None:
     events = adapter.adapt({"choices": [{"index": 0, "delta": {"content": "答"}}]})
 
     first = events[0]
-    assert (first.kind, first.block_ref) == (LLMEventKind.BLOCK_STOP, 0)
+    assert (first.kind, first.block_ref) == (ModelEventKind.BLOCK_STOP, 0)
 
 
 def test_openai_thinking_only_response_closes_at_finish() -> None:

@@ -131,7 +131,7 @@ def _resolve_targets(
 
     目标的每一级祖先包都记为边（导入子模块必先执行祖先 ``__init__``），
     但 source 自身及其祖先不算：子模块回引父包时父包必已在 ``sys.modules``，
-    这正是 llm/plan/prompt 包内"自环"不构成加载期问题的原因。
+    这正是 plan/prompt 包内"自环"不构成加载期问题的原因。
     """
     raw = _imported_names(node, source_package, known)
     targets: set[str] = set()
@@ -307,7 +307,7 @@ def test_domain_layer_imports_respect_layering() -> None:
 @pytest.mark.parametrize(
     ("source", "expected"),
     [
-        ("from harness.app import ports", ["harness.app"]),
+        ("from harness.app import ports", ["harness.app.ports"]),
         ("import harness.adapters.models", ["harness.adapters.models"]),
         ("from sqlalchemy.orm import Mapped", ["sqlalchemy.orm"]),
         ("import fastapi", ["fastapi"]),
@@ -315,7 +315,7 @@ def test_domain_layer_imports_respect_layering() -> None:
         ("import openai", ["openai"]),
         ("from session.service import SessionService", ["session.service"]),
         ("from core.config import settings", ["core.config"]),
-        ("from ..app import ports", ["harness.app"]),
+        ("from ..app import ports", ["harness.app.ports"]),
         ("from core.errors import AgentException", []),
         ("from core.events import ToolInfo", []),
         ("from harness.domain.messages import ToolCall", []),
@@ -330,3 +330,136 @@ def test_domain_layer_checker_reports_violations(source: str, expected: list[str
     tree = ast.parse(source)
 
     assert _domain_layer_violations("harness.domain.sample", tree, False, known) == expected
+
+
+# 应用层（harness.app）加载期禁止导入的外部框架与 SDK（按顶层包名匹配）。
+_APP_FORBIDDEN_THIRD_PARTY = frozenset({"sqlalchemy", "fastapi", "anthropic", "openai"})
+
+
+def _app_layer_violations(
+    module: str,
+    tree: ast.Module,
+    is_package: bool,
+    known: set[str],
+) -> list[str]:
+    """返回 harness.app 下某模块违反分层规则的加载期导入名。
+
+    禁止两类：harness.adapters（应用层只认端口，不认实现）、SQLAlchemy / FastAPI / 各家 SDK。
+    ``if TYPE_CHECKING:`` 块与函数体内的导入不在加载期执行，不计入。
+    """
+    source_package = module if is_package else module.rpartition(".")[0]
+    violations: list[str] = []
+    for node in _iter_load_time_imports(tree):
+        for name in sorted(_imported_names(node, source_package, known)):
+            forbidden_sdk = name.split(".")[0] in _APP_FORBIDDEN_THIRD_PARTY
+            adapter = name == "harness.adapters" or name.startswith("harness.adapters.")
+            if forbidden_sdk or adapter:
+                violations.append(name)
+    return violations
+
+
+def test_app_layer_imports_respect_layering() -> None:
+    """分层防线：harness.app 加载期不得导入 harness.adapters、SQLAlchemy、FastAPI 与各家 SDK。"""
+    files = _first_party_module_files()
+    known = set(files)
+    app_modules = sorted(m for m in files if m == "harness.app" or m.startswith("harness.app."))
+    assert "harness.app.ports" in app_modules, (
+        f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
+    )
+    failures: list[str] = []
+    for module in app_modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        bad = _app_layer_violations(module, tree, path.name == "__init__.py", known)
+        failures.extend(f"  - {module} 导入了 {name}" for name in bad)
+    assert not failures, "应用层存在违反分层规则的加载期导入:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from harness.adapters.models.factory import create_model_client",
+            ["harness.adapters.models.factory"],
+        ),
+        ("from harness import adapters", ["harness.adapters"]),
+        ("from ..adapters import models", ["harness.adapters.models"]),
+        ("from sqlalchemy.ext.asyncio import AsyncSession", ["sqlalchemy.ext.asyncio"]),
+        ("import fastapi", ["fastapi"]),
+        ("import anthropic", ["anthropic"]),
+        ("from openai.types.chat import ChatCompletionMessageParam", ["openai.types.chat"]),
+        ("from harness.domain.messages import ToolCall", []),
+        ("from core.config import settings", []),
+        ("from session.service import SessionService", []),
+        ("from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import sqlalchemy", []),
+        ("def f():\n    import anthropic", []),
+    ],
+)
+def test_app_layer_checker_reports_violations(source: str, expected: list[str]) -> None:
+    """检查器自测：合成模块的违规导入必须被报出，允许项不得误报。"""
+    known = set(_first_party_module_files())
+    tree = ast.parse(source)
+
+    assert _app_layer_violations("harness.app.sample", tree, False, known) == expected
+
+
+# 模型 SDK 顶层包名，以及唯一允许导入它们的生产代码包。
+_MODEL_SDK_PACKAGES = frozenset({"anthropic", "openai"})
+_MODEL_SDK_OWNER = "harness.adapters.models"
+
+
+def _model_sdk_imports(tree: ast.Module) -> list[str]:
+    """返回模块中任何位置导入 anthropic / openai SDK 的模块名。
+
+    比分层检查更严：函数体与 ``if TYPE_CHECKING:`` 块内的导入同样计入，
+    SDK 类型出现在适配层以外，意味着 provider wire 形状已越过中立协议。
+    相对导入只能指向项目内模块，不计入。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        found.extend(name for name in names if name.split(".")[0] in _MODEL_SDK_PACKAGES)
+    return sorted(found)
+
+
+def test_model_sdk_imported_only_by_model_adapters() -> None:
+    """分层防线：除 harness.adapters.models 外，生产代码任何位置都不得导入 anthropic、openai。"""
+    files = _first_party_module_files()
+    owners = {m for m in files if m == _MODEL_SDK_OWNER or m.startswith(f"{_MODEL_SDK_OWNER}.")}
+    assert "harness.adapters.models.anthropic_client" in owners, (
+        f"模块枚举未覆盖模型适配器，仅发现: {sorted(owners)}"
+    )
+    failures: list[str] = []
+    for module, path in sorted(files.items()):
+        if module in owners:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        failures.extend(f"  - {module} 导入了 {name}" for name in _model_sdk_imports(tree))
+    assert not failures, "模型适配器以外的生产代码导入了模型 SDK:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import anthropic", ["anthropic"]),
+        ("from openai import AsyncOpenAI", ["openai"]),
+        ("from anthropic.types import MessageParam", ["anthropic.types"]),
+        ("import json, openai.types", ["openai.types"]),
+        ("def f():\n    import openai", ["openai"]),
+        (
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from anthropic import X",
+            ["anthropic"],
+        ),
+        ("from harness.adapters.models import anthropic_client", []),
+        ("from .openai_client import OpenAIClient", []),
+        ("import anthropic_compat", []),
+    ],
+)
+def test_model_sdk_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置的 SDK 导入都必须被报出，项目内同名模块与相似包名不得误报。"""
+    assert _model_sdk_imports(ast.parse(source)) == expected

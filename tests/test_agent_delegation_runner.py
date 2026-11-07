@@ -10,8 +10,8 @@ from typing import Any, Self
 import pytest
 
 from agent.service import AgentRuntimeConfig
+from harness.app.ports import ModelTurnResult
 from harness.domain.messages import ToolCall
-from llm.types import LLMTurnResult
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from tools.base import ToolContext
@@ -95,7 +95,7 @@ class _FakeDb:
 
 class _FakeAssembler:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.last_result = LLMTurnResult(text="报告", stop_reason="end_turn")
+        self.last_result = ModelTurnResult(text="报告", stop_reason="end_turn")
 
 
 @dataclass
@@ -226,11 +226,11 @@ async def test_delegate_run_record_and_events_carry_agent_id(
 def _script_llm(runner: SubAgentRunner, tool_calls: list[ToolCall]) -> None:
     """第一轮按给定 tool_use 调工具,第二轮给出最终文本。"""
     results = [
-        LLMTurnResult(tool_calls=tool_calls, stop_reason="tool_use"),
-        LLMTurnResult(text="子 Agent 结论", stop_reason="end_turn"),
+        ModelTurnResult(tool_calls=tool_calls, stop_reason="tool_use"),
+        ModelTurnResult(text="子 Agent 结论", stop_reason="end_turn"),
     ]
 
-    async def _fake_stream(*args: Any, **kwargs: Any) -> LLMTurnResult:
+    async def _fake_stream(*args: Any, **kwargs: Any) -> ModelTurnResult:
         return results.pop(0)
 
     runner._stream_and_collect = _fake_stream  # type: ignore[method-assign]
