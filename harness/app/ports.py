@@ -1,4 +1,4 @@
-"""应用层端口：模型客户端接口及其中立流事件、工具描述、system prompt 块与调用异常。
+"""应用层端口：模型客户端、调用参数、模型解析器，以及中立流事件与调用异常。
 
 全部类型不含任何 provider 的 wire 形状；各家 SDK 的适配在 harness.adapters.models 内部完成。
 """
@@ -6,12 +6,14 @@
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from enum import Enum, StrEnum
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.domain.context import Context
 from harness.domain.messages import ThinkingBlock, ToolCall
 
 
@@ -56,28 +58,6 @@ class ModelStreamEvent:
     text: str = ""  # 仅 TEXT_DELTA / THINKING_DELTA
     tool: ToolInfo | None = None  # 仅 TOOL_USE
     result: ModelTurnResult | None = None  # 仅 TURN_RESULT
-
-
-@dataclass(frozen=True)
-class ToolSpec:
-    """中立工具描述。各家客户端自行编码成本家 tools 参数形状。"""
-
-    name: str
-    description: str
-    input_schema: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PromptBlock:
-    """中立 system prompt 块。
-
-    cache_breakpoint=True 表示「此块末尾是一个缓存断点」,语义中立;
-    Anthropic 编码为 cache_control={"type": "ephemeral"},
-    不支持缓存的 provider 直接忽略该标志并拼接纯文本。
-    """
-
-    text: str
-    cache_breakpoint: bool = False
 
 
 # LLM 调用的中立异常:各家 SDK 异常在客户端内部转换成这里的类型,调用方不认供应商异常。
@@ -128,8 +108,65 @@ def error_type_name(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+
+
+class Effort(StrEnum):
+    """思考强度档位，取值与 sessions.thinking_effort 一致。
+
+    fast 表示不额外思考，而不是关闭思考：各端点按自己的协议决定 fast 下发什么，
+    例如原生 OpenAI 协议在未声明 none 映射时保持模型默认行为。
+    """
+
+    FAST = "fast"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+    @classmethod
+    def parse(cls, value: str | None) -> Effort | None:
+        """把会话或请求里的档位字符串转成枚举；None 原样返回，未知取值抛中文异常。"""
+        if value is None:
+            return None
+        try:
+            return cls(value)
+        except ValueError as exc:
+            raise AgentException.message("未知的思考强度档位", {"effort": value}) from exc
+
+
+# 结构化输出未指定 max_tokens 时的上限，沿用原 complete_structured 接口的默认值。
+STRUCTURED_DEFAULT_MAX_TOKENS = 256
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    """一次模型调用的参数，按调用传入，客户端实例上不保存任何可变调用状态。
+
+    effort 为 None 表示用端点默认的思考配置：.env 端点沿用 {provider}_thinking_*，
+    工作区端点没有独立的默认开关，按 fast 处理。max_tokens 为 None 时流式调用取
+    llm_default_max_tokens，结构化调用取 STRUCTURED_DEFAULT_MAX_TOKENS。
+    timeout 为 None 表示沿用客户端构造时的 SDK 超时。
+    """
+
+    model_id: str
+    effort: Effort | None = None
+    max_tokens: int | None = None
+    timeout: float | None = None
+
+    def require_model_id(self) -> str:
+        """取本次调用的模型名；为空属编码错误，抛中文异常而不回落任何默认模型。"""
+        if not self.model_id:
+            raise AgentException.message("模型调用缺少模型名")
+        return self.model_id
+
+
 class ModelClient(ABC):
-    """LLM 客户端统一接口。"""
+    """LLM 客户端统一接口。
+
+    实例只持有端点配置（地址、密钥、重试、超时、思考协议、档位映射表），
+    模型名、思考强度、输出上限一律经 ModelSettings 按调用传入，不在实例上修改。
+    """
 
     @property
     @abstractmethod
@@ -139,24 +176,14 @@ class ModelClient(ABC):
     @abstractmethod
     def stream(
         self,
-        messages: list[dict[str, Any]],
-        system_prompt: str | list[PromptBlock] | None = None,
-        tools: list[ToolSpec] | None = None,
-        model: str | None = None,
+        context: Context[None],
+        settings: ModelSettings,
     ) -> AsyncIterator[ModelStreamEvent]:
         """流式调用，产出中立 ModelStreamEvent；provider 原始格式在实现内部消化，不外露。
 
-        入参全部是中立类型，编码为本家 wire 形状由实现内部私有完成
-        （_encode_messages / _encode_system / _encode_tools），调用方不参与。
-
-        messages 契约：中立消息形状，而非任何 provider 的 wire 形状。三类角色：
-        - {"role": "user", "content": "纯文本"}
-        - {"role": "assistant", "content": [中立块数组]}，块以 kind 判别
-          （见 harness.domain.messages 的 AssistantMessage）
-        - {"role": "tool", "content": ToolResult.to_content()}
-
-        出站翻译刻意收在实现内部而非调用方：stream() 有多个调用点（主 Agent、
-        SubAgent、Compact），且快照与落库一律只存中立形状，翻译放在调用方则每处
+        context 全部是领域类型，编码为本家 wire 形状由实现内部私有完成
+        （_encode_messages / _encode_system / _encode_tools），调用方不参与：
+        stream() 有多个调用点，快照与落库一律只存中立形状，翻译放在调用方则每处
         都要记得翻一次，漏一处即是一次 provider 形状不匹配的请求失败。
 
         实现应为 async generator（调用即得 AsyncIterator，无需 await），
@@ -166,17 +193,87 @@ class ModelClient(ABC):
         """
 
     @abstractmethod
-    async def complete_structured[T: BaseModel](
+    async def complete_structured[O: BaseModel](
         self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
-    ) -> T:
-        """结构化输出，返回 Pydantic 模型实例。
+        context: Context[O],
+        settings: ModelSettings,
+    ) -> O:
+        """结构化输出，返回 context.output_type 的实例。
 
         校验失败时抛出 ValueError 或 ValidationError。
         """
+
+
+@dataclass(frozen=True)
+class ResolvedModel:
+    """模型解析结果：可调用的客户端，加上本场景的默认调用参数。
+
+    provider_record_id 为工作区模型配置 ID，走 .env 时为 None；工作区端点自带模型名，
+    调用方据此不再用 Agent 或会话上的模型名覆盖。context_length 为端点声明的上下文窗口。
+    """
+
+    client: ModelClient
+    settings: ModelSettings
+    provider_record_id: str | None = None
+    context_length: int | None = None
+
+    @classmethod
+    def from_client(cls, client: ModelClient, model_id: str | None = None) -> ResolvedModel:
+        """直接使用给定客户端（测试注入的替身或已建好的客户端），不经解析器。
+
+        模型名取显式值，否则取客户端自带的默认模型名；effort 留空即端点默认，
+        与注入替身自带思考配置的既有语义一致。替身没有模型名时为空串，成本归因据此留空。
+        """
+        default_model = getattr(client, "model", None) or ""
+        return cls(client=client, settings=ModelSettings(model_id=model_id or default_model))
+
+
+class SessionModelOptions(Protocol):
+    """会话上与模型选择相关的只读字段（SessionRecord 天然满足）。"""
+
+    @property
+    def workspace_id(self) -> int | None: ...
+
+    @property
+    def user_id(self) -> int | None: ...
+
+    @property
+    def model_provider_id(self) -> str | None: ...
+
+    @property
+    def extra(self) -> dict[str, Any] | None: ...
+
+    @property
+    def thinking_effort(self) -> str: ...
+
+
+class ModelResolver(Protocol):
+    """按场景与会话解析模型：先查工作区模型配置，查不到再用 .env 的全局 provider。"""
+
+    async def resolve(
+        self,
+        workspace_id: int | None,
+        user_id: int | None,
+        scenario: str,
+        *,
+        provider_id: str | None = None,
+        effort: Effort | None = None,
+    ) -> ResolvedModel:
+        """显式指定 provider 与思考强度解析；workspace_id 为 None 时直接走 .env。"""
+        ...
+
+    async def for_session(self, session: SessionModelOptions, scenario: str) -> ResolvedModel:
+        """按会话保存的模型选项解析：agent 场景始终用会话的供应商，其余场景仅显式指定时沿用。"""
+        ...
+
+    async def for_frozen_job(
+        self,
+        workspace_id: int,
+        user_id: int,
+        scenario: str,
+        *,
+        model: str | None,
+        provider_id: str | None,
+    ) -> ResolvedModel:
+        """按后台任务入队时冻结的模型解析：旧任务只存了 .env 模型名，不迁往后来新增的数据库端点。"""
+        ...

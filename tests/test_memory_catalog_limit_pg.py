@@ -28,7 +28,8 @@ import database.engine  # noqa: F401  副作用注册全部映射与全局软删
 from core.config import settings
 from core.errors import AgentException
 from core.events import BlockType
-from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
+from harness.app.ports import ModelEventKind, ModelSettings, ModelStreamEvent, ModelTurnResult
+from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage
 from memory.jobs.dream import MemoryDreamService
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
@@ -62,15 +63,11 @@ class _FakeLLM:
 
     async def complete_structured[T: BaseModel](
         self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
+        context: Context[T],
+        settings: ModelSettings,
     ) -> T:
-        payload = json.loads(messages[-1]["content"])
+        output_format = context.require_output_type()
+        payload = json.loads(context.messages[-1].text)
         name = output_format.__name__
         if name == "MemoryExtractionResult":
             # 来源引用当前轮次的用户消息：窗口内最后一条 user 消息即本轮请求。
@@ -84,7 +81,7 @@ class _FakeLLM:
         # 召回选择器：不选任何条目，让本轮只依赖 Catalog 渲染本身。
         return output_format.model_validate({"selected_memory_ids": []})
 
-    async def stream(self, messages: list[dict[str, Any]], *args: Any, **kwargs: Any):
+    async def stream(self, context: Context[None], settings: ModelSettings):
         self.stream_calls += 1
         text = "好的。"
         yield ModelStreamEvent(ModelEventKind.BLOCK_START, block_ref=0, block_type=BlockType.TEXT)

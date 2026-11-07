@@ -35,8 +35,8 @@ class _FakeLLM:
     def __init__(self) -> None:
         self.system_prompts: list[Any] = []
 
-    async def stream(self, messages, system_prompt=None, tools=None, model=None):
-        self.system_prompts.append(system_prompt)
+    async def stream(self, context, settings):
+        self.system_prompts.append(context.instruction)
         yield ModelStreamEvent(
             ModelEventKind.TURN_RESULT,
             result=ModelTurnResult(text="答案", stop_reason="end_turn"),

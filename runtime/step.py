@@ -5,11 +5,12 @@ TurnEventAssembler 产出的对外事件，并把终局结果转换成可持久�
 assistant blocks。ReAct 是否继续、工具如何执行、数据库如何提交由上层负责。
 """
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from harness.app.ports import ModelClient, ModelTurnResult, PromptBlock
+from harness.app.ports import ModelClient, ModelSettings, ModelTurnResult
+from harness.domain.context import Context, PromptBlock, messages_from_rows
 from harness.domain.messages import AssistantMessage, ToolCall
 from runtime.stream_assembler import TurnEventAssembler
 from tools.registry import ToolRegistry
@@ -17,12 +18,23 @@ from tools.registry import ToolRegistry
 
 @dataclass(frozen=True)
 class StepRequest:
-    """一次 LLM 调用的完整输入。"""
+    """一次 LLM 调用的完整输入：中立消息、系统指令、可用工具与本次调用参数。"""
 
     messages: list[dict[str, Any]]
-    system_prompt: str | list[PromptBlock] | None
+    system_prompt: str | Sequence[PromptBlock] | None
     tool_registry: ToolRegistry
-    model: str | None = None
+    settings: ModelSettings
+
+    def context(self) -> Context[None]:
+        """在调用边界把中立消息字典还原为领域消息，组装本次调用的 Context。"""
+        instruction = self.system_prompt
+        if instruction is not None and not isinstance(instruction, str):
+            instruction = tuple(instruction)
+        return Context(
+            instruction=instruction,
+            messages=messages_from_rows(self.messages),
+            tools=tuple(self.tool_registry.to_specs()),
+        )
 
 
 @dataclass(frozen=True)
@@ -61,12 +73,7 @@ class AgentStep:
         子代理和 Workflow 可以共享同一实现，同时保留各自的事件归属和生命周期。
         """
         async for event in self._assembler.consume(
-            self._llm.stream(
-                request.messages,
-                request.system_prompt,
-                tools=request.tool_registry.to_specs(),
-                model=request.model,
-            )
+            self._llm.stream(request.context(), request.settings)
         ):
             await self._emit(event)
         result = self._assembler.last_result

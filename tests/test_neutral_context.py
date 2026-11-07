@@ -113,7 +113,7 @@ async def test_auto_compact_snapshot_stores_neutral_shape() -> None:
     class _FakeLLM:
         provider = "anthropic"
 
-        async def stream(self, messages: list[dict[str, Any]], **kwargs: Any):
+        async def stream(self, context: Any, settings: Any):
             yield ModelStreamEvent(
                 kind=ModelEventKind.TURN_RESULT,
                 result=ModelTurnResult(text="历史总结"),

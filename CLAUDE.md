@@ -142,11 +142,14 @@ API、错误与日志：
    同样遵守上文「配置同步规则」。
 4. token 上限读取 `llm_default_max_tokens`（流式调用）和
    `llm_memory_selector_max_tokens` 等场景专用配置，不要在代码中硬编码 max_tokens。
-5. 新代码一律通过 harness/adapters/models/factory.py 的 create_model_client(scenario=...)
-   工厂创建客户端，类型注解使用 harness/app/ports.py 的 ModelClient，不要直接实例化
-   AnthropicClient / OpenAIClient（位于 harness/adapters/models/）；Service 和 Runtime
-   的 __init__ 应接受可选 llm: ModelClient | None = None，未注入时回落工厂，
-   便于测试注入替身；只需模型名而不建客户端时使用 resolve_scenario_model(scenario)。
+5. 新代码一律经 harness/adapters/models/resolver.py 的 DatabaseModelResolver（实现
+   harness/app/ports.py 的 ModelResolver）拿到 ResolvedModel(client, settings)：工作区模型
+   配置优先，查不到再由 factory.py 的 create_model_client(scenario=...) 按 .env 建客户端；
+   工作区端点由 builder.py 按 ModelProviderRecord 构造。类型注解使用 ModelClient，不要直接
+   实例化 AnthropicClient / OpenAIClient（位于 harness/adapters/models/）；Service 和
+   Runtime 的 __init__ 应接受可选 llm: ModelClient | None = None，注入替身时不走解析器，
+   调用参数用 ResolvedModel.from_client(llm) 取替身自带的模型名；只需模型名而不建客户端
+   时使用 resolve_scenario_model(scenario)。
 6. 无静默兜底：provider 未配置或取值不支持、对应 api_key 缺失、场景名未知、
    模型解析不出，一律抛具体中文 AgentException，不得回落到默认 provider 或硬编码模型。
 7. 需要判断当前使用哪家 provider 时，读客户端实例的 provider 属性
@@ -159,14 +162,17 @@ API、错误与日志：
    这类看似无关的错误。
 9. `{provider}_timeout_seconds` 留空表示交给 SDK 自动计算超时；
    给 SDK 显式传 None 会被理解为禁用超时，现有代码统一转成 NOT_GIVEN 规避，
-   新代码沿用该写法。
+   新代码沿用该写法；ModelSettings.timeout 为 None 时同样沿用客户端构造时的超时。
 10. 两家客户端均已实现 stream() 和 complete_structured()，主 Agent、SubAgent、Compact
     三个流式场景两家 provider 都可用。OpenAI 侧流式走 create(stream=True) 裸 chunk 路径，
     不用 SDK 的 .stream() helper：后者会强制校验工具的 strict 字段，在发出请求前就抛
     ValueError，且 get_final_completion() 在截断时抛异常而非返回已生成内容。
 11. LLM 消息体使用中立形状，provider wire 形状只存在于各家客户端 _encode_messages()
-    之后。ModelClient.stream() 的 messages 入参、session_messages.content 和
-    session_snapshots.messages 一律是中立形状，不得写入或读取任何一家的 wire 形状。
+    之后。ModelClient 的签名是 stream(context, settings) 与 complete_structured(context,
+    settings)：context 为 harness/domain/context.py 的 Context（instruction、messages、
+    tools、output_type），messages 是领域消息元组，由调用边界用 messages_from_rows() 从
+    中立 dict 还原；session_messages.content 和 session_snapshots.messages 一律是中立形状，
+    不得写入或读取任何一家的 wire 形状。
 12. assistant 消息 content 为块数组，判别键用 kind 而非 type：
     {"kind": "text", "text": ...} 和 {"kind": "tool_use", "id": ..., "name": ..., "input": ...}，
     经 harness/domain/messages.py 的 AssistantMessage.from_turn() 构造、
@@ -177,6 +183,11 @@ API、错误与日志：
 14. 出站编码是 stream() 的内部步骤，_encode_messages / _encode_system / _encode_tools
     是各家客户端的私有方法，不要提升到 ModelClient 抽象成员（维持 provider、stream、
     complete_structured 三个）；也不要在调用方翻译消息形状。
+15. 模型名、思考强度和输出上限一律通过 ModelSettings(model_id, effort, max_tokens, timeout)
+    按调用传入，不得在客户端实例上修改（不得写 client.max_tokens、client.thinking_enabled
+    之类的属性）。客户端构造参数只放端点配置；effort 为 None 表示端点默认（.env 端点沿用
+    {provider}_thinking_*，工作区端点按 fast 处理），档位到各家参数的翻译在客户端内现场完成，
+    档位收敛（normalize_effort）由 builder 在构造工作区端点的档位映射表时完成。
 
 Anthropic SDK 使用规范：
 1. 新增或修改 Anthropic SDK 相关代码前，必须先查阅 Anthropic 官方文档：

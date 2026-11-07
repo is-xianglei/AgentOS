@@ -42,6 +42,7 @@ def assert_replayable():
     """断言中立消息历史可直接作为下一轮请求:两家出站编码都不报错,tool_use 与结果一一配对。"""
     from harness.adapters.models.anthropic_client import AnthropicClient
     from harness.adapters.models.openai_client import OpenAIClient
+    from harness.domain.context import messages_from_rows
     from harness.domain.messages import AssistantMessage
 
     def check(messages: list[dict]) -> None:
@@ -60,8 +61,8 @@ def assert_replayable():
             else:
                 assert not pending, f"tool_use 缺少对应结果: {pending}"
         assert not pending, f"tool_use 缺少对应结果: {pending}"
-        AnthropicClient._encode_messages(messages)
-        OpenAIClient._encode_messages(messages)
+        AnthropicClient._encode_messages(messages_from_rows(messages))
+        OpenAIClient._encode_messages(messages_from_rows(messages))
 
     return check
 

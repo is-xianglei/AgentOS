@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 import database.registry  # noqa: F401  测试直接构造 ORM 前注册完整映射
 from core.errors import AgentException
+from harness.app.ports import ModelSettings
 from model_service.models import ModelProviderRecord
 from model_service.policy import fast_capabilities, normalize_effort, validate_reasoning_config
 from model_service.schemas import ModelProbeRequest, ModelProviderInput, ModelProviderUpdate
@@ -211,13 +212,14 @@ async def test_non_chat_ping_uses_actual_endpoint(monkeypatch, kind, data):
 async def test_chat_ping_rejects_incomplete_stream_and_closes_it(monkeypatch):
     closed = []
 
-    async def stream(messages):
+    async def stream(context, settings):
         try:
             yield SimpleNamespace(kind=SimpleNamespace(value="text_delta"))
         finally:
             closed.append(True)
 
-    monkeypatch.setattr(ModelService, "build_client", staticmethod(lambda *args: SimpleNamespace(stream=stream)))
+    resolved = SimpleNamespace(client=SimpleNamespace(stream=stream), settings=ModelSettings(model_id="test"))
+    monkeypatch.setattr(ModelService, "build_model", staticmethod(lambda *args: resolved))
     result = await ModelService(SimpleNamespace()).ping(provider())
     assert result.success is False and closed == [True]
 

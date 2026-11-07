@@ -19,7 +19,14 @@ import pytest
 from core.errors import AgentException
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import _TOOL_ERROR_PREFIX, OpenAIClient
+from harness.domain.context import messages_from_rows
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
+
+
+def _encode_rows(client: Any) -> Any:
+    """先把中立 dict 还原为领域消息,再交给客户端私有编码;还原时的形状校验错误照常抛出。"""
+    return lambda rows: client._encode_messages(messages_from_rows(rows))
+
 
 # 完整会话:文本 + 两个并发工具调用 + 两个工具结果(一个失败)+ 纯文本 + 追问。
 # 刻意用两个连续工具结果:Anthropic 侧必须合并进同一条 user 消息,
@@ -176,20 +183,20 @@ def _decode_openai(wire: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def test_anthropic_round_trip_preserves_message() -> None:
     """中立 → Anthropic wire → 回中立,与原消息等价。"""
-    wire = AnthropicClient._encode_messages(_SESSION)
+    wire = AnthropicClient._encode_messages(messages_from_rows(_SESSION))
     assert _decode_anthropic(wire) == _strip_untransmitted(_SESSION)
 
 
 def test_openai_round_trip_preserves_message() -> None:
     """中立 → OpenAI wire → 回中立,与原消息等价。"""
-    wire = OpenAIClient._encode_messages(_SESSION)
+    wire = OpenAIClient._encode_messages(messages_from_rows(_SESSION))
     assert _decode_openai(wire) == _strip_untransmitted(_SESSION)
 
 
 def test_both_round_trips_converge() -> None:
     """两条往返路径落到同一个中立结果:中立协议对两家等距,无偏向某一家。"""
-    assert _decode_anthropic(AnthropicClient._encode_messages(_SESSION)) == _decode_openai(
-        OpenAIClient._encode_messages(_SESSION)
+    assert _decode_anthropic(AnthropicClient._encode_messages(messages_from_rows(_SESSION))) == _decode_openai(
+        OpenAIClient._encode_messages(messages_from_rows(_SESSION))
     )
 
 
@@ -198,7 +205,7 @@ def test_both_round_trips_converge() -> None:
 
 def test_anthropic_wire_shape_of_full_session() -> None:
     """Anthropic 形状:tool_use 是 content 里的块,连续 tool_result 合并进一条 user。"""
-    wire = AnthropicClient._encode_messages(_SESSION)
+    wire = AnthropicClient._encode_messages(messages_from_rows(_SESSION))
     assert [message["role"] for message in wire] == [
         "user",
         "assistant",
@@ -227,7 +234,7 @@ def test_anthropic_wire_shape_of_full_session() -> None:
 
 def test_openai_wire_shape_of_full_session() -> None:
     """OpenAI 形状:tool_use 进 tool_calls 数组,每个结果一条独立 role="tool" 消息。"""
-    wire = OpenAIClient._encode_messages(_SESSION)
+    wire = OpenAIClient._encode_messages(messages_from_rows(_SESSION))
     assert [message["role"] for message in wire] == [
         "user",
         "assistant",
@@ -248,8 +255,8 @@ def test_openai_wire_shape_of_full_session() -> None:
 
 def test_role_counts_differ_between_providers() -> None:
     """两家消息条数不同(4 vs 6),固化「共用一套形状糊不过去」这一事实。"""
-    assert len(AnthropicClient._encode_messages(_SESSION)) == 5
-    assert len(OpenAIClient._encode_messages(_SESSION)) == 6
+    assert len(AnthropicClient._encode_messages(messages_from_rows(_SESSION))) == 5
+    assert len(OpenAIClient._encode_messages(messages_from_rows(_SESSION))) == 6
 
 
 # --- 边界与无静默兜底 ---
@@ -265,18 +272,18 @@ def test_assistant_without_text_keeps_content_null_on_openai() -> None:
             ).to_content(),
         }
     ]
-    assert OpenAIClient._encode_messages(messages)[0]["content"] is None
+    assert OpenAIClient._encode_messages(messages_from_rows(messages))[0]["content"] is None
 
 
 def test_empty_assistant_blocks_encode_to_empty_string_on_anthropic() -> None:
     """空块数组落成空串:Anthropic 拒绝空 content 数组。"""
-    encoded = AnthropicClient._encode_messages([{"role": "assistant", "content": []}])
+    encoded = AnthropicClient._encode_messages(
+        messages_from_rows([{"role": "assistant", "content": []}])
+    )
     assert encoded[0]["content"] == ""
 
 
-@pytest.mark.parametrize(
-    "encode", [AnthropicClient._encode_messages, OpenAIClient._encode_messages]
-)
+@pytest.mark.parametrize("encode", [_encode_rows(AnthropicClient), _encode_rows(OpenAIClient)])
 def test_legacy_provider_shape_raises(encode: Any) -> None:
     """残留的 provider wire 形状(带 type 而非 kind)当场抛错,不被静默误读。
 
@@ -293,18 +300,14 @@ def test_legacy_provider_shape_raises(encode: Any) -> None:
         encode(legacy)
 
 
-@pytest.mark.parametrize(
-    "encode", [AnthropicClient._encode_messages, OpenAIClient._encode_messages]
-)
+@pytest.mark.parametrize("encode", [_encode_rows(AnthropicClient), _encode_rows(OpenAIClient)])
 def test_unknown_role_raises(encode: Any) -> None:
     """未知角色抛中文异常,不静默跳过。"""
     with pytest.raises(AgentException, match="未知的消息角色"):
         encode([{"role": "system", "content": "x"}])
 
 
-@pytest.mark.parametrize(
-    "encode", [AnthropicClient._encode_messages, OpenAIClient._encode_messages]
-)
+@pytest.mark.parametrize("encode", [_encode_rows(AnthropicClient), _encode_rows(OpenAIClient)])
 def test_user_list_content_raises(encode: Any) -> None:
     """user 消息只承载纯文本:list 形态一律视为残留 wire 形状并抛错。"""
     with pytest.raises(AgentException, match="user 消息 content 必须是字符串"):

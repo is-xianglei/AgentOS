@@ -14,7 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from harness.adapters.models.factory import create_model_client, resolve_scenario_model
-from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, error_type_name
+from harness.app.ports import (
+    ModelClient,
+    ModelConnectionError,
+    ModelSettings,
+    ModelStatusError,
+    error_type_name,
+)
+from harness.domain.context import Context
+from harness.domain.messages import UserMessage
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import (
     MemoryItemRecord,
@@ -257,13 +265,13 @@ class MemoryDreamService:
             )
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_dream 场景解析,
         # 不再继承 Extractor 的模型配置(2 层回落:场景覆盖 > provider 主模型)。
-        from runtime.model_selection import frozen_job_client
+        # 局部导入：模型解析器属适配层，阶段 7 由组装根注入。
+        from harness.adapters.models.resolver import DatabaseModelResolver
 
         client = self.llm
         if client is None:
             try:
-                client = await frozen_job_client(
-                    self.db,
+                resolved = await DatabaseModelResolver(self.db).for_frozen_job(
                     space.workspace_id,
                     space.user_id,
                     "memory_dream",
@@ -272,6 +280,7 @@ class MemoryDreamService:
                 )
             except AgentException as exc:
                 raise MemoryDreamFailure("model_missing", exc.message, retryable=False) from exc
+            client = resolved.client
         model = job.model or getattr(client, "model", None)
         if not model:
             try:
@@ -309,21 +318,19 @@ class MemoryDreamService:
         """调用结构化输出并执行严格校验。"""
         client = llm or prepared.client or create_model_client(scenario="memory_dream")
         try:
+            # 模型名用入队时冻结的取值;思考强度沿用端点默认(工作区端点即 fast)。
+            prompt = json.dumps(cls._prompt_payload(prepared.entries), ensure_ascii=False)
             return await client.complete_structured(
-                [
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            cls._prompt_payload(prepared.entries),
-                            ensure_ascii=False,
-                        ),
-                    }
-                ],
-                MemoryDreamResult,
-                system_prompt=cls._system_prompt(prepared.prompt_version),
-                model=prepared.model,
-                max_tokens=settings.llm_memory_dream_max_tokens,
-                timeout=settings.memory_dream_timeout_seconds,
+                Context(
+                    instruction=cls._system_prompt(prepared.prompt_version),
+                    messages=(UserMessage(text=prompt),),
+                    output_type=MemoryDreamResult,
+                ),
+                ModelSettings(
+                    model_id=prepared.model,
+                    max_tokens=settings.llm_memory_dream_max_tokens,
+                    timeout=settings.memory_dream_timeout_seconds,
+                ),
             )
         except (ModelConnectionError, TimeoutError) as exc:
             raise MemoryDreamFailure(

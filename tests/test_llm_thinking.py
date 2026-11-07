@@ -23,11 +23,13 @@ from harness.adapters.models.anthropic_client import (
 )
 from harness.adapters.models.openai_client import OpenAIClient, _OpenAIChunkAdapter
 from harness.app.ports import ModelEventKind, ModelTurnResult
+from harness.domain.context import messages_from_rows
 from harness.domain.messages import AssistantMessage, ThinkingBlock, ToolCall
 from tests.fixtures.anthropic_chunks import (
     CHUNKS_REDACTED_THINKING,
     CHUNKS_THINKING_TEXT_INTERLEAVED,
 )
+from tests.fixtures.model_calls import stream_messages
 
 _ANTHROPIC = AnthropicClient(model="claude-x", api_key="k", base_url="https://example.test")
 _OPENAI = OpenAIClient(model="deepseek-x", api_key="k", base_url="https://example.test/v1")
@@ -145,7 +147,7 @@ def test_legacy_thinking_wire_shape_raises() -> None:
 
 def _encode_assistant(client: Any, blocks: list[dict[str, Any]]) -> dict[str, Any]:
     """把单条 assistant 中立消息编成该 provider 的 wire 消息。"""
-    wire = client._encode_messages([{"role": "assistant", "content": blocks}])
+    wire = client._encode_messages(messages_from_rows([{"role": "assistant", "content": blocks}]))
     return wire[0]
 
 
@@ -342,15 +344,15 @@ def test_anthropic_thinking_param_absent_when_disabled(monkeypatch: pytest.Monke
 
     不能返回 None:显式 None 会被 SDK 当作有效取值下发。
     """
-    monkeypatch.setattr(anthropic_module.settings, "anthropic_thinking_enabled", False)
+    monkeypatch.setattr(anthropic_module.app_settings, "anthropic_thinking_enabled", False)
 
     assert _thinking_param() is NOT_GIVEN
 
 
 def test_anthropic_thinking_param_carries_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """开关打开时下发 enabled 与预算。"""
-    monkeypatch.setattr(anthropic_module.settings, "anthropic_thinking_enabled", True)
-    monkeypatch.setattr(anthropic_module.settings, "anthropic_thinking_budget_tokens", 4096)
+    monkeypatch.setattr(anthropic_module.app_settings, "anthropic_thinking_enabled", True)
+    monkeypatch.setattr(anthropic_module.app_settings, "anthropic_thinking_budget_tokens", 4096)
 
     assert _thinking_param() == {"type": "enabled", "budget_tokens": 4096}
 
@@ -364,8 +366,8 @@ def test_anthropic_budget_out_of_range_raises(
     下限 1024 是 Anthropic 的硬约束;上限须严格小于 max_tokens,
     否则思考会吃满预算导致没有 token 留给正文。
     """
-    monkeypatch.setattr(anthropic_module.settings, "anthropic_thinking_enabled", True)
-    monkeypatch.setattr(anthropic_module.settings, "anthropic_thinking_budget_tokens", budget)
+    monkeypatch.setattr(anthropic_module.app_settings, "anthropic_thinking_enabled", True)
+    monkeypatch.setattr(anthropic_module.app_settings, "anthropic_thinking_budget_tokens", budget)
 
     with pytest.raises(AgentException) as excinfo:
         _thinking_param()
@@ -404,7 +406,7 @@ async def _capture_request_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, 
 
     monkeypatch.setattr(openai_module, "AsyncOpenAI", _StubClient)
     with pytest.raises(_StopStream):
-        async for _ in _OPENAI.stream([{"role": "user", "content": "问题"}]):
+        async for _ in stream_messages(_OPENAI, [{"role": "user", "content": "问题"}]):
             pass
     return captured
 
@@ -414,7 +416,7 @@ async def test_openai_thinking_absent_from_request_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC8:开关关闭时 extra_body / reasoning_effort 两个键都不出现。"""
-    monkeypatch.setattr(openai_module.settings, "openai_thinking_enabled", False)
+    monkeypatch.setattr(openai_module.app_settings, "openai_thinking_enabled", False)
 
     captured = await _capture_request_kwargs(monkeypatch)
 
@@ -425,8 +427,8 @@ async def test_openai_thinking_absent_from_request_when_disabled(
 @pytest.mark.anyio
 async def test_openai_thinking_injected_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """开关打开时 extra_body 带 thinking,配了档位则一并下发。"""
-    monkeypatch.setattr(openai_module.settings, "openai_thinking_enabled", True)
-    monkeypatch.setattr(openai_module.settings, "openai_reasoning_effort", "high")
+    monkeypatch.setattr(openai_module.app_settings, "openai_thinking_enabled", True)
+    monkeypatch.setattr(openai_module.app_settings, "openai_reasoning_effort", "high")
 
     captured = await _capture_request_kwargs(monkeypatch)
 

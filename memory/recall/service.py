@@ -5,13 +5,15 @@ import logging
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from harness.app.ports import ModelClient, error_type_name
+from harness.app.ports import ModelClient, ResolvedModel, error_type_name
+from harness.domain.context import Context
+from harness.domain.messages import UserMessage
 from memory.models import MemoryRevisionRecord, TurnMemoryContextRecord
 from memory.recall.repository import (
     MemoryLexicalCandidate,
@@ -205,23 +207,29 @@ class MemoryRecallService:
         try:
             # 超时预算同时覆盖客户端解析和模型调用。
             async with asyncio.timeout(settings.memory_selector_timeout_seconds):
-                from runtime.model_selection import resolve_runtime_client
+                # 局部导入：模型解析器属适配层，阶段 7 由组装根注入。
+                from harness.adapters.models.resolver import DatabaseModelResolver
 
-                client = self.llm
-                if client is None:
-                    client, _ = await resolve_runtime_client(
-                        self.db,
+                if self.llm is not None:
+                    resolved = ResolvedModel.from_client(self.llm)
+                else:
+                    resolved = await DatabaseModelResolver(self.db).resolve(
                         workspace_id,
                         user_id,
                         "memory_selector",
                     )
-                # 模型已在客户端构造时按 memory_selector 场景解析,此处不再显式传入。
-                output = await client.complete_structured(
-                    [{"role": "user", "content": prompt}],
-                    _MemorySelection,
-                    system_prompt=_SELECTOR_SYSTEM_PROMPT,
-                    max_tokens=settings.llm_memory_selector_max_tokens,
-                    timeout=settings.memory_selector_timeout_seconds,
+                # 模型名取解析器按 memory_selector 场景给出的结果,输出上限与超时按本次调用传入。
+                output = await resolved.client.complete_structured(
+                    Context(
+                        instruction=_SELECTOR_SYSTEM_PROMPT,
+                        messages=(UserMessage(text=prompt),),
+                        output_type=_MemorySelection,
+                    ),
+                    replace(
+                        resolved.settings,
+                        max_tokens=settings.llm_memory_selector_max_tokens,
+                        timeout=settings.memory_selector_timeout_seconds,
+                    ),
                 )
             memory_ids = self._deduplicate(output.selected_memory_ids)
             # 只要有一个 ID 不在目录里，整份输出都不可信，改走词法降级。

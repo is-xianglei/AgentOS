@@ -35,8 +35,9 @@ from core.events import (
 )
 from database.engine import AsyncSessionLocal
 from harness.adapters.models.factory import create_model_client
-from harness.app.ports import ModelClient
-from harness.domain.messages import AssistantMessage
+from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.domain.context import Context
+from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
     ExecutionHandle,
     launch_turn_execution,
@@ -383,6 +384,22 @@ class SequentialOrchestrator(BaseOrchestrator):
         return OrchestrationResult(text=previous_output)
 
 
+def _workflow_model(
+    llm: ModelClient | None,
+    model_settings: ModelSettings | None,
+) -> tuple[ModelClient, ModelSettings]:
+    """编排器的客户端与调用参数：未注入时按 workflow 场景用 .env 建客户端。
+
+    运行时按会话解析出的客户端连同其调用参数一起传入；只注入客户端（测试替身）时，
+    参数取客户端自带的默认模型名，思考配置沿用端点默认。
+    """
+    if llm is None:
+        resolved = ResolvedModel.from_client(create_model_client(scenario="workflow"))
+    else:
+        resolved = ResolvedModel.from_client(llm)
+    return resolved.client, model_settings or resolved.settings
+
+
 class ParallelOrchestrator(BaseOrchestrator):
     """并行编排:全部成员并发执行同一提问,成功结果由 LLM 汇总。
 
@@ -391,9 +408,15 @@ class ParallelOrchestrator(BaseOrchestrator):
     部分容忍,只对成功结果汇总。
     """
 
-    def __init__(self, *, llm: ModelClient | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        llm: ModelClient | None = None,
+        model_settings: ModelSettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
-        self.llm = llm or create_model_client(scenario="workflow")
+        self.llm, self.model_settings = _workflow_model(llm, model_settings)
 
     async def run(self, user_content: str) -> OrchestrationResult:
         self._require_min_members(2, "并行编排")
@@ -490,6 +513,7 @@ class ParallelOrchestrator(BaseOrchestrator):
                 messages=[{"role": "user", "content": prompt}],
                 system_prompt=PARALLEL_MERGE_SYSTEM_PROMPT,
                 tool_registry=ToolRegistry([]),
+                settings=self.model_settings,
             )
         )
         text = step_result.text
@@ -502,16 +526,22 @@ class ParallelOrchestrator(BaseOrchestrator):
         return OrchestrationResult(
             text=text,
             provider=getattr(self.llm, "provider", None),
-            model=getattr(self.llm, "model", None),
+            model=self.model_settings.model_id or None,
         )
 
 
 class LlmRoutingOrchestrator(BaseOrchestrator):
     """智能路由:LLM 依据成员 description 选出唯一成员执行;决策或执行失败均为整体失败(D5)。"""
 
-    def __init__(self, *, llm: ModelClient | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        llm: ModelClient | None = None,
+        model_settings: ModelSettings | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
-        self.llm = llm or create_model_client(scenario="workflow")
+        self.llm, self.model_settings = _workflow_model(llm, model_settings)
 
     async def run(self, user_content: str) -> OrchestrationResult:
         self._require_min_members(2, "智能路由编排")
@@ -552,12 +582,15 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
         )
         try:
             # 结构化输出只有一个整数字段,沿用接口默认的 max_tokens 即可。
-            # 超时不在此处单独设置:客户端由 create_model_client 构造时已带 SDK 层超时
+            # 超时不在此处单独设置:客户端构造时已带 SDK 层超时
             # ({provider}_timeout_seconds,留空则由 SDK 自动计算),此处再叠一层需新增配置项,超出本次范围。
             choice = await self.llm.complete_structured(
-                [{"role": "user", "content": prompt}],
-                _RoutingChoice,
-                system_prompt=LLM_ROUTING_SYSTEM_PROMPT,
+                Context(
+                    instruction=LLM_ROUTING_SYSTEM_PROMPT,
+                    messages=(UserMessage(text=prompt),),
+                    output_type=_RoutingChoice,
+                ),
+                self.model_settings,
             )
         except asyncio.CancelledError:
             raise
@@ -611,6 +644,8 @@ class WorkflowRuntime:
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.llm = llm
+        # 按会话解析出的调用参数;注入替身时为 None,由编排器取替身自带的模型名。
+        self.model_settings: ModelSettings | None = None
         self.session_service = SessionService(db)
         # 执行之外没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
@@ -643,10 +678,11 @@ class WorkflowRuntime:
             **prepare_kwargs,
         )
         if self.llm is None:
-            from runtime.model_selection import session_client
+            # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
+            from harness.adapters.models.resolver import DatabaseModelResolver
 
             # 准入只验证配置，不将工作区客户端当作测试注入冻结给后台任务。
-            await session_client(self.db, session, "workflow")
+            await DatabaseModelResolver(self.db).for_session(session, "workflow")
         turn, _ = await self.session_service.start_turn(
             session,
             self.user_id,
@@ -794,13 +830,16 @@ class WorkflowRuntime:
             "members": members,
         }
         if self.llm is None:
-            from runtime.model_selection import session_client
+            from harness.adapters.models.resolver import DatabaseModelResolver
 
             session = await self.session_service.get_required(session_id)
-            self.llm, _ = await session_client(self.db, session, "workflow")
+            resolved = await DatabaseModelResolver(self.db).for_session(session, "workflow")
+            self.llm, self.model_settings = resolved.client, resolved.settings
         # 只有并行汇总和智能路由要调 LLM，顺序编排不接收客户端。
         if issubclass(orchestrator_cls, ParallelOrchestrator | LlmRoutingOrchestrator):
-            return orchestrator_cls(llm=self.llm, **dependencies)
+            return orchestrator_cls(
+                llm=self.llm, model_settings=self.model_settings, **dependencies
+            )
         return orchestrator_cls(**dependencies)
 
     async def _complete_turn(

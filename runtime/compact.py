@@ -7,7 +7,9 @@ from typing import Any
 
 from core.errors import AgentException
 from harness.adapters.models.factory import create_model_client
-from harness.app.ports import ModelClient, ModelEventKind, ModelTurnResult
+from harness.app.ports import ModelClient, ModelEventKind, ModelTurnResult, ResolvedModel
+from harness.domain.context import Context
+from harness.domain.messages import UserMessage
 from session.repository import SessionRepository
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,7 @@ _MICRO_MIN_LEN = 500
 
 
 class CompactService:
-    """在每次 LLM 调用前控制上下文长度；llm 未注入时 L2 按 compact 场景现建客户端。"""
+    """在每次 LLM 调用前控制上下文长度；未配置模型时 L2 按 compact 场景现建客户端。"""
 
     def __init__(
         self,
@@ -31,9 +33,11 @@ class CompactService:
         llm: ModelClient | None = None,
         threshold: int = 50_000,
     ):
-        """初始化上下文压缩服务依赖。"""
+        """初始化上下文压缩服务依赖；llm 供测试注入替身，运行时由主 Agent 写入解析好的 model。"""
         self.session_repo = session_repo
-        self.llm = llm
+        self.model: ResolvedModel | None = None
+        if llm is not None:
+            self.model = ResolvedModel.from_client(llm)
         self.threshold = threshold
 
     async def maybe_compact(
@@ -145,8 +149,11 @@ class CompactService:
 
         # 压缩只要一段摘要文本,不往 bus 发事件,故不建装配器、直接消费中立流。
         result: ModelTurnResult | None = None
-        client = self.llm or create_model_client(scenario="compact")
-        async for event in client.stream(messages=[{"role": "user", "content": compact_prompt}]):
+        model = self.model or ResolvedModel.from_client(create_model_client(scenario="compact"))
+        context: Context[None] = Context(
+            instruction=None, messages=(UserMessage(text=compact_prompt),)
+        )
+        async for event in model.client.stream(context, model.settings):
             if event.kind is ModelEventKind.TURN_RESULT:
                 result = event.result
         if result is None:

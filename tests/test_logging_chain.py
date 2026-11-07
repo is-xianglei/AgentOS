@@ -176,9 +176,7 @@ class _FakeSessionRepo:
 class _FakeCompactLLM:
     """压缩 LLM 替身:直接产出终局摘要,不发真实请求。"""
 
-    async def stream(
-        self, messages: list[dict[str, Any]], **kwargs: Any
-    ) -> AsyncIterator[ModelStreamEvent]:
+    async def stream(self, context: Any, settings: Any) -> AsyncIterator[ModelStreamEvent]:
         yield ModelStreamEvent(
             kind=ModelEventKind.TURN_RESULT,
             result=ModelTurnResult(text="已完成事项、当前状态与关键决策摘要"),

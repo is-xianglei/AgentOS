@@ -6,7 +6,7 @@
 走 messages 而非 system，见 session/service.py。
 """
 
-from harness.app.ports import PromptBlock
+from harness.domain.context import PromptBlock
 from prompt.context import PromptContext
 from prompt.sections import (
     DELEGATE_CATALOG_HEADER,

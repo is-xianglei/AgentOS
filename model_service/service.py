@@ -7,6 +7,7 @@ import math
 import time
 import wave
 from contextlib import aclosing
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,15 +15,15 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from harness.app.ports import ModelClient, error_type_name
+from harness.app.ports import Effort, ResolvedModel, error_type_name
+from harness.domain.context import Context
+from harness.domain.messages import UserMessage
 from model_service.models import ModelProviderRecord, ModelRoleRecord
 from model_service.policy import (
     MODES,
     REASONING_KEYS,
     fast_capabilities,
-    normalize_effort,
     reasoning_capabilities,
-    resolve_thinking_protocol,
     validate_reasoning_config,
 )
 from model_service.repository import ModelServiceRepository
@@ -46,6 +47,8 @@ ROLE_LABELS = {
     "workflow": "工作流",
 }
 logger = logging.getLogger(__name__)
+# 对话模型连通性测试的输出上限：只需要一句极短回复。
+_PROBE_MAX_TOKENS = 32
 # 只声明项目现有适配器实际支持的协议，避免原生或云平台入口保存后才发现不能运行。
 # 每项依次为：供应商标识、显示名、默认服务地址、是否自动填充地址、是否必须填写密钥。
 _PROVIDERS = [
@@ -308,12 +311,16 @@ class ModelService:
 
     async def _probe_chat(self, record: ModelProviderRecord) -> None:
         """对话模型：发一条极短消息，要求流式输出产出有效的终局结果。"""
-        client = self.build_client(record, "fast")
-        client.max_tokens = 32
+        resolved = self.build_model(record, Effort.FAST)
+        # 连通性测试只要很短的回复，输出上限按本次调用传入，不改客户端实例。
+        settings = replace(resolved.settings, max_tokens=_PROBE_MAX_TOKENS)
+        context: Context[None] = Context(
+            instruction=None, messages=(UserMessage(text="Reply OK"),)
+        )
         result = None
         async with (
             asyncio.timeout(30),
-            aclosing(client.stream([{"role": "user", "content": "Reply OK"}])) as stream,
+            aclosing(resolved.client.stream(context, settings)) as stream,
         ):
             async for event in stream:
                 if event.kind.value == "turn_result":
@@ -546,40 +553,14 @@ class ModelService:
         }
 
     @staticmethod
-    def build_client(record: ModelProviderRecord, effort: str = "fast") -> ModelClient:
-        """按工作区配置构造 LLM 客户端，effort 为请求的思考强度。"""
-        from harness.adapters.models.anthropic_client import AnthropicClient
-        from harness.adapters.models.openai_client import OpenAIClient
+    def build_model(record: ModelProviderRecord, effort: Effort | None) -> ResolvedModel:
+        """按工作区配置构造模型客户端及其默认调用参数，effort 为请求的思考强度。
 
-        normalized = normalize_effort(record.extra_config or {}, effort)
-        # 把档位名换成上游实际接收的值（档位名或思考预算）；fast 没有对应档位，取 None。
-        levels = reasoning_capabilities(record.extra_config or {})["reasoning_effort_levels"]
-        wire_value = None
-        for item in levels:
-            if item["key"] == normalized:
-                wire_value = item["value"]
-                break
-        kwargs = {
-            "model": record.model_name,
-            "api_key": record.api_key or "no-key",
-            "base_url": record.base_url,
-            "max_retries": 1,
-            "timeout": 30.0,
-        }
-        if record.provider == "anthropic":
-            return AnthropicClient(
-                **kwargs,
-                thinking_enabled=normalized != "fast",
-                reasoning_effort=wire_value,
-                thinking_budget_tokens=record.extra_config.get("thinking_budget_tokens"),
-            )
-        return OpenAIClient(
-            **kwargs,
-            thinking_enabled=normalized != "fast",
-            reasoning_effort=wire_value,
-            thinking_protocol=resolve_thinking_protocol(record.provider, record.extra_config),
-            fast_reasoning_effort=record.extra_config.get("fast_reasoning_effort"),
-        )
+        构造细节在模型适配层；此处局部导入，模型服务域的模块加载不依赖适配层（阶段 7 由组装根收拢）。
+        """
+        from harness.adapters.models.builder import build_resolved_model
+
+        return build_resolved_model(record, effort)
 
     async def probe_metadata(self, workspace_id: int, payload: ModelProbeRequest) -> dict[str, Any]:
         """读取上游 /models 中目标模型的元数据，找不到时返回空字典。"""

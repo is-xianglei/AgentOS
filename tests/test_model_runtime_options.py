@@ -14,14 +14,24 @@ from harness.adapters.models import anthropic_client as anthropic_module
 from harness.adapters.models import openai_client as openai_module
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
-from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
+from harness.adapters.models import resolver as resolver_module
+from harness.adapters.models.resolver import DatabaseModelResolver
+from harness.app.ports import (
+    Effort,
+    ModelEventKind,
+    ModelSettings,
+    ModelStreamEvent,
+    ModelTurnResult,
+    ResolvedModel,
+)
+from model_service.models import ModelProviderRecord
 from model_service.service import ModelService
 from model_service.policy import TURBO_PROMPT
-from runtime import model_selection
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
 from session.schemas import SessionRenameRequest, SessionSendMessageRequest
 from session.service import SessionService
+from tests.fixtures.model_calls import structured, thinking_off, thinking_on
 from tools.registry import build_tool_registry
 
 pytestmark = pytest.mark.anyio
@@ -32,6 +42,11 @@ def _provider(provider="openai", extra=None):
         provider_id="provider-a", provider=provider, extra_config=extra or {},
         model_name="model-a", api_key="test", base_url="https://example.test/v1",
     )
+
+
+def _record(provider="openai", extra=None):
+    """build_model 需要真实 ORM 实例（读取 provider_id 等字段），其余用例沿用 SimpleNamespace。"""
+    return ModelProviderRecord(**vars(_provider(provider, extra)))
 
 
 def _session(**kwargs):
@@ -105,59 +120,67 @@ async def test_workflow_uses_role_and_rejects_turbo(monkeypatch):
         await service.apply_model_options(session, 3, 2, {"mode_slug": "turbo"})
 
 
+def _resolved(client=None, provider_record_id=None):
+    return ResolvedModel(
+        client=client or object(),
+        settings=ModelSettings(model_id="model-a"),
+        provider_record_id=provider_record_id,
+    )
+
+
 @pytest.mark.parametrize("scenario", ["agent", "subagent", "workflow"])
 async def test_explicit_model_and_effort_propagate_to_all_scenarios(monkeypatch, scenario):
-    resolve = AsyncMock(return_value=(object(), _provider()))
-    monkeypatch.setattr(model_selection, "resolve_runtime_client", resolve)
+    resolve = AsyncMock(return_value=_resolved(provider_record_id="provider-a"))
+    monkeypatch.setattr(DatabaseModelResolver, "resolve", resolve)
     session = _session()
     session.model_provider_id = "provider-a"
     session.thinking_effort = "high"
     session.extra = {"model_provider_override": True}
-    await model_selection.session_client(object(), session, scenario)
+    await DatabaseModelResolver(object()).for_session(session, scenario)
     assert resolve.await_args.kwargs == {"provider_id": "provider-a", "effort": "high"}
 
 
 async def test_nonexplicit_workflow_uses_its_role(monkeypatch):
-    resolve = AsyncMock(return_value=(object(), _provider()))
-    monkeypatch.setattr(model_selection, "resolve_runtime_client", resolve)
+    resolve = AsyncMock(return_value=_resolved(provider_record_id="provider-a"))
+    monkeypatch.setattr(DatabaseModelResolver, "resolve", resolve)
     session = _session()
     session.model_provider_id = "provider-a"
-    await model_selection.session_client(object(), session, "workflow")
+    await DatabaseModelResolver(object()).for_session(session, "workflow")
     assert resolve.await_args.kwargs["provider_id"] is None
 
 
 @pytest.mark.parametrize("scenario", ["memory_extractor", "memory_dream"])
 async def test_legacy_memory_job_keeps_environment_endpoint(monkeypatch, scenario):
-    legacy_client = object()
-    monkeypatch.setattr(model_selection, "create_model_client", lambda **_: legacy_client)
+    legacy_client = SimpleNamespace(model="legacy-env-model")
+    monkeypatch.setattr(resolver_module, "create_model_client", lambda **_: legacy_client)
     resolve = AsyncMock()
-    monkeypatch.setattr(model_selection, "resolve_runtime_client", resolve)
-    client = await model_selection.frozen_job_client(
-        object(), 2, 3, scenario, model="legacy-model", provider_id=None,
+    monkeypatch.setattr(DatabaseModelResolver, "resolve", resolve)
+    resolved = await DatabaseModelResolver(object()).for_frozen_job(
+        2, 3, scenario, model="legacy-model", provider_id=None,
     )
-    assert client is legacy_client
+    assert resolved.client is legacy_client
     resolve.assert_not_awaited()
 
 
 async def test_new_memory_job_honors_frozen_provider(monkeypatch):
     frozen = object()
-    resolve = AsyncMock(return_value=(frozen, _provider()))
-    monkeypatch.setattr(model_selection, "resolve_runtime_client", resolve)
-    client = await model_selection.frozen_job_client(
-        object(), 2, 3, "memory_extractor", model="frozen", provider_id="provider-a",
+    resolve = AsyncMock(return_value=_resolved(frozen, provider_record_id="provider-a"))
+    monkeypatch.setattr(DatabaseModelResolver, "resolve", resolve)
+    resolved = await DatabaseModelResolver(object()).for_frozen_job(
+        2, 3, "memory_extractor", model="frozen", provider_id="provider-a",
     )
-    assert client is frozen
+    assert resolved.client is frozen
     assert resolve.await_args.kwargs["provider_id"] == "provider-a"
 
 
 async def test_environment_fast_does_not_emit_unverified_private_protocol(monkeypatch):
     client = OpenAIClient(model="model-a", api_key="test")
-    monkeypatch.setattr(model_selection, "create_model_client", lambda **_: client)
-    actual, provider = await model_selection.resolve_runtime_client(
-        object(), None, None, "agent", effort="fast",
+    monkeypatch.setattr(resolver_module, "create_model_client", lambda **_: client)
+    resolved = await DatabaseModelResolver(object()).resolve(
+        None, None, "agent", effort=Effort.FAST,
     )
-    assert provider is None and actual is client
-    assert client._thinking_kwargs() == {}
+    assert resolved.provider_record_id is None and resolved.client is client
+    assert client._thinking_kwargs(resolved.settings.effort) == {}
 
 
 async def test_turbo_never_wakes_existing_team():
@@ -189,16 +212,21 @@ async def test_subagent_rejects_turbo_before_resolving_client(monkeypatch):
 def test_openai_wire_mapping_preserves_protocol_and_value_type(
     protocol, enabled, effort, fast, expected,
 ):
+    levels = thinking_on(effort) if enabled else thinking_off()
     client = OpenAIClient(
         model="model-a", api_key="test", thinking_protocol=protocol,
-        thinking_enabled=enabled, reasoning_effort=effort, fast_reasoning_effort=fast,
+        fast_reasoning_effort=fast, reasoning_levels=levels,
     )
-    assert client._thinking_kwargs() == expected
+    assert client._thinking_kwargs(Effort.HIGH) == expected
 
 
-def test_build_client_honors_native_fast_mapping():
-    client = ModelService.build_client(_provider(extra={"fast_reasoning_effort": "none"}))
-    assert client._thinking_kwargs() == {"reasoning_effort": "none"}
+def test_build_model_honors_native_fast_mapping():
+    resolved = ModelService.build_model(
+        _record(extra={"fast_reasoning_effort": "none"}), Effort.FAST
+    )
+    assert resolved.client._thinking_kwargs(resolved.settings.effort) == {
+        "reasoning_effort": "none"
+    }
 
 
 @pytest.mark.parametrize("effort,expected", [
@@ -206,14 +234,12 @@ def test_build_client_honors_native_fast_mapping():
     (4096, {"thinking": {"type": "enabled", "budget_tokens": 4096}}),
 ])
 def test_anthropic_wire_mapping_preserves_adaptive_or_budget(effort, expected):
-    client = AnthropicClient(
-        model="model-a", api_key="test", thinking_enabled=True, reasoning_effort=effort,
-    )
-    assert client._thinking_kwargs(8192) == expected
+    client = AnthropicClient(model="model-a", api_key="test", reasoning_levels=thinking_on(effort))
+    assert client._thinking_kwargs(Effort.HIGH, 8192) == expected
     with pytest.raises(AgentException):
         AnthropicClient(
-            model="model-a", api_key="test", thinking_enabled=True, reasoning_effort=8192,
-        )._thinking_kwargs(8192)
+            model="model-a", api_key="test", reasoning_levels=thinking_on(8192),
+        )._thinking_kwargs(Effort.HIGH, 8192)
 
 
 class _Output(BaseModel):
@@ -229,23 +255,21 @@ async def test_openai_structured_request_keeps_selected_effort(monkeypatch):
     ))
     client = OpenAIClient(
         model="model-a", api_key="test", thinking_protocol="openai",
-        thinking_enabled=True, reasoning_effort="high",
+        reasoning_levels=thinking_on("high"),
     )
-    assert (await client.complete_structured([], _Output)).answer == 42
+    assert (await structured(client, [], _Output)).answer == 42
     assert parse.await_args.kwargs["reasoning_effort"] == "high"
     assert "temperature" not in parse.await_args.kwargs
 
 
 @pytest.mark.parametrize("budget", [4096, 31744, 32512])
 def test_anthropic_structured_budget_keeps_requested_output_room(monkeypatch, budget):
-    monkeypatch.setattr(anthropic_module.settings, "llm_default_max_tokens", 32768)
-    client = AnthropicClient(
-        model="model-a", api_key="test", thinking_enabled=True, reasoning_effort=budget,
-    )
-    maximum = client._structured_max_tokens(1024)
+    monkeypatch.setattr(anthropic_module.app_settings, "llm_default_max_tokens", 32768)
+    client = AnthropicClient(model="model-a", api_key="test", reasoning_levels=thinking_on(budget))
+    maximum = client._structured_max_tokens(Effort.HIGH, 1024)
     assert maximum == min(budget + 1024, 32768)
     assert maximum > budget
-    assert client._thinking_kwargs(maximum)["thinking"]["budget_tokens"] == budget
+    assert client._thinking_kwargs(Effort.HIGH, maximum)["thinking"]["budget_tokens"] == budget
 
 
 async def test_anthropic_structured_retry_keeps_effort_and_signed_thinking(monkeypatch):
@@ -269,10 +293,8 @@ async def test_anthropic_structured_retry_keeps_effort_and_signed_thinking(monke
     monkeypatch.setattr(anthropic_module, "AsyncAnthropic", lambda **_: SimpleNamespace(
         messages=SimpleNamespace(stream=stream),
     ))
-    client = AnthropicClient(
-        model="model-a", api_key="test", thinking_enabled=True, reasoning_effort="high",
-    )
-    assert (await client.complete_structured([], _Output)).answer == 42
+    client = AnthropicClient(model="model-a", api_key="test", reasoning_levels=thinking_on("high"))
+    assert (await structured(client, [], _Output)).answer == 42
     for call in create.await_args_list:
         assert call.kwargs["tool_choice"] == {"type": "auto"}
         assert call.kwargs["thinking"] == {"type": "adaptive"}
@@ -291,8 +313,8 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
         provider = "openai"
         model = "model-a"
 
-        async def stream(self, messages, system_prompt=None, tools=None, model=None):
-            requests.append({"system_prompt": system_prompt, "tools": tools})
+        async def stream(self, context, settings):
+            requests.append({"system_prompt": context.instruction, "tools": list(context.tools)})
             yield ModelStreamEvent(
                 ModelEventKind.TURN_RESULT,
                 result=ModelTurnResult(text="答案", stop_reason="end_turn"),
@@ -352,7 +374,7 @@ async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
 async def test_anthropic_large_structured_budget_uses_real_sdk_stream_and_retry(monkeypatch):
     from anthropic import AsyncAnthropic
 
-    monkeypatch.setattr(anthropic_module.settings, "llm_default_max_tokens", 50000)
+    monkeypatch.setattr(anthropic_module.app_settings, "llm_default_max_tokens", 50000)
     requests = []
 
     def handle(request):
@@ -399,10 +421,10 @@ async def test_anthropic_large_structured_budget_uses_real_sdk_stream_and_retry(
             lambda **kwargs: AsyncAnthropic(**kwargs, http_client=http_client),
         )
         client = AnthropicClient(
-            model="test-model", api_key="test", thinking_enabled=True,
-            reasoning_effort=30000, max_retries=0,
+            model="test-model", api_key="test", max_retries=0,
+            reasoning_levels=thinking_on(30000),
         )
-        assert (await client.complete_structured([], _Output)).answer == 42
+        assert (await structured(client, [], _Output)).answer == 42
     assert len(requests) == 2
     for body in requests:
         assert body["stream"] is True

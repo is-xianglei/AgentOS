@@ -3,7 +3,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from core.errors import AgentException
-from harness.app.ports import ToolSpec
+from harness.domain.context import ToolSpec
 from tools.base import BaseTool
 from tools.builtin import (
     AgentTool,

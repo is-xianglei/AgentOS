@@ -8,7 +8,7 @@ Anthropic 侧 cache_breakpoint 落成 cache_control,OpenAI 侧忽略断点拼纯
 
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
-from harness.app.ports import PromptBlock, ToolSpec
+from harness.domain.context import PromptBlock, ToolSpec
 
 _TOOL_SPECS = [
     ToolSpec(

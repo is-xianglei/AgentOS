@@ -28,7 +28,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 |---|---|
 | messages.py | 已落地（阶段 1）。`Message = UserMessage \| AssistantMessage \| ToolResult`；`AssistantMessage(blocks)` 的块为 `AssistantBlock = ThinkingBlock \| TextBlock \| ToolCall`；`ToolCall(id, tool_name, arguments)`；`ToolResult(tool_call_id, tool_name, arguments, content, is_error)`；`message_from_row(role, content)` 按角色还原 |
 | session.py | `Session(id, messages, append)`：一次上下文加载得到的会话视图，不是 ORM |
-| context.py | `Context[O](instruction, tools, messages, output_type, memory, project_instructions)` |
+| context.py | 已落地（阶段 2b）。`Context[O](instruction: str \| tuple[PromptBlock, ...] \| None, messages: tuple[Message, ...], tools: tuple[ToolSpec, ...] = (), output_type: type[O] \| None = None)`，以及 `PromptBlock`、`ToolSpec` 两个值类型；`messages_from_rows(rows)` 在调用边界把中立 dict 还原为领域消息。记忆和项目规范不单列字段，由角色渲染进 instruction 或 messages，模型客户端不需要懂记忆的语义 |
 | tool.py | `Tool`、`ToolPolicy`、`ToolContext` |
 | review.py | `Decision(behavior, reason, updated_arguments)`，behavior 取 allow / ask / deny |
 | roles.py | 角色 `Assistant`（主 Agent）、`SubAgent`、`Teammate`、`Compactor`，各自 `context(...) -> Context[...]` |
@@ -60,8 +60,9 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 
 | 端口 | 职责 | 现有实现 | 规划中的实现 |
 |---|---|---|---|
-| ModelClient | `stream(context, settings)`、`complete_structured(context, settings)` | Anthropic、OpenAI | Google |
-| ModelSettings | 每次调用时传入 model_id 和 effort，档位到各家参数的翻译放在适配器里 | — | — |
+| ModelClient | `stream(context: Context[None], settings) -> AsyncIterator[ModelStreamEvent]`、`complete_structured[O](context: Context[O], settings) -> O` | Anthropic、OpenAI | Google |
+| ModelSettings | `ModelSettings(model_id, effort: Effort \| None, max_tokens, timeout)`，每次调用时传入；effort 为 None 表示端点默认（.env 端点沿用 {provider}_thinking_*，工作区端点按 fast）；max_tokens 为 None 时流式取 llm_default_max_tokens、结构化取 256 | — | — |
+| ModelResolver | `resolve(workspace_id, user_id, scenario, *, provider_id, effort)`、`for_session(session, scenario)`、`for_frozen_job(..., model, provider_id)`，返回 `ResolvedModel(client, settings, provider_record_id, context_length)`：先查工作区模型配置，查不到再用 .env | DatabaseModelResolver（数据库 + .env） | — |
 | SessionStore | 按实际操作设计：加载本轮上下文、追加消息、写压缩快照；不做整存整取 | 数据库（包装 SessionService） | 测试用内存实现 |
 | ToolProvider | `list_tools(scope) -> list[Tool]`，代表一个工具来源 | 内置工具 | MCP |
 | MemoryProvider | `recall(request) -> MemoryRecall`，以及回合结束后的写入 | 内置 memory 域 | 外部记忆框架 |
@@ -77,7 +78,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 
 | 目录 | 内容 |
 |---|---|
-| models/ | AnthropicClient、OpenAIClient；factory 负责解析 .env 或工作区模型配置并建客户端 |
+| models/ | AnthropicClient、OpenAIClient：构造参数只放端点配置（地址、密钥、重试、超时、思考协议、档位映射表），effort 按调用翻译成各家参数；factory 解析 .env；builder 按工作区模型配置建客户端；resolver 实现 ModelResolver |
 | stores/ | DatabaseSessionStore |
 | tools/ | builtin/（全部内置工具，Bash 的 shell 校验也在这里）、builtin_provider.py |
 | memory/ | BuiltinMemoryProvider（包装 memory 域的召回和提取） |
@@ -113,7 +114,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | llm/types.py | domain/messages.py；流式事件类型放 app/ports.py |
 | llm/base.py、llm/errors.py | app/ports.py（ModelClient 及其错误类型） |
 | llm/anthropic_client.py、openai_client.py | adapters/models/ |
-| llm/factory.py、runtime/model_selection.py | adapters/models/factory.py，由组装根调用 |
+| llm/factory.py、runtime/model_selection.py | adapters/models/factory.py（.env）、builder.py（工作区端点）、resolver.py（ModelResolver），由组装根调用 |
 | tools/base.py、tools/policy.py 里的 ToolPolicy | domain/tool.py |
 | tools/builtin/、tools/shell_policy.py | adapters/tools/builtin/ |
 | tools/subagents/ | 子代理规格放 domain/roles.py，提示文案放 domain/prompts/ |
@@ -140,6 +141,14 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 事务边界和提交时点、租约与并发顺序、取消与回收语义。持久化仍按轮次和挂起点提交，不改成逐条提交。
 - 测试可以改 import、patch 目标和构造方式；断言语义不变，新端口要补测试。
   测试不删，只有专测已删除功能的用例可以随功能一起删掉，并在汇报里逐个列出。
+- 发往两家 SDK 的请求参数由 tests/test_model_request_golden.py 固化（字面量取自阶段 2b 之前的代码），
+  后续阶段不得改动 tests/fixtures/model_request_golden.py。
+
+已知、有意保留的行为差异和不对称（后续单独处理，不在重构中顺手改）：
+- 未知的 effort 字符串在 `Effort.parse` 处抛中文异常；之前在工作区路径会回落到默认档位，在 .env 路径会原样下发。
+  Schema 只接受六个合法值，开发库里也没有非法值（2026-11-08 核查），属于禁止静默兜底的收紧。
+- `ModelSettings.timeout` 在各条调用路径上的作用范围不一致：Anthropic 流式调用忽略它、只用端点超时；
+  Anthropic 结构化调用作用于单次请求；OpenAI 结构化调用作用于客户端。为了保持请求逐字节一致，暂时原样保留。
 
 ## 8. 阶段
 
@@ -147,7 +156,8 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 |---|---|
 | 0 | 删除编排检查点死代码；agent 域的 `AgentService` 改名为 `AgentDefinitionService`，把名字让给应用层 |
 | 1 | 领域类型：messages、tool（JSON Schema + policy）、review、budget；内置工具迁到 adapters |
-| 2 | ModelClient 端口、ModelSettings、Context；两家客户端迁到 adapters/models |
+| 2a | 已完成：模型端口迁到 app/ports.py，两家客户端迁到 adapters/models |
+| 2b | 已完成：ModelSettings、Effort、Context 按调用传入；客户端去掉可变的思考属性；模型解析迁到 adapters/models/resolver.py，工作区端点构造迁到 builder.py，档位映射表在 reasoning.py |
 | 3 | ToolProvider + ToolSet；ToolCallReviewer + PolicyReviewer，主循环和子代理共用 |
 | 4 | MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
 | 5 | 角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/ 并入 |

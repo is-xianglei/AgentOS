@@ -13,7 +13,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from harness.adapters.models.factory import create_model_client, resolve_scenario_model
-from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, error_type_name
+from harness.app.ports import (
+    ModelClient,
+    ModelConnectionError,
+    ModelSettings,
+    ModelStatusError,
+    error_type_name,
+)
+from harness.domain.context import Context
+from harness.domain.messages import UserMessage
 from memory.jobs.repository import MemoryJobRepository
 from memory.models import MemoryItemRecord
 from memory.repository import MemoryCatalogEntry, MemoryRepository
@@ -278,13 +286,13 @@ class MemoryExtractionService:
 
         # 优先沿用 Job 冻结的模型;新入队 Job 按 memory_extractor 场景解析。
         # 配置缺失属不可重试失败,转成 Job 语义错误而非让中文 AgentException 裸抛。
-        from runtime.model_selection import frozen_job_client
+        # 局部导入：模型解析器属适配层，阶段 7 由组装根注入。
+        from harness.adapters.models.resolver import DatabaseModelResolver
 
         client = self.llm
         if client is None:
             try:
-                client = await frozen_job_client(
-                    self.db,
+                resolved = await DatabaseModelResolver(self.db).for_frozen_job(
                     turn.workspace_id,
                     turn.user_id,
                     "memory_extractor",
@@ -297,6 +305,7 @@ class MemoryExtractionService:
                     exc.message,
                     retryable=False,
                 ) from exc
+            client = resolved.client
         model = job.model or getattr(client, "model", None)
         if not model:
             try:
@@ -355,13 +364,18 @@ class MemoryExtractionService:
             ],
         }
         try:
+            # 模型名用入队时冻结的取值;思考强度沿用端点默认(工作区端点即 fast)。
             return await client.complete_structured(
-                [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                MemoryExtractionResult,
-                system_prompt=cls._system_prompt(prepared.prompt_version),
-                model=prepared.model,
-                max_tokens=settings.llm_memory_extractor_max_tokens,
-                timeout=settings.memory_extractor_timeout_seconds,
+                Context(
+                    instruction=cls._system_prompt(prepared.prompt_version),
+                    messages=(UserMessage(text=json.dumps(payload, ensure_ascii=False)),),
+                    output_type=MemoryExtractionResult,
+                ),
+                ModelSettings(
+                    model_id=prepared.model,
+                    max_tokens=settings.llm_memory_extractor_max_tokens,
+                    timeout=settings.memory_extractor_timeout_seconds,
+                ),
             )
         except Exception as exc:
             code, retryable = _classify_extractor_error(exc)

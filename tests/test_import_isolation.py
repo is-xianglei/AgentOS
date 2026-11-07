@@ -292,7 +292,7 @@ def test_domain_layer_imports_respect_layering() -> None:
     domain_modules = sorted(
         m for m in files if m == "harness.domain" or m.startswith("harness.domain.")
     )
-    assert "harness.domain.messages" in domain_modules, (
+    assert {"harness.domain.messages", "harness.domain.context"} <= set(domain_modules), (
         f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"
     )
     failures: list[str] = []

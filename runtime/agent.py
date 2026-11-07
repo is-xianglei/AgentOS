@@ -27,7 +27,14 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
-from harness.app.ports import ModelClient, ModelConnectionError, ModelStatusError, PromptBlock
+from harness.app.ports import (
+    ModelClient,
+    ModelConnectionError,
+    ModelSettings,
+    ModelStatusError,
+    ResolvedModel,
+)
+from harness.domain.context import PromptBlock
 from harness.domain.messages import ToolCall, ToolResult
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
@@ -151,6 +158,10 @@ class AgentRuntime:
         self.memory_recall_service = MemoryRecallService(db)
         self.llm = llm
         self._llm_injected = llm is not None
+        # 本场景的默认调用参数；注入替身时取替身自带的模型名，未注入时由 _configure_agent 解析。
+        self.model_settings: ModelSettings | None = None
+        if llm is not None:
+            self.model_settings = ResolvedModel.from_client(llm).settings
         self.mode_slug = "standard"
         self._database_model = False
         self.tool_registry = build_tool_registry()
@@ -802,9 +813,9 @@ class AgentRuntime:
                     through_message_id=through_message_id,
                 )
             context = history + current
-            model_override = self._model_override(session)
+            round_settings = self._round_settings(session)
             rounds += 1
-            round_model = self._llm_attribution(model_override)[1]
+            round_model = self._llm_attribution(round_settings)[1]
             round_started = time.perf_counter()
             logger.info(
                 "LLM调用开始",
@@ -826,7 +837,7 @@ class AgentRuntime:
                     messages=context,
                     system_prompt=system_prompt,
                     tool_registry=round_registry,
-                    model=model_override,
+                    settings=round_settings,
                 )
             )
 
@@ -845,7 +856,7 @@ class AgentRuntime:
             # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
             final_content = step_result.assistant_blocks
 
-            provider, effective_model = self._llm_attribution(model_override)
+            provider, effective_model = self._llm_attribution(round_settings)
             assistant_message = await self.session_service.add_message(
                 session_id,
                 "assistant",
@@ -903,7 +914,7 @@ class AgentRuntime:
                 additional_context,
                 rendered_memories,
                 system_prompt,
-                self._model_override(session),
+                self._round_settings(session),
             )
             stop_reason = assembler.last_result.stop_reason or "max_iterations"
 
@@ -1825,23 +1836,22 @@ class AgentRuntime:
         base_registry = build_tool_registry()
         self.mode_slug = getattr(session, "mode_slug", "standard")
         if not self._llm_injected:
-            # 局部导入：每次调用时按模块属性读取，测试替换 model_selection 的函数后立即生效。
-            from runtime.model_selection import resolve_runtime_client, session_client
+            # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
+            from harness.adapters.models.resolver import DatabaseModelResolver
 
-            self.llm, provider = await session_client(self.db, session, "agent")
-            self._database_model = provider is not None
-            self.compact_service.llm, _ = await resolve_runtime_client(
-                self.db,
+            resolver = DatabaseModelResolver(self.db)
+            resolved = await resolver.for_session(session, "agent")
+            self.llm = resolved.client
+            self.model_settings = resolved.settings
+            self._database_model = resolved.provider_record_id is not None
+            self.compact_service.model = await resolver.resolve(
                 self.workspace_id,
                 self.user_id,
                 "compact",
             )
-            # 端点声明了上下文长度时，压缩阈值取其 3/4；type() 判断排除 bool 等 int 子类。
-            context_length = None
-            if provider:
-                context_length = (provider.extra_config or {}).get("context_length")
-            if type(context_length) is int:
-                self.compact_service.threshold = max(1, context_length * 3 // 4)
+            # 端点声明了上下文长度时，压缩阈值取其 3/4。
+            if resolved.context_length is not None:
+                self.compact_service.threshold = max(1, resolved.context_length * 3 // 4)
         session_agent_id = getattr(session, "agent_id", None)
         if session_agent_id is None:
             self.active_agent_id = None
@@ -2014,7 +2024,7 @@ class AgentRuntime:
         )
 
     def _model_override(self, session: SessionRecord) -> str | None:
-        """本次 LLM 调用要覆盖的模型名；None 表示使用客户端构造时解析好的模型。
+        """本次 LLM 调用要覆盖的模型名；None 表示使用解析器给出的场景模型。
 
         数据库模型服务端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
         """
@@ -2024,15 +2034,25 @@ class AgentRuntime:
             return self.active_model_name
         return session.model_name
 
-    def _llm_attribution(self, model_override: str | None) -> tuple[str | None, str | None]:
+    def _round_settings(self, session: SessionRecord) -> ModelSettings:
+        """本轮调用参数：场景默认参数，叠加 Agent 或会话指定的模型名。"""
+        # getattr 兜底同 start()：测试用 __new__ 构造的实例只设置了 llm。
+        base = getattr(self, "model_settings", None)
+        if base is None:
+            base = ResolvedModel.from_client(self.llm).settings
+        override = self._model_override(session)
+        if override:
+            return replace(base, model_id=override)
+        return base
+
+    def _llm_attribution(self, settings: ModelSettings) -> tuple[str | None, str | None]:
         """返回本次 LLM 调用实际生效的 (provider, model)，用于 assistant 消息成本归因。
 
         provider 由客户端自报（ModelClient.provider 属性），注入的测试替身若未实现
-        该属性则留空。model 取逐调用覆盖值，未覆盖时回落客户端构造时解析好的模型。
+        该属性则留空；model 取本次实际发出的模型名，替身没有模型名时留空。
         """
         provider = getattr(self.llm, "provider", None)
-        model = model_override or getattr(self.llm, "model", None)
-        return provider, model
+        return provider, settings.model_id or None
 
     async def _finalize_without_tools(
         self,
@@ -2042,7 +2062,7 @@ class AgentRuntime:
         additional_context: str | None,
         rendered_memories: str | None,
         system_prompt: str | list[PromptBlock],
-        model_name: str | None,
+        round_settings: ModelSettings,
     ) -> SessionMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。
 
@@ -2066,11 +2086,11 @@ class AgentRuntime:
                 messages=context,
                 system_prompt=system_prompt,
                 tool_registry=ToolRegistry([]),
-                model=model_name,
+                settings=round_settings,
             )
         )
         final_content = step_result.assistant_blocks
-        provider, effective_model = self._llm_attribution(model_name)
+        provider, effective_model = self._llm_attribution(round_settings)
         return await self.session_service.add_message(
             session_id,
             "assistant",

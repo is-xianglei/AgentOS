@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -17,29 +17,32 @@ from anthropic import (
 from anthropic.types import MessageParam, TextBlockParam, ToolChoiceToolParam, ToolParam
 from pydantic import BaseModel, ValidationError
 
-from core.config import settings
+from core.config import settings as app_settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.adapters.models.reasoning import ReasoningLevels, resolve_level
 from harness.app.ports import (
+    STRUCTURED_DEFAULT_MAX_TOKENS,
+    Effort,
     ModelCallError,
     ModelClient,
     ModelConnectionError,
     ModelEventKind,
+    ModelSettings,
     ModelStatusError,
     ModelStreamEvent,
     ModelTurnResult,
-    PromptBlock,
-    ToolSpec,
 )
+from harness.domain.context import Context, PromptBlock, ToolSpec
 from harness.domain.messages import (
     AssistantBlock,
     AssistantMessage,
+    Message,
     TextBlock,
     ThinkingBlock,
     ToolCall,
     ToolResult,
     UserMessage,
-    message_from_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,16 +61,16 @@ def _thinking_param() -> dict[str, Any] | NotGiven:
     预算越界当场抛中文异常而不夹取:静默夹取会让实际思考深度与配置不符,
     成本与效果都对不上账。
     """
-    if not settings.anthropic_thinking_enabled:
+    if not app_settings.anthropic_thinking_enabled:
         return NOT_GIVEN
-    budget = settings.anthropic_thinking_budget_tokens
-    if not _MIN_THINKING_BUDGET <= budget < settings.llm_default_max_tokens:
+    budget = app_settings.anthropic_thinking_budget_tokens
+    if not _MIN_THINKING_BUDGET <= budget < app_settings.llm_default_max_tokens:
         raise AgentException.message(
             "思考预算配置越界",
             {
                 "budget_tokens": budget,
                 "min": _MIN_THINKING_BUDGET,
-                "max_tokens": settings.llm_default_max_tokens,
+                "max_tokens": app_settings.llm_default_max_tokens,
             },
         )
     return {"type": "enabled", "budget_tokens": budget}
@@ -353,42 +356,44 @@ class AnthropicClient(ModelClient):
         base_url: str | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
-        thinking_enabled: bool | None = None,
-        reasoning_effort: str | int | None = None,
         thinking_budget_tokens: int | None = None,
+        reasoning_levels: ReasoningLevels | None = None,
     ) -> None:
+        """只接收端点配置；思考强度与输出上限经 ModelSettings 按调用传入。
+
+        reasoning_levels 为 None 表示 .env 端点：未指定思考强度时沿用 anthropic_thinking_*；
+        工作区端点由 builder 传入已收敛的档位映射表，thinking_budget_tokens 是其整数档位缺省时的预算。
+        """
         self.model = model
-        self.api_key = api_key or settings.anthropic_api_key
-        self.base_url = base_url or settings.anthropic_base_url
+        self.api_key = api_key or app_settings.anthropic_api_key
+        self.base_url = base_url or app_settings.anthropic_base_url
         self.max_retries = max_retries
         self.timeout = timeout
-        # 三个思考参数由工作区模型服务按数据库配置传入;
-        # thinking_enabled 为 None 表示沿用环境配置(anthropic_thinking_*)。
-        self.thinking_enabled = thinking_enabled
-        self.reasoning_effort = reasoning_effort
         self.thinking_budget_tokens = thinking_budget_tokens
+        self.reasoning_levels = reasoning_levels
 
-    def _thinking_kwargs(self, max_tokens: int) -> dict[str, Any]:
-        """统一流式与结构化思考配置，严格验证预算和输出上限。"""
-        # 未显式指定时沿用环境配置。
-        if self.thinking_enabled is None:
+    def _thinking_kwargs(self, effort: Effort | None, max_tokens: int) -> dict[str, Any]:
+        """按本次思考强度产出流式与结构化共用的思考参数，严格验证预算和输出上限。"""
+        level = resolve_level(self.reasoning_levels, effort)
+        # .env 端点未指定思考强度时沿用环境配置。
+        if level is None:
             thinking = _thinking_param()
             if isinstance(thinking, dict) and thinking["budget_tokens"] >= max_tokens:
                 raise AgentException.message("Anthropic 思考预算须小于本次最大输出长度")
             return {"thinking": thinking}
-        if not self.thinking_enabled:
+        if not level.enabled:
             return {"thinking": {"type": "disabled"}}
         # 字符串档位走自适应思考,档位经 output_config.effort 下发。
-        if isinstance(self.reasoning_effort, str):
+        if isinstance(level.value, str):
             return {
                 "thinking": {"type": "adaptive"},
-                "output_config": {"effort": self.reasoning_effort},
+                "output_config": {"effort": level.value},
             }
-        # 整数档位直接作为思考预算;未给出时依次回落到实例预算和环境预算。
+        # 整数档位直接作为思考预算;未给出时依次回落到端点预算和环境预算。
         budget = (
-            self.reasoning_effort
+            level.value
             or self.thinking_budget_tokens
-            or settings.anthropic_thinking_budget_tokens
+            or app_settings.anthropic_thinking_budget_tokens
         )
         if not _MIN_THINKING_BUDGET <= budget < max_tokens:
             raise AgentException.message(
@@ -396,25 +401,25 @@ class AnthropicClient(ModelClient):
             )
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
 
-    def _structured_max_tokens(self, requested: int) -> int:
+    def _structured_max_tokens(self, effort: Effort | None, requested: int) -> int:
         """结构化输出在思考预算之外保留请求的结果空间。"""
-        if self.thinking_enabled is None:
-            enabled = settings.anthropic_thinking_enabled
+        level = resolve_level(self.reasoning_levels, effort)
+        if level is None:
+            enabled = app_settings.anthropic_thinking_enabled
         else:
-            enabled = self.thinking_enabled
+            enabled = level.enabled
         if not enabled:
             return requested
-        # 字符串档位(自适应思考)没有显式预算,按实例预算或环境预算预留空间。
-        if isinstance(self.reasoning_effort, int):
-            effort_budget = self.reasoning_effort
-        else:
-            effort_budget = None
+        # 字符串档位(自适应思考)没有显式预算,按端点预算或环境预算预留空间。
+        effort_budget = None
+        if level is not None and isinstance(level.value, int):
+            effort_budget = level.value
         budget = (
             effort_budget
             or self.thinking_budget_tokens
-            or settings.anthropic_thinking_budget_tokens
+            or app_settings.anthropic_thinking_budget_tokens
         )
-        return min(requested + budget, settings.llm_default_max_tokens)
+        return min(requested + budget, app_settings.llm_default_max_tokens)
 
     @property
     def provider(self) -> str:
@@ -422,7 +427,7 @@ class AnthropicClient(ModelClient):
 
     @staticmethod
     def _encode_system(
-        system_prompt: str | list[PromptBlock] | None,
+        system_prompt: str | Sequence[PromptBlock] | None,
     ) -> str | list[TextBlockParam]:
         """把中立 system 描述编成 Anthropic SDK 形状。
 
@@ -444,7 +449,7 @@ class AnthropicClient(ModelClient):
         return blocks
 
     @staticmethod
-    def _encode_tools(tools: list[ToolSpec] | None) -> list[ToolParam]:
+    def _encode_tools(tools: Sequence[ToolSpec] | None) -> list[ToolParam]:
         """把中立工具描述编成 Anthropic 平铺的 ToolParam 形状。"""
         return [
             ToolParam(
@@ -456,7 +461,7 @@ class AnthropicClient(ModelClient):
         ]
 
     @staticmethod
-    def _encode_messages(messages: list[dict[str, Any]]) -> list[MessageParam]:
+    def _encode_messages(messages: Sequence[Message]) -> list[MessageParam]:
         """把中立消息编成 Anthropic wire 形状(出站翻译,Client 私有)。
 
         三类中立角色的映射:
@@ -471,9 +476,8 @@ class AnthropicClient(ModelClient):
         Anthropic 协议无对应位置,不发给模型。
         """
         encoded: list[dict[str, Any]] = []
-        for message in messages:
-            # 角色分派与形状校验由领域层完成,未知角色在此抛中文异常。
-            domain_message = message_from_row(message.get("role"), message.get("content"))
+        # 角色分派与形状校验已在还原领域消息时完成(harness.domain.context.messages_from_rows)。
+        for domain_message in messages:
             if isinstance(domain_message, UserMessage):
                 encoded.append({"role": "user", "content": domain_message.text})
             elif isinstance(domain_message, AssistantMessage):
@@ -498,21 +502,16 @@ class AnthropicClient(ModelClient):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        system_prompt: str | list[PromptBlock] | None = None,
-        tools: list[ToolSpec] | None = None,
-        model: str | None = None,
+        context: Context[None],
+        settings: ModelSettings,
     ) -> AsyncIterator[ModelStreamEvent]:
-        """流式调用,产出中立 ModelStreamEvent。system_prompt 传块列表时可携带 cache 断点。
+        """流式调用,产出中立 ModelStreamEvent。instruction 传块元组时可携带 cache 断点。
 
-        中立入参经私有 _encode_system / _encode_tools 编成 SDK 形状;
+        领域入参经私有 _encode_system / _encode_messages / _encode_tools 编成 SDK 形状;
         SDK 原始事件在内部经 _AnthropicChunkAdapter 消化,不外露;
         流末尾以恰好一个 TURN_RESULT 事件收尾(含终局文本、工具调用与用量)。
-        model 留空时回落构造时由工厂按场景解析的模型,供 SubAgent 按类型指定
-        档位(如 Explore 走速度优先档)。别名与云厂商区域前缀原样透传,
-        不做改写,避免继承时丢前缀。
-
-        扩展思考由 anthropic_thinking_enabled 控制,默认关。
+        模型名取 settings.model_id,别名与云厂商区域前缀原样透传,不做改写。
+        思考参数按 settings.effort 现场计算,未指定时沿用端点默认(.env 默认关)。
         """
         client = AsyncAnthropic(
             base_url=self.base_url,
@@ -522,21 +521,22 @@ class AnthropicClient(ModelClient):
             # 此处转成 NOT_GIVEN 以保留 SDK 的默认超时计算。
             timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
         )
+        model = settings.require_model_id()
+        max_tokens = settings.max_tokens or app_settings.llm_default_max_tokens
+        request = {
+            "max_tokens": max_tokens,
+            "model": model,
+            "system": self._encode_system(context.instruction),
+            "messages": self._encode_messages(context.messages),
+            "tools": self._encode_tools(context.tools),
+            **self._thinking_kwargs(settings.effort, max_tokens),
+        }
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _AnthropicChunkAdapter()
-        # 实例上的 max_tokens 由调用方按需设置(如模型连通性测试只要很短的回复)。
-        max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
         # 建流和迭代都可能抛 SDK 异常(含流中途的 error 事件),统一在此转成中立异常。
         try:
-            async with client.messages.stream(
-                max_tokens=max_tokens,
-                model=model or self.model,
-                system=self._encode_system(system_prompt),
-                messages=self._encode_messages(messages),
-                tools=self._encode_tools(tools),
-                **self._thinking_kwargs(max_tokens),
-            ) as stream:
+            async with client.messages.stream(**request) as stream:
                 async for event in stream:
                     # SDK 事件都是 Pydantic 模型;防御性兜底把其他对象转成只有 type 的噪声事件。
                     if hasattr(event, "model_dump"):
@@ -587,22 +587,23 @@ class AnthropicClient(ModelClient):
             extra={"cache_write": write, "cache_read": read},
         )
 
-    async def complete_structured[T: BaseModel](
+    async def complete_structured[O: BaseModel](
         self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
-    ) -> T:
+        context: Context[O],
+        settings: ModelSettings,
+    ) -> O:
         """用 tool use 强制结构化输出，校验失败时回灌错误重试一次。
 
         结果落在独立的 tool_use block，模型的思考与寒暄留在 text block，二者互不干扰，
         因此不依赖端点是否实现 output_config 结构化输出。tool use 自 2024 年 GA，
         第三方中转普遍支持。校验由 Pydantic 在客户端完成。
+        settings.timeout 作用于单次请求，客户端级超时仍取端点配置。
         """
+        output_format = context.require_output_type()
+        system_prompt = context.text_instruction()
+        model = settings.require_model_id()
+        max_tokens = settings.max_tokens or STRUCTURED_DEFAULT_MAX_TOKENS
+        timeout = settings.timeout
         client = AsyncAnthropic(
             base_url=self.base_url,
             api_key=self.api_key,
@@ -619,9 +620,10 @@ class AnthropicClient(ModelClient):
             # 降级为普通 tool use 而不会报错。
             "strict": True,
         }
-        conversation = list(messages)
-        effective_max_tokens = self._structured_max_tokens(max_tokens)
-        thinking_kwargs = self._thinking_kwargs(effective_max_tokens)
+        # 首轮直接用领域消息编码;回灌重试时要原样回放 SDK 块(含签名思考),故后续轮次是 wire 形状。
+        conversation: list[Any] = list(self._encode_messages(context.messages))
+        effective_max_tokens = self._structured_max_tokens(settings.effort, max_tokens)
+        thinking_kwargs = self._thinking_kwargs(settings.effort, effective_max_tokens)
         thinking = thinking_kwargs["thinking"]
         thinking_on = isinstance(thinking, dict) and thinking["type"] != "disabled"
         # 开启思考时API只允许auto工具选择，不能强制tool或temperature=0。
@@ -643,7 +645,7 @@ class AnthropicClient(ModelClient):
         for attempt in range(2):
             request: dict[str, Any] = {
                 "max_tokens": effective_max_tokens,
-                "model": model or self.model,
+                "model": model,
                 "system": structured_system,
                 "messages": cast("list[MessageParam]", conversation),
                 "tools": [tool],
@@ -680,7 +682,7 @@ class AnthropicClient(ModelClient):
                     break
                 logger.warning(
                     "结构化输出校验失败，回灌错误重试，模型=%s 目标类型=%s 错误数=%d",
-                    model or self.model,
+                    model,
                     output_format.__name__,
                     exc.error_count(),
                 )

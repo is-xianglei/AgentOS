@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
 
@@ -24,7 +24,7 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
-from harness.app.ports import ModelClient, ModelTurnResult
+from harness.app.ports import Effort, ModelClient, ModelSettings, ModelTurnResult, ResolvedModel
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from memory.recall.repository import MemoryRecallRepository
 from prompt import compose_subagent_prompt, compose_teammate_prompt
@@ -135,7 +135,7 @@ class SubAgentRunner:
         self.db = db
         self.bus = bus
         # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
-        # 在每次调用时以 model 参数覆盖,见 _run_react_loop / _run_teammate_loop。
+        # 写进每次调用的 ModelSettings.model_id,见 _configure_model。
         self.llm = llm
         self._llm_injected = llm is not None
         self.run_repo = SubAgentRunRepository(db)
@@ -162,12 +162,16 @@ class SubAgentRunner:
         spec: SubAgentSpec,
         workspace_id: int | None,
         user_id: int | None,
-    ) -> str | None:
-        """按会话模型选项建客户端，返回本次调用要覆盖的模型名(None 表示用客户端自带模型)。"""
+    ) -> ModelSettings:
+        """按会话模型选项解析客户端，返回子代理每轮调用的参数。
+
+        .env 端点上 spec 声明的模型名（固定模型或速度档）覆盖场景模型；
+        数据库端点有自己的模型名，不再用 spec 的 .env 模型名覆盖。
+        """
         if self._llm_injected:
-            return spec.resolve_model()
-        # 局部导入：每次调用时按模块属性读取 resolve_runtime_client，测试替换后立即生效。
-        from runtime.model_selection import resolve_runtime_client
+            return self._override_model(ResolvedModel.from_client(self.llm).settings, spec)
+        # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
+        from harness.adapters.models.resolver import DatabaseModelResolver
         from session.service import SessionService
 
         provider_id = None
@@ -180,19 +184,26 @@ class SubAgentRunner:
                 raise AgentException.message("极速模式不能启动子智能体")
             if (session.extra or {}).get("model_provider_override"):
                 provider_id = session.model_provider_id
-            effort = getattr(session, "thinking_effort", "fast")
-        self.llm, provider = await resolve_runtime_client(
-            self.db,
+            effort = Effort.parse(getattr(session, "thinking_effort", Effort.FAST))
+        resolved = await DatabaseModelResolver(self.db).resolve(
             workspace_id,
             user_id,
             spec.model_scenario or "subagent",
             provider_id=provider_id,
             effort=effort,
         )
-        # 数据库端点有自己的模型名，不再用 spec 的 .env 模型名覆盖。
-        if provider is not None:
-            return None
-        return spec.resolve_model()
+        self.llm = resolved.client
+        if resolved.provider_record_id is not None:
+            return resolved.settings
+        return self._override_model(resolved.settings, spec)
+
+    @staticmethod
+    def _override_model(settings: ModelSettings, spec: SubAgentSpec) -> ModelSettings:
+        """spec 声明了模型名（固定模型或速度档）时覆盖场景模型，否则沿用。"""
+        model = spec.resolve_model()
+        if model:
+            return replace(settings, model_id=model)
+        return settings
 
     async def run(
         self,
@@ -397,7 +408,8 @@ class SubAgentRunner:
         tool_registry: ToolRegistry,
         assembler: TurnEventAssembler,
         rendered_memories: str | None = None,
-        model: str | None = None,
+        *,
+        settings: ModelSettings,
     ) -> ModelTurnResult:
         """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。"""
         request_messages = self._with_memory_context(messages, rendered_memories)
@@ -407,7 +419,7 @@ class SubAgentRunner:
                 messages=request_messages,
                 system_prompt=system_prompt,
                 tool_registry=tool_registry,
-                model=model,
+                settings=settings,
             )
         )
         return result.llm_result
@@ -573,7 +585,7 @@ class SubAgentRunner:
         denied_calls 原样透传给 _execute_tool_uses,用于收集被拒的工具调用。
         """
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        model = await self._configure_model(session_id, spec, workspace_id, user_id)
+        model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
         budget = ToolCallBudget(
             total_limit=max(1, spec.max_rounds * 4),
             per_tool_limit=max(1, spec.max_rounds * 2),
@@ -586,7 +598,7 @@ class SubAgentRunner:
                 tool_registry,
                 assembler,
                 rendered_memories,
-                model=model,
+                settings=model_settings,
             )
             tool_calls = result.tool_calls
             messages.append(
@@ -841,7 +853,7 @@ class SubAgentRunner:
     ) -> str:
         """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环。"""
         name = actor.name
-        model = await self._configure_model(session_id, spec, workspace_id, user_id)
+        model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
         budget = ToolCallBudget(
             total_limit=max(1, TEAMMATE_MAX_ROUNDS * 4),
             per_tool_limit=max(1, TEAMMATE_MAX_ROUNDS * 2),
@@ -856,7 +868,7 @@ class SubAgentRunner:
                 tool_registry,
                 assembler,
                 rendered_memories,
-                model=model,
+                settings=model_settings,
             )
             tool_calls = result.tool_calls
             # 中立块由 to_dict() 产出,均为 JSON 原生结构,可直接随 messages 落

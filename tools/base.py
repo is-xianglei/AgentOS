@@ -8,7 +8,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
-from harness.app.ports import ToolSpec
+from harness.domain.context import ToolSpec
 from tools.policy import ToolProfile
 from tools.shell_policy import ShellAccess
 

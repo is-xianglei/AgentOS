@@ -9,7 +9,6 @@ from core.config import settings
 from core.errors import AgentException
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
-from harness.app.ports import ModelClient
 
 _SUPPORTED_PROVIDERS = ("anthropic", "openai")
 
@@ -86,8 +85,8 @@ def resolve_scenario_model(scenario: str | None = None) -> str:
     return _resolve_model(_require_provider(), scenario)
 
 
-def create_model_client(scenario: str | None = None) -> ModelClient:
-    """创建 LLM 客户端,根据全局 provider 和场景选择模型。
+def create_model_client(scenario: str | None = None) -> AnthropicClient | OpenAIClient:
+    """按 .env 的全局 provider 创建客户端,场景解析出的模型作为客户端的默认模型名。
 
     Args:
         scenario: 场景标识(agent/subagent/subagent_fast/compact/
@@ -95,7 +94,8 @@ def create_model_client(scenario: str | None = None) -> ModelClient:
                   None 表示直接使用 provider 主模型。
 
     Returns:
-        ModelClient 实例(AnthropicClient 或 OpenAIClient)。
+        AnthropicClient 或 OpenAIClient;只带端点配置,思考强度与输出上限按调用经
+        ModelSettings 传入,未指定思考强度时沿用 .env 的 {provider}_thinking_*。
     """
     provider = _require_provider()
     model = _resolve_model(provider, scenario)

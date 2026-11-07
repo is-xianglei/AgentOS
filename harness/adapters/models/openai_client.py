@@ -10,27 +10,30 @@ from openai import NOT_GIVEN, APIConnectionError, APIStatusError, AsyncOpenAI, O
 from openai.types.chat import ChatCompletionFunctionToolParam, ChatCompletionMessageParam
 from pydantic import BaseModel
 
-from core.config import settings
+from core.config import settings as app_settings
 from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
+from harness.adapters.models.reasoning import ReasoningLevels, resolve_level
 from harness.app.ports import (
+    STRUCTURED_DEFAULT_MAX_TOKENS,
+    Effort,
     ModelCallError,
     ModelClient,
     ModelConnectionError,
     ModelEventKind,
+    ModelSettings,
     ModelStatusError,
     ModelStreamEvent,
     ModelTurnResult,
-    PromptBlock,
-    ToolSpec,
 )
+from harness.domain.context import Context, PromptBlock, ToolSpec
 from harness.domain.messages import (
     AssistantMessage,
+    Message,
     ThinkingBlock,
     ToolCall,
     ToolResult,
     UserMessage,
-    message_from_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -357,56 +360,62 @@ class OpenAIClient(ModelClient):
         base_url: str | None = None,
         max_retries: int = 2,
         timeout: float | None = None,
-        thinking_enabled: bool | None = None,
-        reasoning_effort: str | int | None = None,
         thinking_protocol: str = "deepseek",
         fast_reasoning_effort: str | None = None,
+        reasoning_levels: ReasoningLevels | None = None,
     ) -> None:
+        """只接收端点配置；思考强度与输出上限经 ModelSettings 按调用传入。
+
+        reasoning_levels 为 None 表示 .env 端点：未指定思考强度时沿用 openai_thinking_* 与
+        openai_reasoning_effort。.env 端点没有声明兼容协议或 none 映射，fast 只保留模型默认行为。
+        """
         self.model = model
-        self.api_key = api_key or settings.openai_api_key
-        self.base_url = base_url or settings.openai_base_url
+        self.api_key = api_key or app_settings.openai_api_key
+        self.base_url = base_url or app_settings.openai_base_url
         self.max_retries = max_retries
         self.timeout = timeout
-        # 思考相关参数由工作区模型服务按数据库配置传入;
-        # thinking_enabled 为 None 表示沿用环境配置(openai_thinking_enabled 等)。
-        self.thinking_enabled = thinking_enabled
-        self.reasoning_effort = reasoning_effort
         self.thinking_protocol = thinking_protocol
         self.fast_reasoning_effort = fast_reasoning_effort
+        self.reasoning_levels = reasoning_levels
 
-    def _thinking_kwargs(self) -> dict[str, Any]:
-        """让流式与结构化请求共享实例级思考策略。"""
-        # 未显式指定时沿用环境配置(DeepSeek 的 extra_body.thinking 扩展)。
-        if self.thinking_enabled is None:
-            if not settings.openai_thinking_enabled:
+    def _thinking_kwargs(self, effort: Effort | None) -> dict[str, Any]:
+        """按本次思考强度产出流式与结构化共用的思考参数。"""
+        level = resolve_level(self.reasoning_levels, effort)
+        # .env 端点未指定思考强度时沿用环境配置(DeepSeek 的 extra_body.thinking 扩展)。
+        if level is None:
+            if not app_settings.openai_thinking_enabled:
                 return {}
             result: dict[str, Any] = {"extra_body": {"thinking": {"type": "enabled"}}}
-            if settings.openai_reasoning_effort:
-                result["reasoning_effort"] = settings.openai_reasoning_effort
+            if app_settings.openai_reasoning_effort:
+                result["reasoning_effort"] = app_settings.openai_reasoning_effort
             return result
 
+        protocol = self.thinking_protocol
+        # .env 端点没有声明兼容协议,fast 只保留模型默认行为,不下发未经确认的私有开关。
+        if self.reasoning_levels is None and not level.enabled:
+            protocol = "openai"
         # 按网关协议决定思考开关的下发位置:deepseek 用 extra_body.thinking,
         # chat_template 用 extra_body.chat_template_kwargs,openai 原生协议没有开关字段。
         result = {}
-        if self.thinking_protocol == "deepseek":
-            if self.thinking_enabled:
+        if protocol == "deepseek":
+            if level.enabled:
                 thinking_type = "enabled"
             else:
                 thinking_type = "disabled"
             result["extra_body"] = {"thinking": {"type": thinking_type}}
-        elif self.thinking_protocol == "chat_template":
-            template: dict[str, Any] = {"enable_thinking": self.thinking_enabled}
-            if self.thinking_enabled and self.reasoning_effort is not None:
-                template = {"thinking": True, "reasoning_effort": self.reasoning_effort}
+        elif protocol == "chat_template":
+            template: dict[str, Any] = {"enable_thinking": level.enabled}
+            if level.enabled and level.value is not None:
+                template = {"thinking": True, "reasoning_effort": level.value}
             result["extra_body"] = {"chat_template_kwargs": template}
 
         # reasoning_effort 是顶层参数:思考开启时只有 openai 与 deepseek 协议支持;
         # 思考关闭时只有 openai 原生协议可下发配置好的快速档位。
-        if self.thinking_enabled:
-            supports_effort = self.thinking_protocol in {"openai", "deepseek"}
-            if self.reasoning_effort is not None and supports_effort:
-                result["reasoning_effort"] = self.reasoning_effort
-        elif self.thinking_protocol == "openai" and self.fast_reasoning_effort is not None:
+        if level.enabled:
+            supports_effort = protocol in {"openai", "deepseek"}
+            if level.value is not None and supports_effort:
+                result["reasoning_effort"] = level.value
+        elif protocol == "openai" and self.fast_reasoning_effort is not None:
             # 原生协议必须由管理员确认支持 none，不能按模型名猜测禁用能力。
             result["reasoning_effort"] = self.fast_reasoning_effort
         return result
@@ -416,7 +425,7 @@ class OpenAIClient(ModelClient):
         return "openai"
 
     @staticmethod
-    def _encode_system(system_prompt: str | list[PromptBlock] | None) -> str:
+    def _encode_system(system_prompt: str | Sequence[PromptBlock] | None) -> str:
         """把中立 system 描述编成 OpenAI 的纯文本 system 消息内容。
 
         OpenAI 无 prompt cache 断点概念,cache_breakpoint 标志直接忽略,
@@ -429,7 +438,9 @@ class OpenAIClient(ModelClient):
         return "\n\n".join(block.text for block in system_prompt)
 
     @staticmethod
-    def _encode_tools(tools: list[ToolSpec] | None) -> list[ChatCompletionFunctionToolParam]:
+    def _encode_tools(
+        tools: Sequence[ToolSpec] | None,
+    ) -> list[ChatCompletionFunctionToolParam]:
         """把中立工具描述编成 OpenAI 嵌套的 function tool 形状。"""
         return [
             ChatCompletionFunctionToolParam(
@@ -444,7 +455,7 @@ class OpenAIClient(ModelClient):
         ]
 
     @staticmethod
-    def _encode_messages(messages: list[dict[str, Any]]) -> list[ChatCompletionMessageParam]:
+    def _encode_messages(messages: Sequence[Message]) -> list[ChatCompletionMessageParam]:
         """把中立消息编成 OpenAI wire 形状(出站翻译,Client 私有)。
 
         三类中立角色的映射:
@@ -464,9 +475,8 @@ class OpenAIClient(ModelClient):
         属 Anthropic 专有,OpenAI 侧无处安放,不下发。
         """
         encoded: list[dict[str, Any]] = []
-        for message in messages:
-            # 角色分派与形状校验由领域层完成,未知角色在此抛中文异常。
-            domain_message = message_from_row(message.get("role"), message.get("content"))
+        # 角色分派与形状校验已在还原领域消息时完成(harness.domain.context.messages_from_rows)。
+        for domain_message in messages:
             if isinstance(domain_message, UserMessage):
                 encoded.append({"role": "user", "content": domain_message.text})
             elif isinstance(domain_message, AssistantMessage):
@@ -490,18 +500,17 @@ class OpenAIClient(ModelClient):
         # 接口层用 dict[str, Any] 承载动态 JSON,此处收窄为 SDK 的 TypedDict。
         return cast("list[ChatCompletionMessageParam]", encoded)
 
-    async def complete_structured[T: BaseModel](
+    async def complete_structured[O: BaseModel](
         self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
-    ) -> T:
-        """使用 OpenAI Structured Outputs API。"""
-        effective_timeout = timeout if timeout is not None else self.timeout
+        context: Context[O],
+        settings: ModelSettings,
+    ) -> O:
+        """使用 OpenAI Structured Outputs API。settings.timeout 优先于端点超时作用于本次客户端。"""
+        output_format = context.require_output_type()
+        system_prompt = context.text_instruction()
+        model = settings.require_model_id()
+        max_tokens = settings.max_tokens or STRUCTURED_DEFAULT_MAX_TOKENS
+        effective_timeout = settings.timeout if settings.timeout is not None else self.timeout
         client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -511,21 +520,23 @@ class OpenAIClient(ModelClient):
         )
 
         # 构造消息（OpenAI 要求 system 是首条消息）
-        openai_messages: list[dict[str, Any]] = []
+        openai_messages: list[Any] = []
         if system_prompt:
             openai_messages.append({"role": "system", "content": system_prompt})
-        openai_messages.extend(messages)
+        openai_messages.extend(self._encode_messages(context.messages))
 
-        thinking_kwargs = self._thinking_kwargs()
+        thinking_kwargs = self._thinking_kwargs(settings.effort)
         # 推理模型经常不接受 temperature=0；由上游默认温度决定采样。
+        level = resolve_level(self.reasoning_levels, settings.effort)
+        thinking_on = level is not None and level.enabled
         sampling: dict[str, Any]
-        if self.thinking_enabled or thinking_kwargs.get("reasoning_effort"):
+        if thinking_on or thinking_kwargs.get("reasoning_effort"):
             sampling = {}
         else:
             sampling = {"temperature": 0}
         try:
             response = await client.chat.completions.parse(
-                model=model or self.model,
+                model=model,
                 # 接口层统一用 dict[str, Any] 承载动态 JSON，此处收窄为 SDK 的 TypedDict。
                 messages=cast("list[ChatCompletionMessageParam]", openai_messages),
                 response_format=output_format,
@@ -545,10 +556,8 @@ class OpenAIClient(ModelClient):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        system_prompt: str | list[PromptBlock] | None = None,
-        tools: list[ToolSpec] | None = None,
-        model: str | None = None,
+        context: Context[None],
+        settings: ModelSettings,
     ) -> AsyncIterator[ModelStreamEvent]:
         """流式调用,产出中立 ModelStreamEvent。
 
@@ -562,7 +571,8 @@ class OpenAIClient(ModelClient):
         与 Anthropic 侧的结构差异:system 不是顶层参数,包成 messages 首条
         role="system" 消息(空串时不插入);终局由适配器自累积产出。
 
-        思考模式由 openai_thinking_enabled 控制,默认关。
+        模型名取 settings.model_id;思考参数按 settings.effort 现场计算,
+        未指定时沿用端点默认(.env 由 openai_thinking_enabled 控制,默认关)。
         """
         client = AsyncOpenAI(
             base_url=self.base_url,
@@ -573,16 +583,15 @@ class OpenAIClient(ModelClient):
             timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
         )
 
-        openai_messages: list[dict[str, Any]] = []
-        system_text = self._encode_system(system_prompt)
+        openai_messages: list[Any] = []
+        system_text = self._encode_system(context.instruction)
         if system_text:
             openai_messages.append({"role": "system", "content": system_text})
-        openai_messages.extend(self._encode_messages(messages))
+        openai_messages.extend(self._encode_messages(context.messages))
 
-        # 实例上的 max_tokens 由调用方按需设置(如模型连通性测试只要很短的回复)。
-        max_tokens = getattr(self, "max_tokens", settings.llm_default_max_tokens)
+        max_tokens = settings.max_tokens or app_settings.llm_default_max_tokens
         request_kwargs: dict[str, Any] = {
-            "model": model or self.model,
+            "model": settings.require_model_id(),
             "messages": openai_messages,
             "max_completion_tokens": max_tokens,
             "stream": True,
@@ -590,9 +599,9 @@ class OpenAIClient(ModelClient):
             "stream_options": {"include_usage": True},
         }
         # 空 tools 不传该参数:部分兼容网关对空 tools: [] 报 400。
-        if tools:
-            request_kwargs["tools"] = self._encode_tools(tools)
-        request_kwargs.update(self._thinking_kwargs())
+        if context.tools:
+            request_kwargs["tools"] = self._encode_tools(context.tools)
+        request_kwargs.update(self._thinking_kwargs(settings.effort))
 
         # 适配器生命周期即单次调用:流开始创建,结束即弃。
         adapter = _OpenAIChunkAdapter()

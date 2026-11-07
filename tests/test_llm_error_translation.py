@@ -35,6 +35,7 @@ from harness.app.ports import (
     ModelEventKind,
     ModelStatusError,
     ModelStreamEvent,
+    ResolvedModel,
 )
 from memory.jobs.dream import MemoryDreamFailure, MemoryDreamService, PreparedDream
 from memory.jobs.extraction import (
@@ -45,6 +46,7 @@ from memory.jobs.extraction import (
 from memory.recall.service import MemoryRecallService
 from memory.repository import MemoryCatalogEntry
 from model_service.service import ModelService
+from tests.fixtures.model_calls import stream_messages, structured, thinking_off, thinking_on
 
 pytestmark = pytest.mark.anyio
 
@@ -132,7 +134,7 @@ def _structured_client_raising(monkeypatch, provider: str, exc: Exception):
             "AsyncAnthropic",
             lambda **_: SimpleNamespace(messages=SimpleNamespace(create=create)),
         )
-        return AnthropicClient(model="model-a", api_key="test", thinking_enabled=False)
+        return AnthropicClient(model="model-a", api_key="test", reasoning_levels=thinking_off())
     parse = AsyncMock(side_effect=exc)
     monkeypatch.setattr(
         openai_module,
@@ -140,7 +142,10 @@ def _structured_client_raising(monkeypatch, provider: str, exc: Exception):
         lambda **_: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse))),
     )
     return OpenAIClient(
-        model="model-a", api_key="test", thinking_enabled=False, thinking_protocol="openai"
+        model="model-a",
+        api_key="test",
+        thinking_protocol="openai",
+        reasoning_levels=thinking_off(),
     )
 
 
@@ -276,20 +281,20 @@ async def _invoke_anthropic(monkeypatch, path: str, exc: BaseException) -> list[
         monkeypatch.setattr(
             anthropic_module, "AsyncAnthropic", lambda **_: SimpleNamespace(messages=messages)
         )
-        thinking = {"thinking_enabled": True, "reasoning_effort": "high"}
+        levels = thinking_on("high")
         if path == "structured":
-            thinking = {"thinking_enabled": False}
-        client = AnthropicClient(model="model-a", api_key="test", **thinking)
-        return [await client.complete_structured([], _Answer)]
+            levels = thinking_off()
+        client = AnthropicClient(model="model-a", api_key="test", reasoning_levels=levels)
+        return [await structured(client, [], _Answer)]
 
     client = _streaming_client(monkeypatch, "anthropic", exc, open_fails=path == "stream_open")
-    return [event async for event in client.stream([{"role": "user", "content": "hi"}])]
+    return [event async for event in stream_messages(client, [{"role": "user", "content": "hi"}])]
 
 
 async def _invoke_openai(monkeypatch, path: str, exc: BaseException) -> list[Any]:
     if path != "structured":
         client = _streaming_client(monkeypatch, "openai", exc, open_fails=path == "stream_open")
-        return [event async for event in client.stream([{"role": "user", "content": "hi"}])]
+        return [event async for event in stream_messages(client, [{"role": "user", "content": "hi"}])]
     completions = SimpleNamespace(parse=AsyncMock(side_effect=exc))
     monkeypatch.setattr(
         openai_module,
@@ -297,9 +302,12 @@ async def _invoke_openai(monkeypatch, path: str, exc: BaseException) -> list[Any
         lambda **_: SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     client = OpenAIClient(
-        model="model-a", api_key="test", thinking_enabled=False, thinking_protocol="openai"
+        model="model-a",
+        api_key="test",
+        thinking_protocol="openai",
+        reasoning_levels=thinking_off(),
     )
-    return [await client.complete_structured([], _Answer)]
+    return [await structured(client, [], _Answer)]
 
 
 def _streaming_client(monkeypatch, provider: str, exc: BaseException, *, open_fails: bool):
@@ -317,7 +325,7 @@ def _streaming_client(monkeypatch, provider: str, exc: BaseException, *, open_fa
         monkeypatch.setattr(
             anthropic_module, "AsyncAnthropic", lambda **_: SimpleNamespace(messages=messages)
         )
-        return AnthropicClient(model="model-a", api_key="test", thinking_enabled=False)
+        return AnthropicClient(model="model-a", api_key="test", reasoning_levels=thinking_off())
 
     first_chunk = {"choices": [{"delta": {"content": "半截"}, "finish_reason": None}]}
     fake_stream = _FailingStream(exc, open_fails=open_fails, first_chunk=first_chunk)
@@ -328,7 +336,10 @@ def _streaming_client(monkeypatch, provider: str, exc: BaseException, *, open_fa
         lambda **_: SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     return OpenAIClient(
-        model="model-a", api_key="test", thinking_enabled=False, thinking_protocol="openai"
+        model="model-a",
+        api_key="test",
+        thinking_protocol="openai",
+        reasoning_levels=thinking_off(),
     )
 
 
@@ -359,7 +370,7 @@ async def test_stream_mid_failure_keeps_events_before_error(monkeypatch, provide
     received: list[ModelStreamEvent] = []
 
     with pytest.raises(ModelConnectionError) as caught:
-        async for event in client.stream([{"role": "user", "content": "hi"}]):
+        async for event in stream_messages(client, [{"role": "user", "content": "hi"}]):
             received.append(event)
 
     assert caught.value.__cause__ is sdk_exc
@@ -579,7 +590,9 @@ async def test_model_ping_output_unchanged_for_every_sdk_error(
 ):
     sdk_exc = make_exc()
     client = _streaming_client(monkeypatch, provider, sdk_exc, open_fails=False)
-    monkeypatch.setattr(ModelService, "build_client", staticmethod(lambda *_: client))
+    monkeypatch.setattr(
+        ModelService, "build_model", staticmethod(lambda *_: ResolvedModel.from_client(client))
+    )
     expected_error, expected_type, expected_status = _legacy_ping_output(sdk_exc)
 
     with caplog.at_level("WARNING", logger="model_service.service"):

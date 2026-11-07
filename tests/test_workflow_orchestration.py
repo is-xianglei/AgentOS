@@ -26,7 +26,8 @@ from core.events import (
     WorkflowProgressInfo,
     WorkflowProgressStatus,
 )
-from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
+from harness.app.ports import ModelEventKind, ModelSettings, ModelStreamEvent, ModelTurnResult
+from harness.domain.context import Context
 from runtime.workflow import (
     MEMBER_DISPLAY_NAME_MAX_LENGTH,
     LlmRoutingOrchestrator,
@@ -215,12 +216,10 @@ class _FakeLLM:
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        system_prompt: Any = None,
-        tools: Any = None,
-        model: str | None = None,
+        context: Context[None],
+        settings: ModelSettings,
     ) -> AsyncIterator[ModelStreamEvent]:
-        self.stream_prompts.append(messages[-1]["content"])
+        self.stream_prompts.append(context.messages[-1].text)
         self.stream_bus_len.append(self._bus_len())
         if self.cancel_stream:
             raise asyncio.CancelledError()
@@ -234,15 +233,11 @@ class _FakeLLM:
 
     async def complete_structured[T: BaseModel](
         self,
-        messages: list[dict[str, Any]],
-        output_format: type[T],
-        *,
-        system_prompt: str | None = None,
-        model: str | None = None,
-        max_tokens: int = 256,
-        timeout: float | None = None,
+        context: Context[T],
+        settings: ModelSettings,
     ) -> T:
-        self.structured_prompts.append(messages[-1]["content"])
+        output_format = context.require_output_type()
+        self.structured_prompts.append(context.messages[-1].text)
         self.structured_bus_len.append(self._bus_len())
         if self.cancel_structured:
             raise asyncio.CancelledError()
@@ -1290,8 +1285,8 @@ def _make_runtime(
     runtime.session_service = session_service
     runtime.bus = _RecordingBus()
     monkeypatch.setattr(
-        "runtime.model_selection.session_client",
-        AsyncMock(return_value=(None, None)),
+        "harness.adapters.models.resolver.DatabaseModelResolver.for_session",
+        AsyncMock(return_value=None),
     )
 
     async def _build(session_id: int, turn_id: Any, workflow_id: int) -> Any:
