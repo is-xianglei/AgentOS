@@ -392,6 +392,32 @@ class MarketRepository:
         )
         return (await self.db.scalars(stmt)).first()
 
+    async def list_installs_linked_to_skill_for_update(
+        self,
+        workspace_id: int,
+        skill_id: int,
+    ) -> list[MarketInstallRecord]:
+        """加行锁读取工作区里指向这个 Skill 的全部安装记录，已软删除的也算。
+
+        指向包括 target_skill_id 等于它，或 managed_skill_ids 含有它（JSONB 的 @> 包含判断）。
+        按 ID 顺序加锁，多个请求同时锁多行时顺序一致；
+        populate_existing 保证等到锁之后读到的是库里的最新值。
+        """
+        stmt = (
+            select(MarketInstallRecord)
+            .where(
+                MarketInstallRecord.workspace_id == workspace_id,
+                or_(
+                    MarketInstallRecord.target_skill_id == skill_id,
+                    MarketInstallRecord.managed_skill_ids.contains([skill_id]),
+                ),
+            )
+            .order_by(MarketInstallRecord.id)
+            .with_for_update()
+            .execution_options(include_deleted=True, populate_existing=True)
+        )
+        return list(await self.db.scalars(stmt))
+
     async def list_installs_of_workspace(
         self,
         workspace_id: int,

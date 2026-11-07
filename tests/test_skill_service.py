@@ -589,8 +589,10 @@ async def test_enabled_names_filter_disabled_but_binding_allows_them():
 
 async def test_delete_skill_soft_deletes_and_clears_bindings(monkeypatch):
     import agent.service
+    import market.service
 
     removed: list[tuple[int, int]] = []
+    forgotten: list[tuple[int, int]] = []
 
     class _FakeAgentService:
         def __init__(self, db) -> None:
@@ -599,7 +601,15 @@ async def test_delete_skill_soft_deletes_and_clears_bindings(monkeypatch):
         async def remove_skill_bindings(self, workspace_id, skill_id):
             removed.append((workspace_id, skill_id))
 
+    class _FakeMarketService:
+        def __init__(self, db) -> None:
+            pass
+
+        async def forget_deleted_skill(self, workspace_id, skill_id):
+            forgotten.append((workspace_id, skill_id))
+
     monkeypatch.setattr(agent.service, "AgentService", _FakeAgentService)
+    monkeypatch.setattr(market.service, "MarketService", _FakeMarketService)
     repo = _FakeRepo(_record(5))
     service = _service(repo)
 
@@ -607,6 +617,7 @@ async def test_delete_skill_soft_deletes_and_clears_bindings(monkeypatch):
     assert await service.delete_skill(1, 99, 9) is False
     assert repo.soft_deleted == [5]
     assert removed == [(1, 5)]
+    assert forgotten == [(1, 5)]
 
 
 def _tool_ctx() -> ToolContext:

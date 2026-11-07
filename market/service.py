@@ -683,6 +683,44 @@ class MarketService:
             installed_with_agent=installed_with_agent,
         )
 
+    # ---------- 供 skill 域调用 ----------
+
+    async def forget_deleted_skill(self, workspace_id: int, skill_id: int) -> None:
+        """Skill 被删除时，清除本工作区安装记录里指向它的关联；由 skill 域删除 Skill 时调用。
+
+        skill 域新建同名 Skill 时会把软删行原地复活、沿用原 ID，而安装记录按 ID 认对象。
+        不清掉的话，复活后的 Skill 会被当成从市场装来的：旧的 Skill 条目安装跟着复活，
+        用户自己新建的同名 Skill 被当成托管 Skill，升级时被覆盖、也不能上架。
+        已软删除的安装记录也一并处理，免得日后被复用时带回旧关联。
+        写权限已由调用方校验，这里不再重复检查。
+        """
+        installs = await self.repo.list_installs_linked_to_skill_for_update(workspace_id, skill_id)
+        for install in installs:
+            # 目标置空后，这条记录按现有口径视为未安装，重新安装时照旧复用这一行。
+            if install.target_skill_id == skill_id:
+                install.target_skill_id = None
+
+            remaining_skill_ids: list[int] = []
+            for managed_skill_id in install.managed_skill_ids:
+                if managed_skill_id != skill_id:
+                    remaining_skill_ids.append(managed_skill_id)
+            # 整体重新赋值一个新列表，让 JSONB 列的改动一定会被写回库。
+            install.managed_skill_ids = remaining_skill_ids
+            await self.repo.update(install)
+
+        if installs:
+            install_ids: list[int] = []
+            for install in installs:
+                install_ids.append(install.id)
+            logger.info(
+                "已清除被删除 Skill 的市场安装关联",
+                extra={
+                    "workspace_id": workspace_id,
+                    "skill_id": skill_id,
+                    "install_ids": install_ids,
+                },
+            )
+
     # ---------- 安装与升级 ----------
 
     async def install_listing(

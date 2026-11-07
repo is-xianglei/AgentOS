@@ -484,11 +484,19 @@ class SkillService:
         skill_id: int,
         actor_user_id: int,
     ) -> bool:
-        """软删除并清理 agent 绑定;记录不存在或属于别的工作区时返回 False。"""
+        """软删除并清理市场安装关联和 agent 绑定;记录不存在或属于别的工作区时返回 False。"""
         await self._require_write_access(workspace_id, actor_user_id)
         record = await self.repo.get_by_id(workspace_id, skill_id)
         if record is None:
             return False
+        # 先请市场清除指向这个 Skill 的安装关联：同名新建会原地复活这一行并沿用原 ID，
+        # 关联留着的话，复活后的 Skill 会被误认成从市场装来的。
+        # 必须放在软删除之前：市场安装、升级是先锁安装记录、再锁 Skill 行，这里保持同样的顺序，
+        # 两边并发时只会排队，不会互相等待形成死锁。
+        # 局部导入：market.service 顶层导入了 skill.service，改顶层会成环。
+        from market.service import MarketService
+
+        await MarketService(self.db).forget_deleted_skill(workspace_id, record.id)
         await self.repo.soft_delete(record)
         # 局部导入：真实双向 Service 依赖，改顶层仍成环 agent.service -> skill.service，待依赖倒置任务处理。
         from agent.service import AgentService

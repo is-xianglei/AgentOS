@@ -212,7 +212,7 @@ async def export_skill(
 
 @router.delete(
     "/{skill_id}",
-    summary="软删除 skill(同时清理 agent 绑定)",
+    summary="软删除 skill(同时清除 agent 绑定和市场安装关联)",
     response_model=ApiResponse[dict],
 )
 async def delete_skill(

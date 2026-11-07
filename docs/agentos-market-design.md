@@ -302,6 +302,18 @@ Agent 条目的快照：
 - 工具：哪些已绑定，哪些被丢弃、原因是什么；
 - Skill：每个 Skill 的名称和处理结果（新建 / 恢复 / 复用）。
 
+**Skill 删除时清除安装关联**
+- 原因：skill 域新建同名 Skill 时，会把软删除的旧行原地复活并沿用原 ID，而安装记录按 ID 认对象。
+  关联不清掉的话，复活后的 Skill 会被误认成从市场装来的。比如旧的 Skill 条目安装跟着复活，
+  多算安装次数；又比如用户自己新建的同名 Skill 被当成托管 Skill，升级时被覆盖，也不能上架。
+- 做法：`SkillService.delete_skill` 在软删除 Skill 之前，调用 `MarketService.forget_deleted_skill`。
+  它处理该工作区的全部安装记录，已软删除的也算：`target_skill_id` 等于这个 Skill 的置空，
+  这条记录就视为未安装，重新安装时照旧复用这一行；`managed_skill_ids` 里去掉这个 ID。
+- 顺序：先清安装关联，再软删除 Skill。安装、升级都是先锁安装记录、再锁 Skill 行，
+  删除保持同样的加锁顺序，两边并发时只会排队，不会互相等待形成死锁。
+- Agent 不需要同样处理：Agent 名称的唯一索引不含软删除的行，同名新建会得到新 ID，不会复活旧行。
+- 存量数据：迁移 0029 清除了修复之前留下的、指向已软删除 Skill 的关联，只修数据，不能降级还原。
+
 ## 9. 升级：`POST /api/market/listings/{listing_id}/upgrade`
 
 - 调用者必须是当前工作区的 owner 或 admin，条目必须处于 `listed` 状态。
