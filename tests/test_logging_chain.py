@@ -3,7 +3,7 @@
 锁死两条本次任务新补的日志语义,全程 Fake/monkeypatch,不碰真实数据库与 LLM:
 - teammate 唤醒失败时 `_wake_team_members` 必须留下 logger.exception 现场
   (客户端断连后 SSE error 事件无人接收,服务端日志是唯一凭据);
-- CompactService 触发/跳过压缩时必须输出含 token 估算的中文日志。
+- ContextCompaction 触发/跳过压缩时必须输出含 token 估算的中文日志。
 """
 
 import logging
@@ -14,9 +14,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from harness.app.compaction import ContextCompaction
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from runtime.agent import AgentRuntime
-from runtime.compact import CompactService
 
 pytestmark = pytest.mark.anyio
 
@@ -167,9 +167,9 @@ async def test_wake_failure_is_isolated_and_continues(
 
 
 class _FakeSessionRepo:
-    """会话仓储替身;through_message_id 为 None 的用例不应触碰快照写入。"""
+    """会话服务替身;through_message_id 为 None 的用例不应触碰快照写入。"""
 
-    async def add_snapshot(self, *args: Any, **kwargs: Any) -> None:
+    async def save_compact_snapshot(self, *args: Any, **kwargs: Any) -> None:
         raise AssertionError("through_message_id=None 时不应写快照")
 
 
@@ -194,10 +194,10 @@ async def test_compact_triggered_logs_token_estimates(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """R6.3:超阈值时输出触发与完成两条 INFO,含前后 token 估算与耗时。"""
-    service = CompactService(_FakeSessionRepo(), llm=_FakeCompactLLM(), threshold=1)
+    service = ContextCompaction(_FakeSessionRepo(), llm=_FakeCompactLLM(), threshold=1)
     messages = [{"role": "user", "content": "这是一段足够长的历史上下文" * 4}]
 
-    with caplog.at_level(logging.INFO, logger="runtime.compact"):
+    with caplog.at_level(logging.INFO, logger="harness.app.compaction"):
         compacted = await service.maybe_compact(_SID, messages)
 
     triggered = [r for r in caplog.records if "上下文超过阈值" in r.message]
@@ -220,10 +220,10 @@ async def test_compact_skipped_logs_debug_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """R6.3:未超阈值只落一条 DEBUG 跳过日志,不出现触发/完成 INFO,不调用 LLM。"""
-    service = CompactService(_FakeSessionRepo(), llm=_ForbiddenLLM(), threshold=10_000)
+    service = ContextCompaction(_FakeSessionRepo(), llm=_ForbiddenLLM(), threshold=10_000)
     messages = [{"role": "user", "content": "短对话"}]
 
-    with caplog.at_level(logging.DEBUG, logger="runtime.compact"):
+    with caplog.at_level(logging.DEBUG, logger="harness.app.compaction"):
         result = await service.maybe_compact(_SID, messages)
 
     assert result == messages

@@ -26,8 +26,8 @@ from harness.app.ports import (
     ModelTurnResult,
     ResolvedModel,
 )
+from harness.domain.prompts.lead import TURBO_PROMPT
 from model_service.models import ModelProviderRecord
-from model_service.policy import TURBO_PROMPT
 from model_service.service import ModelService
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner

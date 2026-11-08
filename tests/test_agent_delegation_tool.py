@@ -14,8 +14,8 @@ from agent.service import AgentRuntimeConfig
 from core.errors import AgentException
 from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.roles.subagent import AgentType
 from harness.domain.tool import ToolContext
-from tools.subagents.definition import AgentType
 
 pytestmark = pytest.mark.anyio
 

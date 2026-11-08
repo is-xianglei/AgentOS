@@ -15,9 +15,10 @@ from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
 from core.events import ORCHESTRATOR_ACTOR
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
+from harness.domain.memory import MemoryRecall
 from harness.domain.messages import ToolCall
-from prompt import PromptContext, compose_lead_blocks
-from prompt.sections import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
+from harness.domain.prompts.lead import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
+from harness.domain.roles.assistant import Assistant
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
 
 pytestmark = pytest.mark.anyio
@@ -46,16 +47,14 @@ class _FakeLLM:
 
 
 def test_delegate_catalog_is_a_stable_section_after_skills() -> None:
-    blocks = compose_lead_blocks(
-        PromptContext.create(
-            skills_catalog="- s: 技能",
-            delegate_catalog=_CATALOG,
-            session_prompt="会话指令",
-            memory_catalog="- m: 记忆",
-            cwd="/srv",
-            today=date(2026, 11, 4),
-        )
-    )
+    blocks = Assistant(
+        skills_catalog="- s: 技能",
+        delegate_catalog=_CATALOG,
+        session_prompt="会话指令",
+        memory=MemoryRecall(instruction="- m: 记忆"),
+        cwd="/srv",
+        today=date(2026, 11, 4),
+    ).instruction()
 
     stable = blocks[0].text
     # 目录属于跨轮次稳定段(带缓存断点的第一块),位于 skills 之后、会话指令之前。
@@ -67,7 +66,9 @@ def test_delegate_catalog_is_a_stable_section_after_skills() -> None:
 
 @pytest.mark.parametrize("catalog", [None, "", "  \n"])
 def test_empty_delegate_catalog_is_not_injected(catalog: str | None) -> None:
-    blocks = compose_lead_blocks(PromptContext.create(delegate_catalog=catalog))
+    blocks = Assistant(
+        delegate_catalog=catalog, cwd="/srv", today=date(2026, 11, 4)
+    ).instruction()
 
     assert "可委派 Agent 目录" not in blocks[0].text
 

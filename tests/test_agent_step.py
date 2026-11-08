@@ -7,10 +7,9 @@ import pytest
 
 from core.events import ORCHESTRATOR_ACTOR, BlockType, ToolInfo
 from harness.app.ports import ModelEventKind, ModelSettings, ModelStreamEvent, ModelTurnResult
-from harness.app.tool_set import ToolSet
 from harness.domain.context import Context
-from harness.domain.messages import ToolCall
-from runtime.step import AgentStep, StepRequest
+from harness.domain.messages import ToolCall, UserMessage
+from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 
 
@@ -61,12 +60,8 @@ async def test_agent_step_assembles_stream_and_neutral_blocks() -> None:
         emit,
     )
     actual = await step.run(
-        StepRequest(
-            messages=[{"role": "user", "content": "你好"}],
-            system_prompt="系统",
-            tool_registry=ToolSet(),
-            settings=ModelSettings(model_id="test-model"),
-        )
+        Context(instruction="系统", messages=(UserMessage(text="你好"),)),
+        ModelSettings(model_id="test-model"),
     )
 
     assert actual.llm_result == result
@@ -102,7 +97,7 @@ async def test_agent_step_returns_tool_uses_in_result() -> None:
         llm,
         TurnEventAssembler(ORCHESTRATOR_ACTOR, 1, turn_id=None),
         emit,
-    ).run(StepRequest([], None, ToolSet(), ModelSettings(model_id="")))
+    ).run(Context(instruction=None, messages=()), ModelSettings(model_id=""))
 
     assert actual.tool_calls == [tool_call]
     assert actual.assistant_blocks == [

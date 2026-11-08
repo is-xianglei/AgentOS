@@ -10,8 +10,12 @@ import pytest
 
 from harness.adapters.tools.builtin.agent import AgentToolInput
 from harness.domain.messages import AssistantMessage, ToolCall
-from tools.subagents.definition import AgentType
-from tools.subagents.trigger import assess, compose_hint, verification_already_ran
+from harness.domain.roles.subagent import AgentType
+from harness.domain.roles.verification_trigger import (
+    assess,
+    compose_hint,
+    verification_already_ran,
+)
 
 
 def _assistant(*tool_calls: ToolCall) -> dict[str, Any]:

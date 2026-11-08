@@ -12,12 +12,13 @@ from typing import Any
 
 import pytest
 
+from harness.app.compaction import ContextCompaction
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
+from harness.domain.roles.compactor import Compactor
+from harness.domain.roles.verification_trigger import assess
 from memory.jobs.extraction import MemoryExtractionService
-from runtime.compact import CompactService
 from session.service import SessionService
-from tools.subagents.trigger import assess
 
 
 def _msg(message_id: int, role: str, content: Any) -> Any:
@@ -95,8 +96,7 @@ def test_micro_compact_reads_neutral_tool_messages() -> None:
         {"role": "tool", "content": _tool_content("t4", "grep", "D" * 600)},
         {"role": "tool", "content": _tool_content("t5", "grep", "E" * 600)},
     ]
-    service = CompactService(session_repo=None, llm=object())
-    compacted = service._micro_compact(messages)
+    compacted = Compactor().micro_compact(messages)
 
     # 前 2 条是旧结果:非白名单的被替换,read_file 原样保留。
     assert compacted[0]["content"]["output"] == "[Previous: used grep]"
@@ -119,15 +119,15 @@ async def test_auto_compact_snapshot_stores_neutral_shape() -> None:
                 result=ModelTurnResult(text="历史总结"),
             )
 
-    class _FakeRepo:
+    class _FakeSessions:
         def __init__(self) -> None:
             self.snapshots: list[list[Any]] = []
 
-        async def add_snapshot(self, session_id, messages, summary, through_message_id):
+        async def save_compact_snapshot(self, session_id, messages, summary, through_message_id):
             self.snapshots.append(messages)
 
-    repo = _FakeRepo()
-    service = CompactService(session_repo=repo, llm=_FakeLLM(), threshold=10)
+    repo = _FakeSessions()
+    service = ContextCompaction(repo, llm=_FakeLLM(), threshold=10)
     history = [
         {"role": "user", "content": "查一下日志"},
         {

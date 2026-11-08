@@ -38,6 +38,8 @@ from harness.app.ports import (
     ModelTurnResult,
     ResolvedModel,
 )
+from harness.app.subagent_catalog import get_subagent_spec
+from harness.domain.roles.subagent import AgentType
 from hooks import HookRegistry
 from interaction.service import InteractionService
 from memory.jobs.repository import MemoryJobRepository
@@ -46,7 +48,6 @@ from memory.recall.repository import MemoryRecallRepository
 from memory.repository import MemoryCatalogEntry, MemoryCatalogSnapshot, MemoryRepository
 from model_service.service import ModelService
 from plan.service import PlanService
-from prompt import context as prompt_context_module
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
 from session.repository import SessionRepository
@@ -56,8 +57,6 @@ from task.service import TaskService
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
 from tests.fixtures.memory_port_golden import EXPECTED, EXPECTED_SHA256
-from tools.subagents.definition import AgentType
-from tools.subagents.registry import get_subagent_spec
 
 pytestmark = pytest.mark.anyio
 
@@ -939,8 +938,8 @@ def _install(
     """固定配置与环境段，把各域的仓储与服务方法换成记录替身（都按类替换，与谁来构造无关）。"""
     for key, value in {**_FIXED_SETTINGS, **overrides}.items():
         monkeypatch.setattr(app_settings, key, value)
-    monkeypatch.setattr(prompt_context_module, "date", _FixedDate)
-    monkeypatch.setattr(prompt_context_module, "Path", SimpleNamespace(cwd=lambda: "/srv"))
+    monkeypatch.setattr("runtime.agent.date", _FixedDate)
+    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: "/srv"))
     monkeypatch.setattr(hooks_module, "_registry", HookRegistry())
     monkeypatch.setattr("runtime.subagent.new_team_task_instance_id", lambda: "run-golden")
 

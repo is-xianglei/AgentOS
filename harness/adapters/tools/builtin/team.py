@@ -14,10 +14,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from harness.domain.roles.subagent import AgentType
 from harness.domain.tool import LEAD_AND_TEAM, LEAD_ONLY, PydanticTool, ToolContext, tool_policy
 from team.schemas import TeamMemberResponse, TeamMessageResponse, TeamResponse
 from team.service import TeamService
-from tools.subagents.definition import AgentType
 
 # ----- 序列化 helper:复用 team 域的 Response Schema 输出 JSON -----
 

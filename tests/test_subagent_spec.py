@@ -7,8 +7,8 @@ display_name 时必须逐字节回落到 agent_type 枚举值,保证改造前后
 
 import pytest
 
-from tools.subagents.definition import AgentType, SubAgentSpec
-from tools.subagents.registry import get_subagent_spec
+from harness.app.subagent_catalog import get_subagent_spec
+from harness.domain.roles.subagent import AgentType, SubAgentSpec
 
 
 @pytest.mark.parametrize("agent_type", list(AgentType))

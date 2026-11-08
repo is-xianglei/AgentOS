@@ -1,40 +1,18 @@
 """Agent 单步执行原语。
 
-AgentStep 只负责一次模型调用：把中立消息和工具描述交给 LLM，消费
+AgentStep 只负责一次模型调用：把角色组装好的 Context 交给 LLM，消费
 TurnEventAssembler 产出的对外事件，并把终局结果转换成可持久化的中立
 assistant blocks。ReAct 是否继续、工具如何执行、数据库如何提交由上层负责。
 """
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from harness.app.ports import ModelClient, ModelSettings, ModelTurnResult
-from harness.app.tool_set import ToolSet
-from harness.domain.context import Context, PromptBlock, messages_from_rows
+from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, ToolCall
 from runtime.stream_assembler import TurnEventAssembler
-
-
-@dataclass(frozen=True)
-class StepRequest:
-    """一次 LLM 调用的完整输入：中立消息、系统指令、可用工具与本次调用参数。"""
-
-    messages: list[dict[str, Any]]
-    system_prompt: str | Sequence[PromptBlock] | None
-    tool_registry: ToolSet
-    settings: ModelSettings
-
-    def context(self) -> Context[None]:
-        """在调用边界把中立消息字典还原为领域消息，组装本次调用的 Context。"""
-        instruction = self.system_prompt
-        if instruction is not None and not isinstance(instruction, str):
-            instruction = tuple(instruction)
-        return Context(
-            instruction=instruction,
-            messages=messages_from_rows(self.messages),
-            tools=tuple(self.tool_registry.to_specs()),
-        )
 
 
 @dataclass(frozen=True)
@@ -66,14 +44,14 @@ class AgentStep:
         self._assembler = assembler
         self._emit = emit
 
-    async def run(self, request: StepRequest) -> StepResult:
+    async def run(self, context: Context[None], settings: ModelSettings) -> StepResult:
         """执行一次 LLM 流并返回终局结果。
 
         ``emit`` 由调用方提供，因此 AgentStep 不依赖具体的 StreamBus；主 Agent、
         子代理和 Workflow 可以共享同一实现，同时保留各自的事件归属和生命周期。
         """
         async for event in self._assembler.consume(
-            self._llm.stream(request.context(), request.settings)
+            self._llm.stream(context, settings)
         ):
             await self._emit(event)
         result = self._assembler.last_result

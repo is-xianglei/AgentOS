@@ -13,13 +13,13 @@ from agent.service import AgentRuntimeConfig
 from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelTurnResult
+from harness.app.subagent_catalog import get_subagent_spec
 from harness.domain.messages import ToolCall
+from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolContext
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from tools.gateway import ToolGateway
-from tools.subagents.definition import AgentType, SubAgentSpec
-from tools.subagents.registry import get_subagent_spec
 
 pytestmark = pytest.mark.anyio
 
@@ -131,7 +131,7 @@ def _stub_runner(
 
         async def _fake_loop(*args: Any, **kwargs: Any) -> tuple[str, int]:
             # 位置参数顺序见 SubAgentRunner.run 对 _run_react_loop 的调用。
-            return await _capture_loop(capture, args[6], args[7])
+            return await _capture_loop(capture, args[5], args[6])
 
         monkeypatch.setattr(runner, "_run_react_loop", _fake_loop)
     return runner, repo, runner.bus, capture  # type: ignore[return-value]
@@ -346,7 +346,7 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
             return _config()
 
     async def _fake_loop(self: SubAgentRunner, *args: Any, **kwargs: Any) -> tuple[str, int]:
-        return await _capture_loop(capture, args[6], args[7])
+        return await _capture_loop(capture, args[5], args[6])
 
     monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr("database.engine.AsyncSessionLocal", _FakeSessionScope)

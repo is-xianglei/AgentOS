@@ -8,8 +8,8 @@ from pydantic import ValidationError
 from core.errors import AgentException
 from harness.adapters.tools.builtin import team as team_tools
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.roles.subagent import GLOBAL_SUBAGENT_DENIED_TOOLS, AgentType
 from harness.domain.tool import ToolContext, requires_skill_allowlist, tool_policy
-from tools.subagents.definition import GLOBAL_SUBAGENT_DENIED_TOOLS, AgentType
 
 pytestmark = pytest.mark.anyio
 

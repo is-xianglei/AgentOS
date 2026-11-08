@@ -26,15 +26,15 @@ from agent.service import AgentRuntimeConfig
 from core.config import settings as app_settings
 from core.events import ORCHESTRATOR_ACTOR, Actor, subagent_actor, teammate_actor
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.subagent_catalog import get_subagent_spec
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall
+from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolProfile
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner, _render_denied_summary, build_agent_spec
 from tests.fixtures.tool_review_golden import EXPECTED, EXPECTED_SHA256
-from tools.subagents.definition import AgentType, SubAgentSpec
-from tools.subagents.registry import get_subagent_spec
 
 pytestmark = pytest.mark.anyio
 

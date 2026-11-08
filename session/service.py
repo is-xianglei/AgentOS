@@ -656,6 +656,24 @@ class SessionService:
             through_message_id = snapshot_through_id
         return history, current, through_message_id
 
+    async def save_compact_snapshot(
+        self,
+        session_id: int,
+        messages: list[dict[str, Any]],
+        summary: str,
+        through_message_id: int,
+    ) -> SessionSnapshot:
+        """写入一份压缩快照：此后加载上下文时以它替换 through_message_id 及之前的消息。
+
+        messages 是压缩后的中立消息，summary 是摘要正文；只 flush 不提交，随调用方事务生效。
+        """
+        return await self.repo.add_snapshot(
+            session_id,
+            messages,
+            summary,
+            through_message_id=through_message_id,
+        )
+
     def _messages_to_context(
         self,
         messages: list[SessionMessage],

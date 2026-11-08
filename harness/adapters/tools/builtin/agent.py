@@ -7,13 +7,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from core.errors import AgentException
 from core.event_bus import StreamBus
+from harness.app.subagent_catalog import get_subagent_spec, routing_catalog
+from harness.domain.roles.reports import validate_verification_report
+from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import LEAD_ONLY, PydanticTool, ToolContext, tool_policy
-from tools.subagents.definition import AgentType, SubAgentSpec
-from tools.subagents.registry import (
-    get_subagent_spec,
-    routing_catalog,
-    validate_verification_report,
-)
 
 logger = logging.getLogger(__name__)
 

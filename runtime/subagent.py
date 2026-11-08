@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import tempfile
 import time
-from copy import deepcopy
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,7 @@ from core.events import (
     teammate_actor,
 )
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
+from harness.adapters.models.factory import resolve_subagent_model
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.memory_port import MemoryProvider
@@ -38,13 +40,15 @@ from harness.app.ports import (
 )
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
+from harness.domain.context import Context, messages_from_rows
 from harness.domain.memory import TurnRef
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from harness.domain.review import SOURCE_BUDGET, ReviewRequest
+from harness.domain.roles.subagent import AgentType, SubAgent, SubAgentSpec
+from harness.domain.roles.teammate import Teammate, is_identity_block
 from harness.domain.tool import ToolProfile
 from permission.service import PermissionService
-from prompt import compose_subagent_prompt, compose_teammate_prompt
-from runtime.step import AgentStep, StepRequest
+from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from team.isolation import (
     new_team_task_instance_id,
@@ -57,7 +61,6 @@ from tools.gateway import ToolGateway
 
 # 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
 from tools.service import ToolService  # noqa: F401
-from tools.subagents.definition import AgentType, SubAgentSpec
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +154,7 @@ class SubAgentRunner:
         """
         self.db = db
         self.bus = bus
-        # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
+        # 客户端持 subagent 默认档模型;Explore 等速度档由 resolve_subagent_model()
         # 写进每次调用的 ModelSettings.model_id,见 _configure_model。
         self.llm = llm
         self._llm_injected = llm is not None
@@ -223,7 +226,7 @@ class SubAgentRunner:
     @staticmethod
     def _override_model(settings: ModelSettings, spec: SubAgentSpec) -> ModelSettings:
         """spec 声明了模型名（固定模型或速度档）时覆盖场景模型，否则沿用。"""
-        model = spec.resolve_model()
+        model = resolve_subagent_model(spec)
         if model:
             return replace(settings, model_id=model)
         return settings
@@ -288,10 +291,7 @@ class SubAgentRunner:
                 user_id,
                 workspace_id,
             )
-        system_prompt = compose_subagent_prompt(spec.system_prompt, rendered_memories)
-        if spec.critical_reminder:
-            # 关键约束放在系统提示末尾:近端位置比开头更不容易被长上下文冲淡。
-            system_prompt = f"{system_prompt}\n\n{spec.critical_reminder}"
+        role = SubAgent(spec=spec, memory_prefix=rendered_memories)
 
         # 为本次 run 设置独立隔离 id(供运行期内派生消息的隔离与调试归属)。
         token = set_team_task_instance_id(new_team_task_instance_id())
@@ -312,7 +312,7 @@ class SubAgentRunner:
                 agent_id=spec.agent_id,
                 allowed_skill_names=allowed_skill_names,
                 shell_access=spec.shell_access,
-                shell_tmp_root=spec.shell_tmp_root(),
+                shell_tmp_root=spec.shell_tmp_root(Path(tempfile.gettempdir())),
             )
             assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
@@ -325,8 +325,7 @@ class SubAgentRunner:
                         actor,
                         assembler,
                         prompt,
-                        system_prompt,
-                        rendered_memories,
+                        role,
                         tool_registry,
                         tool_gateway,
                         spec,
@@ -401,26 +400,6 @@ class SubAgentRunner:
         # 子代理只继承正文，父 Turn 的记忆目录不进子代理的系统提示。
         return recall.message_prefix
 
-    @staticmethod
-    def _with_memory_context(
-        messages: list[dict[str, Any]],
-        rendered_memories: str | None,
-    ) -> list[dict[str, Any]]:
-        """仅在 LLM 请求副本中前置正文，避免污染 teammate 持久历史。"""
-        request_messages = deepcopy(messages)
-        if not rendered_memories:
-            return request_messages
-        for message in request_messages:
-            content = message.get("content")
-            if (
-                message.get("role") == "user"
-                and isinstance(content, str)
-                and not content.startswith("<identity>")
-            ):
-                message["content"] = f"{rendered_memories}\n\n{content}"
-                break
-        return request_messages
-
     async def _emit_event(self, event: StreamEvent) -> None:
         """向事件总线发送协议事件(若总线存在)。"""
         if self.bus is None:
@@ -430,24 +409,19 @@ class SubAgentRunner:
     async def _stream_and_collect(
         self,
         messages: list[dict[str, Any]],
-        system_prompt: str,
+        role: SubAgent | Teammate,
         tool_registry: ToolSet,
         assembler: TurnEventAssembler,
-        rendered_memories: str | None = None,
         *,
         settings: ModelSettings,
     ) -> ModelTurnResult:
-        """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。"""
-        request_messages = self._with_memory_context(messages, rendered_memories)
+        """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。
+
+        记忆正文由角色拼进请求副本,messages 本身不改动(队友历史会原样落库)。
+        """
+        context: Context[None] = role.context(messages_from_rows(messages), tool_registry.to_specs())
         step = AgentStep(self.llm, assembler, self._emit_event)
-        result = await step.run(
-            StepRequest(
-                messages=request_messages,
-                system_prompt=system_prompt,
-                tool_registry=tool_registry,
-                settings=settings,
-            )
-        )
+        result = await step.run(context, settings)
         return result.llm_result
 
     async def _emit_tool_result(
@@ -577,8 +551,7 @@ class SubAgentRunner:
         actor: Actor,
         assembler: TurnEventAssembler,
         prompt: str,
-        system_prompt: str,
-        rendered_memories: str | None,
+        role: SubAgent,
         tool_registry: ToolSet,
         tool_gateway: ToolGateway,
         spec: SubAgentSpec,
@@ -589,7 +562,7 @@ class SubAgentRunner:
         allowed_skill_names: frozenset[str] | None = None,
         denied_calls: list[DeniedToolCall] | None = None,
     ) -> tuple[str, int]:
-        """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示、工具集与轮次上限均取自 spec。
+        """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示由角色组装,轮次上限取自 spec。
 
         denied_calls 原样透传给 _execute_tool_uses,用于收集被拒的工具调用。
         """
@@ -603,10 +576,9 @@ class SubAgentRunner:
         for round_index in range(max(1, spec.max_rounds)):
             result = await self._stream_and_collect(
                 messages,
-                system_prompt,
+                role,
                 tool_registry,
                 assembler,
-                rendered_memories,
                 settings=model_settings,
             )
             tool_calls = result.tool_calls
@@ -696,6 +668,14 @@ class SubAgentRunner:
             user_id,
             workspace_id,
         )
+        # teammate 人格头:在 spec.system_prompt 之上拼接 name/role/team 身份,不改 spec。
+        teammate = Teammate(
+            spec=spec,
+            session_id=session_id,
+            name=name,
+            role=role,
+            memory_prefix=rendered_memories,
+        )
         # 先继承父 Agent 的硬白名单，再叠加 teammate 规格；通信工具同样不得越过父边界。
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names, "teammate")
         tool_gateway = ToolGateway.from_registry(
@@ -706,7 +686,7 @@ class SubAgentRunner:
             agent_id=spec.agent_id,
             allowed_skill_names=allowed_skill_names,
             shell_access=spec.shell_access,
-            shell_tmp_root=spec.shell_tmp_root(),
+            shell_tmp_root=spec.shell_tmp_root(Path(tempfile.gettempdir())),
         )
 
         # 为本次推进设置独立隔离 id(收件箱消费按该 id 隔离;任务认领不隔离)。
@@ -724,7 +704,7 @@ class SubAgentRunner:
             messages = self._load_history(member)
 
             # 2) 身份重注入:确保首条是 identity,避免重复注入。
-            self._ensure_identity(messages, session_id, name, role)
+            self._ensure_identity(messages, teammate)
 
             # 3) 排空收件箱:每条未读消息作为 user 消息追加(read_inbox 内部已隔离)。
             inbox = await team_service.read_inbox(session_id, name)
@@ -736,10 +716,6 @@ class SubAgentRunner:
                     }
                 )
 
-            # teammate 人格头:在 spec.system_prompt 之上拼接 name/role/team 身份。
-            system_prompt = compose_teammate_prompt(spec.system_prompt, session_id, name, role)
-            system_prompt = compose_subagent_prompt(system_prompt, rendered_memories)
-
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             # 4) ReAct 循环(轮内允许认领本会话 task)。
             report = await self._run_teammate_loop(
@@ -747,8 +723,7 @@ class SubAgentRunner:
                 actor,
                 assembler,
                 messages,
-                system_prompt,
-                rendered_memories,
+                teammate,
                 tool_registry,
                 tool_gateway,
                 spec,
@@ -808,28 +783,14 @@ class SubAgentRunner:
         prompt = member.prompt or ""
         return [{"role": "user", "content": prompt}]
 
-    def _identity_block(self, session_id: int, name: str, role: str) -> str:
-        """构造身份块文本(对应 s11 的 make_identity_block)。"""
-        return (
-            f"<identity>You are '{name}', role: {role}, "
-            f"team session {session_id}. Continue your work.</identity>"
-        )
-
-    def _ensure_identity(
-        self, messages: list[dict[str, Any]], session_id: int, name: str, role: str
-    ) -> None:
+    def _ensure_identity(self, messages: list[dict[str, Any]], teammate: Teammate) -> None:
         """在 messages 最前面注入 identity;若首条已是 identity 则跳过避免重复。"""
-        identity = self._identity_block(session_id, name, role)
         first_text = None
         if messages and isinstance(messages[0], dict):
             first_text = messages[0].get("content")
-        if (
-            isinstance(first_text, str)
-            and first_text.startswith("<identity>")
-            and "Continue your work." in first_text
-        ):
+        if is_identity_block(first_text):
             return
-        messages.insert(0, {"role": "user", "content": identity})
+        messages.insert(0, {"role": "user", "content": teammate.identity_block()})
 
     async def _settle_member_status(
         self, session_id: int, name: str, member, team_service: TeamService
@@ -849,8 +810,7 @@ class SubAgentRunner:
         actor: Actor,
         assembler: TurnEventAssembler,
         messages: list[dict[str, Any]],
-        system_prompt: str,
-        rendered_memories: str | None,
+        teammate: Teammate,
         tool_registry: ToolSet,
         tool_gateway: ToolGateway,
         spec: SubAgentSpec,
@@ -873,10 +833,9 @@ class SubAgentRunner:
 
             result = await self._stream_and_collect(
                 messages,
-                system_prompt,
+                teammate,
                 tool_registry,
                 assembler,
-                rendered_memories,
                 settings=model_settings,
             )
             tool_calls = result.tool_calls

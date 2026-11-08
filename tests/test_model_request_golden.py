@@ -33,24 +33,23 @@ from harness.adapters.models import openai_client as openai_module
 from harness.adapters.models.resolver import DatabaseModelResolver
 from harness.adapters.tools.builtin.echo import EchoTool
 from harness.app.ports import Effort, ResolvedModel
+from harness.app.subagent_catalog import get_subagent_spec
 from harness.app.tool_set import ToolSet
 from harness.domain.context import Context, PromptBlock, messages_from_rows
 from harness.domain.messages import AssistantMessage, ThinkingBlock, ToolCall, ToolResult
+from harness.domain.roles.subagent import AgentType, SubAgent
 from memory.jobs.dream import MemoryDreamService
 from memory.jobs.extraction import MemoryExtractionService
 from memory.recall.service import MemoryRecallService
 from memory.repository import MemoryCatalogEntry
 from model_service.models import ModelProviderRecord
 from model_service.service import ModelService
-from prompt import context as prompt_context_module
 from runtime.agent import AgentRuntime
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from runtime.workflow import LlmRoutingOrchestrator, ParallelOrchestrator
 from session.service import SessionService
 from tests.fixtures.model_request_golden import EXPECTED
-from tools.subagents.definition import AgentType
-from tools.subagents.registry import get_subagent_spec
 
 pytestmark = pytest.mark.anyio
 
@@ -681,8 +680,8 @@ def _world(monkeypatch: pytest.MonkeyPatch, world: str) -> None:
     monkeypatch.setattr("runtime.agent.AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr("runtime.agent.SkillService.get_catalog", AsyncMock(return_value=""))
     # 环境段含工作目录与日期，固定下来，避免系统提示随运行目录或日期变化。
-    monkeypatch.setattr(prompt_context_module, "date", _FixedDate)
-    monkeypatch.setattr(prompt_context_module, "Path", SimpleNamespace(cwd=lambda: "/srv"))
+    monkeypatch.setattr("runtime.agent.date", _FixedDate)
+    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: "/srv"))
 
 
 class _FixedDate(date):
@@ -725,7 +724,7 @@ def _compact_case(world: str):
     async def run(sdk: _Sdk, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         _world(monkeypatch, world)
         runtime = await _configured_agent(_session("max"))
-        compacted = await runtime.compact_service._auto_compact([_USER])
+        compacted = await runtime.compact_service.summarize([_USER])
         return {"threshold": runtime.compact_service.threshold, "summary": compacted}
 
     return run
@@ -743,8 +742,9 @@ def _subagent_case(world: str, effort: str, agent_type: AgentType, spec_model: s
         runner = SubAgentRunner(object())
         settings = await runner._configure_model(1, spec, 2, 3)
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, 1, turn_id=_TURN_ID)
+        role = SubAgent(spec=replace(spec, system_prompt="子代理系统提示", critical_reminder=""))
         await runner._stream_and_collect(
-            [_USER], "子代理系统提示", ToolSet([EchoTool()]), assembler, settings=settings
+            [_USER], role, ToolSet([EchoTool()]), assembler, settings=settings
         )
 
     return run

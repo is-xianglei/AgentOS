@@ -1,3 +1,5 @@
+"""Plan Mode 的提示文案：系统提示末段的 Plan Mode 指令，以及进入 Plan Mode 后回给模型的工具结果。"""
+
 PLAN_MODE_INSTRUCTIONS = """## Plan Mode 已启用
 
 用户当前只允许你探索和规划，不允许执行实现。此约束高于普通任务指令。
@@ -21,5 +23,6 @@ AskUserQuestion；计划完整后必须使用 ExitPlanMode 请求用户批准。
 
 
 def render_plan_mode_instructions(content: str) -> str:
+    """把计划正文填进 Plan Mode 指令；正文为空时提示尽快写入计划骨架。"""
     current = content.strip() or "（尚未创建，请尽快使用 WritePlan 写入计划骨架。）"
     return PLAN_MODE_INSTRUCTIONS.format(plan_content=current)

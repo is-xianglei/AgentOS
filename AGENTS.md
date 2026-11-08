@@ -73,6 +73,10 @@ API、错误与日志：
    声明自身的 policy（ToolPolicy），通过 ToolContext 获取上下文，实现 async run，
    并在 harness/adapters/tools/builtin/__init__.py 和 BuiltinToolProvider 中登记。
 5. 文件类工具使用 pathlib.Path、显式 UTF-8，并先校验路径和参数。
+6. 发给模型的提示文案放 harness/domain/prompts/，由 harness/domain/roles/ 的角色
+   （Assistant、SubAgent、Teammate、Compactor）组装成 Context；角色不做 I/O，不读配置、
+   工作目录与日期，这些由运行时读好后传入。内置子代理规格在 harness/app/subagent_catalog.py，
+   上下文压缩编排在 harness/app/compaction.py，压缩快照经 SessionService 写入。
 
 测试与交付：
 1. 使用 pytest，测试放在 tests/test_*.py；覆盖成功路径、失败路径和关键副作用。

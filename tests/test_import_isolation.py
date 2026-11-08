@@ -32,7 +32,10 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "team.service",
     "interaction.service",
     "runtime.subagent",
-    "runtime.compact",
+    "harness.app.compaction",
+    "harness.app.subagent_catalog",
+    "harness.domain.roles.assistant",
+    "harness.domain.roles.subagent",
     "memory.jobs.extraction",
     "runtime.agent",
     "runtime.workflow",
@@ -301,6 +304,20 @@ def test_domain_layer_imports_respect_layering() -> None:
         "harness.domain.budget",
         "harness.domain.review",
         "harness.domain.memory",
+        "harness.domain.prompts",
+        "harness.domain.prompts.lead",
+        "harness.domain.prompts.memory",
+        "harness.domain.prompts.plan_mode",
+        "harness.domain.prompts.subagents",
+        "harness.domain.prompts.teammate",
+        "harness.domain.prompts.compaction",
+        "harness.domain.roles",
+        "harness.domain.roles.assistant",
+        "harness.domain.roles.subagent",
+        "harness.domain.roles.teammate",
+        "harness.domain.roles.compactor",
+        "harness.domain.roles.reports",
+        "harness.domain.roles.verification_trigger",
     }
     assert expected_domain <= set(domain_modules), (
         f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"
@@ -373,9 +390,14 @@ def test_app_layer_imports_respect_layering() -> None:
     files = _first_party_module_files()
     known = set(files)
     app_modules = sorted(m for m in files if m == "harness.app" or m.startswith("harness.app."))
-    assert {"harness.app.ports", "harness.app.tool_set", "harness.app.memory_port"} <= set(
-        app_modules
-    ), (
+    expected_app = {
+        "harness.app.ports",
+        "harness.app.tool_set",
+        "harness.app.memory_port",
+        "harness.app.compaction",
+        "harness.app.subagent_catalog",
+    }
+    assert expected_app <= set(app_modules), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
     )
     failures: list[str] = []
@@ -542,3 +564,115 @@ def test_memory_package_checker_reports_imports(source: str, expected: list[str]
     known = set(_first_party_module_files())
 
     assert _memory_package_imports(ast.parse(source), "runtime", known) == expected
+
+
+# 领域层不得读取进程状态：工作目录、当前时间与日期、临时目录、环境变量、随机数与 UUID。
+# 这些值由应用层或运行时读取后作为参数传入，角色因此是纯函数，同样的输入总得到同样的 Context。
+_PROCESS_STATE_CALLS = frozenset(
+    {
+        "pathlib.Path.cwd",
+        "pathlib.Path.home",
+        "os.getcwd",
+        "os.getenv",
+        "os.environ.get",
+        "datetime.date.today",
+        "datetime.datetime.now",
+        "datetime.datetime.today",
+        "datetime.datetime.utcnow",
+        "time.time",
+        "time.time_ns",
+        "time.monotonic",
+        "time.perf_counter",
+        "tempfile.gettempdir",
+        "uuid.uuid1",
+        "uuid.uuid4",
+        "random.random",
+        "random.randint",
+        "random.choice",
+    }
+)
+
+
+def _import_aliases(tree: ast.Module) -> dict[str, str]:
+    """本模块任何位置的 import 别名 → 完整名，如 ``Path`` → ``pathlib.Path``。"""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
+
+
+def _dotted_name(node: ast.expr) -> str | None:
+    """把 ``a.b.c`` 形式的表达式还原为点分名，其余形式返回 None。"""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _process_state_calls(tree: ast.Module) -> list[str]:
+    """返回模块中任何位置（含函数体）调用的进程状态读取函数，按 import 别名展开成完整名。"""
+    aliases = _import_aliases(tree)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _dotted_name(node.func)
+        if name is None:
+            continue
+        head, _, rest = name.partition(".")
+        resolved = aliases.get(head, head)
+        full = f"{resolved}.{rest}" if rest else resolved
+        if full in _PROCESS_STATE_CALLS:
+            found.append(full)
+    return sorted(found)
+
+
+def test_domain_layer_does_not_read_process_state() -> None:
+    """纯度防线：harness.domain 不得调用 Path.cwd()、date.today()、datetime.now() 等进程状态读取。"""
+    files = _first_party_module_files()
+    domain_modules = sorted(
+        m for m in files if m == "harness.domain" or m.startswith("harness.domain.")
+    )
+    assert "harness.domain.roles.assistant" in domain_modules, (
+        f"模块枚举未覆盖角色模块，仅发现: {domain_modules}"
+    )
+    failures: list[str] = []
+    for module in domain_modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        failures.extend(f"  - {module} 调用了 {name}()" for name in _process_state_calls(tree))
+    assert not failures, "领域层读取了进程状态:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from pathlib import Path\nPath.cwd()", ["pathlib.Path.cwd"]),
+        ("import pathlib\npathlib.Path.cwd()", ["pathlib.Path.cwd"]),
+        ("from datetime import date\ndef f():\n    return date.today()", ["datetime.date.today"]),
+        ("from datetime import datetime as dt\ndt.now()", ["datetime.datetime.now"]),
+        ("import datetime\ndatetime.datetime.now()", ["datetime.datetime.now"]),
+        ("import os\nos.getcwd()", ["os.getcwd"]),
+        ("import os\nos.environ.get('X')", ["os.environ.get"]),
+        ("import tempfile\ntempfile.gettempdir()", ["tempfile.gettempdir"]),
+        ("from uuid import uuid4\nuuid4()", ["uuid.uuid4"]),
+        ("import time\ntime.perf_counter()", ["time.perf_counter"]),
+        ("from datetime import date\ndate(2026, 1, 1).isoformat()", []),
+        ("from pathlib import Path\nPath('/tmp') / 'x'", []),
+        ("def today():\n    return 1\ntoday()", []),
+    ],
+)
+def test_process_state_checker_reports_calls(source: str, expected: list[str]) -> None:
+    """检查器自测：直接调用与别名调用都必须报出，构造值和同名本地函数不得误报。"""
+    assert _process_state_calls(ast.parse(source)) == expected

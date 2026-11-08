@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 
 from core.events import ActorRole
+from harness.domain.roles.verification_trigger import assess, compose_hint
 from hooks import (
     HookContext,
     HookEvent,
@@ -16,7 +17,6 @@ from hooks import (
     HookRegistry,
     get_hook_registry,
 )
-from tools.subagents.trigger import assess, compose_hint
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ async def verification_trigger(ctx: HookContext) -> HookOutcome | None:
     """非平凡改动结束前提示补一次独立验收。
 
     只对主代理生效:子代理不能再派生子代理,给它注入这条提示只会让它反复
-    尝试一个拿不到的工具。判定逻辑在 tools/subagents/trigger.py。
+    尝试一个拿不到的工具。判定逻辑在 harness/domain/roles/verification_trigger.py。
     """
     if ctx.actor.role is not ActorRole.ORCHESTRATOR:
         return None

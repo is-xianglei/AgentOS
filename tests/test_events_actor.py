@@ -21,9 +21,9 @@ from core.events import (
     teammate_actor,
 )
 from harness.app.ports import ModelTurnResult
+from harness.app.subagent_catalog import get_subagent_spec
+from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from runtime.subagent import SubAgentRunner
-from tools.subagents.definition import AgentType, SubAgentSpec
-from tools.subagents.registry import get_subagent_spec
 
 _SID = 42
 

@@ -85,7 +85,7 @@ class Settings(BaseSettings):
 
     # --- SubAgent ------------------------------------------------------------
     # 模型档位配置已并入 LLM provider 组({provider}_subagent_model 等),
-    # 解析优先级见 tools/subagents/definition.py 的 resolve_model() 与 harness/adapters/models/factory.py。
+    # 解析优先级见 harness/adapters/models/factory.py 的 resolve_subagent_model() 与 _resolve_model()。
     # ReAct 轮次上限,按类型分档。verification 须跑构建+测试+lint+对抗探测。
     subagent_max_rounds: int = 6
     subagent_plan_max_rounds: int = 12

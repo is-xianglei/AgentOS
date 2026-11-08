@@ -6,6 +6,8 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, replace
+from datetime import date
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -27,8 +29,10 @@ from core.events import (
 )
 from database.engine import AsyncSessionLocal
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
+from harness.adapters.models.factory import create_model_client
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.compaction import ContextCompaction
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
@@ -38,27 +42,28 @@ from harness.app.ports import (
     ResolvedModel,
     ToolCallReviewer,
 )
+from harness.app.subagent_catalog import get_subagent_spec
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
-from harness.domain.context import PromptBlock
+from harness.domain.context import messages_from_rows
 from harness.domain.memory import MemoryWriteTicket, TurnRef
 from harness.domain.messages import ToolCall, ToolResult
+from harness.domain.prompts.plan_mode import ENTER_PLAN_MODE_RESULT
 from harness.domain.review import (
     PLAN_MODE_ALLOWED_TOOLS,
     SOURCE_PERMISSION,
     ReviewRequest,
 )
+from harness.domain.roles.assistant import Assistant
+from harness.domain.roles.subagent import AgentType
 from harness.domain.tool import ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
-from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
+from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS
 from permission.service import DANGEROUS_TOOLS, PermissionService
-from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
-from prompt import PromptContext, compose_lead_blocks
-from runtime.compact import CompactService
 from runtime.execution import (
     ExecutionHandle,
     launch_turn_execution,
@@ -66,7 +71,7 @@ from runtime.execution import (
     new_lease_owner,
     write_detached_run_end,
 )
-from runtime.step import AgentStep, StepRequest
+from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from session.models import SessionMessage, SessionRecord, SessionTurnRecord
@@ -77,8 +82,6 @@ from team.service import TeamService
 from tools.gateway import ToolGateway
 from tools.models import ToolCallRecord
 from tools.service import ToolService
-from tools.subagents.definition import AgentType
-from tools.subagents.registry import get_subagent_spec
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +146,13 @@ class AgentRuntime:
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.session_service = SessionService(db)
-        self.compact_service = CompactService(self.session_service.repo)
+        # 压缩快照经会话域 Service 写入；未解析出压缩模型时按 .env 的 compact 场景现建客户端。
+        self.compact_service = ContextCompaction(
+            self.session_service,
+            default_model=lambda: ResolvedModel.from_client(
+                create_model_client(scenario="compact")
+            ),
+        )
         self.permission_service = PermissionService(db)
         if reviewer is None:
             reviewer = PolicyReviewer.for_main_agent(self.permission_service)
@@ -774,39 +783,33 @@ class AgentRuntime:
         if memory_recall is not None:
             # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
             await self.db.commit()
-            # 正文拼到本轮起始的用户消息前面，目录放进系统提示末段。
+            # 正文由会话加载拼到本轮起始的用户消息前面，目录由角色放进系统提示末段。
             rendered_memories = memory_recall.message_prefix
-            memory_catalog = memory_recall.instruction
         else:
             rendered_memories = None
-            memory_catalog = None
 
         # 会话绑定了 Agent 时用 Agent 的提示词，否则用会话自带的系统提示。
         if self.active_agent_id is not None:
             session_prompt = self.active_agent_prompt
         else:
             session_prompt = session.system_prompt
-        # blocks 形式携带 cache 断点：tools + 稳定段跨 turn 复用，
-        # 完整 system 供本 turn 内多轮工具迭代复用。
-        system_prompt: list[PromptBlock] = compose_lead_blocks(
-            PromptContext.create(
-                skills_catalog=skills_catalog,
-                delegate_catalog=delegate_catalog,
-                session_prompt=session_prompt,
-                memory_catalog=memory_catalog,
-            )
-        )
         if turbo:
-            system_prompt = [PromptBlock(text=TURBO_PROMPT)]
             active_plan = None
         else:
             active_plan = await self.plan_service.get_active(session_id)
         active_registry = self._registry_for_mode(active_plan is not None)
-        if active_plan is not None:
-            # plan 内容随计划编辑而变,属易失段,不设 cache 断点以免击穿前两段的缓存前缀。
-            system_prompt.append(
-                PromptBlock(text=render_plan_mode_instructions(active_plan.content))
-            )
+        # 系统指令按回合冻结：块形式携带缓存断点，tools + 稳定段跨回合复用，
+        # 完整指令供本回合内多轮工具迭代复用。工作目录与日期在这里读取，角色不读进程状态。
+        role = Assistant(
+            cwd=str(Path.cwd()),
+            today=date.today(),
+            skills_catalog=skills_catalog,
+            delegate_catalog=delegate_catalog,
+            session_prompt=session_prompt,
+            memory=memory_recall,
+            plan_content=active_plan.content if active_plan is not None else None,
+            turbo=turbo,
+        )
         step = AgentStep(self.llm, assembler, self.bus.emit)
         # 一次 Turn 内跨所有 LLM 回合共享工具预算；恢复人工交互时由调用方传入
         # continuation 中持久化的同一实例，避免重建 AgentRuntime 后额度被重置。
@@ -858,12 +861,8 @@ class AgentRuntime:
             else:
                 round_registry = active_registry
             step_result = await step.run(
-                StepRequest(
-                    messages=context,
-                    system_prompt=system_prompt,
-                    tool_registry=round_registry,
-                    settings=round_settings,
-                )
+                role.context(messages_from_rows(context), round_registry.to_specs()),
+                round_settings,
             )
 
             logger.info(
@@ -938,7 +937,7 @@ class AgentRuntime:
                 assembler,
                 additional_context,
                 rendered_memories,
-                system_prompt,
+                role,
                 self._round_settings(session),
             )
             stop_reason = assembler.last_result.stop_reason or "max_iterations"
@@ -1929,7 +1928,7 @@ class AgentRuntime:
         assembler: TurnEventAssembler,
         additional_context: str | None,
         rendered_memories: str | None,
-        system_prompt: str | list[PromptBlock],
+        role: Assistant,
         round_settings: ModelSettings,
     ) -> SessionMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。
@@ -1949,14 +1948,7 @@ class AgentRuntime:
         context = history + current
 
         step = AgentStep(self.llm, assembler, self.bus.emit)
-        step_result = await step.run(
-            StepRequest(
-                messages=context,
-                system_prompt=system_prompt,
-                tool_registry=ToolSet(),
-                settings=round_settings,
-            )
-        )
+        step_result = await step.run(role.final_context(messages_from_rows(context)), round_settings)
         final_content = step_result.assistant_blocks
         provider, effective_model = self._llm_attribution(round_settings)
         return await self.session_service.add_message(

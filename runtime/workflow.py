@@ -36,7 +36,6 @@ from core.events import (
 from database.engine import AsyncSessionLocal
 from harness.adapters.models.factory import create_model_client
 from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
-from harness.app.tool_set import ToolSet
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
@@ -46,7 +45,7 @@ from runtime.execution import (
     new_lease_owner,
 )
 from runtime.orchestrator import OrchestrationContext, Orchestrator
-from runtime.step import AgentStep, StepRequest
+from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from session.models import SessionRecord, SessionTurnRecord
@@ -509,12 +508,11 @@ class ParallelOrchestrator(BaseOrchestrator):
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, self.session_id, turn_id=self.turn_id)
         step = AgentStep(self.llm, assembler, self.bus.emit)
         step_result = await step.run(
-            StepRequest(
-                messages=[{"role": "user", "content": prompt}],
-                system_prompt=PARALLEL_MERGE_SYSTEM_PROMPT,
-                tool_registry=ToolSet(),
-                settings=self.model_settings,
-            )
+            Context(
+                instruction=PARALLEL_MERGE_SYSTEM_PROMPT,
+                messages=(UserMessage(text=prompt),),
+            ),
+            self.model_settings,
         )
         text = step_result.text
         if not text:

@@ -9,6 +9,7 @@ from core.config import settings
 from core.errors import AgentException
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
+from harness.domain.roles.subagent import SubAgentSpec
 
 _SUPPORTED_PROVIDERS = ("anthropic", "openai")
 
@@ -83,6 +84,24 @@ def resolve_scenario_model(scenario: str | None = None) -> str:
     Memory Job 入队时冻结模型)。校验规则与 create_model_client 一致。
     """
     return _resolve_model(_require_provider(), scenario)
+
+
+def resolve_subagent_model(spec: SubAgentSpec, override: str | None = None) -> str | None:
+    """按优先级定出子代理本次调用使用的模型,None 表示继承客户端的档位模型。
+
+    优先级:显式入参 > spec 固定声明 > 场景档位解析(仅速度档)。
+    默认档返回 None:SubAgentRunner 的客户端已按 subagent 场景解析过模型
+    ({provider}_subagent_model → {provider}_model),无需重复解析。
+    速度档按 {provider}_subagent_fast_model → {provider}_model 两层回落,
+    在调用时惰性解析而非导入期,避免 provider 未配置时崩掉模块导入。
+    .env 里留空的键会被读成空串,一律归一成 None,避免把 "" 当模型名发给 API。
+    """
+    explicit = _blank_to_none(override) or _blank_to_none(spec.model)
+    if explicit is not None:
+        return explicit
+    if spec.model_scenario != "subagent":
+        return resolve_scenario_model(spec.model_scenario)
+    return None
 
 
 def create_model_client(scenario: str | None = None) -> AnthropicClient | OpenAIClient:

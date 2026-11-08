@@ -6,8 +6,8 @@ Plan 报告多为中文输出,行尾常带全角标点;剥不掉会让路径带�
 
 import pytest
 
-from tools.subagents.prompts import PLAN_CRITICAL_FILES_HEADING
-from tools.subagents.registry import _extract_path, parse_plan_critical_files
+from harness.domain.prompts.subagents import PLAN_CRITICAL_FILES_HEADING
+from harness.domain.roles.reports import _extract_path, parse_plan_critical_files
 
 
 @pytest.mark.parametrize(
