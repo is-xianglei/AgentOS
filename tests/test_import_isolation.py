@@ -39,6 +39,7 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "harness.adapters.tools.builtin_provider",
     "harness.adapters.tools.builtin.agent",
     "harness.adapters.reviewers.policy_reviewer",
+    "harness.adapters.memory.builtin_provider",
     "database.registry",
     "api.router",
     "main",
@@ -299,6 +300,7 @@ def test_domain_layer_imports_respect_layering() -> None:
         "harness.domain.tool",
         "harness.domain.budget",
         "harness.domain.review",
+        "harness.domain.memory",
     }
     assert expected_domain <= set(domain_modules), (
         f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"
@@ -371,7 +373,9 @@ def test_app_layer_imports_respect_layering() -> None:
     files = _first_party_module_files()
     known = set(files)
     app_modules = sorted(m for m in files if m == "harness.app" or m.startswith("harness.app."))
-    assert {"harness.app.ports", "harness.app.tool_set"} <= set(app_modules), (
+    assert {"harness.app.ports", "harness.app.tool_set", "harness.app.memory_port"} <= set(
+        app_modules
+    ), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
     )
     failures: list[str] = []
@@ -471,3 +475,70 @@ def test_model_sdk_imported_only_by_model_adapters() -> None:
 def test_model_sdk_checker_reports_imports(source: str, expected: list[str]) -> None:
     """检查器自测：任何位置的 SDK 导入都必须被报出，项目内同名模块与相似包名不得误报。"""
     assert _model_sdk_imports(ast.parse(source)) == expected
+
+
+# runtime 只经记忆端口使用记忆，memory 域的 Service、Repository 与 ORM 一律不直接导入。
+_MEMORY_PACKAGE = "memory"
+_RUNTIME_PACKAGE = "runtime"
+
+
+def _memory_package_imports(tree: ast.Module, source_package: str, known: set[str]) -> list[str]:
+    """返回模块中任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）导入 memory 包的模块名。
+
+    相对导入按所在包展开后再判断，避免以 ``from ..memory import x`` 的写法绕过检查。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, source_package, known)):
+            if name == _MEMORY_PACKAGE or name.startswith(f"{_MEMORY_PACKAGE}."):
+                found.append(name)
+    return found
+
+
+def test_runtime_does_not_import_memory_package() -> None:
+    """分层防线：runtime 包任何位置都不得导入 memory 包，记忆只经 MemoryProvider 端口接入。"""
+    files = _first_party_module_files()
+    known = set(files)
+    runtime_modules = sorted(
+        m for m in files if m == _RUNTIME_PACKAGE or m.startswith(f"{_RUNTIME_PACKAGE}.")
+    )
+    assert {"runtime.agent", "runtime.subagent"} <= set(runtime_modules), (
+        f"模块枚举未覆盖 runtime 包，仅发现: {runtime_modules}"
+    )
+    failures: list[str] = []
+    for module in runtime_modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source_package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+        failures.extend(
+            f"  - {module} 导入了 {name}"
+            for name in _memory_package_imports(tree, source_package, known)
+        )
+    assert not failures, "runtime 包直接导入了 memory 包:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from memory.recall.repository import X", ["memory.recall.repository"]),
+        ("import memory.jobs.service", ["memory.jobs.service"]),
+        ("from memory import models", ["memory.models"]),
+        ("import memory", ["memory"]),
+        ("def f():\n    from memory.jobs.service import MemoryJobRunner", ["memory.jobs.service"]),
+        (
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from memory.models import X",
+            ["memory.models"],
+        ),
+        ("from ..memory import service", ["memory.service"]),
+        ("from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider", []),
+        ("from harness.domain.memory import TurnRef", []),
+        ("import memory_profiler", []),
+    ],
+)
+def test_memory_package_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置导入 memory 包都必须报出，harness 内同名子包与相似包名不得误报。"""
+    known = set(_first_party_module_files())
+
+    assert _memory_package_imports(ast.parse(source), "runtime", known) == expected

@@ -90,9 +90,7 @@ def _loop_runtime(llm: _FakeLLM, delegate_catalog: str | None) -> AgentRuntime:
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
     )
-    runtime.memory_recall_service = SimpleNamespace(
-        get_or_create_context=AsyncMock(return_value=None)
-    )
+    runtime.memory = SimpleNamespace(recall=AsyncMock(return_value=None))
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
     runtime.compact_service = SimpleNamespace(maybe_compact=AsyncMock(return_value=[]))
     runtime._apply_stop_hooks = AsyncMock(return_value=None)
@@ -109,7 +107,10 @@ async def test_run_llm_loop_injects_loaded_catalog_only(
     runtime = _loop_runtime(llm, catalog)
 
     result = await runtime._run_llm_loop(
-        1, SimpleNamespace(system_prompt=None), SimpleNamespace(id=uuid4()), None
+        1,
+        SimpleNamespace(system_prompt=None),
+        SimpleNamespace(id=uuid4(), session_id=1, user_id=1, workspace_id=2),
+        None,
     )
 
     assert result.completed_message_id == 99

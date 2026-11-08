@@ -6,6 +6,7 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, replace
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +23,7 @@ from memory.recall.repository import (
 from memory.repository import MemoryCatalogEntry, MemoryRepository
 from memory.rollout_service import MemoryRolloutService
 from memory.service import MemoryService
-from session.models import SessionTurnRecord
+from session.service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +63,27 @@ class MemoryRecallService:
 
     async def get_or_create_context(
         self,
-        turn: SessionTurnRecord,
+        workspace_id: int,
+        user_id: int,
+        turn_id: UUID,
+        *,
+        session_id: int,
     ) -> TurnMemoryContextRecord | None:
-        """读取或冻结当前 Turn 的精确 Memory 上下文。"""
-        existing = await self.repo.get_context(turn.workspace_id, turn.user_id, turn.id)
+        """读取或冻结当前 Turn 的精确 Memory 上下文；同一 Turn 首次冻结后重复调用返回同一份。
+
+        只写入、不提交：冻结结果由调用方提交，独立数据库会话里的子代理提交后才能读到。
+        """
+        existing = await self.repo.get_context(workspace_id, user_id, turn_id)
         if existing is not None:
             return existing
-        if not MemoryRolloutService.recall_enabled(turn.user_id):
+        if not MemoryRolloutService.recall_enabled(user_id):
             # 灰度未命中属预期跳过（默认 rollout=0 时全量跳过），并非召回失败。
             logger.debug(
                 "记忆召回跳过：用户未命中灰度，并非召回失败",
                 extra={
-                    "session_id": turn.session_id,
-                    "turn_id": str(turn.id),
-                    "user_id": turn.user_id,
+                    "session_id": session_id,
+                    "turn_id": str(turn_id),
+                    "user_id": user_id,
                 },
             )
             return None
@@ -83,20 +91,22 @@ class MemoryRecallService:
         started_at = time.perf_counter()
         logger.info(
             "记忆召回开始",
-            extra={"session_id": turn.session_id, "turn_id": str(turn.id)},
+            extra={"session_id": session_id, "turn_id": str(turn_id)},
         )
-        catalog = await self.memory_service.get_rendered_catalog(turn.workspace_id, turn.user_id)
+        catalog = await self.memory_service.get_rendered_catalog(workspace_id, user_id)
+        # 选择器只看截至本轮起始消息的用户请求；起始消息记在会话域的轮次上。
+        turn = await SessionService(self.db).get_turn_required(turn_id)
         recent_texts = await self.repo.list_recent_user_texts(
-            turn.workspace_id,
-            turn.user_id,
-            turn.session_id,
+            workspace_id,
+            user_id,
+            session_id,
             turn.started_message_id,
             limit=3,
         )
         limited_texts = self._limit_recent_texts(recent_texts)
         selection = await self._select_memory_ids(
-            turn.workspace_id,
-            turn.user_id,
+            workspace_id,
+            user_id,
             catalog.snapshot.entries,
             limited_texts,
         )
@@ -108,12 +118,15 @@ class MemoryRecallService:
             if memory_id in entries_by_id
         ]
         revisions = await self.repo.get_catalog_revisions(
-            turn.workspace_id,
-            turn.user_id,
+            workspace_id,
+            user_id,
             selected_entries,
         )
         selected_revisions, rendered_memories = await self._apply_session_budget(
-            turn,
+            workspace_id,
+            user_id,
+            session_id,
+            turn_id,
             revisions,
         )
         if selection.degraded_reason is not None:
@@ -124,9 +137,9 @@ class MemoryRecallService:
             selector_status = "empty"
         byte_count = len((catalog.content + rendered_memories).encode("utf-8"))
         context = await self.repo.freeze_context(
-            turn.workspace_id,
-            turn.user_id,
-            turn.id,
+            workspace_id,
+            user_id,
+            turn_id,
             space_id=catalog.snapshot.space_id,
             catalog_version=catalog.snapshot.catalog_version,
             selected_revision_ids=[revision.id for revision in selected_revisions],
@@ -144,29 +157,43 @@ class MemoryRecallService:
             nested = await self.db.begin_nested()
             try:
                 await self.memory_repo.touch_used_items(
-                    turn.workspace_id,
-                    turn.user_id,
+                    workspace_id,
+                    user_id,
                     item_ids,
                 )
             except Exception:
                 await nested.rollback()
                 logger.exception(
                     "回写Memory使用热度失败，不影响主链路",
-                    extra={"turn_id": str(turn.id), "item_ids": item_ids},
+                    extra={"turn_id": str(turn_id), "item_ids": item_ids},
                 )
             else:
                 await nested.commit()
         logger.info(
             "记忆召回完成",
             extra={
-                "session_id": turn.session_id,
-                "turn_id": str(turn.id),
+                "session_id": session_id,
+                "turn_id": str(turn_id),
                 "selected_count": len(selected_revisions),
                 "selector_status": selector_status,
                 "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
             },
         )
         return context
+
+    async def get_frozen_context(
+        self,
+        workspace_id: int,
+        user_id: int,
+        turn_id: UUID,
+        *,
+        session_id: int,
+    ) -> TurnMemoryContextRecord | None:
+        """只读取 Turn 已冻结的 Memory 上下文，不触发召回；轮次须属于给定租户和会话。
+
+        子代理据此继承父 Turn 的召回结果；父 Turn 未冻结或不在该会话下时返回 None。
+        """
+        return await self.repo.get_context(workspace_id, user_id, turn_id, session_id=session_id)
 
     async def _select_memory_ids(
         self,
@@ -280,20 +307,23 @@ class MemoryRecallService:
 
     async def _apply_session_budget(
         self,
-        turn: SessionTurnRecord,
+        workspace_id: int,
+        user_id: int,
+        session_id: int,
+        turn_id: UUID,
         revisions: list[MemoryRevisionRecord],
     ) -> tuple[list[MemoryRevisionRecord], str]:
         previous_ids = self._deduplicate(
             await self.repo.list_surfaced_revision_ids(
-                turn.workspace_id,
-                turn.user_id,
-                turn.session_id,
-                exclude_turn_id=turn.id,
+                workspace_id,
+                user_id,
+                session_id,
+                exclude_turn_id=turn_id,
             )
         )
         previous_revisions = await self.repo.get_revisions_by_ids(
-            turn.workspace_id,
-            turn.user_id,
+            workspace_id,
+            user_id,
             previous_ids,
         )
         # 会话预算按「本会话呈现过的不同 Revision」累计字节数，重复呈现不重复计费。

@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from core.errors import AgentException
+from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.models import anthropic_client as anthropic_module
 from harness.adapters.models import openai_client as openai_module
 from harness.adapters.models import resolver as resolver_module
@@ -334,7 +335,7 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
     )
-    runtime.memory_recall_service = SimpleNamespace(get_or_create_context=AsyncMock())
+    runtime.memory = SimpleNamespace(recall=AsyncMock())
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock())
     runtime.compact_service = SimpleNamespace(maybe_compact=AsyncMock())
     runtime._apply_stop_hooks = AsyncMock()
@@ -347,7 +348,7 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
     assert requests[0]["tools"] == []
     assert requests[0]["system_prompt"][0].text == TURBO_PROMPT
     for call in (
-        skill_catalog, runtime.memory_recall_service.get_or_create_context,
+        skill_catalog, runtime.memory.recall,
         runtime.plan_service.get_active, runtime.compact_service.maybe_compact,
         runtime._apply_stop_hooks,
     ):
@@ -357,11 +358,12 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
 async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
     monkeypatch.setattr("runtime.agent.settings.memory_extraction_enabled", True)
     enqueue = AsyncMock()
-    monkeypatch.setattr("runtime.agent.MemoryJobService.enqueue_extract", enqueue)
+    monkeypatch.setattr("memory.jobs.service.MemoryJobService.enqueue_extract", enqueue)
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.mode_slug = "turbo"
     runtime._fence_lease = AsyncMock()
     runtime.db = SimpleNamespace(commit=AsyncMock(), begin_nested=AsyncMock())
+    runtime.memory = BuiltinMemoryProvider(runtime.db)
     runtime.session_service = SimpleNamespace(
         mark_turn_status=AsyncMock(), repo=SimpleNamespace(update_status=AsyncMock()),
     )

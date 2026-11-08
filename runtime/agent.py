@@ -26,8 +26,10 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
+from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
     ModelConnectionError,
@@ -39,6 +41,7 @@ from harness.app.ports import (
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.context import PromptBlock
+from harness.domain.memory import MemoryWriteTicket, TurnRef
 from harness.domain.messages import ToolCall, ToolResult
 from harness.domain.review import (
     PLAN_MODE_ALLOWED_TOOLS,
@@ -50,8 +53,6 @@ from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
-from memory.jobs.service import MemoryJobRunner, MemoryJobService
-from memory.recall.service import MemoryRecallService
 from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
 from permission.service import DANGEROUS_TOOLS, PermissionService
 from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
@@ -132,8 +133,12 @@ class AgentRuntime:
         workspace_id: int | None = None,
         llm: ModelClient | None = None,
         reviewer: ToolCallReviewer | None = None,
+        memory: MemoryProvider | None = None,
     ):
-        """初始化 Agent 主运行时依赖。reviewer 未注入时使用主 Agent 的规则链审核员。"""
+        """初始化 Agent 主运行时依赖。
+
+        reviewer 未注入时使用主 Agent 的规则链审核员；memory 未注入时使用绑定本会话的内置记忆。
+        """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
@@ -145,7 +150,11 @@ class AgentRuntime:
         self.reviewer = reviewer
         self.interaction_service = InteractionService(db)
         self.plan_service = PlanService(db)
-        self.memory_recall_service = MemoryRecallService(db)
+        # 组装根（阶段 7）之前在这里回落内置实现；注入的 Provider 随后台执行一并传递。
+        self._memory_injected = memory is not None
+        if memory is None:
+            memory = BuiltinMemoryProvider(db)
+        self.memory = memory
         self.llm = llm
         self._llm_injected = llm is not None
         # 本场景的默认调用参数；注入替身时取替身自带的模型名，未注入时由 _configure_agent 解析。
@@ -180,6 +189,16 @@ class AgentRuntime:
         """把运行时绑定到一次后台执行的事件流与租约。"""
         self.bus = bus
         self.lease_owner = lease_owner
+
+    def _injected_memory(self) -> MemoryProvider | None:
+        """返回构造时注入的记忆 Provider，供后台执行重建运行时时沿用。
+
+        未注入时返回 None：内置实现绑定请求作用域的数据库会话，由后台运行时按自己的会话重建。
+        getattr 兜底：测试用 __new__ 构造的实例没有 _memory_injected 属性。
+        """
+        if getattr(self, "_memory_injected", False):
+            return self.memory
+        return None
 
     async def start(
         self,
@@ -231,11 +250,14 @@ class AgentRuntime:
             llm = self.llm
         else:
             llm = None
+        memory = self._injected_memory()
 
         async def body(bus: RunStreamBus) -> None:
             # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
             async with AsyncSessionLocal() as db:
-                runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime = AgentRuntime(
+                    db, user_id=user_id, workspace_id=workspace_id, llm=llm, memory=memory
+                )
                 runtime.bind_execution(bus, owner)
                 await runtime._produce(target_session_id, turn_id, user_content)
 
@@ -304,12 +326,13 @@ class AgentRuntime:
                 if loop_result.interaction is not None:
                     await self._emit_interaction(loop_result.interaction)
                 return
-            memory_job_id = await self._complete_turn(
+            memory_ticket = await self._complete_turn(
                 session,
                 turn,
                 loop_result.completed_message_id,
             )
-            await self._run_inline_memory_job(memory_job_id)
+            if memory_ticket is not None:
+                await self.memory.after_commit(memory_ticket)
             # 完成状态已提交，独立数据库会话中的队友才能读取到本轮最终回复。
             await self._wake_team_members(session_id, turn)
         except LeaseLostError:
@@ -374,15 +397,18 @@ class AgentRuntime:
         # 显式提交:租约须在后台任务读取前可见,请求作用域的 db 不随 SSE 挂着事务。
         await self.db.commit()
         user_id, workspace_id = self.user_id, self.workspace_id
-        # 与 start 相同：只传递构造时注入的客户端。
+        # 与 start 相同：只传递构造时注入的客户端与记忆 Provider。
         if getattr(self, "_llm_injected", self.llm is not None):
             llm = self.llm
         else:
             llm = None
+        memory = self._injected_memory()
 
         async def body(bus: RunStreamBus) -> None:
             async with AsyncSessionLocal() as db:
-                runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime = AgentRuntime(
+                    db, user_id=user_id, workspace_id=workspace_id, llm=llm, memory=memory
+                )
                 runtime.bind_execution(bus, owner)
                 await runtime._produce_resume(session_id, request_id)
 
@@ -645,12 +671,13 @@ class AgentRuntime:
                 if loop_result.interaction is not None:
                     await self._emit_interaction(loop_result.interaction)
                 return
-            memory_job_id = await self._complete_turn(
+            memory_ticket = await self._complete_turn(
                 session,
                 turn,
                 loop_result.completed_message_id,
             )
-            await self._run_inline_memory_job(memory_job_id)
+            if memory_ticket is not None:
+                await self.memory.after_commit(memory_ticket)
             await self._wake_team_members(session_id, turn)
         except LeaseLostError:
             await self.db.rollback()
@@ -734,14 +761,22 @@ class AgentRuntime:
             delegate_catalog = self.delegate_catalog
 
         if turbo:
-            memory_context = None
+            memory_recall = None
         else:
-            memory_context = await self.memory_recall_service.get_or_create_context(turn)
-        if memory_context is not None:
+            memory_recall = await self.memory.recall(
+                TurnRef(
+                    workspace_id=turn.workspace_id,
+                    user_id=turn.user_id,
+                    session_id=turn.session_id,
+                    turn_id=turn.id,
+                )
+            )
+        if memory_recall is not None:
             # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
             await self.db.commit()
-            rendered_memories = memory_context.rendered_memories
-            memory_catalog = memory_context.rendered_catalog
+            # 正文拼到本轮起始的用户消息前面，目录放进系统提示末段。
+            rendered_memories = memory_recall.message_prefix
+            memory_catalog = memory_recall.instruction
         else:
             rendered_memories = None
             memory_catalog = None
@@ -934,8 +969,11 @@ class AgentRuntime:
         session: SessionRecord,
         turn: SessionTurnRecord,
         completed_message_id: int | None,
-    ) -> UUID | None:
-        """原子完成 Turn、恢复 Session，并按开关幂等创建提取 Job。"""
+    ) -> MemoryWriteTicket | None:
+        """原子完成 Turn、恢复 Session，并在同一事务里登记回合的记忆写入。
+
+        返回记忆写入回执，调用方在本方法提交之后交给 memory.after_commit。
+        """
         # 先按「会话 → 轮次」加锁隔离,与取消接口的加锁顺序一致。
         await self._fence_lease(session.id, turn.id)
         await self.session_service.mark_turn_status(
@@ -944,63 +982,24 @@ class AgentRuntime:
             completed_message_id=completed_message_id,
         )
         await self.session_service.repo.update_status(session, "idle")
-        job_id: UUID | None = None
-        if settings.memory_extraction_enabled and getattr(self, "mode_slug", "standard") != "turbo":
-            # Memory 是旁路子系统，入队失败不得回滚 Turn 完成与 Session 恢复。
-            # 失败语句会让事务进入 aborted，故用 SAVEPOINT 隔离后回滚，
-            # 保证下面的 commit 仍能提交主链路状态；本轮记忆则直接放弃。
-            nested = await self.db.begin_nested()
-            try:
-                job = await MemoryJobService(self.db).enqueue_extract(session, turn)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                await nested.rollback()
-                logger.exception(
-                    "创建Memory提取任务失败，本轮不提取记忆",
-                    extra={"session_id": str(session.id), "turn_id": str(turn.id)},
+        memory_ticket: MemoryWriteTicket | None = None
+        # 极速模式不写入记忆；写入失败由 Provider 自行隔离，不影响下面提交的回合终态。
+        if getattr(self, "mode_slug", "standard") != "turbo":
+            memory_ticket = await self.memory.on_turn_completed(
+                TurnRef(
+                    workspace_id=turn.workspace_id,
+                    user_id=turn.user_id,
+                    session_id=session.id,
+                    turn_id=turn.id,
                 )
-            else:
-                await nested.commit()
-                job_id = job.id
-                logger.info(
-                    "Memory提取任务已入队",
-                    extra={
-                        "session_id": str(session.id),
-                        "turn_id": str(turn.id),
-                        "job_id": str(job.id),
-                        "mode": (job.payload or {}).get("mode"),
-                    },
-                )
+            )
         # 流式运行需要在生产者生命周期内明确提交最终状态，不能依赖请求收尾。
         await self.db.commit()
         logger.debug(
             "回合完成状态已提交",
             extra={"session_id": str(session.id), "turn_id": str(turn.id)},
         )
-        return job_id
-
-    async def _run_inline_memory_job(self, job_id: UUID | None) -> None:
-        """终轮提交后就地执行提取；失败时由持久 Job 和 Worker 接管。"""
-        if job_id is None or not settings.memory_extraction_inline:
-            return
-        logger.info(
-            "开始就地执行Memory提取任务",
-            extra={"job_id": str(job_id)},
-        )
-        try:
-            if self.workspace_id is None or self.user_id is None:
-                raise RuntimeError("就地执行Memory任务缺少可信作用域")
-            await MemoryJobRunner(
-                claim_scope=(self.workspace_id, self.user_id),
-            ).run_once(job_id=job_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "就地执行Memory提取任务失败，等待独立Worker接管",
-                extra={"job_id": str(job_id)},
-            )
+        return memory_ticket
 
     async def _mark_abnormal_end(
         self,

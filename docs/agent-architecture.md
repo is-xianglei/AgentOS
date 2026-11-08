@@ -33,6 +33,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | review.py | 已落地（阶段 3b）。`Decision(behavior, arguments, source, message, reason, interaction, needs_approval)`，只经工厂方法 `Decision.allow(arguments, *, source)`、`Decision.deny(message, *, arguments, source, reason, needs_approval)`、`Decision.ask(interaction, *, arguments, reason, source)` 构造，`__post_init__` 拒绝非法组合；arguments 是审核后（可能已规范化）的入参；message 回给模型，reason 供日志和被拒摘要；needs_approval 标出「需审批但无审批通道而合并成的拒绝」。`ReviewRequest(session_id, profile, agent_type, budget, workspace_id, allowed_skill_names, plan_content, tools)`，plan_content 为 None 表示不在 Plan 模式，tools 只需满足 `ToolInputValidator`（validate_input）。纯函数 `check_capability(tool_name, policy, profile, arguments, allowed_skill_names) -> str \| None` 由审核规则和 ToolService 执行层兜底共用。另有 `PLAN_MODE_ALLOWED_TOOLS`、`INTERACTION_TOOL_KINDS`、`SOURCE_*` 规则来源名 |
 | roles.py | 角色 `Assistant`（主 Agent）、`SubAgent`、`Teammate`、`Compactor`，各自 `context(...) -> Context[...]` |
 | budget.py | 已落地（阶段 3a）。`ToolCallBudget`：循环额度，可序列化进挂起的续跑状态 |
+| memory.py | 已落地（阶段 4）。`TurnRef(workspace_id, user_id, session_id, turn_id)` 是召回与写入需要的回合身份；`MemoryRecall(instruction, message_prefix)`：instruction 进系统指令末段，message_prefix 拼到本轮起始用户消息前；`MemoryWriteTicket(turn, ref)` 是写入回执 |
 | prompts/ | 各角色的提示文案，逐字保持现状 |
 
 与视频有意不同的地方：
@@ -65,7 +66,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | ModelResolver | `resolve(workspace_id, user_id, scenario, *, provider_id, effort)`、`for_session(session, scenario)`、`for_frozen_job(..., model, provider_id)`，返回 `ResolvedModel(client, settings, provider_record_id, context_length)`：先查工作区模型配置，查不到再用 .env | DatabaseModelResolver（数据库 + .env） | — |
 | SessionStore | 按实际操作设计：加载本轮上下文、追加消息、写压缩快照；不做整存整取 | 数据库（包装 SessionService） | 测试用内存实现 |
 | ToolProvider | `list_tools() -> list[Tool]`，代表一个工具来源；目前同步、不带 scope，接入 MCP 时扩展为 `async list_tools(scope)` | BuiltinToolProvider | MCP |
-| MemoryProvider | `recall(request) -> MemoryRecall`，以及回合结束后的写入 | 内置 memory 域 | 外部记忆框架 |
+| MemoryProvider | 在 `app/memory_port.py`（与模型端口无关，单独成模块）。`recall(turn)`、`inherited(turn)`、`on_turn_completed(turn) -> MemoryWriteTicket | None`、`after_commit(ticket)`；调用方持有会话并负责提交，recall 和 on_turn_completed 在调用方事务里执行、从不提交，after_commit 在提交后自管事务 | BuiltinMemoryProvider | 外部记忆框架 |
 | ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
 
 编排：
@@ -82,7 +83,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | models/ | AnthropicClient、OpenAIClient：构造参数只放端点配置（地址、密钥、重试、超时、思考协议、档位映射表），effort 按调用翻译成各家参数；factory 解析 .env；builder 按工作区模型配置建客户端；resolver 实现 ModelResolver |
 | stores/ | DatabaseSessionStore |
 | tools/ | builtin/（全部内置工具，Bash 的 shell 校验也在这里）、builtin_provider.py |
-| memory/ | BuiltinMemoryProvider（包装 memory 域的召回和提取） |
+| memory/ | 已落地（阶段 4）。BuiltinMemoryProvider 包装 memory 域的召回和提取，提取开关、SAVEPOINT、就地执行开关和日志保留在这里；AgentRuntime 与 SubAgentRunner 的构造参数 `memory` 未注入时回落到它，后台重建 runtime 时沿用注入值 |
 | reviewers/ | 已落地（阶段 3b）。`PolicyReviewer(rules)` 按序执行一组规则（每条规则本身也是 ToolCallReviewer），拒绝或挂起即终局，放行可改写入参交给下一条。`for_main_agent(permission_service)`：BudgetRule → PlanModeToolsRule → ArgumentsRule → CapabilityRule → PlanModeAgentRule → InteractionToolRule → PermissionRule。`for_subagent(permission_service)`：BudgetRule → NoApprovalChannelRule(CapabilityRule, PermissionRule)，后者把挂起合并为拒绝并换成子代理文案。AgentRuntime、SubAgentRunner 构造参数 `reviewer` 未注入时用对应组装入口 |
 
 HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：路由只把请求转成对 AgentService 的调用，
@@ -103,7 +104,8 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 以 MemoryProvider 接入。主循环只认召回和回合结束写入两个动作，不关心记忆怎么存、怎么检索。
 - MemoryRecall 分两部分：进系统指令的部分（使用规则、目录），进本轮用户消息前缀的部分（召回正文），
   分别对应现在的 memory_catalog 和 rendered_memories。
-- 同一回合重复召回结果相同：子代理经同一个 Provider 拿到父回合冻结下来的结果，不再直接读 memory 的 Repository。
+- 同一回合重复召回结果相同：子代理经 `inherited` 拿到父回合冻结下来的结果，不再直接读 memory 的 Repository；子代理只继承 message_prefix，不继承目录。
+- 极速模式不召回、不写入，这是运行模式的取舍，由调用方判断，Provider 不感知。
 - 回合结束写入失败不得影响回合终态。内置实现「入队与回合终态同一事务、用 SAVEPOINT 隔离」的语义保留在内置适配器内部。
 - 内置 memory 域的管理接口（条目增删改查、dream、保留策略）属于内置实现自己的功能，不进入端口。
 - 用哪个 Provider 由组装根决定；接入第二种实现时再新增配置项，并遵守配置同步规则。
@@ -145,6 +147,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
   测试不删，只有专测已删除功能的用例可以随功能一起删掉，并在汇报里逐个列出。
 - 发往两家 SDK 的请求参数由 tests/test_model_request_golden.py 固化（字面量取自阶段 2b 之前的代码），
   后续阶段不得改动 tests/fixtures/model_request_golden.py。
+- 记忆接入主循环的行为（召回结果在系统提示和用户消息里的位置、提交与 SAVEPOINT 的调用顺序、入队参数、日志、子代理继承）由 tests/test_memory_port_golden.py 固化（27 种情况，字面量取自阶段 4 之前的代码），后续阶段不得改动 tests/fixtures/memory_port_golden.py。runtime/ 不得导入 memory 包，由 tests/test_import_isolation.py 静态检查。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
 - 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
 
@@ -156,6 +159,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 阶段 3b 起，Plan 状态由调用方在审核前读出并放进 ReviewRequest，所以预算已耗尽的调用也会多查一次 Plan；之前是预算扣减成功后才读。写出的结果不变，黄金测试已覆盖。
 - 交互工具（AskUserQuestion、EnterPlanMode、ExitPlanMode）不经过权限规则；人工审批通过后的恢复路径不会重新审核，只重新校验用户改过的入参，执行层的能力兜底仍然生效。两条都是现状，已在黄金测试中固化。
 - Decision.source 取 `SOURCE_*` 常量，运行时据此决定打哪条日志；以后接入 LLM 审核员时要用新的来源名，不要复用这些常量。
+- 阶段 4 起，就地执行记忆提取的 claim_scope 取回合自身的租户，而不是运行时实例上的 workspace_id / user_id；两者在所有路径上相等，黄金测试已固化。入队与就地执行的日志 logger 名从 runtime.agent 变为 harness.adapters.memory.builtin_provider，正文与 extra 不变。
 
 ## 8. 阶段
 
@@ -167,7 +171,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | 2b | 已完成：ModelSettings、Effort、Context 按调用传入；客户端去掉可变的思考属性；模型解析迁到 adapters/models/resolver.py，工作区端点构造迁到 builder.py，档位映射表在 reasoning.py |
 | 3a | 已完成：工具领域类型（Tool 以 JSON Schema 为准、自带 ToolPolicy；ToolContext；ToolCallBudget）；内置工具迁到 adapters/tools/builtin；ToolProvider + ToolSet 取代 ToolRegistry |
 | 3b | 已完成：ToolCallReviewer + Decision；PolicyReviewer 合并原 7 层审核，主循环和子代理共用；审核结果由 tests/test_tool_review_golden.py 固化 |
-| 4 | MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
+| 4 | 已完成：MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
 | 5 | 角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/ 并入 |
 | 6 | SessionStore + AgentService：拆分 AgentRuntime，三份 ReAct 循环合成一份 |
 | 7 | 组装根：bootstrap 装配，API 层通过依赖注入拿 AgentService，清理跨域直连 Repository |

@@ -217,7 +217,7 @@ async def _extract_turn(shared: _Shared, ids, session_id: int, llm: _FakeLLM) ->
         )
         await service.mark_turn_status(turn, "completed", completed_message_id=reply.id)
         try:
-            job = await MemoryJobService(db).enqueue_extract(session, turn)
+            job = await MemoryJobService(db).enqueue_extract(session.id, turn.id)
         except AgentException as exc:
             raise _SetupError(f"提取 Job 入队失败: {exc.message}") from exc
         await db.commit()
@@ -336,7 +336,7 @@ async def _run_turn(
     with caplog.at_level(logging.ERROR, logger="runtime.agent"):
         async with shared.session() as db:
             runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=scenario.llm)
-            runtime.memory_recall_service.llm = scenario.llm
+            runtime.memory.recall_service.llm = scenario.llm
             runtime.bind_execution(bus, owner)
             await runtime._produce(session_id, turn_id, "继续")
     failures = [

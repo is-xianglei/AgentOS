@@ -24,8 +24,10 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
+from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     Effort,
     ModelClient,
@@ -36,10 +38,10 @@ from harness.app.ports import (
 )
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
+from harness.domain.memory import TurnRef
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from harness.domain.review import SOURCE_BUDGET, ReviewRequest
 from harness.domain.tool import ToolProfile
-from memory.recall.repository import MemoryRecallRepository
 from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
 from runtime.step import AgentStep, StepRequest
@@ -141,8 +143,12 @@ class SubAgentRunner:
         bus: StreamBus | None = None,
         llm: ModelClient | None = None,
         reviewer: ToolCallReviewer | None = None,
+        memory: MemoryProvider | None = None,
     ):
-        """初始化子代理运行器依赖。reviewer 未注入时使用子代理的规则链审核员。"""
+        """初始化子代理运行器依赖。
+
+        reviewer 未注入时使用子代理的规则链审核员；memory 未注入时使用绑定本会话的内置记忆。
+        """
         self.db = db
         self.bus = bus
         # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
@@ -154,6 +160,10 @@ class SubAgentRunner:
         if reviewer is None:
             reviewer = PolicyReviewer.for_subagent(self.permission_service)
         self.reviewer = reviewer
+        # 组装根（阶段 7）之前在这里回落内置实现。
+        if memory is None:
+            memory = BuiltinMemoryProvider(db)
+        self.memory = memory
 
     @staticmethod
     def _resolve_tools(
@@ -378,15 +388,18 @@ class SubAgentRunner:
         """只读继承父 Turn 已冻结正文，缺失可信作用域时不注入。"""
         if parent_turn_id is None or user_id is None or workspace_id is None:
             return None
-        context = await MemoryRecallRepository(self.db).get_context(
-            workspace_id,
-            user_id,
-            parent_turn_id,
-            session_id=session_id,
+        recall = await self.memory.inherited(
+            TurnRef(
+                workspace_id=workspace_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn_id=parent_turn_id,
+            )
         )
-        if context is None:
+        if recall is None:
             return None
-        return context.rendered_memories
+        # 子代理只继承正文，父 Turn 的记忆目录不进子代理的系统提示。
+        return recall.message_prefix
 
     @staticmethod
     def _with_memory_context(

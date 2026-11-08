@@ -319,7 +319,6 @@ async def test_no_error_when_turn_already_completed(monkeypatch: pytest.MonkeyPa
 
     runtime = _runtime(monkeypatch, sessions, _loop)
     monkeypatch.setattr(runtime, "_complete_turn", _complete)
-    monkeypatch.setattr(runtime, "_run_inline_memory_job", _noop)
     monkeypatch.setattr(runtime, "_wake_team_members", _raise(RuntimeError("队友列表读取失败")))
 
     events, _ = await _drive(runtime, sessions)

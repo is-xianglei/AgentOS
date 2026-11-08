@@ -701,9 +701,7 @@ async def _configured_agent(session: Any) -> AgentRuntime:
         load_context_for_turn=AsyncMock(return_value=([], [_USER], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
     )
-    runtime.memory_recall_service = SimpleNamespace(
-        get_or_create_context=AsyncMock(return_value=None)
-    )
+    runtime.memory = SimpleNamespace(recall=AsyncMock(return_value=None))
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
     runtime._apply_stop_hooks = AsyncMock(return_value=None)
     return runtime
@@ -715,7 +713,8 @@ def _agent_case(world: str, effort: str, model_name: str | None, agent_id: int |
         session = _session(effort, model_name=model_name)
         session.agent_id = agent_id
         runtime = await _configured_agent(session)
-        await runtime._run_llm_loop(1, session, SimpleNamespace(id=_TURN_ID), None)
+        turn = SimpleNamespace(id=_TURN_ID, session_id=1, user_id=3, workspace_id=2)
+        await runtime._run_llm_loop(1, session, turn, None)
         attribution = runtime.session_service.add_message.await_args.kwargs
         return {"provider": attribution["provider"], "model": attribution["model"]}
 

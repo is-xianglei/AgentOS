@@ -31,7 +31,7 @@ from memory.jobs.repository import MemoryJobRepository
 from memory.models import MemoryJobRecord
 from memory.repository import MemoryRepository
 from memory.rollout_service import MemoryRolloutService
-from session.models import SessionRecord, SessionTurnRecord
+from session.service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +47,14 @@ class MemoryJobService:
         self.job_repo = MemoryJobRepository(db)
         self.memory_repo = MemoryRepository(db)
 
-    async def enqueue_extract(
-        self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-    ) -> MemoryJobRecord:
-        """为真正完成的 Turn 幂等入队一次提取任务。"""
+    async def enqueue_extract(self, session_id: int, turn_id: UUID) -> MemoryJobRecord:
+        """为真正完成的 Turn 幂等入队一次提取任务。
+
+        会话与轮次经会话域按 ID 读取，须在提交回合终态的同一事务里调用，才能读到已完成的轮次。
+        """
+        session_service = SessionService(self.db)
+        session = await session_service.get_required(session_id)
+        turn = await session_service.get_turn_required(turn_id)
         if (
             turn.status != "completed"
             or turn.completed_message_id is None
