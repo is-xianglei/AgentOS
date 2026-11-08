@@ -24,13 +24,23 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
+from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.app.ports import Effort, ModelClient, ModelSettings, ModelTurnResult, ResolvedModel
+from harness.app.ports import (
+    Effort,
+    ModelClient,
+    ModelSettings,
+    ModelTurnResult,
+    ResolvedModel,
+    ToolCallReviewer,
+)
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
+from harness.domain.review import SOURCE_BUDGET, ReviewRequest
 from harness.domain.tool import ToolProfile
 from memory.recall.repository import MemoryRecallRepository
+from permission.service import PermissionService
 from prompt import compose_subagent_prompt, compose_teammate_prompt
 from runtime.step import AgentStep, StepRequest
 from runtime.stream_assembler import TurnEventAssembler
@@ -42,7 +52,6 @@ from team.isolation import (
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
 from tools.gateway import ToolGateway
-from tools.policy_engine import PolicyEngine
 
 # 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
 from tools.service import ToolService  # noqa: F401
@@ -131,8 +140,9 @@ class SubAgentRunner:
         db: AsyncSession,
         bus: StreamBus | None = None,
         llm: ModelClient | None = None,
+        reviewer: ToolCallReviewer | None = None,
     ):
-        """初始化子代理运行器依赖。"""
+        """初始化子代理运行器依赖。reviewer 未注入时使用子代理的规则链审核员。"""
         self.db = db
         self.bus = bus
         # 客户端持 subagent 默认档模型;Explore 等速度档由 spec.resolve_model()
@@ -140,8 +150,10 @@ class SubAgentRunner:
         self.llm = llm
         self._llm_injected = llm is not None
         self.run_repo = SubAgentRunRepository(db)
-        self.policy_engine = PolicyEngine(db)
-        self.permission_service = self.policy_engine.permission_service
+        self.permission_service = PermissionService(db)
+        if reviewer is None:
+            reviewer = PolicyReviewer.for_subagent(self.permission_service)
+        self.reviewer = reviewer
 
     @staticmethod
     def _resolve_tools(
@@ -475,37 +487,21 @@ class SubAgentRunner:
                 per_tool_limit=max(1, spec.max_rounds * 2),
             )
         for tool_call in tool_calls:
-            # 预算耗尽不执行工具，原因作为错误结果回给模型。
-            allowed, budget_error = budget.try_consume(tool_call.tool_name)
-            if not allowed:
-                output = budget_error or "error: 工具调用预算不足。"
-                await self._emit_tool_result(
-                    actor, session_id, tool_call, output, is_error=True
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "content": ToolResult(
-                            tool_call_id=tool_call.id,
-                            tool_name=tool_call.tool_name,
-                            arguments=tool_call.arguments,
-                            content=output,
-                            is_error=True,
-                        ).to_content(),
-                    }
-                )
-                continue
-            decision = await self.policy_engine.authorize(
-                session_id,
-                tool_call.tool_name,
-                tool_gateway.context.profile,
-                input_args=tool_call.arguments,
-                allowed_skill_names=tool_gateway.context.allowed_skill_names,
-                agent_type=agent_type,
-                workspace_id=workspace_id,
+            decision = await self.reviewer.review(
+                tool_call,
+                ReviewRequest(
+                    session_id=session_id,
+                    profile=tool_gateway.context.profile,
+                    agent_type=agent_type,
+                    budget=budget,
+                    workspace_id=workspace_id,
+                    allowed_skill_names=tool_gateway.context.allowed_skill_names,
+                ),
             )
-            behavior = decision.behavior
-            if behavior == "allow":
+            # 审核员改写过入参时（默认规则链不改写），执行与落库都用审核后的入参。
+            if decision.arguments is not tool_call.arguments:
+                tool_call = replace(tool_call, arguments=decision.arguments)
+            if decision.behavior == "allow":
                 output = await tool_gateway.run(
                     session_id,
                     tool_call.tool_name,
@@ -517,8 +513,17 @@ class SubAgentRunner:
                     allowed_skill_names=allowed_skill_names,
                 )
                 is_error = False
+            elif decision.source == SOURCE_BUDGET:
+                # 预算耗尽不执行工具，原因作为错误结果回给模型；不算权限裁决，不记被拒摘要。
+                output = decision.message
+                is_error = True
             else:
-                output = self._denied_message(tool_call.tool_name, behavior)
+                # 子代理没有审批通道，审核员已把挂起合并为拒绝。
+                if decision.needs_approval:
+                    behavior = "ask"
+                else:
+                    behavior = "deny"
+                output = decision.message
                 is_error = True
                 logger.warning(
                     "子代理工具调用被权限策略拒绝,会话 ID=%s 类型=%s 工具=%s 判定=%s",
@@ -534,7 +539,7 @@ class SubAgentRunner:
                             tool_name=tool_call.tool_name,
                             input_args=tool_call.arguments,
                             behavior=behavior,
-                            reason=decision.reason or "权限策略拒绝执行该工具调用",
+                            reason=decision.reason,
                         )
                     )
             await self._emit_tool_result(actor, session_id, tool_call, output, is_error=is_error)
@@ -552,16 +557,6 @@ class SubAgentRunner:
                     ).to_content(),
                 }
             )
-
-    @staticmethod
-    def _denied_message(tool_name: str, behavior: str) -> str:
-        """拒绝原因文本:区分显式 deny 与因无审批通道而坍缩的 ask。"""
-        if behavior == "ask":
-            return (
-                f"error: 工具 {tool_name} 需要用户审批,而子代理无审批通道,"
-                "本次调用已被拒绝。请改用只读方式完成,或把该操作留给主代理。"
-            )
-        return f"error: 工具 {tool_name} 已被权限策略禁止,本次调用未执行。"
 
     async def _run_react_loop(
         self,

@@ -38,6 +38,7 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "runtime.workflow",
     "harness.adapters.tools.builtin_provider",
     "harness.adapters.tools.builtin.agent",
+    "harness.adapters.reviewers.policy_reviewer",
     "database.registry",
     "api.router",
     "main",
@@ -297,6 +298,7 @@ def test_domain_layer_imports_respect_layering() -> None:
         "harness.domain.context",
         "harness.domain.tool",
         "harness.domain.budget",
+        "harness.domain.review",
     }
     assert expected_domain <= set(domain_modules), (
         f"模块枚举未覆盖 harness 领域层，仅发现: {domain_modules}"

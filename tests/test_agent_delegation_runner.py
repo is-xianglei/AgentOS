@@ -253,7 +253,7 @@ def _script_permissions(
         executed.append(tool_name)
         return "工具输出"
 
-    monkeypatch.setattr(runner.policy_engine.permission_service, "evaluate", _evaluate)
+    monkeypatch.setattr(runner.permission_service, "evaluate", _evaluate)
     monkeypatch.setattr(ToolGateway, "run", _gateway_run)
     return evaluated_agent_types, executed
 

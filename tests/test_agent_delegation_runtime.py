@@ -19,7 +19,6 @@ from harness.domain.messages import ToolCall
 from prompt import PromptContext, compose_lead_blocks
 from prompt.sections import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
-from tools.policy_engine import ToolAccessDecision
 
 pytestmark = pytest.mark.anyio
 
@@ -221,8 +220,8 @@ def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[Ag
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=active_plan))
     runtime.session_service = SimpleNamespace(add_message=AsyncMock())
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.policy_engine.authorize = AsyncMock(  # type: ignore[method-assign]
-        return_value=ToolAccessDecision("Agent", "lead", True, "allow")
+    runtime.permission_service.evaluate = AsyncMock(  # type: ignore[method-assign]
+        return_value="allow"
     )
     gateway_calls: list[dict[str, Any]] = []
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -27,6 +26,7 @@ from core.events import (
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
+from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import (
     ModelClient,
@@ -34,11 +34,17 @@ from harness.app.ports import (
     ModelSettings,
     ModelStatusError,
     ResolvedModel,
+    ToolCallReviewer,
 )
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.context import PromptBlock
 from harness.domain.messages import ToolCall, ToolResult
+from harness.domain.review import (
+    PLAN_MODE_ALLOWED_TOOLS,
+    SOURCE_PERMISSION,
+    ReviewRequest,
+)
 from harness.domain.tool import ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
@@ -47,7 +53,7 @@ from interaction.service import InteractionService
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
 from memory.recall.service import MemoryRecallService
 from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS, TURBO_PROMPT
-from permission.service import DANGEROUS_TOOLS
+from permission.service import DANGEROUS_TOOLS, PermissionService
 from plan.prompts import ENTER_PLAN_MODE_RESULT, render_plan_mode_instructions
 from plan.service import PlanService
 from prompt import PromptContext, compose_lead_blocks
@@ -69,31 +75,11 @@ from task.service import TaskService
 from team.service import TeamService
 from tools.gateway import ToolGateway
 from tools.models import ToolCallRecord
-from tools.policy_engine import PolicyEngine
 from tools.service import ToolService
 from tools.subagents.definition import AgentType
 from tools.subagents.registry import get_subagent_spec
 
 logger = logging.getLogger(__name__)
-
-INTERACTION_TOOL_KINDS = {
-    "AskUserQuestion": "user_question",
-    "EnterPlanMode": "enter_plan_mode",
-    "ExitPlanMode": "exit_plan_mode",
-}
-PLAN_MODE_ALLOWED_TOOLS = frozenset(
-    {
-        "Read",
-        "Glob",
-        "Grep",
-        "Agent",
-        "Skill",
-        "SkillResource",
-        "AskUserQuestion",
-        "WritePlan",
-        "ExitPlanMode",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -145,15 +131,18 @@ class AgentRuntime:
         user_id: int | None = None,
         workspace_id: int | None = None,
         llm: ModelClient | None = None,
+        reviewer: ToolCallReviewer | None = None,
     ):
-        """初始化 Agent 主运行时依赖。"""
+        """初始化 Agent 主运行时依赖。reviewer 未注入时使用主 Agent 的规则链审核员。"""
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.session_service = SessionService(db)
         self.compact_service = CompactService(self.session_service.repo)
-        self.policy_engine = PolicyEngine(db)
-        self.permission_service = self.policy_engine.permission_service
+        self.permission_service = PermissionService(db)
+        if reviewer is None:
+            reviewer = PolicyReviewer.for_main_agent(self.permission_service)
+        self.reviewer = reviewer
         self.interaction_service = InteractionService(db)
         self.plan_service = PlanService(db)
         self.memory_recall_service = MemoryRecallService(db)
@@ -1082,202 +1071,81 @@ class AgentRuntime:
             if tool_call.id in done_ids:
                 continue
 
-            allowed, budget_error = budget.try_consume(tool_call.tool_name)
-            if not allowed:
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    budget_error or "error: 工具调用预算不足。",
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
-
             # 每个工具前重新读取 Plan 状态：同一批工具中前面的 Enter/ExitPlanMode
             # 经人工确认恢复后可能已改变它。
             if getattr(self, "mode_slug", "standard") == "turbo":
                 active_plan = None
             else:
                 active_plan = await self.plan_service.get_active(session_id)
-            if active_plan is not None and tool_call.tool_name not in PLAN_MODE_ALLOWED_TOOLS:
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    "Plan Mode仅允许只读探索、AskUserQuestion、WritePlan和ExitPlanMode。",
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
-
-            try:
-                normalized_input = self.tool_registry.validate_input(
-                    tool_call.tool_name,
-                    tool_call.arguments,
-                )
-            except AgentException as exc:
-                # 入参校验失败不中断回合，把错误详情作为工具结果回给模型自行修正。
-                if exc.details:
-                    details = f"：{json.dumps(exc.details, ensure_ascii=False, default=str)}"
-                else:
-                    details = ""
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    f"{exc.message}{details}",
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
-            tool_call = replace(tool_call, arguments=normalized_input)
-            tool_calls[idx] = tool_call
-
-            # 交互工具和 Plan Mode 分支在这里会提前挂起，先做 profile 能力检查，
-            # 防止历史消息或伪造的 tool_use 绕过 user_agent 的控制面边界。
-            capability = self.policy_engine.admit_tool(
-                tool_call.tool_name,
-                self.active_profile,
-                input_args=tool_call.arguments,
-                allowed_skill_names=self.allowed_skill_names,
+            plan_content = None
+            if active_plan is not None:
+                plan_content = active_plan.content
+            decision = await self.reviewer.review(
+                tool_call,
+                ReviewRequest(
+                    session_id=session_id,
+                    profile=self.active_profile,
+                    agent_type=self.active_profile,
+                    budget=budget,
+                    workspace_id=self.workspace_id,
+                    allowed_skill_names=self.allowed_skill_names,
+                    plan_content=plan_content,
+                    tools=self.tool_registry,
+                ),
             )
-            if not capability.allowed:
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    capability.reason
-                    or f"工具能力策略拒绝执行: tool={tool_call.tool_name}, "
-                    f"profile={self.active_profile}",
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
+            # 审核可能规范化了入参：执行、落库与挂起的续跑状态都用审核后的入参。
+            if decision.arguments is not tool_call.arguments:
+                tool_call = replace(tool_call, arguments=decision.arguments)
+                tool_calls[idx] = tool_call
 
-            if (
-                active_plan is not None
-                and tool_call.tool_name == "Agent"
-                and tool_call.arguments.get("agent_type") not in {"Explore", "Plan"}
-            ):
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    "Plan Mode只能派发Explore或Plan只读子代理。",
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
-
-            if tool_call.tool_name in INTERACTION_TOOL_KINDS:
-                if tool_call.tool_name == "EnterPlanMode" and active_plan is not None:
-                    await self._record_tool_response(
-                        session_id,
-                        turn.id,
-                        actor,
-                        tool_call,
-                        "当前会话已经处于Plan Mode。",
-                        is_error=True,
+            if decision.behavior == "deny":
+                if decision.source == SOURCE_PERMISSION:
+                    logger.warning(
+                        "工具权限策略拒绝执行该工具调用",
+                        extra={
+                            "session_id": session_id,
+                            "turn_id": str(turn.id),
+                            "tool_name": tool_call.tool_name,
+                            "decision": "deny",
+                        },
                     )
-                    done_ids.append(tool_call.id)
-                    continue
-                if tool_call.tool_name == "ExitPlanMode":
-                    if active_plan is None:
-                        await self._record_tool_response(
-                            session_id,
-                            turn.id,
-                            actor,
-                            tool_call,
-                            "当前会话未处于Plan Mode，不能调用ExitPlanMode。",
-                            is_error=True,
-                        )
-                        done_ids.append(tool_call.id)
-                        continue
-                    if not active_plan.content.strip():
-                        await self._record_tool_response(
-                            session_id,
-                            turn.id,
-                            actor,
-                            tool_call,
-                            "计划正文为空。请先使用WritePlan保存计划，再请求退出。",
-                            is_error=True,
-                        )
-                        done_ids.append(tool_call.id)
-                        continue
-
-                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
-                return await self._suspend_for_interaction(
-                    session_id,
-                    session,
-                    turn,
-                    assistant_message_id,
-                    remaining,
-                    done_ids,
-                    additional_context,
-                    INTERACTION_TOOL_KINDS[tool_call.tool_name],
-                    existing_suspension,
-                    budget,
-                )
-
-            decision = await self.policy_engine.authorize(
-                session_id,
-                tool_call.tool_name,
-                self.active_profile,
-                input_args=tool_call.arguments,
-                agent_type=self.active_profile,
-                workspace_id=self.workspace_id,
-                allowed_skill_names=self.allowed_skill_names,
-            )
-            behavior = decision.behavior
-            if behavior == "ask":
-                logger.info(
-                    "工具权限策略要求人工审批，挂起等待用户确认",
-                    extra={
-                        "session_id": session_id,
-                        "turn_id": str(turn.id),
-                        "tool_name": tool_call.tool_name,
-                        "decision": "ask",
-                    },
-                )
-                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
-                return await self._suspend_for_interaction(
-                    session_id,
-                    session,
-                    turn,
-                    assistant_message_id,
-                    remaining,
-                    done_ids,
-                    additional_context,
-                    "tool_approval",
-                    existing_suspension,
-                    budget,
-                )
-            if behavior == "deny":
-                logger.warning(
-                    "工具权限策略拒绝执行该工具调用",
-                    extra={
-                        "session_id": session_id,
-                        "turn_id": str(turn.id),
-                        "tool_name": tool_call.tool_name,
-                        "decision": "deny",
-                    },
-                )
                 await self._record_tool_response(
                     session_id,
                     turn.id,
                     actor,
                     tool_call,
-                    "权限策略拒绝执行该工具调用。",
+                    decision.message,
                     is_error=True,
                 )
                 done_ids.append(tool_call.id)
                 continue
+
+            if decision.behavior == "ask":
+                interaction = decision.require_interaction()
+                if decision.source == SOURCE_PERMISSION:
+                    logger.info(
+                        "工具权限策略要求人工审批，挂起等待用户确认",
+                        extra={
+                            "session_id": session_id,
+                            "turn_id": str(turn.id),
+                            "tool_name": tool_call.tool_name,
+                            "decision": "ask",
+                        },
+                    )
+                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
+                return await self._suspend_for_interaction(
+                    session_id,
+                    session,
+                    turn,
+                    assistant_message_id,
+                    remaining,
+                    done_ids,
+                    additional_context,
+                    interaction,
+                    existing_suspension,
+                    budget,
+                )
+
             # 本轮实际生效的工具名单按刚读到的 Plan 状态计算;委派自建 Agent 时,
             # 被委派方的工具不能超出它,否则 Plan Mode 下可借子 Agent 绕过只读限制。
             round_tool_names = self._registry_for_mode(active_plan is not None).names

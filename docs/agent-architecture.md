@@ -30,7 +30,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | session.py | `Session(id, messages, append)`：一次上下文加载得到的会话视图，不是 ORM |
 | context.py | 已落地（阶段 2b）。`Context[O](instruction: str \| tuple[PromptBlock, ...] \| None, messages: tuple[Message, ...], tools: tuple[ToolSpec, ...] = (), output_type: type[O] \| None = None)`，以及 `PromptBlock`、`ToolSpec` 两个值类型；`messages_from_rows(rows)` 在调用边界把中立 dict 还原为领域消息。记忆和项目规范不单列字段，由角色渲染进 instruction 或 messages，模型客户端不需要懂记忆的语义 |
 | tool.py | 已落地（阶段 3a）。`Tool(name, description, parameters, policy)`，抽象方法 `normalize_arguments`、`execute(arguments, ctx)`；`PydanticTool` 是内置工具基类，parameters 由 input_model 派生；`ToolPolicy`、`ToolProfile`、`ShellAccess`、`ToolContext`（db、bus 的类型只在 TYPE_CHECKING 下导入）；`tool_policy()`、`unknown_tool_policy()`、`requires_skill_allowlist()` |
-| review.py | `Decision(behavior, reason, updated_arguments)`，behavior 取 allow / ask / deny |
+| review.py | 已落地（阶段 3b）。`Decision(behavior, arguments, source, message, reason, interaction, needs_approval)`，只经工厂方法 `Decision.allow(arguments, *, source)`、`Decision.deny(message, *, arguments, source, reason, needs_approval)`、`Decision.ask(interaction, *, arguments, reason, source)` 构造，`__post_init__` 拒绝非法组合；arguments 是审核后（可能已规范化）的入参；message 回给模型，reason 供日志和被拒摘要；needs_approval 标出「需审批但无审批通道而合并成的拒绝」。`ReviewRequest(session_id, profile, agent_type, budget, workspace_id, allowed_skill_names, plan_content, tools)`，plan_content 为 None 表示不在 Plan 模式，tools 只需满足 `ToolInputValidator`（validate_input）。纯函数 `check_capability(tool_name, policy, profile, arguments, allowed_skill_names) -> str \| None` 由审核规则和 ToolService 执行层兜底共用。另有 `PLAN_MODE_ALLOWED_TOOLS`、`INTERACTION_TOOL_KINDS`、`SOURCE_*` 规则来源名 |
 | roles.py | 角色 `Assistant`（主 Agent）、`SubAgent`、`Teammate`、`Compactor`，各自 `context(...) -> Context[...]` |
 | budget.py | 已落地（阶段 3a）。`ToolCallBudget`：循环额度，可序列化进挂起的续跑状态 |
 | prompts/ | 各角色的提示文案，逐字保持现状 |
@@ -66,13 +66,13 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | SessionStore | 按实际操作设计：加载本轮上下文、追加消息、写压缩快照；不做整存整取 | 数据库（包装 SessionService） | 测试用内存实现 |
 | ToolProvider | `list_tools() -> list[Tool]`，代表一个工具来源；目前同步、不带 scope，接入 MCP 时扩展为 `async list_tools(scope)` | BuiltinToolProvider | MCP |
 | MemoryProvider | `recall(request) -> MemoryRecall`，以及回合结束后的写入 | 内置 memory 域 | 外部记忆框架 |
-| ToolCallReviewer | `review(...) -> Decision` | 规则链（原 7 层审核合一） | LLM 审核员 |
+| ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
 
 编排：
 - `AgentService` 对外提供 new_session / list_sessions / chat / resume / cancel。主 Agent、子代理、队友
   共用唯一一份 ReAct 循环（loop.py）。
 - `ToolSet`（已落地，阶段 3a）聚合多个 ToolProvider，负责重名校验、按模式和档位裁剪，并保证工具顺序稳定（提示缓存依赖这一点）。提供 to_specs、get、validate_input、only、without、with_tools，以及按名查策略的 policy_for、callable_names、bindable_names、denied_names（吸收了原 ToolCapabilityResolver）。
-  只有工具名、拿不到 ToolSet 的调用方（PermissionService、PolicyEngine、ToolCatalogService、ToolService 的能力检查等）暂时调用 `builtin_tool_set()` 查策略；接入 MCP 前由组装根注入完整 ToolSet（阶段 7）。
+  只有工具名、拿不到 ToolSet 的调用方（PermissionService、PolicyReviewer 的能力规则、ToolCatalogService、ToolService 的能力检查等）暂时调用 `builtin_tool_set()` 查策略；接入 MCP 前由组装根注入完整 ToolSet（阶段 7）。
 - 后台执行与租约、SSE 跟随、孤儿回收、取消还原、Workflow 编排、Hook 注册表也都放在应用层。
 
 ## 4. 适配层（harness/adapters/）
@@ -83,7 +83,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | stores/ | DatabaseSessionStore |
 | tools/ | builtin/（全部内置工具，Bash 的 shell 校验也在这里）、builtin_provider.py |
 | memory/ | BuiltinMemoryProvider（包装 memory 域的召回和提取） |
-| reviewers/ | PolicyReviewer（档位能力、Skill 白名单、Plan 模式、权限规则、预算等合成一条规则链） |
+| reviewers/ | 已落地（阶段 3b）。`PolicyReviewer(rules)` 按序执行一组规则（每条规则本身也是 ToolCallReviewer），拒绝或挂起即终局，放行可改写入参交给下一条。`for_main_agent(permission_service)`：BudgetRule → PlanModeToolsRule → ArgumentsRule → CapabilityRule → PlanModeAgentRule → InteractionToolRule → PermissionRule。`for_subagent(permission_service)`：BudgetRule → NoApprovalChannelRule(CapabilityRule, PermissionRule)，后者把挂起合并为拒绝并换成子代理文案。AgentRuntime、SubAgentRunner 构造参数 `reviewer` 未注入时用对应组装入口 |
 
 HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：路由只把请求转成对 AgentService 的调用，
 不再自己 new 运行时。
@@ -120,7 +120,8 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | tools/builtin/、tools/shell_policy.py 的命令校验 | adapters/tools/builtin/（已完成） |
 | tools/subagents/ | 子代理规格放 domain/roles.py，提示文案放 domain/prompts/ |
 | tools/registry.py、tools/policy.py 的 ToolCapabilityResolver | app/tool_set.py + adapters/tools/builtin_provider.py（已完成） |
-| tools/gateway.py、policy_engine.py、policy.py | adapters/reviewers/policy_reviewer.py |
+| tools/policy_engine.py、runtime 里两份逐条审核 | adapters/reviewers/policy_reviewer.py（已完成，PolicyEngine 已删除；静态能力检查收进 domain/review.py 的 check_capability） |
+| tools/gateway.py | 待定：网关冻结执行身份并在执行层兜底，随 ToolService 迁往 app/tool_executor.py 时一并处理 |
 | tools/service.py 里的 ToolService | app/tool_executor.py（执行与钩子）；调用记录仍经 tools 域写入 |
 | tools/ 的 ToolCatalogService、models、repository、api | 留在 tools/，工具目录和调用记录属于平台数据 |
 | prompt/ | domain/prompts/，由角色负责组装 |
@@ -145,12 +146,16 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 发往两家 SDK 的请求参数由 tests/test_model_request_golden.py 固化（字面量取自阶段 2b 之前的代码），
   后续阶段不得改动 tests/fixtures/model_request_golden.py。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
+- 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
 
 已知、有意保留的行为差异和不对称（后续单独处理，不在重构中顺手改）：
 - 未知的 effort 字符串在 `Effort.parse` 处抛中文异常；之前在工作区路径会回落到默认档位，在 .env 路径会原样下发。
   Schema 只接受六个合法值，开发库里也没有非法值（2026-11-08 核查），属于禁止静默兜底的收紧。
 - `ModelSettings.timeout` 在各条调用路径上的作用范围不一致：Anthropic 流式调用忽略它、只用端点超时；
   Anthropic 结构化调用作用于单次请求；OpenAI 结构化调用作用于客户端。为了保持请求逐字节一致，暂时原样保留。
+- 阶段 3b 起，Plan 状态由调用方在审核前读出并放进 ReviewRequest，所以预算已耗尽的调用也会多查一次 Plan；之前是预算扣减成功后才读。写出的结果不变，黄金测试已覆盖。
+- 交互工具（AskUserQuestion、EnterPlanMode、ExitPlanMode）不经过权限规则；人工审批通过后的恢复路径不会重新审核，只重新校验用户改过的入参，执行层的能力兜底仍然生效。两条都是现状，已在黄金测试中固化。
+- Decision.source 取 `SOURCE_*` 常量，运行时据此决定打哪条日志；以后接入 LLM 审核员时要用新的来源名，不要复用这些常量。
 
 ## 8. 阶段
 
@@ -161,7 +166,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | 2a | 已完成：模型端口迁到 app/ports.py，两家客户端迁到 adapters/models |
 | 2b | 已完成：ModelSettings、Effort、Context 按调用传入；客户端去掉可变的思考属性；模型解析迁到 adapters/models/resolver.py，工作区端点构造迁到 builder.py，档位映射表在 reasoning.py |
 | 3a | 已完成：工具领域类型（Tool 以 JSON Schema 为准、自带 ToolPolicy；ToolContext；ToolCallBudget）；内置工具迁到 adapters/tools/builtin；ToolProvider + ToolSet 取代 ToolRegistry |
-| 3b | ToolCallReviewer + Decision；PolicyReviewer 合并原 7 层审核，主循环和子代理共用 |
+| 3b | 已完成：ToolCallReviewer + Decision；PolicyReviewer 合并原 7 层审核，主循环和子代理共用；审核结果由 tests/test_tool_review_golden.py 固化 |
 | 4 | MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
 | 5 | 角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/ 并入 |
 | 6 | SessionStore + AgentService：拆分 AgentRuntime，三份 ReAct 循环合成一份 |

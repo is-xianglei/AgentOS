@@ -1,4 +1,4 @@
-"""应用层端口：模型客户端、调用参数、模型解析器、工具来源，以及中立流事件与调用异常。
+"""应用层端口：模型客户端、调用参数、模型解析器、工具来源、工具调用审核员，以及中立流事件与调用异常。
 
 全部类型不含任何 provider 的 wire 形状；各家 SDK 的适配在 harness.adapters.models 内部完成。
 """
@@ -15,6 +15,7 @@ from core.errors import AgentException
 from core.events import BlockType, ToolInfo, Usage
 from harness.domain.context import Context
 from harness.domain.messages import ThinkingBlock, ToolCall
+from harness.domain.review import Decision, ReviewRequest
 from harness.domain.tool import Tool
 
 
@@ -291,3 +292,15 @@ class ToolProvider(ABC):
     @abstractmethod
     def list_tools(self) -> list[Tool]:
         """按稳定顺序返回本来源的全部工具；顺序决定发给模型的工具顺序，提示缓存依赖它。"""
+
+
+class ToolCallReviewer(ABC):
+    """工具调用审核员：模型发起的每个工具调用先经它审核，得到 allow / ask / deny 结论。
+
+    现有实现是适配层的规则链 PolicyReviewer（预算、Plan 模式、入参、能力、交互工具、权限规则）。
+    以后的 LLM 审核员是这个端口的另一种实现，也可以作为规则链里的一条规则接入。
+    """
+
+    @abstractmethod
+    async def review(self, call: ToolCall, request: ReviewRequest) -> Decision:
+        """审核一个工具调用。可能扣减 request.budget 的额度；放行时按 Decision.arguments 执行。"""

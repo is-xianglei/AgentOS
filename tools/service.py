@@ -12,12 +12,8 @@ from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.tool_set import ToolSet
-from harness.domain.tool import (
-    ShellAccess,
-    ToolContext,
-    ToolProfile,
-    requires_skill_allowlist,
-)
+from harness.domain.review import check_capability
+from harness.domain.tool import ShellAccess, ToolContext, ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord, ToolRecord
@@ -366,24 +362,17 @@ class ToolService:
         # 运行时显式携带 profile，则未知工具也必须先登记策略才能调用。
         capability_check_required = profile is not None or policy.category != "unknown"
         denied: str | None = None
-        if capability_check_required and not policy.can_call(resolved_profile):
-            denied = f"工具能力策略拒绝执行: tool={tool_name}, profile={resolved_profile}"
-        elif policy.requires_bound_skill and requires_skill_allowlist(resolved_profile):
-            # Skill 的参数名是 ``name``，SkillResource / SkillRun 使用
-            # ``skill_name``。统一在执行网关做资产边界校验，不能只依赖
-            # 工具自身的错误文本或模型可见 schema。lead 使用工作区级目录，
-            # 其他运行身份必须由父运行时显式下发白名单。
-            skill_arg = "name" if tool_name == "Skill" else "skill_name"
-            requested_skill = input_args.get(skill_arg)
-            if (
-                allowed_skill_names is None
-                or not isinstance(requested_skill, str)
-                or requested_skill not in allowed_skill_names
-            ):
-                denied = (
-                    "工具能力策略拒绝执行: 当前运行身份只能访问已绑定的 skill"
-                    f" (skill={requested_skill!r})"
-                )
+        if capability_check_required:
+            # 与审核规则共用同一份能力检查（档位 + Skill 白名单），这里是执行层的纵深防御，
+            # 不能只依赖工具自身的错误文本或模型可见 schema。跳过时策略必为未知工具策略，
+            # 它不要求绑定 skill，所以只跳过档位检查不会漏掉 Skill 白名单检查。
+            denied = check_capability(
+                tool_name,
+                policy,
+                resolved_profile,
+                input_args,
+                allowed_skill_names,
+            )
         # 被策略拒绝的调用同样落一条失败记录并触发 PostToolUse，便于审计；
         # 拒绝理由作为工具结果回给模型，不抛异常。
         if denied is not None:
