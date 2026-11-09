@@ -632,7 +632,10 @@ def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     if case.registry is not None:
         runtime.tool_registry = builtin_tool_set().only(*case.registry)
     runtime.plan_service = _FakePlanService(case.plans)
-    runtime.session_service = _FakeSessionService(recorder)
+    session_service = _FakeSessionService(recorder)
+    # 会话状态改经 SessionService.set_status 写入，替身的记录方法挂在 repo 上，这里转接过去。
+    session_service.set_status = session_service.repo.update_status  # type: ignore[attr-defined]
+    runtime.session_service = session_service
     runtime.interaction_service = _FakeInteractionService(recorder)
     runtime.bus = _FakeBus(recorder)
     runtime.tool_gateway = _FakeGateway(recorder, case.profile, case.allowed_skill_names)
@@ -640,9 +643,7 @@ def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     async def _mark_awaiting(record: Any) -> None:
         recorder.awaiting.append(record.id)
 
-    runtime.tool_service = SimpleNamespace(
-        tool_repo=SimpleNamespace(mark_awaiting_interaction=_mark_awaiting)
-    )
+    runtime.tool_service = SimpleNamespace(mark_call_awaiting=_mark_awaiting)
     return runtime
 
 

@@ -287,6 +287,24 @@ class ToolService:
             raise AgentException.message("人工交互关联的工具调用不存在")
         return record
 
+    # ---- 调用记录状态流转：只转发到仓储，flush 不提交，随调用方事务生效 ----
+
+    async def get_call(self, tool_call_id: int) -> ToolCallRecord | None:
+        """按 ID 读取工具调用记录，不存在时返回 None，不校验会话归属。"""
+        return await self.tool_repo.get(tool_call_id)
+
+    async def complete_call(self, record: ToolCallRecord, output: Any) -> ToolCallRecord:
+        """把调用记录标记为成功并写入输出，用于不经真实执行的合成结果。"""
+        return await self.tool_repo.succeed(record, output)
+
+    async def mark_call_awaiting(self, record: ToolCallRecord) -> ToolCallRecord:
+        """把调用记录置为等待人工交互。"""
+        return await self.tool_repo.mark_awaiting_interaction(record)
+
+    async def reject_awaiting_call(self, record: ToolCallRecord, message: str) -> ToolCallRecord:
+        """把等待人工交互的调用记录标记为拒绝并写入原因。"""
+        return await self.tool_repo.reject_awaiting(record, message)
+
     async def _open_call_record(
         self,
         record: ToolCallRecord | None,

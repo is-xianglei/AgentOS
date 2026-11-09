@@ -71,6 +71,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 
 编排：
 - `AgentService` 对外提供 new_session / list_sessions / chat / resume / cancel。主 Agent、子代理、队友
+- `app/loop.py`（已落地，阶段 6a）是唯一的 ReAct 循环骨架：`run_react_loop(policy, step, *, max_rounds)`。每轮依次执行 `before_round` → `load_context` → 调模型 → `record_assistant`，之后有工具调用就走 `execute_tools` + `flush`，没有就走 `on_no_tool_calls`；钩子返回 `LoopExit` 时立即结束（结束前也会先 `flush`），跑满轮次后走 `on_exhausted`。三种循环策略都放在 runtime：`LeadLoopPolicy`（runtime/agent.py）、`SubAgentLoopPolicy` / `TeammateLoopPolicy`（runtime/subagent.py），因为它们要用到 session、team 等 feature 域的 Service。
   共用唯一一份 ReAct 循环（loop.py）。
 - `ToolSet`（已落地，阶段 3a）聚合多个 ToolProvider，负责重名校验、按模式和档位裁剪，并保证工具顺序稳定（提示缓存依赖这一点）。提供 to_specs、get、validate_input、only、without、with_tools，以及按名查策略的 policy_for、callable_names、bindable_names、denied_names（吸收了原 ToolCapabilityResolver）。
   只有工具名、拿不到 ToolSet 的调用方（PermissionService、PolicyReviewer 的能力规则、ToolCatalogService、ToolService 的能力检查等）暂时调用 `builtin_tool_set()` 查策略；接入 MCP 前由组装根注入完整 ToolSet（阶段 7）。
@@ -128,7 +129,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | tools/ 的 ToolCatalogService、models、repository、api | 留在 tools/，工具目录和调用记录属于平台数据 |
 | prompt/、plan/prompts.py、TURBO_PROMPT | 已完成：domain/prompts/，由角色负责组装 |
 | hooks/ | app/hooks.py |
-| runtime/agent.py、subagent.py、step.py、stream_assembler.py | app/agent_service.py、app/loop.py |
+| runtime/agent.py、subagent.py、step.py、stream_assembler.py | app/agent_service.py、app/loop.py（循环骨架与 StepResult 已迁入，阶段 6a） |
 | runtime/compact.py | 已完成：domain/roles/compactor.py 的 Compactor，加上 app/compaction.py 的 ContextCompaction 编排；快照改走新增的 SessionService.save_compact_snapshot，runtime 不再持有 SessionRepository |
 | runtime/budget.py | domain/budget.py（已完成） |
 | runtime/execution.py、turn_follow.py、recovery.py、cancel_partial.py | app/ 下同名模块 |
@@ -149,6 +150,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
   后续阶段不得改动 tests/fixtures/model_request_golden.py。
 - 记忆接入主循环的行为（召回结果在系统提示和用户消息里的位置、提交与 SAVEPOINT 的调用顺序、入队参数、日志、子代理继承）由 tests/test_memory_port_golden.py 固化（27 种情况，字面量取自阶段 4 之前的代码），后续阶段不得改动 tests/fixtures/memory_port_golden.py。runtime/ 不得导入 memory 包，由 tests/test_import_isolation.py 静态检查。
 - 各角色产出的系统指令与消息（主 Agent 组合矩阵、极速、Plan、收尾不带工具、子代理与队友、压缩）、子代理规格的全部字段与派生结果、输出协议解析与路由目录，由 tests/test_role_context_golden.py 固化（80 种情况，字面量取自阶段 5 之前的代码），后续阶段不得改动 tests/fixtures/role_context_golden.py。harness/domain 不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由 tests/test_import_isolation.py 静态检查。
+- 主循环、子代理和队友循环发出的 SSE 事件序列、落库与状态变化序列、commit / flush 顺序、模型请求、日志和返回值，由 tests/test_react_loop_golden.py 固化（27 种情况，字面量取自阶段 6a 之前的代码），后续阶段不得改动 tests/fixtures/react_loop_golden.py。runtime/ 和 harness/app/ 不得导入任何 `*.repository` 模块（函数体和 TYPE_CHECKING 里的导入也算），由 tests/test_import_isolation.py 静态检查。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
 - 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
 
@@ -175,6 +177,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | 3b | 已完成：ToolCallReviewer + Decision；PolicyReviewer 合并原 7 层审核，主循环和子代理共用；审核结果由 tests/test_tool_review_golden.py 固化 |
 | 4 | 已完成：MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
 | 5 | 已完成：角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/、tools/subagents/、runtime/compact.py 并入 harness |
-| 6 | SessionStore + AgentService：拆分 AgentRuntime，三份 ReAct 循环合成一份 |
+| 6a | 已完成：主 Agent、子代理、队友共用 app/loop.py；runtime 不再直接使用别域 Repository，改走新增的 Service 公开方法：SessionService.get / get_turn / set_status，ToolService.get_call / complete_call / mark_call_awaiting / reject_awaiting_call，TeamService.create_subagent_run / succeed_subagent_run / fail_subagent_run |
+| 6b | SessionStore 端口 + AgentService：拆分 AgentRuntime（准入、执行生命周期、人工交互、模型与工具配置），对外提供 new_session / list_sessions / chat / resume / cancel |
 | 7 | 组装根：bootstrap 装配，API 层通过依赖注入拿 AgentService，清理跨域直连 Repository |
 | 8 | 更新 CLAUDE.md、AGENTS.md、README |

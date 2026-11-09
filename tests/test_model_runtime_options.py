@@ -365,7 +365,7 @@ async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
     runtime.db = SimpleNamespace(commit=AsyncMock(), begin_nested=AsyncMock())
     runtime.memory = BuiltinMemoryProvider(runtime.db)
     runtime.session_service = SimpleNamespace(
-        mark_turn_status=AsyncMock(), repo=SimpleNamespace(update_status=AsyncMock()),
+        mark_turn_status=AsyncMock(), set_status=AsyncMock(),
     )
     assert await runtime._complete_turn(SimpleNamespace(id=1), SimpleNamespace(id=uuid4()), 99) is None
     enqueue.assert_not_awaited()

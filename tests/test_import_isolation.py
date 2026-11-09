@@ -396,6 +396,7 @@ def test_app_layer_imports_respect_layering() -> None:
         "harness.app.memory_port",
         "harness.app.compaction",
         "harness.app.subagent_catalog",
+        "harness.app.loop",
     }
     assert expected_app <= set(app_modules), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
@@ -564,6 +565,114 @@ def test_memory_package_checker_reports_imports(source: str, expected: list[str]
     known = set(_first_party_module_files())
 
     assert _memory_package_imports(ast.parse(source), "runtime", known) == expected
+
+
+# runtime 与应用层只经各域 Service 读写别域数据，任何 Repository 模块都不得直接导入。
+_REPOSITORY_GUARDED_PACKAGES = ("runtime", "harness.app")
+
+
+def _is_repository_module(name: str) -> bool:
+    """模块名最后一段是 repository，或以 _repository 结尾（如 team.subagent_run_repository）。"""
+    last = name.rsplit(".", 1)[-1]
+    return last == "repository" or last.endswith("_repository")
+
+
+def _repository_imports(tree: ast.Module, source_package: str, known: set[str]) -> list[str]:
+    """返回模块中任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）导入的 Repository 模块名。
+
+    相对导入按所在包展开；``from session import repository`` 这种按包导入子模块的写法同样报出。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, source_package, known)):
+            if _is_repository_module(name):
+                found.append(name)
+    return found
+
+
+def test_runtime_and_app_do_not_import_repositories() -> None:
+    """分层防线：runtime 与 harness.app 任何位置都不得导入 *.repository 模块，别域数据经 Service 访问。"""
+    files = _first_party_module_files()
+    known = set(files)
+    guarded = sorted(
+        module
+        for module in files
+        if any(
+            module == package or module.startswith(f"{package}.")
+            for package in _REPOSITORY_GUARDED_PACKAGES
+        )
+    )
+    assert {"runtime.agent", "runtime.subagent", "harness.app.loop"} <= set(guarded), (
+        f"模块枚举未覆盖 runtime 与应用层，仅发现: {guarded}"
+    )
+    failures: list[str] = []
+    for module in guarded:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source_package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+        failures.extend(
+            f"  - {module} 导入了 {name}"
+            for name in _repository_imports(tree, source_package, known)
+        )
+    assert not failures, "runtime 或应用层直接导入了 Repository 模块:\n" + "\n".join(failures)
+
+
+_TYPE_CHECKING_REPOSITORY_IMPORT = (
+    "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from team.repository import X"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from session.repository import SessionRepository", ["session.repository"]),
+        (
+            "from team.subagent_run_repository import SubAgentRunRepository",
+            ["team.subagent_run_repository"],
+        ),
+        ("import tools.repository", ["tools.repository"]),
+        ("from session import repository", ["session.repository"]),
+        ("def f():\n    from memory.recall.repository import X", ["memory.recall.repository"]),
+        (_TYPE_CHECKING_REPOSITORY_IMPORT, ["team.repository"]),
+        ("from ..session import repository", ["session.repository"]),
+        ("from session.service import SessionService", []),
+        ("from tools.models import ToolCallRecord", []),
+        ("import repository_utils", []),
+    ],
+)
+def test_repository_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：各种写法导入 Repository 模块都必须报出，Service、ORM 与相似名不得误报。"""
+    known = set(_first_party_module_files())
+
+    assert _repository_imports(ast.parse(source), "runtime", known) == expected
+
+
+# harness.app.loop 是三种循环共用的骨架，只认领域层与模型端口，不得触达 feature 包。
+_LOOP_MODULE = "harness.app.loop"
+
+
+def test_loop_module_does_not_import_feature_packages() -> None:
+    """分层防线：循环骨架任何位置都不得导入 feature 包、adapters、SQLAlchemy、FastAPI 与 SDK。"""
+    files = _first_party_module_files()
+    known = set(files)
+    path = files[_LOOP_MODULE]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    allowed_tops = {"harness", "core"}
+    first_party_tops = {name.split(".")[0] for name in known}
+    failures: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, "harness.app", known)):
+            top = name.split(".")[0]
+            forbidden_sdk = top in _APP_FORBIDDEN_THIRD_PARTY
+            adapter = name == "harness.adapters" or name.startswith("harness.adapters.")
+            feature = top in first_party_tops and top not in allowed_tops
+            if forbidden_sdk or adapter or feature:
+                failures.append(name)
+    assert not failures, f"{_LOOP_MODULE} 导入了不该依赖的模块: {failures}"
 
 
 # 领域层不得读取进程状态：工作目录、当前时间与日期、临时目录、环境变量、随机数与 UUID。

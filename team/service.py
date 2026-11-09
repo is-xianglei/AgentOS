@@ -214,6 +214,31 @@ class TeamService:
         await self.session_service.require_read_access(session_id, user_id, workspace_id)
         return await self.run_repo.list_by_session(session_id)
 
+    # 子代理运行记录的写入只转发到仓储：flush 不提交，提交由子代理运行器在收尾时负责。
+
+    async def create_subagent_run(
+        self,
+        session_id: int,
+        member_name: str,
+        prompt: str,
+        *,
+        agent_id: int | None = None,
+    ) -> SubAgentRunRecord:
+        """建一条 running 的子代理运行记录；agent_id 只有数据库 Agent 构造的规格才传入。"""
+        return await self.run_repo.create(session_id, member_name, prompt, agent_id=agent_id)
+
+    async def succeed_subagent_run(self, run: SubAgentRunRecord, report: str) -> SubAgentRunRecord:
+        """把子代理运行记录标记为成功并写入报告。"""
+        return await self.run_repo.succeed(run, report)
+
+    async def fail_subagent_run(
+        self,
+        run: SubAgentRunRecord,
+        error_message: str,
+    ) -> SubAgentRunRecord:
+        """把子代理运行记录标记为失败并写入错误信息。"""
+        return await self.run_repo.fail(run, error_message)
+
     # ----- 团队(会话 1:1) -----
 
     async def get_or_create_team(

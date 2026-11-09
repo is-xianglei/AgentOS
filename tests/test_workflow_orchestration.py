@@ -1231,20 +1231,16 @@ class _FakeRuntimeSessionService:
         self.turn_statuses: list[str] = []
         self.session_statuses: list[str] = []
         self.prepare_kwargs: dict[str, Any] = {}
-        service = self
 
-        class _Repo:
-            async def update_status(self, session: Any, status: str) -> Any:
-                service.session_statuses.append(status)
-                return session
+    async def set_status(self, session: Any, status: str) -> Any:
+        self.session_statuses.append(status)
+        return session
 
-            async def get(self, session_id: int) -> Any:
-                return service.session
+    async def get(self, session_id: int) -> Any:
+        return self.session
 
-            async def get_turn(self, turn_id: Any) -> Any:
-                return service.turn
-
-        self.repo = _Repo()
+    async def get_turn(self, turn_id: Any) -> Any:
+        return self.turn
 
     async def prepare_for_message(self, session_id, content, user_id, workspace_id, **kwargs):
         self.prepare_kwargs = kwargs

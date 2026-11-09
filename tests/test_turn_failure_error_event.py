@@ -87,7 +87,7 @@ class _Sessions:
         self.turn = SimpleNamespace(id=uuid4(), session_id=_SID, status="running")
         self.lock_error = lock_error
         self.persist_error = persist_error
-        self.repo = SimpleNamespace(update_status=self._update_session_status)
+        self.set_status = self._update_session_status
 
     async def get_required(self, session_id: int) -> SimpleNamespace:
         return self.session

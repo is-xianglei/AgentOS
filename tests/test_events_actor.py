@@ -198,7 +198,7 @@ def _stub_runner(
     """构造跳过 LLM / 工具 / 记忆 / 权限依赖的运行器,只保留建记录与发事件两步。"""
     runner = SubAgentRunner(_FakeDb(), bus=_RecordingBus(), llm=object())  # type: ignore[arg-type]
     repo = _RecordingRunRepo()
-    runner.run_repo = repo  # type: ignore[assignment]
+    runner.team_service.run_repo = repo  # type: ignore[assignment]
 
     async def _fake_loop(*args: Any, **kwargs: Any) -> tuple[str, int]:
         return "报告", 1

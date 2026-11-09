@@ -12,9 +12,10 @@ import pytest
 from agent.service import AgentRuntimeConfig
 from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.loop import StepResult
 from harness.app.ports import ModelTurnResult
 from harness.app.subagent_catalog import get_subagent_spec
-from harness.domain.messages import ToolCall
+from harness.domain.messages import AssistantMessage, ToolCall
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolContext
 from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
@@ -124,7 +125,7 @@ def _stub_runner(
     """构造跳过 LLM 的运行器;fake_loop=False 时保留真实 ReAct 循环与工具裁决。"""
     runner = SubAgentRunner(_FakeDb(), bus=_RecordingBus(), llm=object())  # type: ignore[arg-type]
     repo = _RecordingRunRepo()
-    runner.run_repo = repo  # type: ignore[assignment]
+    runner.team_service.run_repo = repo  # type: ignore[assignment]
     capture = _LoopCapture()
     monkeypatch.setattr("runtime.subagent.TurnEventAssembler", _FakeAssembler)
     if fake_loop:
@@ -230,10 +231,13 @@ def _script_llm(runner: SubAgentRunner, tool_calls: list[ToolCall]) -> None:
         ModelTurnResult(text="子 Agent 结论", stop_reason="end_turn"),
     ]
 
-    async def _fake_stream(*args: Any, **kwargs: Any) -> ModelTurnResult:
-        return results.pop(0)
+    class _ScriptedStep:
+        async def run(self, context: Any, settings: Any) -> StepResult:
+            result = results.pop(0)
+            blocks = AssistantMessage.from_turn(result.text, result.tool_calls).to_content()
+            return StepResult(llm_result=result, assistant_blocks=blocks)
 
-    runner._stream_and_collect = _fake_stream  # type: ignore[method-assign]
+    runner._model_step = lambda assembler: _ScriptedStep()  # type: ignore[method-assign]
 
 
 def _script_permissions(
@@ -350,7 +354,7 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
 
     monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
     monkeypatch.setattr("database.engine.AsyncSessionLocal", _FakeSessionScope)
-    monkeypatch.setattr("runtime.subagent.SubAgentRunRepository", lambda db: _RecordingRunRepo())
+    monkeypatch.setattr("team.service.SubAgentRunRepository", lambda db: _RecordingRunRepo())
     monkeypatch.setattr("runtime.subagent.TurnEventAssembler", _FakeAssembler)
     monkeypatch.setattr(SubAgentRunner, "_run_react_loop", _fake_loop)
     ctx = ToolContext(

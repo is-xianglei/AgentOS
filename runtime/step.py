@@ -6,33 +6,17 @@ assistant blocks。ReAct 是否继续、工具如何执行、数据库如何提�
 """
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
-from harness.app.ports import ModelClient, ModelSettings, ModelTurnResult
+from harness.app.loop import StepResult
+from harness.app.ports import ModelClient, ModelSettings
 from harness.domain.context import Context
-from harness.domain.messages import AssistantMessage, ToolCall
+from harness.domain.messages import AssistantMessage
 from runtime.stream_assembler import TurnEventAssembler
 
 
-@dataclass(frozen=True)
-class StepResult:
-    """一次 LLM 调用的终局结果和中立助手消息块。"""
-
-    llm_result: ModelTurnResult
-    assistant_blocks: list[dict[str, Any]]
-
-    @property
-    def tool_calls(self) -> list[ToolCall]:
-        return self.llm_result.tool_calls
-
-    @property
-    def text(self) -> str:
-        return self.llm_result.text
-
-
 class AgentStep:
-    """跨主 Agent、SubAgent、teammate、Workflow 节点复用的单步执行器。"""
+    """跨主 Agent、SubAgent、teammate、Workflow 节点复用的单步执行器，满足循环骨架的 ModelStep 端口。"""
 
     def __init__(
         self,

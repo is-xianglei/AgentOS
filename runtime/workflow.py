@@ -853,7 +853,7 @@ class WorkflowRuntime:
             "completed",
             completed_message_id=completed_message_id,
         )
-        await self.session_service.repo.update_status(session, "idle")
+        await self.session_service.set_status(session, "idle")
         # 流式运行需要在生产者生命周期内明确提交最终状态,不能依赖请求收尾。
         await self.db.commit()
         logger.debug(
@@ -877,13 +877,13 @@ class WorkflowRuntime:
                     session_id, turn_id, self.lease_owner
                 )
             else:
-                session = await self.session_service.repo.get(session_id)
-                turn = await self.session_service.repo.get_turn(turn_id)
+                session = await self.session_service.get(session_id)
+                turn = await self.session_service.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
                 await self.db.rollback()
                 return
             await self.session_service.mark_turn_status(turn, turn_status)
-            await self.session_service.repo.update_status(session, "failed")
+            await self.session_service.set_status(session, "failed")
             await self.db.commit()
         except LeaseLostError:
             await self.db.rollback()

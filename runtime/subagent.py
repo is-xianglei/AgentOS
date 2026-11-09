@@ -29,18 +29,25 @@ from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.models.factory import resolve_subagent_model
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.loop import (
+    LoopExit,
+    LoopPolicy,
+    LoopRound,
+    ModelRequest,
+    StepResult,
+    run_react_loop,
+)
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     Effort,
     ModelClient,
     ModelSettings,
-    ModelTurnResult,
     ResolvedModel,
     ToolCallReviewer,
 )
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
-from harness.domain.context import Context, messages_from_rows
+from harness.domain.context import messages_from_rows
 from harness.domain.memory import TurnRef
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from harness.domain.review import SOURCE_BUDGET, ReviewRequest
@@ -56,7 +63,6 @@ from team.isolation import (
     set_team_task_instance_id,
 )
 from team.service import TeamService
-from team.subagent_run_repository import SubAgentRunRepository
 from tools.gateway import ToolGateway
 
 # 兼容旧测试/扩展点(测试会替换本模块的 ToolService)；实际执行统一经 ToolGateway。
@@ -137,6 +143,163 @@ def _render_denied_summary(denied_calls: list[DeniedToolCall]) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class SubAgentLoopRun:
+    """一次子代理或队友循环共用的运行参数：身份、工具、调用参数与工具预算。"""
+
+    session_id: int
+    actor: Actor
+    spec: SubAgentSpec
+    tool_registry: ToolSet
+    tool_gateway: ToolGateway
+    model_settings: ModelSettings
+    budget: ToolCallBudget
+    parent_turn_id: UUID | None
+    user_id: int | None
+    workspace_id: int | None
+    allowed_skill_names: frozenset[str] | None
+
+
+class _InMemoryLoopPolicy[R](LoopPolicy[R]):
+    """子代理与队友共用的循环策略基类：消息只在内存列表里，工具结果追加回同一列表。
+
+    记忆正文由角色拼进请求副本，messages 本身不改动（队友历史会原样落库）。
+    """
+
+    def __init__(
+        self,
+        runner: SubAgentRunner,
+        run: SubAgentLoopRun,
+        messages: list[dict[str, Any]],
+        role: SubAgent | Teammate,
+        *,
+        denied_calls: list[DeniedToolCall] | None = None,
+    ) -> None:
+        self._runner = runner
+        self._run = run
+        self.messages = messages
+        self._role = role
+        self._denied_calls = denied_calls
+
+    async def load_context(self, loop_round: LoopRound) -> ModelRequest:
+        context = self._role.context(
+            messages_from_rows(self.messages),
+            self._run.tool_registry.to_specs(),
+        )
+        return ModelRequest(context=context, settings=self._run.model_settings)
+
+    async def record_assistant(self, loop_round: LoopRound, reply: StepResult) -> None:
+        # 中立块均为 JSON 原生结构,可直接随 messages 落 team_members.history 并原样 round-trip。
+        result = reply.llm_result
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": AssistantMessage.from_turn(
+                    result.text, result.tool_calls, result.thinking
+                ).to_content(),
+            }
+        )
+
+    async def execute_tools(self, loop_round: LoopRound, reply: StepResult) -> LoopExit[R] | None:
+        run = self._run
+        await self._runner._execute_tool_calls(
+            run.session_id,
+            run.actor,
+            reply.tool_calls,
+            self.messages,
+            run.tool_gateway,
+            run.spec,
+            run.parent_turn_id,
+            run.user_id,
+            run.workspace_id,
+            allowed_skill_names=run.allowed_skill_names,
+            budget=run.budget,
+            denied_calls=self._denied_calls,
+        )
+        return None
+
+    async def flush(self) -> None:
+        await self._runner.db.flush()
+
+
+class SubAgentLoopPolicy(_InMemoryLoopPolicy[tuple[str, int]]):
+    """一次性子代理的循环策略：返回 (报告, 实际执行轮数)。
+
+    轮次耗尽不抛异常：调用方（Agent 工具）需要拿到已完成的部分结论，返回带注意事项的截断报告。
+    """
+
+    def __init__(
+        self,
+        runner: SubAgentRunner,
+        run: SubAgentLoopRun,
+        messages: list[dict[str, Any]],
+        role: SubAgent,
+        *,
+        denied_calls: list[DeniedToolCall] | None = None,
+    ) -> None:
+        super().__init__(runner, run, messages, role, denied_calls=denied_calls)
+        # 最近一次非空文本，轮次耗尽时作为截断报告的正文。
+        self._last_text = ""
+
+    async def record_assistant(self, loop_round: LoopRound, reply: StepResult) -> None:
+        await super().record_assistant(loop_round, reply)
+        if reply.text:
+            self._last_text = reply.text
+
+    async def on_no_tool_calls(
+        self,
+        loop_round: LoopRound,
+        reply: StepResult,
+    ) -> LoopExit[tuple[str, int]] | None:
+        return LoopExit((reply.text, loop_round.index + 1))
+
+    async def on_exhausted(self) -> tuple[str, int]:
+        # 抛异常会让整轮子代理白跑,截断报告 + 明确标注仍可供主代理判断与补做。
+        spec = self._run.spec
+        session_id = self._run.session_id
+        logger.warning(
+            "子代理轮次耗尽,返回截断报告,会话 ID=%s 类型=%s 上限=%s",
+            session_id,
+            spec.runtime_name,
+            spec.max_rounds,
+            extra={"session_id": session_id, "agent_type": spec.runtime_name},
+        )
+        notice = f"[注意] 子代理已达 {spec.max_rounds} 轮工具调用上限,以下为截断的中间结论:"
+        rounds = max(1, spec.max_rounds)
+        if self._last_text:
+            return f"{notice}\n\n{self._last_text}", rounds
+        return notice, rounds
+
+
+class TeammateLoopPolicy(_InMemoryLoopPolicy[str]):
+    """队友的循环策略：每轮开始先认领本会话任务，返回本次推进的报告。
+
+    队友历史全落库，截断后可再次唤醒接着推进，所以轮次耗尽同样不抛异常。
+    """
+
+    async def before_round(self, loop_round: LoopRound) -> None:
+        # 轮首尝试认领可处理任务(只按 session_id,不加实例隔离)。
+        run = self._run
+        await self._runner._try_claim_tasks(run.session_id, run.actor.name, self.messages)
+
+    async def on_no_tool_calls(
+        self,
+        loop_round: LoopRound,
+        reply: StepResult,
+    ) -> LoopExit[str] | None:
+        return LoopExit(reply.text)
+
+    async def on_exhausted(self) -> str:
+        session_id = self._run.session_id
+        logger.warning(
+            "teammate 轮次耗尽,本次推进结束,会话 ID=%s 成员=%s",
+            session_id,
+            self._run.actor.name,
+            extra={"session_id": session_id},
+        )
+        return f"[注意] 已达 {TEAMMATE_MAX_ROUNDS} 轮工具调用上限,本次推进到此结束,可再次唤醒继续。"
+
+
 class SubAgentRunner:
     """在父轮次内运行子代理；事件经父 bus 发出，actor 标识子代理自身。"""
 
@@ -158,7 +321,8 @@ class SubAgentRunner:
         # 写进每次调用的 ModelSettings.model_id,见 _configure_model。
         self.llm = llm
         self._llm_injected = llm is not None
-        self.run_repo = SubAgentRunRepository(db)
+        # 子代理运行记录属 team 域，经其 Service 写入。
+        self.team_service = TeamService(db)
         self.permission_service = PermissionService(db)
         if reviewer is None:
             reviewer = PolicyReviewer.for_subagent(self.permission_service)
@@ -296,7 +460,7 @@ class SubAgentRunner:
         # 为本次 run 设置独立隔离 id(供运行期内派生消息的隔离与调试归属)。
         token = set_team_task_instance_id(new_team_task_instance_id())
         try:
-            run = await self.run_repo.create(
+            run = await self.team_service.create_subagent_run(
                 session_id, member_name, prompt, agent_id=spec.agent_id
             )
             # 一次性子代理的 actor:role=subagent,name=agent_type,唯一键 run_id,task=prompt;
@@ -337,7 +501,7 @@ class SubAgentRunner:
                     )
                 if denied_calls:
                     report = f"{report}\n\n{_render_denied_summary(denied_calls)}"
-                await self.run_repo.succeed(run, report)
+                await self.team_service.succeed_subagent_run(run, report)
                 await self.db.commit()
                 result = assembler.last_result
                 await self._emit_event(
@@ -364,7 +528,7 @@ class SubAgentRunner:
                         "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
                     },
                 )
-                await self.run_repo.fail(run, str(exc))
+                await self.team_service.fail_subagent_run(run, str(exc))
                 await self.db.commit()
                 await self._emit_event(
                     StreamEvent.error_event(
@@ -406,23 +570,9 @@ class SubAgentRunner:
             return
         await self.bus.emit(event)
 
-    async def _stream_and_collect(
-        self,
-        messages: list[dict[str, Any]],
-        role: SubAgent | Teammate,
-        tool_registry: ToolSet,
-        assembler: TurnEventAssembler,
-        *,
-        settings: ModelSettings,
-    ) -> ModelTurnResult:
-        """跑一次 LLM 流:中立事件经装配器补齐 actor/index 后 emit,返回终局结果。
-
-        记忆正文由角色拼进请求副本,messages 本身不改动(队友历史会原样落库)。
-        """
-        context: Context[None] = role.context(messages_from_rows(messages), tool_registry.to_specs())
-        step = AgentStep(self.llm, assembler, self._emit_event)
-        result = await step.run(context, settings)
-        return result.llm_result
+    def _model_step(self, assembler: TurnEventAssembler) -> AgentStep:
+        """每轮调模型的单步执行器：中立事件经装配器补齐 actor/index 后发到父 bus。"""
+        return AgentStep(self.llm, assembler, self._emit_event)
 
     async def _emit_tool_result(
         self,
@@ -564,69 +714,34 @@ class SubAgentRunner:
     ) -> tuple[str, int]:
         """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示由角色组装,轮次上限取自 spec。
 
-        denied_calls 原样透传给 _execute_tool_uses,用于收集被拒的工具调用。
+        denied_calls 原样透传给 _execute_tool_calls,用于收集被拒的工具调用。
         """
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
-        budget = ToolCallBudget(
-            total_limit=max(1, spec.max_rounds * 4),
-            per_tool_limit=max(1, spec.max_rounds * 2),
+        run = SubAgentLoopRun(
+            session_id=session_id,
+            actor=actor,
+            spec=spec,
+            tool_registry=tool_registry,
+            tool_gateway=tool_gateway,
+            model_settings=model_settings,
+            budget=ToolCallBudget(
+                total_limit=max(1, spec.max_rounds * 4),
+                per_tool_limit=max(1, spec.max_rounds * 2),
+            ),
+            parent_turn_id=parent_turn_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            allowed_skill_names=allowed_skill_names,
         )
-        last_text = ""
-        for round_index in range(max(1, spec.max_rounds)):
-            result = await self._stream_and_collect(
-                messages,
-                role,
-                tool_registry,
-                assembler,
-                settings=model_settings,
-            )
-            tool_calls = result.tool_calls
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": AssistantMessage.from_turn(
-                        result.text, tool_calls, result.thinking
-                    ).to_content(),
-                }
-            )
-            # 记住最近一次非空文本，轮次耗尽时作为截断报告的正文。
-            if result.text:
-                last_text = result.text
-
-            if not tool_calls:
-                return result.text, round_index + 1
-
-            await self._execute_tool_calls(
-                session_id,
-                actor,
-                tool_calls,
-                messages,
-                tool_gateway,
-                spec,
-                parent_turn_id,
-                user_id,
-                workspace_id,
-                allowed_skill_names=allowed_skill_names,
-                budget=budget,
-                denied_calls=denied_calls,
-            )
-            await self.db.flush()
-
-        # 轮次耗尽不抛异常:调用方(Agent 工具)需要拿到已完成的部分结论。
-        # 抛异常会让整轮子代理白跑,而截断报告 + 明确标注仍可供主代理判断与补做。
-        logger.warning(
-            "子代理轮次耗尽,返回截断报告,会话 ID=%s 类型=%s 上限=%s",
-            session_id,
-            spec.runtime_name,
-            spec.max_rounds,
-            extra={"session_id": session_id, "agent_type": spec.runtime_name},
+        policy = SubAgentLoopPolicy(
+            self,
+            run,
+            [{"role": "user", "content": prompt}],
+            role,
+            denied_calls=denied_calls,
         )
-        notice = f"[注意] 子代理已达 {spec.max_rounds} 轮工具调用上限,以下为截断的中间结论:"
-        rounds = max(1, spec.max_rounds)
-        if last_text:
-            return f"{notice}\n\n{last_text}", rounds
-        return notice, rounds
+        step = self._model_step(assembler)
+        return await run_react_loop(policy, step, max_rounds=max(1, spec.max_rounds))
 
     # ============ teammate 模式:无状态短运行,在请求内被唤醒 ============
 
@@ -820,62 +935,27 @@ class SubAgentRunner:
         *,
         allowed_skill_names: frozenset[str] | None = None,
     ) -> str:
-        """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环。"""
-        name = actor.name
+        """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环;messages 原地追加。"""
         model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
-        budget = ToolCallBudget(
-            total_limit=max(1, TEAMMATE_MAX_ROUNDS * 4),
-            per_tool_limit=max(1, TEAMMATE_MAX_ROUNDS * 2),
+        run = SubAgentLoopRun(
+            session_id=session_id,
+            actor=actor,
+            spec=spec,
+            tool_registry=tool_registry,
+            tool_gateway=tool_gateway,
+            model_settings=model_settings,
+            budget=ToolCallBudget(
+                total_limit=max(1, TEAMMATE_MAX_ROUNDS * 4),
+                per_tool_limit=max(1, TEAMMATE_MAX_ROUNDS * 2),
+            ),
+            parent_turn_id=parent_turn_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            allowed_skill_names=allowed_skill_names,
         )
-        for _ in range(TEAMMATE_MAX_ROUNDS):
-            # 轮首尝试认领可处理任务(只按 session_id,不加实例隔离)。
-            await self._try_claim_tasks(session_id, name, messages)
-
-            result = await self._stream_and_collect(
-                messages,
-                teammate,
-                tool_registry,
-                assembler,
-                settings=model_settings,
-            )
-            tool_calls = result.tool_calls
-            # 中立块由 to_dict() 产出,均为 JSON 原生结构,可直接随 messages 落
-            # team_members.history 并由 _load_history() 原样 round-trip。
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": AssistantMessage.from_turn(
-                        result.text, tool_calls, result.thinking
-                    ).to_content(),
-                }
-            )
-
-            if not tool_calls:
-                return result.text
-
-            await self._execute_tool_calls(
-                session_id,
-                actor,
-                tool_calls,
-                messages,
-                tool_gateway,
-                spec,
-                parent_turn_id,
-                user_id,
-                workspace_id,
-                allowed_skill_names=allowed_skill_names,
-                budget=budget,
-            )
-            await self.db.flush()
-
-        # teammate 历史全落库,截断后可再次唤醒接着推进,故这里也不抛异常。
-        logger.warning(
-            "teammate 轮次耗尽,本次推进结束,会话 ID=%s 成员=%s",
-            session_id,
-            name,
-            extra={"session_id": session_id},
-        )
-        return f"[注意] 已达 {TEAMMATE_MAX_ROUNDS} 轮工具调用上限,本次推进到此结束,可再次唤醒继续。"
+        policy = TeammateLoopPolicy(self, run, messages, teammate)
+        step = self._model_step(assembler)
+        return await run_react_loop(policy, step, max_rounds=TEAMMATE_MAX_ROUNDS)
 
     async def _try_claim_tasks(
         self, session_id: int, name: str, messages: list[dict[str, Any]]

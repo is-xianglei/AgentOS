@@ -33,6 +33,14 @@ from harness.adapters.models.factory import create_model_client
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.compaction import ContextCompaction
+from harness.app.loop import (
+    LoopExit,
+    LoopPolicy,
+    LoopRound,
+    ModelRequest,
+    StepResult,
+    run_react_loop,
+)
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
@@ -126,6 +134,224 @@ def _turn_failure_info(exc: Exception) -> ErrorInfo:
             fatal=True,
         )
     return ErrorInfo(code="TURN_FAILED", message="本轮处理失败，请稍后重试", fatal=True)
+
+
+class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
+    """主 Agent 的循环策略：消息每轮从会话加载并按需压缩，assistant 消息落库到 session_messages。
+
+    没有工具调用时先跑 Stop hook（可要求续跑一轮）；工具阶段可能挂起等待人工交互；
+    用完轮次后不带工具再调一次收尾，极速模式改为抛中文异常。回合级的工具预算、角色与
+    「LLM调用开始/完成」「回合结束」观测日志都在这里，事件经运行时的 bus 发出。
+    """
+
+    def __init__(
+        self,
+        runtime: AgentRuntime,
+        *,
+        session_id: int,
+        session: SessionRecord,
+        turn: SessionTurnRecord,
+        additional_context: str | None,
+        rendered_memories: str | None,
+        role: Assistant,
+        tools: ToolSet,
+        budget: ToolCallBudget,
+        assembler: TurnEventAssembler,
+        step: AgentStep,
+    ) -> None:
+        self._runtime = runtime
+        self._session_id = session_id
+        self._session = session
+        self._turn = turn
+        self._additional_context = additional_context
+        self._rendered_memories = rendered_memories
+        self._role = role
+        self._tools = tools
+        self._budget = budget
+        self._assembler = assembler
+        self._step = step
+        self._turbo = runtime.mode_slug == "turbo"
+        # 观测用计时与轮次计数，仅供日志使用，不参与业务控制流。
+        self._started = time.perf_counter()
+        self._rounds = 0
+        self._round_started = 0.0
+        self._round_settings: ModelSettings | None = None
+        self._context: list[dict[str, Any]] = []
+        self._assistant_message: SessionMessage | None = None
+        self._stop_reason: str | None = None
+
+    async def load_context(self, loop_round: LoopRound) -> ModelRequest:
+        runtime = self._runtime
+        # 极速模式不压缩；只压缩当前 Turn 之前的历史，原始请求和本轮工具轨迹始终完整保留。
+        self._context = await self._load_messages(compact=not self._turbo)
+        self._round_settings = runtime._round_settings(self._session)
+        self._rounds += 1
+        round_model = runtime._llm_attribution(self._round_settings)[1]
+        self._round_started = time.perf_counter()
+        logger.info(
+            "LLM调用开始",
+            extra={
+                "session_id": self._session_id,
+                "turn_id": str(self._turn.id),
+                "round": self._rounds,
+                "model": round_model,
+                "msg_count": len(self._context),
+            },
+        )
+        # 极速模式最后一轮不给工具，迫使模型直接作答。
+        if self._turbo and loop_round.is_last:
+            round_tools = self._tools.only()
+        else:
+            round_tools = self._tools
+        context = self._role.context(messages_from_rows(self._context), round_tools.to_specs())
+        return ModelRequest(context=context, settings=self._round_settings)
+
+    async def record_assistant(self, loop_round: LoopRound, reply: StepResult) -> None:
+        logger.info(
+            "LLM调用完成",
+            extra={
+                "session_id": self._session_id,
+                "turn_id": str(self._turn.id),
+                "round": self._rounds,
+                "duration_ms": round((time.perf_counter() - self._round_started) * 1000, 2),
+            },
+        )
+        self._stop_reason = reply.llm_result.stop_reason
+        # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
+        assert self._round_settings is not None
+        self._assistant_message = await self._add_assistant(reply, self._round_settings)
+
+    async def on_no_tool_calls(
+        self,
+        loop_round: LoopRound,
+        reply: StepResult,
+    ) -> LoopExit[TurnLoopResult] | None:
+        # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
+        # (作为一条 user 消息注入),否则正常结束本回合。极速模式不触发。
+        runtime = self._runtime
+        continuation = None
+        if not self._turbo:
+            continuation = await runtime._apply_stop_hooks(
+                self._session_id,
+                self._turn.id,
+                ORCHESTRATOR_ACTOR,
+                self._context,
+            )
+        if continuation is None:
+            return LoopExit(await self._finish())
+        await runtime.session_service.add_message(
+            self._session_id,
+            "user",
+            continuation,
+            turn_id=self._turn.id,
+        )
+        await runtime.db.flush()
+        return None
+
+    async def execute_tools(
+        self,
+        loop_round: LoopRound,
+        reply: StepResult,
+    ) -> LoopExit[TurnLoopResult] | None:
+        assert self._assistant_message is not None
+        interaction = await self._runtime._execute_tool_calls(
+            self._session_id,
+            self._session,
+            self._turn,
+            ORCHESTRATOR_ACTOR,
+            self._assistant_message.id,
+            reply.tool_calls,
+            done_ids=[],
+            additional_context=self._additional_context,
+            budget=self._budget,
+        )
+        if interaction is None:
+            return None
+        return LoopExit(TurnLoopResult(suspended=True, interaction=interaction))
+
+    async def flush(self) -> None:
+        await self._runtime.db.flush()
+
+    async def on_exhausted(self) -> TurnLoopResult:
+        # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
+        if self._turbo:
+            raise AgentException.message("极速模式已达到模型调用上限，请切换标准模式继续")
+        self._assistant_message = await self._finalize_without_tools()
+        self._stop_reason = self._assembler.last_result.stop_reason or "max_iterations"
+        return await self._finish()
+
+    async def _load_messages(self, *, compact: bool) -> list[dict[str, Any]]:
+        """加载本轮上下文：可压缩的历史在前，本轮消息在后；compact 为 True 时先压缩历史。"""
+        runtime = self._runtime
+        history, current, through_message_id = await runtime.session_service.load_context_for_turn(
+            self._turn,
+            self._additional_context,
+            rendered_memories=self._rendered_memories,
+        )
+        if compact:
+            history = await runtime.compact_service.maybe_compact(
+                self._session_id,
+                history,
+                through_message_id=through_message_id,
+            )
+        return history + current
+
+    async def _add_assistant(
+        self,
+        reply: StepResult,
+        round_settings: ModelSettings,
+    ) -> SessionMessage:
+        provider, effective_model = self._runtime._llm_attribution(round_settings)
+        return await self._runtime.session_service.add_message(
+            self._session_id,
+            "assistant",
+            reply.assistant_blocks,
+            turn_id=self._turn.id,
+            provider=provider,
+            model=effective_model,
+        )
+
+    async def _finalize_without_tools(self) -> SessionMessage:
+        """禁用工具再调一次 LLM,产出最终答复并落库。
+
+        沿用同一装配器,使收尾这次调用的块 index 接在前面的块之后,不从 0 重来。
+        """
+        round_settings = self._runtime._round_settings(self._session)
+        context = await self._load_messages(compact=True)
+        reply = await self._step.run(
+            self._role.final_context(messages_from_rows(context)),
+            round_settings,
+        )
+        return await self._add_assistant(reply, round_settings)
+
+    async def _finish(self) -> TurnLoopResult:
+        """回合正常结束：记「回合结束」日志并发出 turn_end。"""
+        assert self._assistant_message is not None
+        usage = self._assembler.last_result.usage
+        logger.info(
+            "回合结束",
+            extra={
+                "session_id": self._session_id,
+                "turn_id": str(self._turn.id),
+                "stop_reason": self._stop_reason,
+                "rounds": self._rounds,
+                "in_tokens": usage.input_tokens if usage else None,
+                "out_tokens": usage.output_tokens if usage else None,
+                "duration_ms": round((time.perf_counter() - self._started) * 1000, 2),
+            },
+        )
+        await self._runtime.bus.emit(
+            StreamEvent.turn_end(
+                ORCHESTRATOR_ACTOR,
+                self._session_id,
+                self._stop_reason,
+                self._assembler.last_result.usage,
+            )
+        )
+        return TurnLoopResult(
+            suspended=False,
+            completed_message_id=self._assistant_message.id,
+        )
 
 
 class AgentRuntime:
@@ -658,7 +884,7 @@ class AgentRuntime:
                 return
 
             await self.interaction_service.mark_suspension_resolved(suspension.id)
-            await self.session_service.repo.update_status(session, "running")
+            await self.session_service.set_status(session, "running")
             await self.session_service.mark_turn_status(turn, "running")
             await self._fence_lease(session_id, turn.id)
             await self.db.commit()
@@ -819,149 +1045,24 @@ class AgentRuntime:
                 per_tool_limit=max(1, settings.max_tool_iterations),
             )
 
-        # 观测用计时与轮次计数，仅供日志使用，不参与业务控制流。
-        loop_started = time.perf_counter()
-        rounds = 0
-        stop_reason: str | None = None
+        policy = LeadLoopPolicy(
+            self,
+            session_id=session_id,
+            session=session,
+            turn=turn,
+            additional_context=additional_context,
+            rendered_memories=rendered_memories,
+            role=role,
+            tools=active_registry,
+            budget=budget,
+            assembler=assembler,
+            step=step,
+        )
         if turbo:
             iterations = TURBO_MAX_ITERATIONS
         else:
             iterations = settings.max_tool_iterations
-        for iteration in range(iterations):
-            history, current, through_message_id = await self.session_service.load_context_for_turn(
-                turn,
-                additional_context,
-                rendered_memories=rendered_memories,
-            )
-            # 只压缩当前 Turn 之前的历史，原始请求和本轮工具轨迹始终完整保留。
-            if not turbo:
-                history = await self.compact_service.maybe_compact(
-                    session_id,
-                    history,
-                    through_message_id=through_message_id,
-                )
-            context = history + current
-            round_settings = self._round_settings(session)
-            rounds += 1
-            round_model = self._llm_attribution(round_settings)[1]
-            round_started = time.perf_counter()
-            logger.info(
-                "LLM调用开始",
-                extra={
-                    "session_id": session_id,
-                    "turn_id": str(turn.id),
-                    "round": rounds,
-                    "model": round_model,
-                    "msg_count": len(context),
-                },
-            )
-            # 极速模式最后一轮不给工具，迫使模型直接作答。
-            if turbo and iteration == iterations - 1:
-                round_registry = active_registry.only()
-            else:
-                round_registry = active_registry
-            step_result = await step.run(
-                role.context(messages_from_rows(context), round_registry.to_specs()),
-                round_settings,
-            )
-
-            logger.info(
-                "LLM调用完成",
-                extra={
-                    "session_id": session_id,
-                    "turn_id": str(turn.id),
-                    "round": rounds,
-                    "duration_ms": round((time.perf_counter() - round_started) * 1000, 2),
-                },
-            )
-            result = step_result.llm_result
-            stop_reason = result.stop_reason
-            tool_calls = result.tool_calls
-            # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
-            final_content = step_result.assistant_blocks
-
-            provider, effective_model = self._llm_attribution(round_settings)
-            assistant_message = await self.session_service.add_message(
-                session_id,
-                "assistant",
-                final_content,
-                turn_id=turn.id,
-                provider=provider,
-                model=effective_model,
-            )
-
-            if not tool_calls:
-                # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
-                # (作为一条 user 消息注入),否则正常结束本回合。
-                if turbo:
-                    continuation = None
-                else:
-                    continuation = await self._apply_stop_hooks(
-                        session_id,
-                        turn.id,
-                        actor,
-                        context,
-                    )
-                if continuation is not None:
-                    await self.session_service.add_message(
-                        session_id,
-                        "user",
-                        continuation,
-                        turn_id=turn.id,
-                    )
-                    await self.db.flush()
-                    continue
-                break
-
-            interaction = await self._execute_tool_calls(
-                session_id,
-                session,
-                turn,
-                actor,
-                assistant_message.id,
-                tool_calls,
-                done_ids=[],
-                additional_context=additional_context,
-                budget=budget,
-            )
-            await self.db.flush()
-            if interaction is not None:
-                return TurnLoopResult(suspended=True, interaction=interaction)
-        else:
-            # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
-            if turbo:
-                raise AgentException.message("极速模式已达到模型调用上限，请切换标准模式继续")
-            assistant_message = await self._finalize_without_tools(
-                session_id,
-                turn,
-                assembler,
-                additional_context,
-                rendered_memories,
-                role,
-                self._round_settings(session),
-            )
-            stop_reason = assembler.last_result.stop_reason or "max_iterations"
-
-        usage = assembler.last_result.usage
-        logger.info(
-            "回合结束",
-            extra={
-                "session_id": session_id,
-                "turn_id": str(turn.id),
-                "stop_reason": stop_reason,
-                "rounds": rounds,
-                "in_tokens": usage.input_tokens if usage else None,
-                "out_tokens": usage.output_tokens if usage else None,
-                "duration_ms": round((time.perf_counter() - loop_started) * 1000, 2),
-            },
-        )
-        await self.bus.emit(
-            StreamEvent.turn_end(actor, session_id, stop_reason, assembler.last_result.usage)
-        )
-        return TurnLoopResult(
-            suspended=False,
-            completed_message_id=assistant_message.id,
-        )
+        return await run_react_loop(policy, step, max_rounds=iterations)
 
     async def _complete_turn(
         self,
@@ -980,7 +1081,7 @@ class AgentRuntime:
             "completed",
             completed_message_id=completed_message_id,
         )
-        await self.session_service.repo.update_status(session, "idle")
+        await self.session_service.set_status(session, "idle")
         memory_ticket: MemoryWriteTicket | None = None
         # 极速模式不写入记忆；写入失败由 Provider 自行隔离，不影响下面提交的回合终态。
         if getattr(self, "mode_slug", "standard") != "turbo":
@@ -1022,13 +1123,13 @@ class AgentRuntime:
                     session_id, turn_id, self.lease_owner
                 )
             else:
-                session = await self.session_service.repo.get(session_id)
-                turn = await self.session_service.repo.get_turn(turn_id)
+                session = await self.session_service.get(session_id)
+                turn = await self.session_service.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
                 await self.db.rollback()
                 return False
             await self.session_service.mark_turn_status(turn, turn_status)
-            await self.session_service.repo.update_status(session, "failed")
+            await self.session_service.set_status(session, "failed")
             await self.db.commit()
         except LeaseLostError:
             await self.db.rollback()
@@ -1229,9 +1330,9 @@ class AgentRuntime:
         """持久化不经过真实工具执行的合成 tool_result。"""
         if record is not None:
             if is_error:
-                await self.tool_service.tool_repo.reject_awaiting(record, output)
+                await self.tool_service.reject_awaiting_call(record, output)
             else:
-                await self.tool_service.tool_repo.succeed(record, output)
+                await self.tool_service.complete_call(record, output)
         await self.bus.emit(
             StreamEvent.tool_result(
                 actor,
@@ -1279,7 +1380,7 @@ class AgentRuntime:
             message_id=assistant_message_id,
             agent_id=self.active_agent_id,
         )
-        await self.tool_service.tool_repo.mark_awaiting_interaction(record)
+        await self.tool_service.mark_call_awaiting(record)
         continuation = {
             "assistant_message_id": assistant_message_id,
             "pending": [
@@ -1319,7 +1420,7 @@ class AgentRuntime:
                     request_create,
                 )
             )
-        await self.session_service.repo.update_status(session, "awaiting_interaction")
+        await self.session_service.set_status(session, "awaiting_interaction")
         await self.session_service.mark_turn_status(turn, "awaiting_interaction")
         logger.info(
             "人工交互挂起，等待用户响应",
@@ -1419,7 +1520,7 @@ class AgentRuntime:
         record: ToolCallRecord | None = None
         tool_call_id = target_item.get("tool_call_id")
         if tool_call_id is not None:
-            record = await self.db.get(ToolCallRecord, tool_call_id)
+            record = await self.tool_service.get_call(tool_call_id)
         if record is None or request.tool_call_id != record.id or request.tool_use_id != target.id:
             raise AgentException.message("人工交互与工具调用记录不匹配")
         response = request.response_payload
@@ -1848,7 +1949,7 @@ class AgentRuntime:
                         {"tool_call_id": record.id, "status": record.status},
                     )
         await self.session_service.mark_turn_status(turn, "interrupted")
-        await self.session_service.repo.update_status(session, "idle")
+        await self.session_service.set_status(session, "idle")
 
     async def _normalize_interaction_response(
         self,
@@ -1920,45 +2021,6 @@ class AgentRuntime:
         """
         provider = getattr(self.llm, "provider", None)
         return provider, settings.model_id or None
-
-    async def _finalize_without_tools(
-        self,
-        session_id: int,
-        turn: SessionTurnRecord,
-        assembler: TurnEventAssembler,
-        additional_context: str | None,
-        rendered_memories: str | None,
-        role: Assistant,
-        round_settings: ModelSettings,
-    ) -> SessionMessage:
-        """禁用工具再调一次 LLM,产出最终答复并落库。
-
-        沿用同一装配器,使收尾这次调用的块 index 接在前面的块之后,不从 0 重来。
-        """
-        history, current, through_message_id = await self.session_service.load_context_for_turn(
-            turn,
-            additional_context,
-            rendered_memories=rendered_memories,
-        )
-        history = await self.compact_service.maybe_compact(
-            session_id,
-            history,
-            through_message_id=through_message_id,
-        )
-        context = history + current
-
-        step = AgentStep(self.llm, assembler, self.bus.emit)
-        step_result = await step.run(role.final_context(messages_from_rows(context)), round_settings)
-        final_content = step_result.assistant_blocks
-        provider, effective_model = self._llm_attribution(round_settings)
-        return await self.session_service.add_message(
-            session_id,
-            "assistant",
-            final_content,
-            turn_id=turn.id,
-            provider=provider,
-            model=effective_model,
-        )
 
     async def _apply_user_prompt_hooks(
         self,

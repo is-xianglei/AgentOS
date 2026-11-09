@@ -265,6 +265,10 @@ class SessionService:
             group_ids=groups,
         )
 
+    async def get(self, session_id: int) -> SessionRecord | None:
+        """查询会话，不存在时返回 None；需要报错时用 get_required。"""
+        return await self.repo.get(session_id)
+
     async def get_required(self, session_id: int) -> SessionRecord:
         """查询会话，不存在时抛出业务错误。"""
         session = await self.repo.get(session_id)
@@ -450,6 +454,13 @@ class SessionService:
         await self.db.commit()
         return session
 
+    async def set_status(self, session: SessionRecord, status: str) -> SessionRecord:
+        """切换会话状态并刷新活跃时间，只 flush 不提交，随调用方事务生效。
+
+        与自带提交的 mark_finished 区分：运行时要把会话状态与轮次状态、暂停点等写入放进同一事务。
+        """
+        return await self.repo.update_status(session, status)
+
     async def prepare_for_message(
         self,
         session_id: int | None,
@@ -544,6 +555,10 @@ class SessionService:
         )
         await self.repo.bind_message_to_turn(message, turn.id)
         return turn, message
+
+    async def get_turn(self, turn_id: UUID) -> SessionTurnRecord | None:
+        """查询交互轮次，不存在时返回 None；需要报错时用 get_turn_required。"""
+        return await self.repo.get_turn(turn_id)
 
     async def get_turn_required(self, turn_id: UUID) -> SessionTurnRecord:
         """查询交互轮次，不存在时抛出业务错误。"""

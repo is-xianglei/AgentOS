@@ -45,6 +45,7 @@ from memory.repository import MemoryCatalogEntry
 from model_service.models import ModelProviderRecord
 from model_service.service import ModelService
 from runtime.agent import AgentRuntime
+from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner
 from runtime.workflow import LlmRoutingOrchestrator, ParallelOrchestrator
@@ -743,9 +744,9 @@ def _subagent_case(world: str, effort: str, agent_type: AgentType, spec_model: s
         settings = await runner._configure_model(1, spec, 2, 3)
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, 1, turn_id=_TURN_ID)
         role = SubAgent(spec=replace(spec, system_prompt="子代理系统提示", critical_reminder=""))
-        await runner._stream_and_collect(
-            [_USER], role, ToolSet([EchoTool()]), assembler, settings=settings
-        )
+        # 子代理循环每轮的模型调用：角色组装 Context，经 AgentStep 发起流式调用。
+        context = role.context(messages_from_rows([_USER]), ToolSet([EchoTool()]).to_specs())
+        await AgentStep(runner.llm, assembler, runner._emit_event).run(context, settings)
 
     return run
 

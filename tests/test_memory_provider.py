@@ -127,7 +127,7 @@ async def test_injected_provider_drives_recall_and_turn_write(
         load_context_for_turn=_load,
         add_message=AsyncMock(return_value=SimpleNamespace(id=9)),
         mark_turn_status=AsyncMock(),
-        repo=SimpleNamespace(update_status=AsyncMock()),
+        set_status=AsyncMock(),
     )
     runtime.compact_service = SimpleNamespace(maybe_compact=AsyncMock(return_value=[]))
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
@@ -156,7 +156,7 @@ async def test_turbo_mode_skips_injected_provider() -> None:
     runtime = AgentRuntime(db, user_id=3, workspace_id=2, llm=object(), memory=fake)  # type: ignore[arg-type]
     runtime.mode_slug = "turbo"
     runtime.session_service = SimpleNamespace(
-        mark_turn_status=AsyncMock(), repo=SimpleNamespace(update_status=AsyncMock())
+        mark_turn_status=AsyncMock(), set_status=AsyncMock()
     )
     turn = SimpleNamespace(id=_TURN_ID, session_id=1, user_id=3, workspace_id=2)
 
