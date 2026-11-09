@@ -17,7 +17,7 @@ import tempfile
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -867,8 +867,8 @@ def _install(monkeypatch: pytest.MonkeyPatch, fakes: _Fakes, overrides: dict[str
     """固定配置、环境段与临时目录，把各域的仓储与服务方法换成记录替身。"""
     for key, value in {**_FIXED_SETTINGS, **overrides}.items():
         monkeypatch.setattr(app_settings, key, value)
-    monkeypatch.setattr("runtime.agent.date", _FixedDate)
-    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: _CWD))
+    monkeypatch.setattr("runtime.lead_loop.date", _FixedDate)
+    monkeypatch.setattr("runtime.lead_loop.Path", SimpleNamespace(cwd=lambda: _CWD))
     monkeypatch.setattr(tempfile, "tempdir", _TMP_DIR)
     registry = HookRegistry()
     registry.register(HookEvent.STOP, fakes.stop_hook)
@@ -914,14 +914,15 @@ async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[s
         memory=_FakeMemory(world, case.memory),  # type: ignore[arg-type]
     )
     runtime.bus = _NullBus()  # type: ignore[assignment]
-    runtime.tool_registry = builtin_tool_set().only(*_MAIN_TOOLS)
+    overrides: dict[str, Any] = {
+        "tools": builtin_tool_set().only(*_MAIN_TOOLS),
+        "delegate_catalog": case.delegate,
+    }
     if case.turbo:
-        runtime.mode_slug = "turbo"
+        overrides["mode_slug"] = "turbo"
     if case.agent_prompt is not None:
-        runtime.active_agent_id = 7
-        runtime.active_profile = "user_agent"
-        runtime.active_agent_prompt = case.agent_prompt
-    runtime.delegate_catalog = case.delegate
+        overrides.update(agent_id=7, profile="user_agent", agent_prompt=case.agent_prompt)
+    runtime.configuration = replace(runtime.configuration, **overrides)
     runtime.compact_service.model = ResolvedModel.from_client(
         _compact_llm(world, "早先对话的摘要。")  # type: ignore[arg-type]
     )
@@ -1082,10 +1083,11 @@ async def _drive_enter_plan_mode(
         workspace_id=_WORKSPACE_ID,
         llm=_FakeLLM(world, "agent", "claude-golden", "好的。"),  # type: ignore[arg-type]
     )
-    runtime._record_tool_response = fakes.record_tool_response  # type: ignore[method-assign]
+    flow = runtime._interactions()
+    flow._executor.record_response = fakes.record_tool_response  # type: ignore[method-assign]
     turn = SimpleNamespace(id=_TURN_ID, session_id=_SESSION_ID)
     target = ToolCall(id="p1", tool_name="EnterPlanMode", arguments={})
-    await runtime._apply_enter_plan_mode(
+    await flow._apply_enter_plan_mode(
         turn, ORCHESTRATOR_ACTOR, target, SimpleNamespace(id=5), response  # type: ignore[arg-type]
     )
     return {"journal": world.journal}

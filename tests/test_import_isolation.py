@@ -38,7 +38,12 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "harness.domain.roles.subagent",
     "memory.jobs.extraction",
     "runtime.agent",
+    "runtime.turn_config",
+    "runtime.tool_execution",
+    "runtime.interaction_flow",
+    "runtime.lead_loop",
     "runtime.workflow",
+    "harness.app.agent_service",
     "harness.adapters.tools.builtin_provider",
     "harness.adapters.tools.builtin.agent",
     "harness.adapters.reviewers.policy_reviewer",
@@ -397,6 +402,7 @@ def test_app_layer_imports_respect_layering() -> None:
         "harness.app.compaction",
         "harness.app.subagent_catalog",
         "harness.app.loop",
+        "harness.app.agent_service",
     }
     assert expected_app <= set(app_modules), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
@@ -785,3 +791,124 @@ def test_domain_layer_does_not_read_process_state() -> None:
 def test_process_state_checker_reports_calls(source: str, expected: list[str]) -> None:
     """检查器自测：直接调用与别名调用都必须报出，构造值和同名本地函数不得误报。"""
     assert _process_state_calls(ast.parse(source)) == expected
+
+
+# 应用层入口 AgentService 只认端口：运行时、适配层、数据库、Web 框架、SDK 与 feature 包一律不碰，
+# 具体运行时由装配方以工厂注入。项目内只允许 harness.app、harness.domain 与 core。
+_AGENT_SERVICE_MODULE = "harness.app.agent_service"
+_AGENT_SERVICE_FORBIDDEN_THIRD_PARTY = frozenset({"sqlalchemy", "fastapi", "anthropic", "openai"})
+
+
+def _agent_service_violations(tree: ast.Module, known: set[str]) -> list[str]:
+    """返回 AgentService 模块任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）的违规导入。"""
+    first_party_tops = {name.split(".")[0] for name in known}
+    failures: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, "harness.app", known)):
+            top = name.split(".")[0]
+            forbidden_sdk = top in _AGENT_SERVICE_FORBIDDEN_THIRD_PARTY
+            allowed = top == "core" or name.startswith(("harness.app", "harness.domain"))
+            other_first_party = top in first_party_tops and not allowed
+            if forbidden_sdk or other_first_party:
+                failures.append(name)
+    return failures
+
+
+def test_agent_service_imports_only_ports() -> None:
+    """分层防线：AgentService 不得导入 runtime、adapters、SQLAlchemy、FastAPI、SDK 与 feature 包。"""
+    files = _first_party_module_files()
+    known = set(files)
+    path = files[_AGENT_SERVICE_MODULE]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    failures = _agent_service_violations(tree, known)
+
+    assert not failures, f"{_AGENT_SERVICE_MODULE} 导入了不该依赖的模块: {failures}"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from runtime.agent import AgentRuntime", ["runtime.agent"]),
+        ("def f():\n    from runtime.workflow import WorkflowRuntime", ["runtime.workflow"]),
+        ("from harness.adapters.models.factory import x", ["harness.adapters.models.factory"]),
+        ("from sqlalchemy.ext.asyncio import AsyncSession", ["sqlalchemy.ext.asyncio"]),
+        ("import fastapi", ["fastapi"]),
+        ("from session.service import SessionService", ["session.service"]),
+        ("from harness import adapters", ["harness.adapters"]),
+        (
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from runtime.execution import X",
+            ["runtime.execution"],
+        ),
+        ("from harness.app.ports import ModelClient", []),
+        ("from harness.domain.messages import ToolCall", []),
+        ("from core.errors import AgentException", []),
+        ("from typing import Protocol\nfrom uuid import UUID", []),
+    ],
+)
+def test_agent_service_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置导入运行时、适配层、框架与 feature 包都必须报出，端口与领域层不得误报。"""
+    known = set(_first_party_module_files())
+
+    assert _agent_service_violations(ast.parse(source), known) == expected
+
+
+# HTTP 路由经 AgentService 调用运行时，不再自己构造运行时或编排器。
+_RUNTIME_ENTRY_MODULES = frozenset({"runtime.agent", "runtime.workflow", "runtime.orchestrator"})
+_ROUTE_MODULES_WITHOUT_RUNTIME = ("session.api", "interaction.api")
+
+
+def _runtime_entry_imports(tree: ast.Module, source_package: str, known: set[str]) -> list[str]:
+    """返回模块中任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）导入的运行时入口模块名。
+
+    ``from runtime import agent`` 这种按包导入子模块的写法同样报出。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, source_package, known)):
+            if any(name == entry or name.startswith(f"{entry}.") for entry in _RUNTIME_ENTRY_MODULES):
+                found.append(name)
+    return found
+
+
+def test_routes_do_not_import_runtime_entries() -> None:
+    """分层防线：会话与交互路由不得导入 runtime.agent、runtime.workflow、runtime.orchestrator。"""
+    files = _first_party_module_files()
+    known = set(files)
+    failures: list[str] = []
+    for module in _ROUTE_MODULES_WITHOUT_RUNTIME:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source_package = module.rpartition(".")[0]
+        failures.extend(
+            f"  - {module} 导入了 {name}"
+            for name in _runtime_entry_imports(tree, source_package, known)
+        )
+    assert not failures, "路由直接导入了运行时入口:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from runtime.agent import AgentRuntime", ["runtime.agent"]),
+        ("from runtime import workflow", ["runtime.workflow"]),
+        ("import runtime.orchestrator", ["runtime.orchestrator"]),
+        ("def f():\n    from runtime.agent import AgentRuntime", ["runtime.agent"]),
+        (
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from runtime.workflow import X",
+            ["runtime.workflow"],
+        ),
+        ("from runtime.turn_follow import follow_execution", []),
+        ("from runtime.execution import cancel_turn", []),
+        ("from harness.app.agent_service import AgentService", []),
+    ],
+)
+def test_runtime_entry_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：各种写法导入运行时入口都必须报出，SSE 跟随与应用层入口不得误报。"""
+    known = set(_first_party_module_files())
+
+    assert _runtime_entry_imports(ast.parse(source), "session", known) == expected

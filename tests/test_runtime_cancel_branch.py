@@ -9,6 +9,7 @@ import pytest
 from core.event_bus import NullStreamBus
 from runtime import agent as agent_module
 from runtime.agent import AgentRuntime
+from runtime.turn_config import TurnConfiguration
 from runtime.workflow import WorkflowRuntime
 
 pytestmark = pytest.mark.anyio
@@ -58,7 +59,7 @@ async def test_agent_cancel_defers_terminal_state_when_bound(
     runtime.session_service = _Service()
     runtime.bus = NullStreamBus()
     runtime.lease_owner = owner
-    runtime.mode_slug = "standard"
+    runtime.configuration = TurnConfiguration.for_lead(runtime.db)
     marked: list[str] = []
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)

@@ -70,12 +70,11 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
 
 编排：
-- `AgentService` 对外提供 new_session / list_sessions / chat / resume / cancel。主 Agent、子代理、队友
-- `app/loop.py`（已落地，阶段 6a）是唯一的 ReAct 循环骨架：`run_react_loop(policy, step, *, max_rounds)`。每轮依次执行 `before_round` → `load_context` → 调模型 → `record_assistant`，之后有工具调用就走 `execute_tools` + `flush`，没有就走 `on_no_tool_calls`；钩子返回 `LoopExit` 时立即结束（结束前也会先 `flush`），跑满轮次后走 `on_exhausted`。三种循环策略都放在 runtime：`LeadLoopPolicy`（runtime/agent.py）、`SubAgentLoopPolicy` / `TeammateLoopPolicy`（runtime/subagent.py），因为它们要用到 session、team 等 feature 域的 Service。
-  共用唯一一份 ReAct 循环（loop.py）。
+- `AgentService`（已落地，阶段 6b，harness/app/agent_service.py）对外提供 `chat`、`resume`、`cancel_interaction`、`cancel_turn`，吸收了原 TopLevelOrchestrator 的 Agent / Workflow 分发。它只依赖端口：`AgentRunner`（start / start_resume / cancel_interaction）、`WorkflowRunner`（start），以工厂形式注入，轮次取消注入 `TurnCanceller` 函数；`ExecutionHandle` 移到 app 层。视频里的 new_session / list_session 由 SessionService 的会话接口承担，没有进 AgentService。HTTP 路由经 `api/deps.py` 的 `get_agent_service` 拿到 AgentService，具体运行时类只在这里出现（组装根的前身，阶段 7 接管）；鉴权与 409 校验仍在路由。
+- `app/loop.py`（已落地，阶段 6a）是唯一的 ReAct 循环骨架：`run_react_loop(policy, step, *, max_rounds)`。每轮依次执行 `before_round` → `load_context` → 调模型 → `record_assistant`，之后有工具调用就走 `execute_tools` + `flush`，没有就走 `on_no_tool_calls`；钩子返回 `LoopExit` 时立即结束（结束前也会先 `flush`），跑满轮次后走 `on_exhausted`。三种循环策略都放在 runtime：`LeadLoopPolicy`（runtime/lead_loop.py）、`SubAgentLoopPolicy` / `TeammateLoopPolicy`（runtime/subagent.py），因为它们要用到 session、team 等 feature 域的 Service。
 - `ToolSet`（已落地，阶段 3a）聚合多个 ToolProvider，负责重名校验、按模式和档位裁剪，并保证工具顺序稳定（提示缓存依赖这一点）。提供 to_specs、get、validate_input、only、without、with_tools，以及按名查策略的 policy_for、callable_names、bindable_names、denied_names（吸收了原 ToolCapabilityResolver）。
   只有工具名、拿不到 ToolSet 的调用方（PermissionService、PolicyReviewer 的能力规则、ToolCatalogService、ToolService 的能力检查等）暂时调用 `builtin_tool_set()` 查策略；接入 MCP 前由组装根注入完整 ToolSet（阶段 7）。
-- 后台执行与租约、SSE 跟随、孤儿回收、取消还原、Workflow 编排、Hook 注册表也都放在应用层。
+- 后台执行与租约、SSE 跟随、孤儿回收、取消还原、Workflow 编排、Hook 注册表目前仍在 runtime/、hooks/，阶段 7 再决定是否迁入 harness/app。
 
 ## 4. 适配层（harness/adapters/）
 
@@ -129,11 +128,11 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | tools/ 的 ToolCatalogService、models、repository、api | 留在 tools/，工具目录和调用记录属于平台数据 |
 | prompt/、plan/prompts.py、TURBO_PROMPT | 已完成：domain/prompts/，由角色负责组装 |
 | hooks/ | app/hooks.py |
-| runtime/agent.py、subagent.py、step.py、stream_assembler.py | app/agent_service.py、app/loop.py（循环骨架与 StepResult 已迁入，阶段 6a） |
+| runtime/agent.py、subagent.py、step.py、stream_assembler.py | app/agent_service.py（阶段 6b）、app/loop.py（阶段 6a）；runtime/agent.py 拆出 turn_config.py（TurnConfiguration 不可变回合配置）、tool_execution.py（LeadToolExecutor）、interaction_flow.py（InteractionFlow 人工交互）、lead_loop.py（LeadLoopPolicy），AgentRuntime 只保留准入、后台执行与回合终态（约 700 行） |
 | runtime/compact.py | 已完成：domain/roles/compactor.py 的 Compactor，加上 app/compaction.py 的 ContextCompaction 编排；快照改走新增的 SessionService.save_compact_snapshot，runtime 不再持有 SessionRepository |
 | runtime/budget.py | domain/budget.py（已完成） |
 | runtime/execution.py、turn_follow.py、recovery.py、cancel_partial.py | app/ 下同名模块 |
-| runtime/orchestrator.py、workflow.py | app/workflow_runner.py |
+| runtime/orchestrator.py、workflow.py | TopLevelOrchestrator 已并入 app/agent_service.py（阶段 6b）；Workflow 编排基类与 WorkflowRuntime 暂留 runtime |
 | runtime/checkpoint.py、runtime/models.py | 删除（没有调用方的死代码） |
 | core/ 的事件、事件流与 SSE | 留在原位：StreamBus、RunEventStore 已经是端口 + 适配器的形态 |
 | session、memory、interaction、plan、permission、model_service、skill、team、task、agent、workflow | 保留为 feature 包，由适配器或应用层通过它们的 Service 调用 |
@@ -151,6 +150,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 记忆接入主循环的行为（召回结果在系统提示和用户消息里的位置、提交与 SAVEPOINT 的调用顺序、入队参数、日志、子代理继承）由 tests/test_memory_port_golden.py 固化（27 种情况，字面量取自阶段 4 之前的代码），后续阶段不得改动 tests/fixtures/memory_port_golden.py。runtime/ 不得导入 memory 包，由 tests/test_import_isolation.py 静态检查。
 - 各角色产出的系统指令与消息（主 Agent 组合矩阵、极速、Plan、收尾不带工具、子代理与队友、压缩）、子代理规格的全部字段与派生结果、输出协议解析与路由目录，由 tests/test_role_context_golden.py 固化（80 种情况，字面量取自阶段 5 之前的代码），后续阶段不得改动 tests/fixtures/role_context_golden.py。harness/domain 不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由 tests/test_import_isolation.py 静态检查。
 - 主循环、子代理和队友循环发出的 SSE 事件序列、落库与状态变化序列、commit / flush 顺序、模型请求、日志和返回值，由 tests/test_react_loop_golden.py 固化（27 种情况，字面量取自阶段 6a 之前的代码），后续阶段不得改动 tests/fixtures/react_loop_golden.py。runtime/ 和 harness/app/ 不得导入任何 `*.repository` 模块（函数体和 TYPE_CHECKING 里的导入也算），由 tests/test_import_isolation.py 静态检查。
+- HTTP 入口（发消息的 Agent / Workflow 分发、409、前置校验、model_options 透传、交互恢复与取消、轮次取消、鉴权失败与 422）到运行时边界的行为由 tests/test_agent_service_golden.py 固化（49 种情况，字面量取自阶段 6b 之前的代码），后续阶段不得改动 tests/fixtures/agent_service_golden.py。AgentService 只能导入 harness.app、harness.domain 与 core；session/api.py、interaction/api.py 不得导入 runtime.agent / workflow / orchestrator，均由 tests/test_import_isolation.py 静态检查。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
 - 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
 
@@ -164,6 +164,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - Decision.source 取 `SOURCE_*` 常量，运行时据此决定打哪条日志；以后接入 LLM 审核员时要用新的来源名，不要复用这些常量。
 - 阶段 4 起，就地执行记忆提取的 claim_scope 取回合自身的租户，而不是运行时实例上的 workspace_id / user_id；两者在所有路径上相等，黄金测试已固化。入队与就地执行的日志 logger 名从 runtime.agent 变为 harness.adapters.memory.builtin_provider，正文与 extra 不变。
 - 阶段 5 起，L1 微压缩返回新列表而不是原地改写入参（主循环入参本就是副本，观测结果一致）；压缩日志的 logger 名从 runtime.compact 变为 harness.app.compaction，正文与 extra 不变。队友的系统提示不追加子代理规格的 critical_reminder，这是现状，已在黄金测试中固化。
+- 阶段 6b 起这些日志的 logger 名改变，正文与 extra 不变：「LLM调用开始/完成」「回合结束」→ runtime.lead_loop；工具权限策略相关 → runtime.tool_execution；人工交互挂起/取消 → runtime.interaction_flow。同时带 agent_id 和 workflow_id、会话不存在两种请求返回 500（AgentException 默认状态码），是现状，已在 HTTP 黄金测试中固化。
 
 ## 8. 阶段
 
@@ -178,6 +179,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | 4 | 已完成：MemoryProvider + BuiltinMemoryProvider；runtime 不再直接引用 memory 域 |
 | 5 | 已完成：角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/、tools/subagents/、runtime/compact.py 并入 harness |
 | 6a | 已完成：主 Agent、子代理、队友共用 app/loop.py；runtime 不再直接使用别域 Repository，改走新增的 Service 公开方法：SessionService.get / get_turn / set_status，ToolService.get_call / complete_call / mark_call_awaiting / reject_awaiting_call，TeamService.create_subagent_run / succeed_subagent_run / fail_subagent_run |
-| 6b | SessionStore 端口 + AgentService：拆分 AgentRuntime（准入、执行生命周期、人工交互、模型与工具配置），对外提供 new_session / list_sessions / chat / resume / cancel |
+| 6b | 已完成：AgentRuntime 拆出 TurnConfiguration、LeadToolExecutor、InteractionFlow、LeadLoopPolicy；新增应用层 AgentService（chat / resume / cancel_interaction / cancel_turn），吸收 TopLevelOrchestrator；HTTP 路由经 get_agent_service 调用 |
+| 6c | SessionStore 端口：把运行时用到的会话操作（加载本轮上下文、追加消息、写快照、状态与租约）收成端口，SessionService 作为数据库实现，再补一个测试用内存实现 |
 | 7 | 组装根：bootstrap 装配，API 层通过依赖注入拿 AgentService，清理跨域直连 Repository |
 | 8 | 更新 CLAUDE.md、AGENTS.md、README |

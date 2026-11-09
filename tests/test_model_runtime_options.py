@@ -17,7 +17,6 @@ from harness.adapters.models import resolver as resolver_module
 from harness.adapters.models.anthropic_client import AnthropicClient
 from harness.adapters.models.openai_client import OpenAIClient
 from harness.adapters.models.resolver import DatabaseModelResolver
-from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import (
     Effort,
     ModelEventKind,
@@ -31,6 +30,7 @@ from model_service.models import ModelProviderRecord
 from model_service.service import ModelService
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
+from runtime.turn_config import TurnConfiguration
 from session.schemas import SessionRenameRequest, SessionSendMessageRequest
 from session.service import SessionService
 from tests.fixtures.model_calls import structured, thinking_off, thinking_on
@@ -186,7 +186,7 @@ async def test_environment_fast_does_not_emit_unverified_private_protocol(monkey
 
 async def test_turbo_never_wakes_existing_team():
     runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.mode_slug = "turbo"
+    runtime.configuration = TurnConfiguration.for_lead(object(), mode_slug="turbo")
     await runtime._wake_team_members(1, object())
 
 
@@ -321,16 +321,15 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
                 result=ModelTurnResult(text="答案", stop_reason="end_turn"),
             )
 
-    runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.db = SimpleNamespace(commit=AsyncMock())
-    runtime.workspace_id = 2
-    runtime.mode_slug = "turbo"
-    runtime.active_agent_id = None
-    runtime.active_agent_prompt = None
-    runtime._database_model = True
-    runtime.llm = _LLM()
+    db = SimpleNamespace(commit=AsyncMock())
+    runtime = AgentRuntime(db, workspace_id=2, llm=_LLM())
+    runtime.configuration = TurnConfiguration.for_lead(
+        db,
+        mode_slug="turbo",
+        model=runtime.configuration.model,
+        database_model=True,
+    )
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.tool_registry = builtin_tool_set()
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
@@ -340,7 +339,7 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
     runtime.compact_service = SimpleNamespace(maybe_compact=AsyncMock())
     runtime._apply_stop_hooks = AsyncMock()
     skill_catalog = AsyncMock()
-    monkeypatch.setattr("runtime.agent.SkillService.get_catalog", skill_catalog)
+    monkeypatch.setattr("runtime.lead_loop.SkillService.get_catalog", skill_catalog)
     session = SimpleNamespace(system_prompt="原系统提示")
     result = await runtime._run_llm_loop(1, session, SimpleNamespace(id=uuid4()), None)
     assert not result.suspended and result.completed_message_id == 99
@@ -356,11 +355,11 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
 
 
 async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
-    monkeypatch.setattr("runtime.agent.settings.memory_extraction_enabled", True)
+    monkeypatch.setattr("core.config.settings.memory_extraction_enabled", True)
     enqueue = AsyncMock()
     monkeypatch.setattr("memory.jobs.service.MemoryJobService.enqueue_extract", enqueue)
     runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.mode_slug = "turbo"
+    runtime.configuration = TurnConfiguration.for_lead(object(), mode_slug="turbo")
     runtime._fence_lease = AsyncMock()
     runtime.db = SimpleNamespace(commit=AsyncMock(), begin_nested=AsyncMock())
     runtime.memory = BuiltinMemoryProvider(runtime.db)

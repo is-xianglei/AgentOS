@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from api import deps as api_deps
 from core.errors import AgentException, LeaseLostError
 from core.events import ORCHESTRATOR_ACTOR, BlockType, RuntimeEvent, StreamEvent, Usage
 from core.run_events import LocalRunEventStore
@@ -183,7 +184,7 @@ async def env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(turn_follow, "get_run_event_store", lambda: store)
     monkeypatch.setattr(turn_follow, "STREAM_BLOCK_MS", 100)
     environment = _Env(leases, store, asyncio.Event(), asyncio.Event())
-    monkeypatch.setattr(session_api, "AgentRuntime", _scripted_runtime(environment))
+    monkeypatch.setattr(api_deps, "AgentRuntime", _scripted_runtime(environment))
     yield environment
     await execution.shutdown_executions(timeout=1)
 
@@ -246,7 +247,18 @@ async def _frames(iterator, *, until: str = "run_end") -> list[dict[str, Any]]:
 
 async def _send() -> Any:
     payload = SessionSendMessageRequest(content="你好")
-    return await session_api.send_message(payload, _FakeDb(), _USER, _WS)
+    db = _FakeDb()
+    agent_service = await api_deps.get_agent_service(db, _USER, _WS)
+    return await session_api.send_message(payload, db, _USER, _WS, agent_service)
+
+
+async def _cancel(session_id: int, turn_id: UUID) -> Any:
+    """经真实的 get_agent_service 装配，调用取消轮次接口。"""
+    db = _FakeDb()
+    agent_service = await api_deps.get_agent_service(db, _USER, _WS)
+    return await session_api.cancel_turn_execution(
+        session_id, turn_id, _REQUEST, db, _USER, _WS, agent_service
+    )
 
 
 async def _wait_done(turn_id: UUID) -> None:
@@ -358,9 +370,7 @@ async def test_active_turn_and_cancel(env: _Env) -> None:
     active = await session_api.get_active_turn(42, _REQUEST, _FakeDb(), _USER, _WS)
     assert active["data"].turn_id == turn_id and active["data"].executing is True
 
-    cancelled = await session_api.cancel_turn_execution(
-        42, turn_id, _REQUEST, _FakeDb(), _USER, _WS
-    )
+    cancelled = await _cancel(42, turn_id)
     assert (cancelled["data"].status, cancelled["data"].session_status) == ("interrupted", "idle")
     # 本进程任务自己收尾:半截回答与 interrupted/idle 同一次 finish_turn_execution 提交。
     assert [(d.role, d.content) for d in env.leases.partials[turn_id]] == [
@@ -375,7 +385,7 @@ async def test_active_turn_and_cancel(env: _Env) -> None:
     after = await session_api.get_active_turn(42, _REQUEST, _FakeDb(), _USER, _WS)
     assert after["data"].executing is False and after["data"].status == "interrupted"
     with pytest.raises(AgentException) as again:
-        await session_api.cancel_turn_execution(42, turn_id, _REQUEST, _FakeDb(), _USER, _WS)
+        await _cancel(42, turn_id)
     assert again.value.status_code == 409
 
 
@@ -385,7 +395,7 @@ async def test_cancel_awaiting_interaction_turn_is_409(env: _Env) -> None:
     env.leases.sessions[42] = "awaiting_interaction"
 
     with pytest.raises(AgentException) as exc_info:
-        await session_api.cancel_turn_execution(42, turn_id, _REQUEST, _FakeDb(), _USER, _WS)
+        await _cancel(42, turn_id)
     assert exc_info.value.status_code == 409
     assert env.leases.turns[turn_id].owner == "x"
 

@@ -38,6 +38,7 @@ from interaction.service import InteractionService
 from runtime import execution, recovery, turn_follow
 from runtime.agent import AgentRuntime
 from runtime.cancel_partial import CANCELLED_TOOL_OUTPUT
+from runtime.turn_config import TurnConfiguration
 from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from tools.service import ToolService
@@ -605,6 +606,11 @@ def _interaction_runtime(db: AsyncSession, ids) -> AgentRuntime:
     runtime.interaction_service = InteractionService(db)
     runtime.tool_service = ToolService(db, builtin_tool_set())
     runtime.bus = NullStreamBus()
+    # 交互取消用不到审核、Plan、权限与回合模型，这里只给出流程组装需要的占位。
+    runtime.configuration = TurnConfiguration.for_lead(db)
+    runtime.reviewer = None
+    runtime.plan_service = None
+    runtime.permission_service = None
     return runtime
 
 

@@ -1,30 +1,27 @@
-"""主 Agent 运行时：请求阶段准入、后台 ReAct 主循环、工具执行与人工交互挂起/恢复。"""
+"""主 Agent 运行时：请求阶段准入、后台执行体与回合终态。
+
+回合配置（模型、工具边界、Agent 绑定、委派目录）见 turn_config，工具执行见 tool_execution，
+人工交互的挂起、恢复与取消见 interaction_flow，回合循环见 lead_loop；运行时按组合调用它们。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from dataclasses import dataclass, replace
-from datetime import date
-from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentDefinitionService
-from core.config import settings
 from core.errors import AgentException, LeaseLostError
 from core.event_bus import NullStreamBus, RunStreamBus, StreamBus
 from core.events import (
     ORCHESTRATOR_ACTOR,
     Actor,
     ErrorInfo,
-    InteractionInfo,
     RuntimeEvent,
     StreamEvent,
-    ToolInfo,
     teammate_actor,
 )
 from database.engine import AsyncSessionLocal
@@ -32,87 +29,44 @@ from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.models.factory import create_model_client
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.agent_service import ExecutionHandle
 from harness.app.compaction import ContextCompaction
-from harness.app.loop import (
-    LoopExit,
-    LoopPolicy,
-    LoopRound,
-    ModelRequest,
-    StepResult,
-    run_react_loop,
-)
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
     ModelConnectionError,
-    ModelSettings,
     ModelStatusError,
     ResolvedModel,
     ToolCallReviewer,
 )
 from harness.app.subagent_catalog import get_subagent_spec
-from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
-from harness.domain.context import messages_from_rows
 from harness.domain.memory import MemoryWriteTicket, TurnRef
-from harness.domain.messages import ToolCall, ToolResult
-from harness.domain.prompts.plan_mode import ENTER_PLAN_MODE_RESULT
-from harness.domain.review import (
-    PLAN_MODE_ALLOWED_TOOLS,
-    SOURCE_PERMISSION,
-    ReviewRequest,
-)
-from harness.domain.roles.assistant import Assistant
 from harness.domain.roles.subagent import AgentType
-from harness.domain.tool import ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
-from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
-from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
+from interaction.models import RuntimeSuspensionRecord
 from interaction.service import InteractionService
-from model_service.policy import TURBO_ALLOWED_TOOLS, TURBO_MAX_ITERATIONS
-from permission.service import DANGEROUS_TOOLS, PermissionService
+from permission.service import PermissionService
 from plan.service import PlanService
-from runtime.execution import (
-    ExecutionHandle,
-    launch_turn_execution,
-    lease_seconds,
-    new_lease_owner,
-    write_detached_run_end,
+from runtime.execution import launch_turn_execution, lease_seconds, new_lease_owner
+from runtime.interaction_flow import (
+    RESUME_CANCEL_QUESTION,
+    RESUME_REPLAY_FINISHED,
+    RESUME_REPLAY_PENDING,
+    InteractionFlow,
+    SuspendedInteraction,
 )
-from runtime.step import AgentStep
-from runtime.stream_assembler import TurnEventAssembler
+from runtime.lead_loop import LeadLoopDeps, TurnLoopResult, run_lead_turn
 from runtime.subagent import SubAgentRunner
-from session.models import SessionMessage, SessionRecord, SessionTurnRecord
+from runtime.tool_execution import LeadToolExecutor
+from runtime.turn_config import TurnConfiguration, configure_turn
+from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
-from skill.service import SkillService
 from task.service import TaskService
 from team.service import TeamService
-from tools.gateway import ToolGateway
-from tools.models import ToolCallRecord
 from tools.service import ToolService
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class TurnLoopResult:
-    """一次 Turn 主循环的持久化结果。"""
-
-    suspended: bool
-    completed_message_id: int | None = None
-    interaction: SuspendedInteraction | None = None
-
-
-@dataclass(frozen=True)
-class SuspendedInteraction:
-    """提交挂起事务后需要发布给客户端的交互事件快照。"""
-
-    session_id: int
-    suspension_id: UUID
-    request_id: UUID
-    kind: str
-    request_payload: dict[str, Any]
-    schema_version: int
 
 
 def _turn_failure_info(exc: Exception) -> ErrorInfo:
@@ -136,225 +90,9 @@ def _turn_failure_info(exc: Exception) -> ErrorInfo:
     return ErrorInfo(code="TURN_FAILED", message="本轮处理失败，请稍后重试", fatal=True)
 
 
-class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
-    """主 Agent 的循环策略：消息每轮从会话加载并按需压缩，assistant 消息落库到 session_messages。
-
-    没有工具调用时先跑 Stop hook（可要求续跑一轮）；工具阶段可能挂起等待人工交互；
-    用完轮次后不带工具再调一次收尾，极速模式改为抛中文异常。回合级的工具预算、角色与
-    「LLM调用开始/完成」「回合结束」观测日志都在这里，事件经运行时的 bus 发出。
-    """
-
-    def __init__(
-        self,
-        runtime: AgentRuntime,
-        *,
-        session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-        additional_context: str | None,
-        rendered_memories: str | None,
-        role: Assistant,
-        tools: ToolSet,
-        budget: ToolCallBudget,
-        assembler: TurnEventAssembler,
-        step: AgentStep,
-    ) -> None:
-        self._runtime = runtime
-        self._session_id = session_id
-        self._session = session
-        self._turn = turn
-        self._additional_context = additional_context
-        self._rendered_memories = rendered_memories
-        self._role = role
-        self._tools = tools
-        self._budget = budget
-        self._assembler = assembler
-        self._step = step
-        self._turbo = runtime.mode_slug == "turbo"
-        # 观测用计时与轮次计数，仅供日志使用，不参与业务控制流。
-        self._started = time.perf_counter()
-        self._rounds = 0
-        self._round_started = 0.0
-        self._round_settings: ModelSettings | None = None
-        self._context: list[dict[str, Any]] = []
-        self._assistant_message: SessionMessage | None = None
-        self._stop_reason: str | None = None
-
-    async def load_context(self, loop_round: LoopRound) -> ModelRequest:
-        runtime = self._runtime
-        # 极速模式不压缩；只压缩当前 Turn 之前的历史，原始请求和本轮工具轨迹始终完整保留。
-        self._context = await self._load_messages(compact=not self._turbo)
-        self._round_settings = runtime._round_settings(self._session)
-        self._rounds += 1
-        round_model = runtime._llm_attribution(self._round_settings)[1]
-        self._round_started = time.perf_counter()
-        logger.info(
-            "LLM调用开始",
-            extra={
-                "session_id": self._session_id,
-                "turn_id": str(self._turn.id),
-                "round": self._rounds,
-                "model": round_model,
-                "msg_count": len(self._context),
-            },
-        )
-        # 极速模式最后一轮不给工具，迫使模型直接作答。
-        if self._turbo and loop_round.is_last:
-            round_tools = self._tools.only()
-        else:
-            round_tools = self._tools
-        context = self._role.context(messages_from_rows(self._context), round_tools.to_specs())
-        return ModelRequest(context=context, settings=self._round_settings)
-
-    async def record_assistant(self, loop_round: LoopRound, reply: StepResult) -> None:
-        logger.info(
-            "LLM调用完成",
-            extra={
-                "session_id": self._session_id,
-                "turn_id": str(self._turn.id),
-                "round": self._rounds,
-                "duration_ms": round((time.perf_counter() - self._round_started) * 1000, 2),
-            },
-        )
-        self._stop_reason = reply.llm_result.stop_reason
-        # 落库中立块:库中不存任何 provider wire 形状,出站翻译由各 Client 现编。
-        assert self._round_settings is not None
-        self._assistant_message = await self._add_assistant(reply, self._round_settings)
-
-    async def on_no_tool_calls(
-        self,
-        loop_round: LoopRound,
-        reply: StepResult,
-    ) -> LoopExit[TurnLoopResult] | None:
-        # Stop:回合即将结束时触发。hook 可返回 continuation 强制续跑
-        # (作为一条 user 消息注入),否则正常结束本回合。极速模式不触发。
-        runtime = self._runtime
-        continuation = None
-        if not self._turbo:
-            continuation = await runtime._apply_stop_hooks(
-                self._session_id,
-                self._turn.id,
-                ORCHESTRATOR_ACTOR,
-                self._context,
-            )
-        if continuation is None:
-            return LoopExit(await self._finish())
-        await runtime.session_service.add_message(
-            self._session_id,
-            "user",
-            continuation,
-            turn_id=self._turn.id,
-        )
-        await runtime.db.flush()
-        return None
-
-    async def execute_tools(
-        self,
-        loop_round: LoopRound,
-        reply: StepResult,
-    ) -> LoopExit[TurnLoopResult] | None:
-        assert self._assistant_message is not None
-        interaction = await self._runtime._execute_tool_calls(
-            self._session_id,
-            self._session,
-            self._turn,
-            ORCHESTRATOR_ACTOR,
-            self._assistant_message.id,
-            reply.tool_calls,
-            done_ids=[],
-            additional_context=self._additional_context,
-            budget=self._budget,
-        )
-        if interaction is None:
-            return None
-        return LoopExit(TurnLoopResult(suspended=True, interaction=interaction))
-
-    async def flush(self) -> None:
-        await self._runtime.db.flush()
-
-    async def on_exhausted(self) -> TurnLoopResult:
-        # 达到轮数上限:禁用工具最后调一次 LLM,产出最终答复(优雅降级)。
-        if self._turbo:
-            raise AgentException.message("极速模式已达到模型调用上限，请切换标准模式继续")
-        self._assistant_message = await self._finalize_without_tools()
-        self._stop_reason = self._assembler.last_result.stop_reason or "max_iterations"
-        return await self._finish()
-
-    async def _load_messages(self, *, compact: bool) -> list[dict[str, Any]]:
-        """加载本轮上下文：可压缩的历史在前，本轮消息在后；compact 为 True 时先压缩历史。"""
-        runtime = self._runtime
-        history, current, through_message_id = await runtime.session_service.load_context_for_turn(
-            self._turn,
-            self._additional_context,
-            rendered_memories=self._rendered_memories,
-        )
-        if compact:
-            history = await runtime.compact_service.maybe_compact(
-                self._session_id,
-                history,
-                through_message_id=through_message_id,
-            )
-        return history + current
-
-    async def _add_assistant(
-        self,
-        reply: StepResult,
-        round_settings: ModelSettings,
-    ) -> SessionMessage:
-        provider, effective_model = self._runtime._llm_attribution(round_settings)
-        return await self._runtime.session_service.add_message(
-            self._session_id,
-            "assistant",
-            reply.assistant_blocks,
-            turn_id=self._turn.id,
-            provider=provider,
-            model=effective_model,
-        )
-
-    async def _finalize_without_tools(self) -> SessionMessage:
-        """禁用工具再调一次 LLM,产出最终答复并落库。
-
-        沿用同一装配器,使收尾这次调用的块 index 接在前面的块之后,不从 0 重来。
-        """
-        round_settings = self._runtime._round_settings(self._session)
-        context = await self._load_messages(compact=True)
-        reply = await self._step.run(
-            self._role.final_context(messages_from_rows(context)),
-            round_settings,
-        )
-        return await self._add_assistant(reply, round_settings)
-
-    async def _finish(self) -> TurnLoopResult:
-        """回合正常结束：记「回合结束」日志并发出 turn_end。"""
-        assert self._assistant_message is not None
-        usage = self._assembler.last_result.usage
-        logger.info(
-            "回合结束",
-            extra={
-                "session_id": self._session_id,
-                "turn_id": str(self._turn.id),
-                "stop_reason": self._stop_reason,
-                "rounds": self._rounds,
-                "in_tokens": usage.input_tokens if usage else None,
-                "out_tokens": usage.output_tokens if usage else None,
-                "duration_ms": round((time.perf_counter() - self._started) * 1000, 2),
-            },
-        )
-        await self._runtime.bus.emit(
-            StreamEvent.turn_end(
-                ORCHESTRATOR_ACTOR,
-                self._session_id,
-                self._stop_reason,
-                self._assembler.last_result.usage,
-            )
-        )
-        return TurnLoopResult(
-            suspended=False,
-            completed_message_id=self._assistant_message.id,
-        )
-
-
 class AgentRuntime:
+    """主 Agent 运行时：准入、后台执行体与回合终态，按组合调用回合配置、工具执行与人工交互流程。"""
+
     def __init__(
         self,
         db: AsyncSession,
@@ -366,11 +104,13 @@ class AgentRuntime:
     ):
         """初始化 Agent 主运行时依赖。
 
+        llm 是注入的模型客户端，注入后不再按会话解析模型，后台重建运行时时随之传递；
         reviewer 未注入时使用主 Agent 的规则链审核员；memory 未注入时使用绑定本会话的内置记忆。
         """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
+        self.llm = llm
         self.session_service = SessionService(db)
         # 压缩快照经会话域 Service 写入；未解析出压缩模型时按 .env 的 compact 场景现建客户端。
         self.compact_service = ContextCompaction(
@@ -385,36 +125,18 @@ class AgentRuntime:
         self.reviewer = reviewer
         self.interaction_service = InteractionService(db)
         self.plan_service = PlanService(db)
+        # 只做调用记录的状态流转，与工具边界无关；工具执行经回合配置里的网关。
+        self.tool_service = ToolService(db, builtin_tool_set())
         # 组装根（阶段 7）之前在这里回落内置实现；注入的 Provider 随后台执行一并传递。
         self._memory_injected = memory is not None
         if memory is None:
             memory = BuiltinMemoryProvider(db)
         self.memory = memory
-        self.llm = llm
-        self._llm_injected = llm is not None
-        # 本场景的默认调用参数；注入替身时取替身自带的模型名，未注入时由 _configure_agent 解析。
-        self.model_settings: ModelSettings | None = None
+        # 按会话配置之前的回合配置：默认 Agent、标准模式；注入客户端时模型取客户端自带的默认参数。
+        model = None
         if llm is not None:
-            self.model_settings = ResolvedModel.from_client(llm).settings
-        self.mode_slug = "standard"
-        self._database_model = False
-        self.tool_registry = builtin_tool_set()
-        self.tool_service = ToolService(db, self.tool_registry)
-        self.tool_gateway = ToolGateway.from_registry(
-            db,
-            self.tool_registry,
-            "lead",
-            principal_name="lead",
-        )
-        self.active_agent_id: int | None = None
-        self.active_profile: ToolProfile = "lead"
-        self.active_principal_name: str = "lead"
-        self.active_agent_prompt: str | None = None
-        self.active_model_name: str | None = None
-        self.active_skill_ids: tuple[int, ...] | None = None
-        self.allowed_skill_names: frozenset[str] | None = None
-        # 可委派 Agent 目录,只有默认 Agent(会话未绑定自建 Agent)才会在 _configure_agent 中加载。
-        self.delegate_catalog: str | None = None
+            model = ResolvedModel.from_client(llm)
+        self.configuration = TurnConfiguration.for_lead(db, model=model)
         # 执行之外(准入、交互取消)没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
         # 当前执行的租约持有者;提交终态前据此隔离已被取消或回收的执行。
@@ -434,6 +156,47 @@ class AgentRuntime:
         if getattr(self, "_memory_injected", False):
             return self.memory
         return None
+
+    async def _configure_agent(self, session: SessionRecord) -> None:
+        """按会话绑定刷新回合配置；解析出压缩模型与阈值时同步给上下文压缩。"""
+        configuration = await configure_turn(
+            self.db,
+            session,
+            user_id=self.user_id,
+            workspace_id=self.workspace_id,
+            injected=self.llm,
+        )
+        if configuration.compact_model is not None:
+            self.compact_service.model = configuration.compact_model
+        if configuration.compact_threshold is not None:
+            self.compact_service.threshold = configuration.compact_threshold
+        self.configuration = configuration
+
+    def _interactions(self) -> InteractionFlow:
+        """按当前回合配置、事件总线与各域 Service 组装工具执行者与人工交互流程。"""
+        executor = LeadToolExecutor(
+            configuration=self.configuration,
+            reviewer=self.reviewer,
+            plan_service=self.plan_service,
+            session_service=self.session_service,
+            tool_service=self.tool_service,
+            bus=self.bus,
+            user_id=self.user_id,
+            workspace_id=self.workspace_id,
+        )
+        return InteractionFlow(
+            db=self.db,
+            configuration=self.configuration,
+            executor=executor,
+            session_service=self.session_service,
+            interaction_service=self.interaction_service,
+            plan_service=self.plan_service,
+            permission_service=self.permission_service,
+            tool_service=self.tool_service,
+            bus=self.bus,
+            user_id=self.user_id,
+            workspace_id=self.workspace_id,
+        )
 
     async def start(
         self,
@@ -461,9 +224,8 @@ class AgentRuntime:
             agent_id,
             **prepare_kwargs,
         )
-        # 准入前解析实际模型，缺配置通过普通 JSON 错误返回。
-        # getattr 兜底：测试用 __new__ 构造的实例没有 _llm_injected 属性。
-        if not getattr(self, "_llm_injected", self.llm is not None):
+        # 准入前解析实际模型，缺配置通过普通 JSON 错误返回；注入客户端时不解析。
+        if self.llm is None:
             await self._configure_agent(session)
         turn, _ = await self.session_service.start_turn(
             session,
@@ -471,20 +233,29 @@ class AgentRuntime:
             self.workspace_id,
             user_content,
         )
+        target_session_id, turn_id = session.id, turn.id
+        return await self._launch(
+            target_session_id,
+            turn_id,
+            lambda runtime: runtime._produce(target_session_id, turn_id, user_content),
+        )
+
+    async def _launch(
+        self,
+        session_id: int,
+        turn_id: UUID,
+        run: Callable[[AgentRuntime], Awaitable[None]],
+    ) -> ExecutionHandle:
+        """对轮次认领租约并提交，再在独立数据库会话里重建运行时、启动后台执行。"""
         owner = new_lease_owner()
         start_offset = await self.session_service.claim_turn_lease(
-            turn.id, owner, lease_seconds()
+            turn_id, owner, lease_seconds()
         )
         # 显式提交:请求作用域的 db 只用于准入;轮次与租约须在后台任务读取前可见,
         # 且 get_db 要等整个 SSE 发完才收尾,不能让连接在推流期间一直挂着事务。
         await self.db.commit()
-        target_session_id, turn_id = session.id, turn.id
-        user_id, workspace_id = self.user_id, self.workspace_id
-        # 只把构造时注入的客户端传给后台任务；按会话解析的客户端由后台运行时重新解析。
-        if getattr(self, "_llm_injected", self.llm is not None):
-            llm = self.llm
-        else:
-            llm = None
+        # 只把构造时注入的客户端与记忆 Provider 传给后台任务；按会话解析的由后台运行时重新解析。
+        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
         memory = self._injected_memory()
 
         async def body(bus: RunStreamBus) -> None:
@@ -494,11 +265,11 @@ class AgentRuntime:
                     db, user_id=user_id, workspace_id=workspace_id, llm=llm, memory=memory
                 )
                 runtime.bind_execution(bus, owner)
-                await runtime._produce(target_session_id, turn_id, user_content)
+                await run(runtime)
 
         return await launch_turn_execution(
             turn_id=turn_id,
-            session_id=target_session_id,
+            session_id=session_id,
             owner=owner,
             start_offset=start_offset,
             body=body,
@@ -529,7 +300,7 @@ class AgentRuntime:
 
             # Hook 只生成本次模型请求的临时上下文，绝不改写已保存的原始用户消息。
             # 极速模式不触发 Hook。
-            if self.mode_slug == "turbo":
+            if self.configuration.turbo:
                 additional_context = None
             else:
                 additional_context = await self._apply_user_prompt_hooks(
@@ -625,34 +396,10 @@ class AgentRuntime:
             kind,
             response_payload,
         )
-        owner = new_lease_owner()
-        start_offset = await self.session_service.claim_turn_lease(
-            turn_id, owner, lease_seconds()
-        )
-        # 显式提交:租约须在后台任务读取前可见,请求作用域的 db 不随 SSE 挂着事务。
-        await self.db.commit()
-        user_id, workspace_id = self.user_id, self.workspace_id
-        # 与 start 相同：只传递构造时注入的客户端与记忆 Provider。
-        if getattr(self, "_llm_injected", self.llm is not None):
-            llm = self.llm
-        else:
-            llm = None
-        memory = self._injected_memory()
-
-        async def body(bus: RunStreamBus) -> None:
-            async with AsyncSessionLocal() as db:
-                runtime = AgentRuntime(
-                    db, user_id=user_id, workspace_id=workspace_id, llm=llm, memory=memory
-                )
-                runtime.bind_execution(bus, owner)
-                await runtime._produce_resume(session_id, request_id)
-
-        return await launch_turn_execution(
-            turn_id=turn_id,
-            session_id=session_id,
-            owner=owner,
-            start_offset=start_offset,
-            body=body,
+        return await self._launch(
+            session_id,
+            turn_id,
+            lambda runtime: runtime._produce_resume(session_id, request_id),
         )
 
     async def prepare_interaction_response(
@@ -668,98 +415,28 @@ class AgentRuntime:
         """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
-
         session = await self.session_service.lock_required(session_id)
         await self._configure_agent(session)
-        current = await self.interaction_service.get_request_required(
-            request_id,
-            session_id=session_id,
-        )
-        is_replay = current.status == "resolved"
-        if not is_replay and session.status != "awaiting_interaction":
-            raise AgentException.message("会话当前没有待处理的人工交互")
-
-        normalized = await self._normalize_interaction_response(
+        return await self._interactions().save_response(
             session_id,
+            session,
             request_id,
             kind,
             response_payload,
         )
-        request, suspension = await self.interaction_service.resolve_request(
-            request_id,
-            normalized,
-            self.user_id,
-            session_id=session_id,
-            expected_kind=kind,
-        )
-        turn = await self.session_service.get_turn_required(suspension.turn_id)
-        if turn.session_id != session_id:
-            raise AgentException.message("人工交互对应的轮次不属于指定会话")
-        if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
-            raise AgentException.message("无权限恢复该交互轮次", status_code=403)
-        if not is_replay and turn.status != "awaiting_interaction":
-            raise AgentException.message("人工交互对应的轮次不可恢复")
-        if request.response_payload != normalized:
-            raise AgentException.message("人工交互响应持久化结果不一致")
-
-        # 流建立或客户端连接随后失败时，响应仍可从 resuming 暂停点重放。
-        await self.db.commit()
-        return turn.id
 
     async def cancel_interaction(
         self,
         session_id: int,
         suspension_id: UUID,
     ) -> RuntimeSuspensionRecord:
-        """取消当前暂停点，原子收尾关联的 Turn 与工具调用，提交后补写 run_end。
-
-        补写的 run_end(interrupted, cancelled=true)让快照离开 awaiting_interaction、
-        不再显示待处理交互;取消之后才订阅的客户端同样拿到该终态。
-        """
+        """取消当前暂停点，原子收尾关联的 Turn 与工具调用，提交后补写 run_end。"""
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
-
-        session = await self.session_service.ensure_interaction_resumable(session_id)
-        suspension = await self.interaction_service.get_suspension_required(
-            suspension_id,
-            session_id=session_id,
-        )
-        turn = await self.session_service.get_turn_required(suspension.turn_id)
-        if turn.session_id != session_id:
-            raise AgentException.message("运行暂停点与交互轮次不匹配")
-        if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
-            raise AgentException.message("无权限取消该交互轮次", status_code=403)
-
-        suspension, requests = await self.interaction_service.cancel_suspension(
-            suspension_id,
-            self.user_id,
-            session_id=session_id,
-        )
-        await self._finish_cancelled_interaction(
-            session,
-            turn,
-            requests,
-            "用户取消了运行暂停点。",
-        )
-        termination = await self.session_service.release_turn_for_detached_end(session, turn)
-        # 显式提交:数据库是事实来源,补写 run_end 必须在终态提交之后;
-        # 与轮次取消接口一致,写事件流失败只记日志,不影响已提交的取消。
-        await self.db.commit()
-        await write_detached_run_end(termination, cancelled=True)
-        logger.info(
-            "人工交互已取消",
-            extra={
-                "session_id": session_id,
-                "turn_id": str(turn.id),
-                "kind": ",".join(req.kind for req in requests),
-                "suspension_id": str(suspension_id),
-            },
-        )
-        return suspension
+        return await self._interactions().cancel(session_id, suspension_id)
 
     async def _produce_resume(self, session_id: int, request_id: UUID) -> None:
         """后台恢复执行体:响应已由请求阶段提交,应用 continuation 并续跑主循环。"""
-        session: SessionRecord | None = None
         turn: SessionTurnRecord | None = None
         continuation_applied = False
         idempotent_replay = False
@@ -769,87 +446,33 @@ class AgentRuntime:
             # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
             session = await self.session_service.lock_required(session_id)
             await self._configure_agent(session)
-            request = await self.interaction_service.get_request_required(
-                request_id,
-                session_id=session_id,
-            )
-            suspension = await self.interaction_service.lock_suspension_required(
-                request.suspension_id,
-                session_id=session_id,
-            )
-            turn = await self.session_service.get_turn_required(suspension.turn_id)
-            if request.suspension_id != suspension.id or turn.session_id != session_id:
-                raise AgentException.message("人工交互与运行暂停点不匹配")
-            if turn.user_id != self.user_id or turn.workspace_id != self.workspace_id:
-                raise AgentException.message("无权限恢复该交互轮次", status_code=403)
+            interactions = self._interactions()
+            point = await interactions.load_resume_point(session_id, request_id)
+            turn, suspension = point.turn, point.suspension
+            step = interactions.resume_step(session_id, session, point)
 
-            # 上一次恢复已经推进到同一 suspension 的下一项交互时，相同响应只需
-            # 重放当前待处理请求，不能再次执行已经完成的工具副作用。
-            if suspension.status == "pending":
-                if session.status != "awaiting_interaction":
-                    raise AgentException.message("人工交互暂停点与会话状态不一致")
+            if step == RESUME_REPLAY_PENDING:
                 idempotent_replay = True
                 await self.db.commit()
-                interaction = await self._get_pending_interaction(session_id)
+                interaction = await interactions.pending_interaction(session_id)
                 await self._emit_interaction(interaction)
                 return
-
-            if suspension.status in {"resolved", "cancelled", "failed"}:
-                idempotent_replay = True
-                await self.db.commit()
-                await self.bus.emit(
-                    RuntimeEvent.session_ready(session.id, session.title, session.status)
-                )
-                await self.bus.emit(
-                    StreamEvent.turn_end(
-                        ORCHESTRATOR_ACTOR,
-                        session_id,
-                        f"interaction_{suspension.status}",
-                        None,
-                    )
-                )
-                return
-            if suspension.status != "resuming":
-                raise AgentException.message(
-                    "运行暂停点当前不可恢复",
-                    {"status": suspension.status},
-                )
-            if (
-                session.status != "awaiting_interaction"
-                or turn.status != "awaiting_interaction"
-            ):
-                raise AgentException.message("人工交互对应的会话或轮次不可恢复")
-
-            persisted_response = request.response_payload
-            if persisted_response is None:
-                raise AgentException.message("人工交互缺少已持久化的响应")
-
-            if request.kind == "user_question" and persisted_response["decision"] == "cancel":
-                suspension, requests = await self.interaction_service.cancel_suspension(
-                    suspension.id,
-                    self.user_id,
-                    session_id=session_id,
-                )
-                await self._finish_cancelled_interaction(
-                    session,
-                    turn,
-                    requests,
-                    "用户取消了问题交互。",
-                )
+            if step == RESUME_CANCEL_QUESTION:
+                await interactions.cancel_question(session_id, session, point)
                 await self._fence_lease(session_id, turn.id)
                 await self.db.commit()
                 continuation_applied = True
                 terminal_committed = True
-                await self.bus.emit(
-                    RuntimeEvent.session_ready(session.id, session.title, session.status)
-                )
-                await self.bus.emit(
-                    StreamEvent.turn_end(
-                        ORCHESTRATOR_ACTOR,
-                        session_id,
-                        "user_cancelled",
-                        None,
-                    )
+                await self._emit_resume_end(session, session_id, "user_cancelled")
+                return
+            if step == RESUME_REPLAY_FINISHED:
+                # 暂停点已终结：相同响应只重放结束事件。
+                idempotent_replay = True
+                await self.db.commit()
+                await self._emit_resume_end(
+                    session,
+                    session_id,
+                    f"interaction_{suspension.status}",
                 )
                 return
 
@@ -858,22 +481,16 @@ class AgentRuntime:
                 extra={
                     "session_id": session_id,
                     "turn_id": str(turn.id),
-                    "kind": request.kind,
+                    "kind": point.request.kind,
                     "suspension_id": str(suspension.id),
                 },
             )
-            pending_budget = ToolCallBudget.from_dict(
-                suspension.continuation_payload.get("tool_budget"),
-                default=ToolCallBudget(
-                    total_limit=max(1, settings.max_tool_iterations * 4),
-                    per_tool_limit=max(1, settings.max_tool_iterations),
-                ),
-            )
-            interaction = await self._apply_interaction_and_continue(
+            pending_budget = InteractionFlow.restored_budget(suspension)
+            interaction = await interactions.apply_and_continue(
                 session_id,
                 session,
                 turn,
-                request,
+                point.request,
                 suspension,
                 budget=pending_budget,
             )
@@ -883,9 +500,7 @@ class AgentRuntime:
                 await self._emit_interaction(interaction)
                 return
 
-            await self.interaction_service.mark_suspension_resolved(suspension.id)
-            await self.session_service.set_status(session, "running")
-            await self.session_service.mark_turn_status(turn, "running")
+            await interactions.mark_resumed(session, turn, suspension)
             await self._fence_lease(session_id, turn.id)
             await self.db.commit()
             continuation_applied = True
@@ -954,6 +569,20 @@ class AgentRuntime:
             else:
                 await self._mark_abnormal_end(session_id, turn.id if turn else None, "failed")
 
+    async def _emit_resume_end(
+        self,
+        session: SessionRecord,
+        session_id: int,
+        stop_reason: str,
+    ) -> None:
+        """恢复执行不再续跑时补发会话快照与 turn_end，前端据此离开等待交互状态。"""
+        await self.bus.emit(RuntimeEvent.session_ready(session.id, session.title, session.status))
+        await self.bus.emit(StreamEvent.turn_end(ORCHESTRATOR_ACTOR, session_id, stop_reason, None))
+
+    async def _emit_interaction(self, interaction: SuspendedInteraction) -> None:
+        """挂起事务提交之后发布交互请求事件。"""
+        await self._interactions().emit(interaction)
+
     async def _run_llm_loop(
         self,
         session_id: int,
@@ -962,107 +591,20 @@ class AgentRuntime:
         additional_context: str | None,
         budget: ToolCallBudget | None = None,
     ) -> TurnLoopResult:
-        """运行 ReAct 循环并处理模型工具调用,事件以协议形式 emit 到 bus。
-
-        返回结果包含是否挂起；成功结束时还包含最终助手消息 ID。
-        """
-        actor = ORCHESTRATOR_ACTOR
-        # 装配器跨本回合多次 LLM 调用共用:块 index 需在 turn 内全局递增连号,
-        # 这是它唯一的跨调用状态(详见装配器 docstring)。
-        assembler = TurnEventAssembler(actor, session_id, turn_id=turn.id)
-
-        # 回合开始(开场事件,带完整 actor)。
-        await self.bus.emit(StreamEvent.turn_start(actor, session_id))
-
-        if self.workspace_id is None:
-            raise AgentException.message("缺少可信工作区上下文")
-        # 极速模式跳过 skill、记忆、Plan Mode、上下文压缩与 Stop hook，只用固定提示词。
-        turbo = self.mode_slug == "turbo"
-
-        # skill catalog 每次 run 取一次缓存复用(仅主代理注入,§15.2):进 for 循环前取一次,
-        # 循环内各轮共用,避免每轮 loop 都打 DB。
-        if turbo:
-            skills_catalog = ""
-        else:
-            if self.active_skill_ids is not None:
-                skill_ids = list(self.active_skill_ids)
-            else:
-                skill_ids = None
-            skills_catalog = await SkillService(self.db).get_catalog(self.workspace_id, skill_ids)
-        # 可委派 Agent 目录已在 _configure_agent 的 lead 分支加载;极速模式没有 Agent 工具,不注入。
-        if turbo:
-            delegate_catalog = None
-        else:
-            delegate_catalog = self.delegate_catalog
-
-        if turbo:
-            memory_recall = None
-        else:
-            memory_recall = await self.memory.recall(
-                TurnRef(
-                    workspace_id=turn.workspace_id,
-                    user_id=turn.user_id,
-                    session_id=turn.session_id,
-                    turn_id=turn.id,
-                )
-            )
-        if memory_recall is not None:
-            # 子代理使用独立数据库会话，冻结结果必须先提交才能稳定继承。
-            await self.db.commit()
-            # 正文由会话加载拼到本轮起始的用户消息前面，目录由角色放进系统提示末段。
-            rendered_memories = memory_recall.message_prefix
-        else:
-            rendered_memories = None
-
-        # 会话绑定了 Agent 时用 Agent 的提示词，否则用会话自带的系统提示。
-        if self.active_agent_id is not None:
-            session_prompt = self.active_agent_prompt
-        else:
-            session_prompt = session.system_prompt
-        if turbo:
-            active_plan = None
-        else:
-            active_plan = await self.plan_service.get_active(session_id)
-        active_registry = self._registry_for_mode(active_plan is not None)
-        # 系统指令按回合冻结：块形式携带缓存断点，tools + 稳定段跨回合复用，
-        # 完整指令供本回合内多轮工具迭代复用。工作目录与日期在这里读取，角色不读进程状态。
-        role = Assistant(
-            cwd=str(Path.cwd()),
-            today=date.today(),
-            skills_catalog=skills_catalog,
-            delegate_catalog=delegate_catalog,
-            session_prompt=session_prompt,
-            memory=memory_recall,
-            plan_content=active_plan.content if active_plan is not None else None,
-            turbo=turbo,
+        """按当前回合配置组装循环协作者，运行一个回合的 ReAct 循环。"""
+        deps = LeadLoopDeps(
+            db=self.db,
+            bus=self.bus,
+            configuration=self.configuration,
+            interactions=self._interactions(),
+            memory=self.memory,
+            plan_service=self.plan_service,
+            session_service=self.session_service,
+            compaction=self.compact_service,
+            stop_hooks=self._apply_stop_hooks,
+            workspace_id=self.workspace_id,
         )
-        step = AgentStep(self.llm, assembler, self.bus.emit)
-        # 一次 Turn 内跨所有 LLM 回合共享工具预算；恢复人工交互时由调用方传入
-        # continuation 中持久化的同一实例，避免重建 AgentRuntime 后额度被重置。
-        if budget is None:
-            budget = ToolCallBudget(
-                total_limit=max(1, settings.max_tool_iterations * 4),
-                per_tool_limit=max(1, settings.max_tool_iterations),
-            )
-
-        policy = LeadLoopPolicy(
-            self,
-            session_id=session_id,
-            session=session,
-            turn=turn,
-            additional_context=additional_context,
-            rendered_memories=rendered_memories,
-            role=role,
-            tools=active_registry,
-            budget=budget,
-            assembler=assembler,
-            step=step,
-        )
-        if turbo:
-            iterations = TURBO_MAX_ITERATIONS
-        else:
-            iterations = settings.max_tool_iterations
-        return await run_react_loop(policy, step, max_rounds=iterations)
+        return await run_lead_turn(deps, session_id, session, turn, additional_context, budget)
 
     async def _complete_turn(
         self,
@@ -1084,7 +626,7 @@ class AgentRuntime:
         await self.session_service.set_status(session, "idle")
         memory_ticket: MemoryWriteTicket | None = None
         # 极速模式不写入记忆；写入失败由 Provider 自行隔离，不影响下面提交的回合终态。
-        if getattr(self, "mode_slug", "standard") != "turbo":
+        if not self.configuration.turbo:
             memory_ticket = await self.memory.on_turn_completed(
                 TurnRef(
                     workspace_id=turn.workspace_id,
@@ -1146,882 +688,6 @@ class AgentRuntime:
             )
         return True
 
-    async def _execute_tool_calls(
-        self,
-        session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-        actor: Actor,
-        assistant_message_id: int,
-        tool_calls: list[ToolCall],
-        done_ids: list[str],
-        additional_context: str | None,
-        existing_suspension: RuntimeSuspensionRecord | None = None,
-        budget: ToolCallBudget | None = None,
-    ) -> SuspendedInteraction | None:
-        """按原始顺序执行工具；需要人工输入时返回可发布的交互事件快照。"""
-        if budget is None:
-            budget = ToolCallBudget(
-                total_limit=max(1, settings.max_tool_iterations * 4),
-                per_tool_limit=max(1, settings.max_tool_iterations),
-            )
-        for idx, tool_call in enumerate(tool_calls):
-            # 恢复人工交互时，挂起前已完成的工具不再重复执行。
-            if tool_call.id in done_ids:
-                continue
-
-            # 每个工具前重新读取 Plan 状态：同一批工具中前面的 Enter/ExitPlanMode
-            # 经人工确认恢复后可能已改变它。
-            if getattr(self, "mode_slug", "standard") == "turbo":
-                active_plan = None
-            else:
-                active_plan = await self.plan_service.get_active(session_id)
-            plan_content = None
-            if active_plan is not None:
-                plan_content = active_plan.content
-            decision = await self.reviewer.review(
-                tool_call,
-                ReviewRequest(
-                    session_id=session_id,
-                    profile=self.active_profile,
-                    agent_type=self.active_profile,
-                    budget=budget,
-                    workspace_id=self.workspace_id,
-                    allowed_skill_names=self.allowed_skill_names,
-                    plan_content=plan_content,
-                    tools=self.tool_registry,
-                ),
-            )
-            # 审核可能规范化了入参：执行、落库与挂起的续跑状态都用审核后的入参。
-            if decision.arguments is not tool_call.arguments:
-                tool_call = replace(tool_call, arguments=decision.arguments)
-                tool_calls[idx] = tool_call
-
-            if decision.behavior == "deny":
-                if decision.source == SOURCE_PERMISSION:
-                    logger.warning(
-                        "工具权限策略拒绝执行该工具调用",
-                        extra={
-                            "session_id": session_id,
-                            "turn_id": str(turn.id),
-                            "tool_name": tool_call.tool_name,
-                            "decision": "deny",
-                        },
-                    )
-                await self._record_tool_response(
-                    session_id,
-                    turn.id,
-                    actor,
-                    tool_call,
-                    decision.message,
-                    is_error=True,
-                )
-                done_ids.append(tool_call.id)
-                continue
-
-            if decision.behavior == "ask":
-                interaction = decision.require_interaction()
-                if decision.source == SOURCE_PERMISSION:
-                    logger.info(
-                        "工具权限策略要求人工审批，挂起等待用户确认",
-                        extra={
-                            "session_id": session_id,
-                            "turn_id": str(turn.id),
-                            "tool_name": tool_call.tool_name,
-                            "decision": "ask",
-                        },
-                    )
-                remaining = [item for item in tool_calls[idx:] if item.id not in done_ids]
-                return await self._suspend_for_interaction(
-                    session_id,
-                    session,
-                    turn,
-                    assistant_message_id,
-                    remaining,
-                    done_ids,
-                    additional_context,
-                    interaction,
-                    existing_suspension,
-                    budget,
-                )
-
-            # 本轮实际生效的工具名单按刚读到的 Plan 状态计算;委派自建 Agent 时,
-            # 被委派方的工具不能超出它,否则 Plan Mode 下可借子 Agent 绕过只读限制。
-            round_tool_names = self._registry_for_mode(active_plan is not None).names
-            await self._execute_one(
-                session_id,
-                turn.id,
-                actor,
-                assistant_message_id,
-                tool_call,
-                round_tool_names=round_tool_names,
-            )
-            done_ids.append(tool_call.id)
-        return None
-
-    async def _execute_one(
-        self,
-        session_id: int,
-        turn_id: UUID,
-        actor: Actor,
-        assistant_message_id: int,
-        tool_call: ToolCall,
-        record: ToolCallRecord | None = None,
-        round_tool_names: frozenset[str] | None = None,
-    ) -> str:
-        """执行单个工具:调用 tool_service、emit tool_result、落 tool 消息。
-
-        record 非空时复用该 tool_calls 记录(审批通过后复用之前的 awaiting 记录),
-        避免同一调用留下两条记录。round_tool_names 是本轮实际生效的工具名单,
-        透传给工具上下文,供 Agent 工具委派自建 Agent 时裁剪工具。
-        """
-        output = await self.tool_gateway.run(
-            session_id,
-            tool_call.tool_name,
-            tool_call.arguments,
-            message_id=assistant_message_id,
-            bus=self.bus,
-            record=record,
-            actor=actor,
-            turn_id=turn_id,
-            user_id=self.user_id,
-            workspace_id=self.workspace_id,
-            agent_id=self.active_agent_id,
-            allowed_skill_names=self.allowed_skill_names,
-            round_tool_names=round_tool_names,
-        )
-        await self.bus.emit(
-            StreamEvent.tool_result(
-                actor,
-                session_id,
-                ToolInfo(
-                    id=tool_call.id,
-                    name=tool_call.tool_name,
-                    output=output,
-                    is_error=False,
-                ),
-            )
-        )
-        await self.session_service.add_message(
-            session_id,
-            "tool",
-            ToolResult(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.tool_name,
-                arguments=tool_call.arguments,
-                content=output,
-                is_error=False,
-            ).to_content(),
-            turn_id=turn_id,
-        )
-        return output
-
-    async def _record_tool_response(
-        self,
-        session_id: int,
-        turn_id: UUID,
-        actor: Actor,
-        tool_call: ToolCall,
-        output: str,
-        *,
-        is_error: bool,
-        record: ToolCallRecord | None = None,
-    ) -> None:
-        """持久化不经过真实工具执行的合成 tool_result。"""
-        if record is not None:
-            if is_error:
-                await self.tool_service.reject_awaiting_call(record, output)
-            else:
-                await self.tool_service.complete_call(record, output)
-        await self.bus.emit(
-            StreamEvent.tool_result(
-                actor,
-                session_id,
-                ToolInfo(
-                    id=tool_call.id,
-                    name=tool_call.tool_name,
-                    output=output,
-                    is_error=is_error,
-                ),
-            )
-        )
-        await self.session_service.add_message(
-            session_id,
-            "tool",
-            ToolResult(
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.tool_name,
-                arguments=tool_call.arguments,
-                content=output,
-                is_error=is_error,
-            ).to_content(),
-            turn_id=turn_id,
-        )
-
-    async def _suspend_for_interaction(
-        self,
-        session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-        assistant_message_id: int,
-        remaining: list[ToolCall],
-        done_ids: list[str],
-        additional_context: str | None,
-        kind: str,
-        existing_suspension: RuntimeSuspensionRecord | None,
-        budget: ToolCallBudget,
-    ) -> SuspendedInteraction:
-        """冻结 continuation 并创建一项业务交互请求。"""
-        target = remaining[0]
-        record = await self.tool_gateway.start_call(
-            session_id,
-            target.tool_name,
-            target.arguments,
-            message_id=assistant_message_id,
-            agent_id=self.active_agent_id,
-        )
-        await self.tool_service.mark_call_awaiting(record)
-        continuation = {
-            "assistant_message_id": assistant_message_id,
-            "pending": [
-                {
-                    "tool_use_id": tu.id,
-                    "tool_name": tu.tool_name,
-                    "input": tu.arguments,
-                    "tool_call_id": record.id if tu.id == target.id else None,
-                }
-                for tu in remaining
-            ],
-            "done_tool_use_ids": list(done_ids),
-            "additional_context": additional_context,
-            "tool_budget": budget.to_dict(),
-        }
-        request_payload = await self._build_interaction_payload(session_id, kind, target)
-        request_create = InteractionRequestCreate(
-            kind=kind,
-            request_payload=request_payload,
-            tool_call_id=record.id,
-            tool_use_id=target.id,
-        )
-
-        if existing_suspension is None:
-            suspension, request = await self.interaction_service.create_suspension_with_request(
-                session_id,
-                turn.id,
-                continuation,
-                {"mode": "sequential"},
-                request_create,
-            )
-        else:
-            suspension, request = (
-                await self.interaction_service.continue_suspension_with_request(
-                    existing_suspension.id,
-                    continuation,
-                    request_create,
-                )
-            )
-        await self.session_service.set_status(session, "awaiting_interaction")
-        await self.session_service.mark_turn_status(turn, "awaiting_interaction")
-        logger.info(
-            "人工交互挂起，等待用户响应",
-            extra={
-                "session_id": session_id,
-                "turn_id": str(turn.id),
-                "kind": kind,
-                "suspension_id": str(suspension.id),
-            },
-        )
-        return SuspendedInteraction(
-            session_id=session_id,
-            suspension_id=suspension.id,
-            request_id=request.id,
-            kind=request.kind,
-            request_payload=dict(request.request_payload),
-            schema_version=request.schema_version,
-        )
-
-    def _ask_reason(self, tool_name: str) -> str:
-        """给前端展示的审批原因文案。"""
-        if tool_name in DANGEROUS_TOOLS:
-            return "危险工具默认需审批"
-        return "该工具已被配置为需审批"
-
-    async def _build_interaction_payload(
-        self,
-        session_id: int,
-        kind: str,
-        target: ToolCall,
-    ) -> dict[str, Any]:
-        if kind == "tool_approval":
-            return {
-                "tool": {
-                    "id": target.id,
-                    "name": target.tool_name,
-                    "input": target.arguments,
-                },
-                "reason": self._ask_reason(target.tool_name),
-                "allowed_decisions": ["allow_once", "always_allow", "deny"],
-                "can_update_input": True,
-            }
-        if kind == "user_question":
-            return AskUserQuestionRequestPayload.model_validate(target.arguments).model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=True,
-            )
-        if kind == "enter_plan_mode":
-            return {"message": "是否进入只读Plan Mode？"}
-        if kind == "exit_plan_mode":
-            plan = await self.plan_service.get_active_required(session_id)
-            return {
-                "plan_id": str(plan.id),
-                "plan": plan.content,
-                "plan_version": plan.version,
-                "allowedPrompts": target.arguments.get("allowedPrompts", []),
-            }
-        raise AgentException.message("不支持的人工交互类型")
-
-    async def _apply_interaction_and_continue(
-        self,
-        session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-        request: InteractionRequestRecord,
-        suspension: RuntimeSuspensionRecord,
-        *,
-        budget: ToolCallBudget | None = None,
-    ) -> SuspendedInteraction | None:
-        """应用已持久化的业务响应，并继续同一 assistant 工具序列。"""
-        pending = suspension.continuation_payload
-        if budget is None:
-            budget = ToolCallBudget.from_dict(
-                pending.get("tool_budget"),
-                default=ToolCallBudget(
-                    total_limit=max(1, settings.max_tool_iterations * 4),
-                    per_tool_limit=max(1, settings.max_tool_iterations),
-                ),
-            )
-        pending_items = pending.get("pending", [])
-        if not pending_items:
-            raise AgentException.message("运行暂停点缺少待处理工具")
-        assistant_message_id = pending.get("assistant_message_id")
-        if not isinstance(assistant_message_id, int):
-            raise AgentException.message("运行暂停点缺少关联的助手消息")
-        done_ids = list(pending.get("done_tool_use_ids", []))
-        tool_calls = [
-            ToolCall(
-                id=it["tool_use_id"], tool_name=it["tool_name"], arguments=it.get("input") or {}
-            )
-            for it in pending_items
-        ]
-        target_item = pending_items[0]
-        target = tool_calls[0]
-        # 复用挂起时建的 awaiting 记录(避免同一调用留两条)。
-        record: ToolCallRecord | None = None
-        tool_call_id = target_item.get("tool_call_id")
-        if tool_call_id is not None:
-            record = await self.tool_service.get_call(tool_call_id)
-        if record is None or request.tool_call_id != record.id or request.tool_use_id != target.id:
-            raise AgentException.message("人工交互与工具调用记录不匹配")
-        response = request.response_payload
-        if response is None:
-            raise AgentException.message("人工交互缺少已持久化的响应")
-
-        actor = ORCHESTRATOR_ACTOR
-        if request.kind == "tool_approval":
-            await self._apply_tool_approval(
-                session_id,
-                turn,
-                actor,
-                assistant_message_id,
-                target,
-                tool_calls,
-                record,
-                response,
-            )
-        elif request.kind == "user_question":
-            await self._apply_user_question(turn, actor, target, record, request, response)
-        elif request.kind == "enter_plan_mode":
-            await self._apply_enter_plan_mode(turn, actor, target, record, response)
-        elif request.kind == "exit_plan_mode":
-            await self._apply_exit_plan_mode(turn, actor, target, record, request, response)
-        else:
-            raise AgentException.message("不支持的人工交互类型")
-        done_ids.append(target.id)
-
-        return await self._execute_tool_calls(
-            session_id,
-            session,
-            turn,
-            actor,
-            assistant_message_id,
-            tool_calls,
-            done_ids,
-            additional_context=pending.get("additional_context"),
-            existing_suspension=suspension,
-            budget=budget,
-        )
-
-    async def _apply_tool_approval(
-        self,
-        session_id: int,
-        turn: SessionTurnRecord,
-        actor: Actor,
-        assistant_message_id: int,
-        target: ToolCall,
-        tool_calls: list[ToolCall],
-        record: ToolCallRecord,
-        response: dict[str, Any],
-    ) -> None:
-        decision = response["decision"]
-        if decision == "deny":
-            message = response.get("message") or "用户拒绝执行该工具调用。"
-            await self._record_tool_response(
-                session_id,
-                turn.id,
-                actor,
-                target,
-                message,
-                is_error=True,
-                record=record,
-            )
-            return
-
-        updated_input = response.get("updated_input")
-        if updated_input is not None:
-            normalized = self.tool_registry.validate_input(target.tool_name, updated_input)
-            target = replace(target, arguments=normalized)
-            tool_calls[0] = target
-        if decision == "always_allow":
-            await self.permission_service.add_always_allow(
-                session_id,
-                target.tool_name,
-                response.get("always_scope", "session"),
-                workspace_id=self.workspace_id,
-            )
-        # 审批通过后执行的若是委派,同样按此刻的 Plan 状态计算本轮生效的工具名单。
-        active_plan = await self.plan_service.get_active(session_id)
-        round_tool_names = self._registry_for_mode(active_plan is not None).names
-        await self._execute_one(
-            session_id,
-            turn.id,
-            actor,
-            assistant_message_id,
-            target,
-            record=record,
-            round_tool_names=round_tool_names,
-        )
-
-    async def _apply_user_question(
-        self,
-        turn: SessionTurnRecord,
-        actor: Actor,
-        target: ToolCall,
-        record: ToolCallRecord,
-        request: InteractionRequestRecord,
-        response: dict[str, Any],
-    ) -> None:
-        decision = response["decision"]
-        answers = response.get("answers") or {}
-        if decision == "submit":
-            output = self._format_question_answers(
-                request.request_payload,
-                answers,
-                response.get("annotations") or {},
-            )
-            is_error = False
-        elif decision == "cancel":
-            raise AgentException.message("取消问题交互必须由运行时中止路径处理")
-        elif decision == "discuss":
-            output = self._format_question_discussion(
-                request.request_payload,
-                answers,
-                response.get("message"),
-            )
-            is_error = True
-        else:
-            active_plan = await self.plan_service.get_active(turn.session_id)
-            if active_plan is None:
-                output = "只有Plan Mode中的规划访谈可以使用finish_plan_interview。"
-            else:
-                output = self._format_finish_plan_interview(
-                    request.request_payload,
-                    answers,
-                    response.get("message"),
-                )
-            is_error = True
-        await self._record_tool_response(
-            turn.session_id,
-            turn.id,
-            actor,
-            target,
-            output,
-            is_error=is_error,
-            record=record,
-        )
-
-    async def _apply_enter_plan_mode(
-        self,
-        turn: SessionTurnRecord,
-        actor: Actor,
-        target: ToolCall,
-        record: ToolCallRecord,
-        response: dict[str, Any],
-    ) -> None:
-        if response["decision"] == "approve":
-            await self.plan_service.enter(turn.session_id, turn.id)
-            output = ENTER_PLAN_MODE_RESULT
-            is_error = False
-        else:
-            feedback = response.get("feedback")
-            output = "用户拒绝进入Plan Mode。"
-            if feedback:
-                output = f"{output}\n\n用户反馈：{feedback}"
-            is_error = True
-        await self._record_tool_response(
-            turn.session_id,
-            turn.id,
-            actor,
-            target,
-            output,
-            is_error=is_error,
-            record=record,
-        )
-
-    async def _apply_exit_plan_mode(
-        self,
-        turn: SessionTurnRecord,
-        actor: Actor,
-        target: ToolCall,
-        record: ToolCallRecord,
-        request: InteractionRequestRecord,
-        response: dict[str, Any],
-    ) -> None:
-        if self.user_id is None:
-            raise AgentException.message("退出Plan Mode缺少可信用户")
-        edited_plan = response.get("edited_plan")
-        feedback = response.get("feedback")
-        if response["decision"] == "approve":
-            allowed_prompts = request.request_payload.get("allowedPrompts") or []
-            plan = await self.plan_service.approve_exit(
-                turn.session_id,
-                turn.id,
-                self.user_id,
-                allowed_prompts,
-                feedback,
-                edited_plan,
-            )
-            output = f"用户已批准以下计划并退出Plan Mode：\n\n{plan.content}"
-            if feedback:
-                output = f"{output}\n\n用户反馈：{feedback}"
-            if allowed_prompts:
-                output = (
-                    f"{output}\n\nallowedPrompts仅作为计划声明保存，"
-                    "不会绕过现有工具权限规则。"
-                )
-            is_error = False
-        else:
-            plan = await self.plan_service.reject_exit(
-                turn.session_id,
-                feedback,
-                edited_plan,
-            )
-            output = "用户暂未批准计划，Plan Mode保持启用。"
-            if feedback:
-                output = f"{output}\n\n用户反馈：{feedback}"
-            output = f"{output}\n\n当前计划：\n{plan.content}"
-            is_error = True
-        await self._record_tool_response(
-            turn.session_id,
-            turn.id,
-            actor,
-            target,
-            output,
-            is_error=is_error,
-            record=record,
-        )
-
-    @staticmethod
-    def _format_question_answers(
-        request_payload: dict[str, Any],
-        answers: dict[str, str],
-        annotations: dict[str, dict[str, str]],
-    ) -> str:
-        parts: list[str] = []
-        for question in request_payload.get("questions", []):
-            question_text = question["question"]
-            answer = answers[question_text]
-            answer_parts = [f'"{question_text}"="{answer}"']
-            annotation = annotations.get(question_text) or {}
-            if annotation.get("preview"):
-                answer_parts.append(f"selected preview:\n{annotation['preview']}")
-            if annotation.get("notes"):
-                answer_parts.append(f"user notes: {annotation['notes']}")
-            parts.append(" ".join(answer_parts))
-        joined = ", ".join(parts)
-        return (
-            "User has answered your questions: "
-            f"{joined}. You can now continue with the user's answers in mind."
-        )
-
-    @staticmethod
-    def _format_question_discussion(
-        request_payload: dict[str, Any],
-        answers: dict[str, str],
-        message: str | None,
-    ) -> str:
-        lines = ["用户希望先讨论这些问题。请先询问用户想澄清什么，再按需重写问题。"]
-        for question in request_payload.get("questions", []):
-            text = question["question"]
-            lines.append(f'- "{text}": {answers.get(text, "（未回答）")}')
-        if message:
-            lines.append(f"用户补充：{message}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_finish_plan_interview(
-        request_payload: dict[str, Any],
-        answers: dict[str, str],
-        message: str | None,
-    ) -> str:
-        lines = ["用户表示规划访谈信息已经足够。停止继续澄清并完成计划。"]
-        for question in request_payload.get("questions", []):
-            text = question["question"]
-            lines.append(f'- "{text}": {answers.get(text, "（未回答）")}')
-        if message:
-            lines.append(f"用户补充：{message}")
-        return "\n".join(lines)
-
-    def _registry_for_mode(self, plan_mode: bool) -> ToolSet:
-        if self.mode_slug == "turbo":
-            return self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
-        if plan_mode:
-            return self.tool_registry.only(*PLAN_MODE_ALLOWED_TOOLS)
-        return self.tool_registry.without("ExitPlanMode", "WritePlan")
-
-    async def _configure_agent(self, session: SessionRecord) -> None:
-        """按会话绑定刷新本次运行的提示词、模型、Tool与Skill边界。"""
-        base_registry = builtin_tool_set()
-        self.mode_slug = getattr(session, "mode_slug", "standard")
-        if not self._llm_injected:
-            # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
-            from harness.adapters.models.resolver import DatabaseModelResolver
-
-            resolver = DatabaseModelResolver(self.db)
-            resolved = await resolver.for_session(session, "agent")
-            self.llm = resolved.client
-            self.model_settings = resolved.settings
-            self._database_model = resolved.provider_record_id is not None
-            self.compact_service.model = await resolver.resolve(
-                self.workspace_id,
-                self.user_id,
-                "compact",
-            )
-            # 端点声明了上下文长度时，压缩阈值取其 3/4。
-            if resolved.context_length is not None:
-                self.compact_service.threshold = max(1, resolved.context_length * 3 // 4)
-        session_agent_id = getattr(session, "agent_id", None)
-        if session_agent_id is None:
-            self.active_agent_id = None
-            self.active_profile = "lead"
-            self.active_principal_name = "lead"
-            self.active_agent_prompt = None
-            self.active_model_name = None
-            self.active_skill_ids = None
-            self.allowed_skill_names = None
-            self.tool_registry = base_registry
-            # 只有默认 Agent 能委派,可委派目录只在这个分支加载。
-            self.delegate_catalog = await self._load_delegate_catalog()
-        else:
-            if self.workspace_id is None:
-                raise AgentException.message("缺少可信工作区上下文")
-            config = await AgentDefinitionService(self.db).get_runtime_config(
-                self.workspace_id,
-                session_agent_id,
-            )
-            runtime_names = base_registry.callable_names(
-                config.tool_runtime_names,
-                "user_agent",
-                strict=True,
-            )
-            self.active_agent_id = config.agent_id
-            self.active_profile = "user_agent"
-            # 稳定主键作为工具身份，避免使用可修改的显示名称或模型输入。
-            self.active_principal_name = f"agent:{config.agent_id}"
-            self.active_agent_prompt = config.system_prompt
-            self.active_model_name = config.model_name
-            self.active_skill_ids = config.skill_ids
-            self.allowed_skill_names = frozenset(config.skill_names)
-            self.tool_registry = base_registry.only(*runtime_names)
-            # 绑定了自建 Agent 的会话不能再委派(委派深度为 1),不注入目录。
-            self.delegate_catalog = None
-        if self.mode_slug == "turbo":
-            self.tool_registry = self.tool_registry.only(*TURBO_ALLOWED_TOOLS)
-            self.allowed_skill_names = frozenset()
-        self.tool_gateway = ToolGateway.from_registry(
-            self.db,
-            self.tool_registry,
-            self.active_profile,
-            principal_name=self.active_principal_name,
-            agent_id=self.active_agent_id,
-            allowed_skill_names=self.allowed_skill_names,
-        )
-        self.tool_service = self.tool_gateway.service
-
-    async def _load_delegate_catalog(self) -> str | None:
-        """渲染默认 Agent 的可委派 Agent 目录:当前工作区每个已启用的 Agent 占一行。
-
-        没有可信工作区或工作区里没有已启用的 Agent 时返回 None,系统提示不注入该段。
-        """
-        if self.workspace_id is None:
-            return None
-        entries = await AgentDefinitionService(self.db).list_delegate_catalog(self.workspace_id)
-        lines: list[str] = []
-        for entry in entries:
-            # 描述可能含换行,压成一行,保证目录里一个 Agent 只占一行。
-            description = "(无描述)"
-            if entry.description and entry.description.strip():
-                description = " ".join(entry.description.split())
-            tools = "(无)"
-            if entry.tool_names:
-                tools = "、".join(entry.tool_names)
-            lines.append(
-                f"- agent_id={entry.agent_id} 名称:{entry.name} 描述:{description} 工具:{tools}"
-            )
-        if not lines:
-            return None
-        return "\n".join(lines)
-
-    async def _get_pending_interaction(self, session_id: int) -> SuspendedInteraction:
-        """读取已提交的唯一待处理请求，用于幂等重放 SSE 通知。"""
-        pending = await self.interaction_service.get_pending(session_id)
-        if pending is None:
-            raise AgentException.message("会话没有可重放的人工交互")
-        suspension, requests = pending
-        if suspension.status != "pending" or len(requests) != 1:
-            raise AgentException.message(
-                "运行暂停点的待处理请求数量无效",
-                {"status": suspension.status, "request_count": len(requests)},
-            )
-        request = requests[0]
-        return SuspendedInteraction(
-            session_id=session_id,
-            suspension_id=suspension.id,
-            request_id=request.id,
-            kind=request.kind,
-            request_payload=dict(request.request_payload),
-            schema_version=request.schema_version,
-        )
-
-    async def _finish_cancelled_interaction(
-        self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
-        requests: list[InteractionRequestRecord],
-        message: str,
-    ) -> None:
-        """将取消投影到工具调用、Turn 与 Session，避免留下半挂起状态。"""
-        for request in requests:
-            if request.tool_call_id is not None:
-                record = await self.tool_service.get_interaction_call_required(
-                    request.tool_call_id,
-                    session.id,
-                )
-                if record.status == "awaiting_interaction":
-                    if request.tool_use_id is None:
-                        raise AgentException.message("人工交互请求缺少工具调用ID")
-                    await self._record_tool_response(
-                        session.id,
-                        turn.id,
-                        ORCHESTRATOR_ACTOR,
-                        ToolCall(
-                            id=request.tool_use_id,
-                            tool_name=record.tool_name,
-                            arguments=dict(record.input_args),
-                        ),
-                        message,
-                        is_error=True,
-                        record=record,
-                    )
-                elif record.status not in {"succeeded", "failed", "rejected"}:
-                    raise AgentException.message(
-                        "人工交互关联的工具调用状态无效",
-                        {"tool_call_id": record.id, "status": record.status},
-                    )
-        await self.session_service.mark_turn_status(turn, "interrupted")
-        await self.session_service.set_status(session, "idle")
-
-    async def _normalize_interaction_response(
-        self,
-        session_id: int,
-        request_id: UUID,
-        kind: str,
-        response_payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """在响应落库前完成依赖工具注册表的校验。"""
-        if kind != "tool_approval" or response_payload.get("updated_input") is None:
-            return response_payload
-        request = await self.interaction_service.get_request_required(
-            request_id,
-            session_id=session_id,
-        )
-        tool = request.request_payload.get("tool") or {}
-        tool_name = tool.get("name")
-        if not isinstance(tool_name, str):
-            raise AgentException.message("工具审批请求缺少有效工具名")
-        normalized = dict(response_payload)
-        normalized["updated_input"] = self.tool_registry.validate_input(
-            tool_name,
-            response_payload["updated_input"],
-        )
-        return normalized
-
-    async def _emit_interaction(self, interaction: SuspendedInteraction) -> None:
-        await self.bus.emit(
-            StreamEvent.interaction_request(
-                ORCHESTRATOR_ACTOR,
-                interaction.session_id,
-                InteractionInfo(
-                    request_id=str(interaction.request_id),
-                    suspension_id=str(interaction.suspension_id),
-                    kind=interaction.kind,
-                    schema_version=interaction.schema_version,
-                    request_payload=interaction.request_payload,
-                ),
-            )
-        )
-
-    def _model_override(self, session: SessionRecord) -> str | None:
-        """本次 LLM 调用要覆盖的模型名；None 表示使用解析器给出的场景模型。
-
-        数据库模型服务端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
-        """
-        if self._database_model:
-            return None
-        if self.active_agent_id is not None:
-            return self.active_model_name
-        return session.model_name
-
-    def _round_settings(self, session: SessionRecord) -> ModelSettings:
-        """本轮调用参数：场景默认参数，叠加 Agent 或会话指定的模型名。"""
-        # getattr 兜底同 start()：测试用 __new__ 构造的实例只设置了 llm。
-        base = getattr(self, "model_settings", None)
-        if base is None:
-            base = ResolvedModel.from_client(self.llm).settings
-        override = self._model_override(session)
-        if override:
-            return replace(base, model_id=override)
-        return base
-
-    def _llm_attribution(self, settings: ModelSettings) -> tuple[str | None, str | None]:
-        """返回本次 LLM 调用实际生效的 (provider, model)，用于 assistant 消息成本归因。
-
-        provider 由客户端自报（ModelClient.provider 属性），注入的测试替身若未实现
-        该属性则留空；model 取本次实际发出的模型名，替身没有模型名时留空。
-        """
-        provider = getattr(self.llm, "provider", None)
-        return provider, settings.model_id or None
-
     async def _apply_user_prompt_hooks(
         self,
         session_id: int,
@@ -2081,7 +747,7 @@ class AgentRuntime:
         每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
-        if getattr(self, "mode_slug", "standard") == "turbo":
+        if self.configuration.turbo:
             return
         members = await TeamService(self.db).list_members(session_id)
         working = [m for m in members if m.status == "working"]
@@ -2097,8 +763,8 @@ class AgentRuntime:
                         parent_turn_id=turn.id,
                         user_id=turn.user_id,
                         workspace_id=turn.workspace_id,
-                        parent_allowed_tool_names=self.tool_registry.names,
-                        allowed_skill_names=self.allowed_skill_names,
+                        parent_allowed_tool_names=self.configuration.tools.names,
+                        allowed_skill_names=self.configuration.allowed_skill_names,
                     )
             except Exception as exc:
                 # 单个队友失败隔离:发 error 事件后继续唤醒其余成员。

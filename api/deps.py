@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 
 import jwt
 from fastapi import Depends
@@ -9,6 +10,11 @@ from auth.service import AuthService
 from core.config import settings
 from core.errors import AgentException
 from database.engine import get_db
+from harness.app.agent_service import AgentService
+from runtime.agent import AgentRuntime
+from runtime.execution import cancel_turn
+from runtime.workflow import WorkflowRuntime
+from session.service import TurnTermination
 from user.models import UserRecord
 from workspace.service import WorkspaceService
 
@@ -109,7 +115,37 @@ async def get_current_platform_admin(
     return current_user
 
 
+async def get_agent_service(
+    db: DatabaseSession,
+    current_user: Annotated[UserRecord, Depends(get_current_active_user)],
+    workspace_id: Annotated[int, Depends(get_current_workspace_id)],
+) -> AgentService:
+    """按请求装配 AgentService：运行时绑定本次请求的数据库会话与可信用户、工作区。
+
+    具体的 AgentRuntime / WorkflowRuntime 只在这里出现，路由只认 AgentService；
+    阶段 7 由组装根接管装配。
+    """
+
+    async def _cancel_turn(session_id: int, turn_id: UUID) -> TurnTermination:
+        return await cancel_turn(db, session_id, turn_id)
+
+    return AgentService(
+        agent_runner=lambda: AgentRuntime(
+            db,
+            user_id=current_user.id,
+            workspace_id=workspace_id,
+        ),
+        workflow_runner=lambda: WorkflowRuntime(
+            db,
+            user_id=current_user.id,
+            workspace_id=workspace_id,
+        ),
+        cancel_turn=_cancel_turn,
+    )
+
+
 __all__ = [
+    "get_agent_service",
     "get_current_active_user",
     "get_current_admin_user",
     "get_current_platform_admin",

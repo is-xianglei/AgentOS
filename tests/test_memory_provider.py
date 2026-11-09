@@ -6,6 +6,7 @@
 """
 
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -23,6 +24,7 @@ from harness.domain.memory import MemoryRecall, MemoryWriteTicket, TurnRef
 from memory.jobs.service import MemoryJobService
 from memory.recall.service import MemoryRecallService
 from runtime import agent as agent_module
+from runtime import lead_loop as lead_loop_module
 from runtime.agent import AgentRuntime
 from runtime.subagent import SubAgentRunner
 
@@ -133,7 +135,7 @@ async def test_injected_provider_drives_recall_and_turn_write(
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
     runtime._apply_stop_hooks = AsyncMock(return_value=None)
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    monkeypatch.setattr(agent_module.SkillService, "get_catalog", AsyncMock(return_value=""))
+    monkeypatch.setattr(lead_loop_module.SkillService, "get_catalog", AsyncMock(return_value=""))
     turn = SimpleNamespace(id=_TURN_ID, session_id=1, user_id=3, workspace_id=2)
 
     session = SimpleNamespace(system_prompt=None, model_name=None)
@@ -154,7 +156,7 @@ async def test_turbo_mode_skips_injected_provider() -> None:
     fake = _FakeMemory()
     db = _Db()
     runtime = AgentRuntime(db, user_id=3, workspace_id=2, llm=object(), memory=fake)  # type: ignore[arg-type]
-    runtime.mode_slug = "turbo"
+    runtime.configuration = replace(runtime.configuration, mode_slug="turbo")
     runtime.session_service = SimpleNamespace(
         mark_turn_status=AsyncMock(), set_status=AsyncMock()
     )

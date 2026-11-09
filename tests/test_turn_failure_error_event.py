@@ -23,6 +23,7 @@ from harness.app.ports import ModelCallError, ModelConnectionError, ModelStatusE
 from runtime import agent as agent_module
 from runtime.agent import AgentRuntime, TurnLoopResult
 from runtime.execution import run_end_status
+from runtime.turn_config import TurnConfiguration
 
 pytestmark = pytest.mark.anyio
 
@@ -134,7 +135,7 @@ def _runtime(
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = _Db()
     runtime.session_service = sessions
-    runtime.mode_slug = "standard"
+    runtime.configuration = TurnConfiguration.for_lead(runtime.db)
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)
     monkeypatch.setattr(runtime, "_run_llm_loop", loop)

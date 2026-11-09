@@ -49,6 +49,7 @@ from memory.repository import MemoryCatalogEntry, MemoryCatalogSnapshot, MemoryR
 from model_service.service import ModelService
 from plan.service import PlanService
 from runtime.agent import AgentRuntime
+from runtime.interaction_flow import InteractionFlow
 from runtime.subagent import SubAgentRunner
 from session.repository import SessionRepository
 from session.service import SessionService
@@ -938,8 +939,8 @@ def _install(
     """固定配置与环境段，把各域的仓储与服务方法换成记录替身（都按类替换，与谁来构造无关）。"""
     for key, value in {**_FIXED_SETTINGS, **overrides}.items():
         monkeypatch.setattr(app_settings, key, value)
-    monkeypatch.setattr("runtime.agent.date", _FixedDate)
-    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: "/srv"))
+    monkeypatch.setattr("runtime.lead_loop.date", _FixedDate)
+    monkeypatch.setattr("runtime.lead_loop.Path", SimpleNamespace(cwd=lambda: "/srv"))
     monkeypatch.setattr(hooks_module, "_registry", HookRegistry())
     monkeypatch.setattr("runtime.subagent.new_team_task_instance_id", lambda: "run-golden")
 
@@ -993,7 +994,7 @@ def _install(
         monkeypatch.setattr(TeamService, name, getattr(fakes, name))
     for name in ("get_request_required", "lock_suspension_required", "mark_suspension_resolved"):
         monkeypatch.setattr(InteractionService, name, getattr(fakes, name))
-    monkeypatch.setattr(AgentRuntime, "_apply_interaction_and_continue", fakes.apply_interaction)
+    monkeypatch.setattr(InteractionFlow, "apply_and_continue", fakes.apply_interaction)
     monkeypatch.setattr(SubAgentRunRepository, "create", fakes.run_create)
     monkeypatch.setattr(SubAgentRunRepository, "succeed", fakes.run_succeed)
     monkeypatch.setattr(SubAgentRunRepository, "fail", fakes.run_fail)

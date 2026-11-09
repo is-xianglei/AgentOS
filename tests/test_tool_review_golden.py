@@ -14,7 +14,7 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -624,13 +624,17 @@ def _install_permissions(
 def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     """真实 __init__ 的主运行时；会话、交互、Plan、事件总线与工具网关换成记录替身。"""
     runtime = AgentRuntime(object(), user_id=_USER_ID, workspace_id=_WORKSPACE_ID, llm=object())
-    runtime.active_profile = case.profile
-    runtime.allowed_skill_names = case.allowed_skill_names
-    runtime.mode_slug = case.mode_slug
+    overrides: dict[str, Any] = {
+        "profile": case.profile,
+        "allowed_skill_names": case.allowed_skill_names,
+        "mode_slug": case.mode_slug,
+        "gateway": _FakeGateway(recorder, case.profile, case.allowed_skill_names),
+    }
     if case.profile == "user_agent":
-        runtime.active_agent_id = 7
+        overrides["agent_id"] = 7
     if case.registry is not None:
-        runtime.tool_registry = builtin_tool_set().only(*case.registry)
+        overrides["tools"] = builtin_tool_set().only(*case.registry)
+    runtime.configuration = replace(runtime.configuration, **overrides)
     runtime.plan_service = _FakePlanService(case.plans)
     session_service = _FakeSessionService(recorder)
     # 会话状态改经 SessionService.set_status 写入，替身的记录方法挂在 repo 上，这里转接过去。
@@ -638,7 +642,6 @@ def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     runtime.session_service = session_service
     runtime.interaction_service = _FakeInteractionService(recorder)
     runtime.bus = _FakeBus(recorder)
-    runtime.tool_gateway = _FakeGateway(recorder, case.profile, case.allowed_skill_names)
 
     async def _mark_awaiting(record: Any) -> None:
         recorder.awaiting.append(record.id)
@@ -662,7 +665,7 @@ async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[s
     tool_calls = list(case.calls)
     done_ids = list(case.done_ids)
     with _capture_logs() as logs:
-        result = await runtime._execute_tool_calls(
+        result = await runtime._interactions().run_tool_calls(
             _SESSION_ID,
             SimpleNamespace(id=_SESSION_ID),
             SimpleNamespace(id=_TURN_ID, session_id=_SESSION_ID),

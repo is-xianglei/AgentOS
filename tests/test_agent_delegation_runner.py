@@ -16,9 +16,9 @@ from harness.app.loop import StepResult
 from harness.app.ports import ModelTurnResult
 from harness.app.subagent_catalog import get_subagent_spec
 from harness.domain.messages import AssistantMessage, ToolCall
+from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolContext
-from runtime.agent import PLAN_MODE_ALLOWED_TOOLS
 from runtime.subagent import SubAgentRunner, build_agent_spec
 from tools.gateway import ToolGateway
 

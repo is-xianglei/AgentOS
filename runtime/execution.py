@@ -31,6 +31,7 @@ from core.events import RunEvent
 from core.run_events import START_CURSOR, get_run_event_store
 from core.run_state import TurnState, restore
 from database.engine import AsyncSessionLocal
+from harness.app.agent_service import ExecutionHandle
 from runtime.cancel_partial import extract_unsaved_messages
 from session.service import MessageDraft, SessionService, TurnTermination
 
@@ -105,16 +106,6 @@ class TurnOffsets:
         self._next += 1
         self._remaining -= 1
         return offset
-
-
-@dataclass(frozen=True)
-class ExecutionHandle:
-    """返回给流式接口:从 start_cursor 之后、sequence 大于 start_offset 处开始跟随。"""
-
-    turn_id: UUID
-    session_id: int
-    start_offset: int
-    start_cursor: str
 
 
 @dataclass

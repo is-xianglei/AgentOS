@@ -18,7 +18,8 @@ from core.run_events import (
     get_run_event_store,
 )
 from core.run_state import TurnState, restore, snapshot_frame
-from runtime.execution import ExecutionHandle, run_end_status, run_in_session
+from harness.app.agent_service import ExecutionHandle
+from runtime.execution import run_end_status, run_in_session
 from session.service import TurnExecutionState
 
 logger = logging.getLogger(__name__)

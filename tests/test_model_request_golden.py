@@ -678,11 +678,11 @@ class _FakeAgentDefinitionService:
 def _world(monkeypatch: pytest.MonkeyPatch, world: str) -> None:
     _apply(monkeypatch, _WORLD_SETTINGS[world])
     _use_endpoint(monkeypatch, _WORLD_ENDPOINTS[world])
-    monkeypatch.setattr("runtime.agent.AgentDefinitionService", _FakeAgentDefinitionService)
-    monkeypatch.setattr("runtime.agent.SkillService.get_catalog", AsyncMock(return_value=""))
+    monkeypatch.setattr("runtime.turn_config.AgentDefinitionService", _FakeAgentDefinitionService)
+    monkeypatch.setattr("runtime.lead_loop.SkillService.get_catalog", AsyncMock(return_value=""))
     # 环境段含工作目录与日期，固定下来，避免系统提示随运行目录或日期变化。
-    monkeypatch.setattr("runtime.agent.date", _FixedDate)
-    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: "/srv"))
+    monkeypatch.setattr("runtime.lead_loop.date", _FixedDate)
+    monkeypatch.setattr("runtime.lead_loop.Path", SimpleNamespace(cwd=lambda: "/srv"))
 
 
 class _FixedDate(date):
@@ -695,7 +695,7 @@ async def _configured_agent(session: Any) -> AgentRuntime:
     """经真实 __init__ 与 _configure_agent 解析主 Agent 与压缩客户端，再换掉数据库依赖。"""
     runtime = AgentRuntime(object(), user_id=3, workspace_id=2)
     await runtime._configure_agent(session)
-    runtime.tool_registry = ToolSet([EchoTool()])
+    runtime.configuration = replace(runtime.configuration, tools=ToolSet([EchoTool()]))
     runtime.bus = SimpleNamespace(emit=AsyncMock())
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [_USER], 1)),

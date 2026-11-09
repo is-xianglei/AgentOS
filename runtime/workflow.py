@@ -35,11 +35,11 @@ from core.events import (
 )
 from database.engine import AsyncSessionLocal
 from harness.adapters.models.factory import create_model_client
+from harness.app.agent_service import ExecutionHandle
 from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
-    ExecutionHandle,
     launch_turn_execution,
     lease_seconds,
     new_lease_owner,

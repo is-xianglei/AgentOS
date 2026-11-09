@@ -1167,8 +1167,8 @@ def _install(monkeypatch: pytest.MonkeyPatch, fakes: _Fakes, overrides: dict[str
     """固定配置与环境段，把各域的仓储与外围服务方法换成记录替身（都按类替换）。"""
     for key, value in {**_FIXED_SETTINGS, **overrides}.items():
         monkeypatch.setattr(app_settings, key, value)
-    monkeypatch.setattr("runtime.agent.date", _FixedDate)
-    monkeypatch.setattr("runtime.agent.Path", SimpleNamespace(cwd=lambda: _CWD))
+    monkeypatch.setattr("runtime.lead_loop.date", _FixedDate)
+    monkeypatch.setattr("runtime.lead_loop.Path", SimpleNamespace(cwd=lambda: _CWD))
     registry = HookRegistry()
     registry.register(HookEvent.STOP, fakes.stop_hook)
     monkeypatch.setattr(hooks_module, "_registry", registry)
@@ -1258,7 +1258,7 @@ async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[s
     if case.resume is not None:
         fakes.resume = _RESUMES[case.resume]
     _install(monkeypatch, fakes, {"max_tool_iterations": case.max_tool_iterations})
-    monkeypatch.setattr("runtime.agent.TURBO_ALLOWED_TOOLS", case.turbo_tools)
+    monkeypatch.setattr("runtime.turn_config.TURBO_ALLOWED_TOOLS", case.turbo_tools)
     runtime = _main_runtime(case, world)
     result: Any = None
     with _capture_logs() as logs:

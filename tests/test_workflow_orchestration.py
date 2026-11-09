@@ -18,6 +18,7 @@ import pytest
 from pydantic import BaseModel
 
 from agent.service import AgentRuntimeConfig
+from api import deps as api_deps
 from core.errors import AgentException
 from core.events import (
     BlockType,
@@ -1084,7 +1085,7 @@ def _install_api_fakes(
     monkeypatch: pytest.MonkeyPatch,
     session: _FakeSession | None,
 ) -> tuple[_FakeRuntimeFactory, _FakeRuntimeFactory, list[int]]:
-    """替换 session.api 内的两个运行时、SessionService 与 WorkflowService。"""
+    """替换 get_agent_service 装配用的两个运行时，以及 session.api 内的 SessionService 与 WorkflowService。"""
     workflow_rt = _FakeRuntimeFactory()
     agent_rt = _FakeRuntimeFactory()
     workflow_checks: list[int] = []
@@ -1110,20 +1111,23 @@ def _install_api_fakes(
         yield {"type": "run_started", "turn_id": str(handle.turn_id)}
 
     monkeypatch.setattr(session_api, "follow_execution", _fake_follow)
-    monkeypatch.setattr(session_api, "WorkflowRuntime", workflow_rt.cls)
-    monkeypatch.setattr(session_api, "AgentRuntime", agent_rt.cls)
+    monkeypatch.setattr(api_deps, "WorkflowRuntime", workflow_rt.cls)
+    monkeypatch.setattr(api_deps, "AgentRuntime", agent_rt.cls)
     monkeypatch.setattr(session_api, "SessionService", _FakeSessionService)
     monkeypatch.setattr(session_api, "WorkflowService", _FakeWorkflowService)
     return workflow_rt, agent_rt, workflow_checks
 
 
 async def _call_send_message(payload: SessionSendMessageRequest) -> list[str]:
-    """直接调用路由函数并抽干 SSE 生成器,返回各帧文本。"""
+    """经真实的 get_agent_service 装配后直接调用路由函数,抽干 SSE 生成器,返回各帧文本。"""
+    db, user = object(), SimpleNamespace(id=_USER_ID)
+    agent_service = await api_deps.get_agent_service(db, user, _WORKSPACE_ID)  # type: ignore[arg-type]
     response = await session_api.send_message(
         payload,
-        object(),
-        SimpleNamespace(id=_USER_ID),
+        db,  # type: ignore[arg-type]
+        user,  # type: ignore[arg-type]
         _WORKSPACE_ID,
+        agent_service,
     )
     return [chunk async for chunk in response.body_iterator]
 

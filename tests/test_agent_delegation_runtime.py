@@ -13,13 +13,14 @@ import pytest
 
 from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
 from core.events import ORCHESTRATOR_ACTOR
-from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
 from harness.domain.memory import MemoryRecall
 from harness.domain.messages import ToolCall
 from harness.domain.prompts.lead import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
+from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.assistant import Assistant
-from runtime.agent import PLAN_MODE_ALLOWED_TOOLS, AgentRuntime
+from runtime.agent import AgentRuntime
+from runtime.turn_config import TurnConfiguration
 
 pytestmark = pytest.mark.anyio
 
@@ -74,19 +75,16 @@ def test_empty_delegate_catalog_is_not_injected(catalog: str | None) -> None:
 
 
 def _loop_runtime(llm: _FakeLLM, delegate_catalog: str | None) -> AgentRuntime:
-    """绕过 __init__ 组装非极速模式 _run_llm_loop 所需的最小运行时。"""
-    runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.db = SimpleNamespace(commit=AsyncMock())
-    runtime.workspace_id = 2
-    runtime.mode_slug = "standard"
-    runtime.active_agent_id = None
-    runtime.active_agent_prompt = None
-    runtime.active_skill_ids = None
-    runtime.delegate_catalog = delegate_catalog
-    runtime._database_model = True
-    runtime.llm = llm
+    """真实 __init__ 的非极速运行时，换掉 _run_llm_loop 用到的数据库、会话、记忆与 Plan 依赖。"""
+    db: Any = SimpleNamespace(commit=AsyncMock())
+    runtime = AgentRuntime(db, workspace_id=2, llm=llm)  # type: ignore[arg-type]
+    runtime.configuration = TurnConfiguration.for_lead(
+        db,
+        delegate_catalog=delegate_catalog,
+        model=runtime.configuration.model,
+        database_model=True,
+    )
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.tool_registry = builtin_tool_set()
     runtime.session_service = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
@@ -103,7 +101,7 @@ async def test_run_llm_loop_injects_loaded_catalog_only(
     monkeypatch: pytest.MonkeyPatch,
     catalog: str | None,
 ) -> None:
-    monkeypatch.setattr("runtime.agent.SkillService.get_catalog", AsyncMock(return_value=""))
+    monkeypatch.setattr("runtime.lead_loop.SkillService.get_catalog", AsyncMock(return_value=""))
     llm = _FakeLLM()
     runtime = _loop_runtime(llm, catalog)
 
@@ -154,7 +152,7 @@ def _install_agent_definition_service(
                 description=None,
             )
 
-    monkeypatch.setattr("runtime.agent.AgentDefinitionService", _FakeAgentDefinitionService)
+    monkeypatch.setattr("runtime.turn_config.AgentDefinitionService", _FakeAgentDefinitionService)
     return catalog_requests
 
 
@@ -180,7 +178,7 @@ async def test_lead_session_loads_and_renders_delegate_catalog(
 
     assert requests == [2]
     # 一个 Agent 一行;描述里的换行压成空格,缺失的描述与工具给出占位。
-    assert runtime.delegate_catalog == (
+    assert runtime.configuration.delegate_catalog == (
         "- agent_id=7 名称:审稿人 描述:负责 审稿 工具:Read\n"
         "- agent_id=9 名称:写手 描述:(无描述) 工具:(无)"
     )
@@ -192,11 +190,11 @@ async def test_bound_agent_session_gets_no_catalog(monkeypatch: pytest.MonkeyPat
 
     await runtime._configure_agent(SimpleNamespace(agent_id=7, mode_slug="standard"))
 
-    assert runtime.active_profile == "user_agent"
-    assert runtime.delegate_catalog is None
+    assert runtime.configuration.profile == "user_agent"
+    assert runtime.configuration.delegate_catalog is None
     assert requests == []
     # 绑定了自建 Agent 的会话本就拿不到 Agent 工具,委派深度为 1。
-    assert "Agent" not in runtime.tool_registry.names
+    assert "Agent" not in runtime.configuration.tools.names
 
 
 @pytest.mark.parametrize(("workspace_id", "entries"), [(None, _ENTRIES), (2, ())])
@@ -210,7 +208,7 @@ async def test_no_workspace_or_no_enabled_agent_means_no_catalog(
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
 
-    assert runtime.delegate_catalog is None
+    assert runtime.configuration.delegate_catalog is None
 
 
 # ---------- _execute_tool_calls:透传本轮实际生效的工具名单 ----------
@@ -231,12 +229,12 @@ def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[Ag
         gateway_calls.append({"tool_name": tool_name, **kwargs})
         return "ok"
 
-    monkeypatch.setattr(runtime.tool_gateway, "run", _gateway_run)
+    monkeypatch.setattr(runtime.configuration.gateway, "run", _gateway_run)
     return runtime, gateway_calls
 
 
 async def _execute(runtime: AgentRuntime, tool_input: dict[str, Any]) -> None:
-    await runtime._execute_tool_calls(
+    await runtime._interactions().run_tool_calls(
         1,
         SimpleNamespace(),
         SimpleNamespace(id=uuid4()),
@@ -254,7 +252,7 @@ async def test_normal_round_tool_names_reach_the_tool(monkeypatch: pytest.Monkey
     await _execute(runtime, {"agent_id": 7, "prompt": "审稿"})
 
     round_names = calls[0]["round_tool_names"]
-    assert round_names == runtime.tool_registry.without("ExitPlanMode", "WritePlan").names
+    assert round_names == runtime.configuration.tools.without("ExitPlanMode", "WritePlan").names
     assert {"Agent", "Write"} <= round_names
 
 
@@ -264,7 +262,7 @@ async def test_plan_mode_round_tool_names_are_read_only(monkeypatch: pytest.Monk
     await _execute(runtime, {"agent_type": "Explore", "prompt": "找代码"})
 
     round_names = calls[0]["round_tool_names"]
-    assert round_names == runtime.tool_registry.only(*PLAN_MODE_ALLOWED_TOOLS).names
+    assert round_names == runtime.configuration.tools.only(*PLAN_MODE_ALLOWED_TOOLS).names
     assert "Write" not in round_names
 
 

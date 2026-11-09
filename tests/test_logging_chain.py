@@ -9,6 +9,7 @@
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Self
 from uuid import UUID, uuid4
 
@@ -77,8 +78,11 @@ def _make_runtime() -> AgentRuntime:
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = object()
     runtime.bus = _RecordingBus()
-    runtime.tool_registry = _FakeRegistry()
-    runtime.allowed_skill_names = None
+    runtime.configuration = SimpleNamespace(
+        turbo=False,
+        tools=_FakeRegistry(),
+        allowed_skill_names=None,
+    )
     return runtime
 
 

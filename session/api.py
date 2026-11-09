@@ -5,15 +5,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.deps import get_current_active_user, get_current_workspace_id, get_db
+from api.deps import get_agent_service, get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from core.sse import sse_response
-from runtime.agent import AgentRuntime
-from runtime.execution import cancel_turn
-from runtime.orchestrator import TopLevelOrchestrator
+from harness.app.agent_service import AgentService
 from runtime.turn_follow import follow_execution, subscribe_turn
-from runtime.workflow import WorkflowRuntime
 from session.schemas import (
     ActiveTurnResponse,
     SessionBatchDeleteRequest,
@@ -36,6 +33,7 @@ router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
 CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
+AgentServiceDep = Annotated[AgentService, Depends(get_agent_service)]
 
 
 @router.get("", summary="查询会话列表", response_model=ApiResponse[list[SessionResponse]])
@@ -56,6 +54,7 @@ async def send_message(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
+    agent_service: AgentServiceDep,
 ):
     # 链路起点日志：只记提问字符数，正文可能含敏感内容，严禁入日志。
     logger.info(
@@ -98,27 +97,18 @@ async def send_message(
     # 一个都没提交时不传 model_options。
     model_option_fields = {"model_provider_id", "mode_slug", "thinking_effort"}
     submitted_option_fields = payload.model_fields_set & model_option_fields
-    start_kwargs: dict[str, Any] = {}
+    model_options: dict[str, Any] | None = None
     if submitted_option_fields:
-        start_kwargs["model_options"] = payload.model_dump(include=submitted_option_fields)
+        model_options = payload.model_dump(include=submitted_option_fields)
 
     # 准入(建轮次、认领租约、提交)在返回 SSE 前完成:冲突与配置错误走普通 JSON 错误响应,
-    # 后台执行与本次连接解耦,客户端断开只停止跟随,不取消执行。
-    orchestrator = TopLevelOrchestrator(
-        db,
-        user_id=current_user.id,
-        workspace_id=workspace_id,
-        # 注入模块级类，保留测试与部署层替换运行时的能力，同时把分发逻辑
-        # 从 HTTP handler 收口到统一 Orchestrator。
-        agent_runtime_cls=AgentRuntime,
-        workflow_runtime_cls=WorkflowRuntime,
-    )
-    handle = await orchestrator.start(
+    # 后台执行与本次连接解耦,客户端断开只停止跟随,不取消执行。Agent / Workflow 由 AgentService 分发。
+    handle = await agent_service.chat(
         payload.session_id,
         payload.content,
         agent_id=payload.agent_id,
         workflow_id=effective_workflow_id,
-        **start_kwargs,
+        model_options=model_options,
     )
     return sse_response(follow_execution(handle))
 
@@ -179,9 +169,10 @@ async def cancel_turn_execution(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
+    agent_service: AgentServiceDep,
 ):
     await SessionService(db).require_write_access(session_id, current_user.id, workspace_id)
-    termination = await cancel_turn(db, session_id, turn_id)
+    termination = await agent_service.cancel_turn(session_id, turn_id)
     return ok(
         TurnCancelResponse(
             turn_id=termination.turn_id,

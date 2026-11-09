@@ -185,12 +185,12 @@ async def test_runtime_injects_catalog_only_for_lead_session(pg) -> None:
     runtime = AgentRuntime(pg.db, user_id=pg.user_id, workspace_id=pg.workspace_id, llm=_FakeLLM())
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
-    lead_catalog = runtime.delegate_catalog
+    lead_catalog = runtime.configuration.delegate_catalog
     await runtime._configure_agent(SimpleNamespace(agent_id=reviewer.id, mode_slug="standard"))
 
     assert lead_catalog == f"- agent_id={reviewer.id} 名称:审稿人 描述:审稿人的描述 工具:Read"
     # 绑定了自建 Agent 的会话不注入目录。
-    assert runtime.delegate_catalog is None
+    assert runtime.configuration.delegate_catalog is None
 
 
 async def test_runtime_without_enabled_agents_injects_no_catalog(pg) -> None:
@@ -199,7 +199,7 @@ async def test_runtime_without_enabled_agents_injects_no_catalog(pg) -> None:
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
 
-    assert runtime.delegate_catalog is None
+    assert runtime.configuration.delegate_catalog is None
 
 
 # ---------- 委派:经 agent 域运行配置校验 ----------

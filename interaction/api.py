@@ -5,17 +5,17 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.deps import get_current_active_user, get_current_workspace_id, get_db
+from api.deps import get_agent_service, get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from core.sse import sse_response
+from harness.app.agent_service import AgentService
 from interaction.schemas import (
     InteractionResolutionRequest,
     PendingInteractionResponse,
     RuntimeSuspensionResponse,
 )
 from interaction.service import InteractionService
-from runtime.agent import AgentRuntime
 from runtime.turn_follow import follow_execution
 from session.service import SessionService
 from user.models import UserRecord
@@ -26,6 +26,7 @@ router = APIRouter()
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
 CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
+AgentServiceDep = Annotated[AgentService, Depends(get_agent_service)]
 
 
 async def _require_session_access(
@@ -92,26 +93,22 @@ async def resolve_interaction(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
+    agent_service: AgentServiceDep,
 ):
     # 交互响应入口日志：打在鉴权前，故只陈述"收到"，不断言已恢复执行；
-    # 实际恢复与否由 runtime/agent.py 的恢复日志体现。用户回答正文不入日志。
+    # 实际恢复与否由运行时的恢复日志体现。用户回答正文不入日志。
     logger.info(
         "收到人工交互响应",
         extra={"session_id": session_id, "kind": payload.kind},
     )
     await _require_session_write_access(db, session_id, current_user.id, workspace_id)
-    runtime = AgentRuntime(
-        db,
-        user_id=current_user.id,
-        workspace_id=workspace_id,
-    )
     response_payload = payload.response_payload.model_dump(
         mode="json",
         by_alias=True,
     )
     # 在返回 SSE 前完成校验、响应落库与租约认领，使 409 等业务错误保持普通 HTTP 语义；
     # 响应提交后即使 SSE 未建立，也可用相同响应继续恢复。客户端断开不取消恢复执行。
-    handle = await runtime.start_resume(
+    handle = await agent_service.resume(
         session_id,
         request_id,
         payload.kind,
@@ -132,12 +129,8 @@ async def cancel_interaction(
     db: DatabaseSession,
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
+    agent_service: AgentServiceDep,
 ):
     await _require_session_write_access(db, session_id, current_user.id, workspace_id)
-    runtime = AgentRuntime(
-        db,
-        user_id=current_user.id,
-        workspace_id=workspace_id,
-    )
-    suspension = await runtime.cancel_interaction(session_id, suspension_id)
+    suspension = await agent_service.cancel_interaction(session_id, suspension_id)
     return ok(RuntimeSuspensionResponse.model_validate(suspension), request)

@@ -348,10 +348,10 @@ async def test_injected_reviewer_replaces_policy_reviewer_in_agent_runtime() -> 
         executed.append({"tool_name": tool_name, "input_args": input_args})
         return "ok"
 
-    runtime.tool_gateway.run = _gateway_run  # type: ignore[method-assign]
+    runtime.configuration.gateway.run = _gateway_run  # type: ignore[method-assign]
     done_ids: list[str] = []
 
-    await runtime._execute_tool_calls(
+    await runtime._interactions().run_tool_calls(
         1,
         SimpleNamespace(),
         SimpleNamespace(id=uuid4()),
