@@ -1,120 +1,142 @@
 # AgentOS
 
-AgentOS 是一个面向 Agent 会话运行的后端基座。第一阶段聚焦会话主链路：创建会话、发送消息、SSE 流式返回、记录消息历史、记录工具调用、上下文压缩与恢复。
+AgentOS 是一个 Agent 会话运行的后端基座（Python 3.14 + FastAPI + PostgreSQL）。它负责多租户工作区下的会话、
+消息历史与 SSE 流式返回，Agent 的 ReAct 循环、工具调用与人工审批，子代理、队友与 Workflow 编排，
+上下文压缩与长期记忆，并同时支持 Anthropic 和 OpenAI 两家模型。
 
-## 当前范围
+## 架构概览
 
-- 已实现 FastAPI 应用入口：`main:app`
-- 已实现 Session、Message、Snapshot、ToolCall、Task、Team 数据模型
-- 已实现统一响应和统一错误格式
-- 已实现示例工具 `echo`
-- 已实现 `/docs` 和 `/openapi.json`
+Agent 核心在 `harness/` 内按「领域层 / 应用层 / 适配层 + 组装根」分层，依赖方向为 adapters → app → domain；
+其余业务按 feature 包组织。设计、分层规则与扩展点见 [docs/agent-architecture.md](docs/agent-architecture.md)。
+
+```text
+harness/
+├── domain/        领域层：消息、Context、Tool、审核结论、角色与提示文案；纯逻辑，不做 I/O
+├── app/           应用层：端口（ports.py 等）、ReAct 循环（loop.py）、AgentService、ToolSet、上下文压缩
+├── adapters/      适配层：端口的实现，包括模型客户端、内置工具、审核规则链、内置记忆
+└── bootstrap.py   组装根：唯一实例化适配器的地方，把实现装配进运行时
+runtime/           运行时编排：主循环策略、子代理与队友、Workflow、后台执行、租约与回收；只认端口
+session/ memory/ skill/ user/ team/ task/ ...   业务域：models / schemas / repository / service / api
+core/              配置、统一错误、事件类型、事件流与 SSE
+api/               路由汇总（router.py）与依赖注入（deps.py）
+database/          ORM 基类与实体登记（registry.py）；迁移在 alembic/
+```
 
 ## 启动
 
+依赖用 uv 管理。首次启动前把 `.env.example` 复制为 `.env` 并填写，再执行迁移：
+
 ```bash
+uv sync
+uv run alembic upgrade head
 uv run uvicorn main:app --reload
 ```
 
-默认会读取 `.env` 中的 `AGENTOS_DATABASE_URL`，且必须是 PostgreSQL 连接地址。正式建表请使用 Alembic：
+`.env` 里的关键配置项：
+
+- `AGENTOS_DATABASE_URL`：PostgreSQL 连接地址。
+- `AGENTOS_REDIS_URL`：run 事件流。启动时会自检，连不上就启动失败；单进程本地调试可以设
+  `AGENTOS_DISABLE_REDIS_EVENTS=true`，改用进程内后端。
+- `AGENTOS_JWT_SECRET_KEY`：签发访问令牌的密钥。
+- `AGENTOS_LLM_PROVIDER`（anthropic / openai），以及对应的 `AGENTOS_ANTHROPIC_BASE_URL`、
+  `AGENTOS_ANTHROPIC_API_KEY`、`AGENTOS_ANTHROPIC_MODEL` 或 `AGENTOS_OPENAI_BASE_URL`、
+  `AGENTOS_OPENAI_API_KEY`、`AGENTOS_OPENAI_MODEL`。工作区里配置了模型时优先用工作区的，这组配置只作回退。
+  Anthropic 的 base_url 不带 `/v1`，OpenAI 的必须带 `/v1`。
+- `AGENTOS_CREATE_TABLES`：开发时启动自动建表；正式环境用 Alembic。
+- `AGENTOS_TEAM_TASK_DEBUG_ISOLATION` 与 `AGENTOS_INSTANCE_ID`：多个实例连同一个库调试时开启，
+  本实例派发的团队任务只被 `AGENTOS_INSTANCE_ID` 相同的实例消费。
+
+记忆的抽取、整理（dream）与保留清理由独立 Worker 执行：`uv run python -m memory.jobs.worker`。
+接口文档在 `/docs`。
+
+## 发送消息
+
+接口需要 Bearer 令牌，令牌里带着当前工作区。先注册（`POST /api/auth/register`，字段 email、username、
+password），再登录取令牌：
 
 ```bash
-uv run alembic upgrade head
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"<邮箱>","password":"<密码>"}' | jq -r .access_token)
 ```
 
-如需在本地临时开发时自动建表，可以设置 `AGENTOS_CREATE_TABLES=1`。
-
-运行态状态通过主会话消息接口的 SSE 返回；持久化状态由消息、工具调用、任务、团队和子代理运行表分别记录。
-
-多台本地或远程实例连接同一个数据库调试子代理时，可以开启团队任务消费隔离：
-
-```bash
-AGENTOS_TEAM_TASK_DEBUG_ISOLATION=1
-AGENTOS_INSTANCE_ID=local-dev
-```
-
-开启后，本实例通过 Team/Agent 派发的 `task` 消息只会被相同 `AGENTOS_INSTANCE_ID`
-的实例消费，避免远程进程误取本地调试任务。
-
-## 示例
-
-发送第一条消息会自动创建会话，标题由首条消息浓缩生成：
+不带 `session_id` 发送第一条消息时会自动创建会话，标题取自首条消息：
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"content":"你好"}'
 ```
 
-继续已有会话时，在请求体中带上 `session_id`：
+继续已有会话时，在请求体里带上 `session_id`：
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"session_id":1,"content":"继续刚才的话题"}'
 ```
 
-SSE 使用单层 JSON 数据，事件类型放在 `type` 字段：
+请求体还支持 `agent_id` 或 `workflow_id`（二选一，会话建立后不能切换）、`model_provider_id`、
+`mode_slug`（standard / turbo）和 `thinking_effort`（fast / low / medium / high / xhigh / max），
+Schema 见 `session/schemas.py` 的 `SessionSendMessageRequest`。
+
+### SSE 事件
+
+每帧是一行 `data: <JSON>`，事件类型放在 `type` 字段；长时间没有事件时会发 `: heartbeat` 注释行保活。
+事件定义在 `core/events.py`：
+
+| 类别 | type | 说明 |
+|---|---|---|
+| 执行边界（RunEvent） | `run_started`、`run_end` | 第一帧是带 `turn_id` 的 `run_started`；`run_end` 的 `status` 取 completed / awaiting_interaction / failed / interrupted，读到它即结束 |
+| 会话级（RuntimeEvent） | `session_ready`、`task_snapshot` | 会话元信息；任务全量快照 |
+| 产出者事件（StreamEvent，`EventType`） | `turn_start`、`turn_end`、`block_start`、`block_stop`、`thinking_delta`、`text_delta`、`tool_use`、`tool_result`、`interaction_request`、`error`、`workflow_progress` | 带 `session_id`、`actor`、`sequence` |
 
 ```text
-data: {"id":12,"type":"task_created","session_id":1,"data":{"subject":"写文档"}}
+data: {"type":"text_delta","session_id":1,"actor":{"role":"orchestrator","name":"orchestrator"},"sequence":5,"block":{"index":0},"text":"你好"}
 ```
 
-Workflow 会话（首轮带 `workflow_id`，或会话已锁定 workflow）额外产出 `workflow_progress` 事件：`progress.phase`（member / routing / merging）
-与 `progress.status`（running / done / failed）为受控取值，成员事件的 `actor.agent_id` 可把事件归到工作流图节点。
+- `actor.role` 取 orchestrator（主循环）、subagent（Agent 工具派出的一次性子代理）、teammate（团队成员）。
+- `workflow_progress` 只出现在 Workflow 会话里：`progress.phase` 取 member / routing / merging，
+  `progress.status` 取 running / done / failed；成员事件的 `actor.agent_id` 用来把事件归到工作流图的节点。
+- `interaction_request` 表示本轮挂起、等待人工答复，此时 `run_end` 的 status 为 awaiting_interaction。
 
-触发示例工具：
+相关接口：
 
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":1,"content":"/tool echo hello"}'
-```
+- `GET /api/sessions/{session_id}/active-turn`：查询最新轮次和执行状态。
+- `GET /api/sessions/{session_id}/turns/{turn_id}/subscription`：断线重连。先发一帧 `run_snapshot`，再接着推送后续事件。
+- `POST /api/sessions/{session_id}/turns/{turn_id}/cancel`：取消执行中的轮次。
+- `POST /api/interactions/sessions/{session_id}/requests/{request_id}/resolve`：答复人工交互，恢复执行。
 
-触发旧工具适配后的天气工具：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":1,"content":"/tool Weather 上海"}'
-```
-
-创建数据库任务：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":1,"content":"/tool Task {\"action\":\"create\",\"subject\":\"写文档\",\"description\":\"补充API文档\"}"}'
-```
-
-创建团队成员并分派子代理任务：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":1,"content":"/tool Agent {\"name\":\"Researcher\",\"role\":\"资料员\",\"prompt\":\"整理上海天气信息\"}"}'
-```
-
-同名子代理会被复用，新的 prompt 会追加为新的 task 消息。
-
-运行子代理待处理任务：
-
-```bash
-curl -N -X POST http://127.0.0.1:8000/api/sessions/messages \
-  -H 'Content-Type: application/json' \
-  -d '{"session_id":1,"content":"/tool Agent {\"action\":\"run_pending\",\"name\":\"Researcher\"}"}'
-```
-
-查询子代理运行历史：
-
-```bash
-curl http://127.0.0.1:8000/api/teams/subagent-runs?session_id=1
-```
-
-真实 LLM 返回 `tool_use` 时，后端会通过 `ToolRunner` 执行工具，通过 SSE 返回 `tool_start/tool_done/tool_error` 状态，记录 `tool_calls`，并把 `tool_result` 回灌给模型继续生成。
+客户端断开只会停止推送，后台执行不受影响。
 
 ## 测试
 
 ```bash
 uv run pytest
 ```
+
+PostgreSQL、Redis 集成测试（`tests/test_*_pg.py` 等）读取 `.env` 里的连接，连不上时自动跳过。
+
+- 黄金测试：七份 `tests/test_*_golden.py` 用 `tests/fixtures/*_golden.py` 里的期望字面量逐项比对对外行为
+  （含字典键序），字面量取自重构前代码的实际产出。分别固化发给模型的请求（model_request）、
+  工具描述（tool_spec）、审核结果（tool_review）、记忆接入（memory_port）、角色上下文（role_context）、
+  循环事件与落库（react_loop）以及 HTTP 入口（agent_service）。改这些行为时要先说明原因，
+  并重新生成字面量，不允许手改。
+- 分层静态检查：`tests/test_import_isolation.py` 用 AST 检查导入关系，例如 runtime、app、domain
+  不得导入 adapters，runtime 和 app 不得导入 Repository，领域层不得读取 cwd、日期等进程状态；
+  还会逐个起子进程导入全部模块，防止加载期出现循环导入。
+
+## 扩展
+
+以下两种接入方式都还没有实现，设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
+
+- **接入 MCP**：实现 `harness/app/ports.py` 的 `ToolProvider`，把每个远端工具包装成
+  `harness/domain/tool.py` 的 `Tool`，命名为 `mcp__{server}__{tool}`，参数直接沿用 server 下发的
+  inputSchema。然后在 `harness/bootstrap.py` 的 `platform_tool_set()` 里追加这个工具来源，
+  由 `ToolSet` 统一做重名校验和排序。
+- **接入外部记忆**：实现 `harness/app/memory_port.py` 的 `MemoryProvider`（recall、inherited、
+  on_turn_completed、after_commit），在 `harness/bootstrap.py` 里替换 `Harness` 的 `memory` 字段
+  （如 `dataclasses.replace(builtin_harness(), memory=...)`）。主循环只认召回和回合结束写入两个动作，
+  运行时代码不用改。

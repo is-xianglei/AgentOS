@@ -1,15 +1,27 @@
 你正在维护 AgentOS。这是一个 Python 3.14 后端项目，主要技术栈为 FastAPI、
-Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pytest，
-依赖使用 uv 管理。当前仓库没有前端工程，不要虚构前端技术栈。
+Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK、OpenAI SDK
+和 pytest，依赖使用 uv 管理。当前仓库没有前端工程，不要虚构前端技术栈。
 
 编码前先阅读相邻模块，复用已有分层和抽象，保持改动小而聚焦，不做无关重构，
 不要覆盖用户已有改动，不要自动执行 git push。
 
 架构与职责：
 1. 保持 API -> Service -> Repository -> ORM Model 的分层依赖关系，Schema 与 ORM 分离。
-   分层是依赖约定，不是目录结构：代码按 feature 域组织，每个域一个顶层包，
-   内含 models.py、schemas.py、repository.py、service.py、api.py，
-   不要再新建 models/、services/、repositories/、schemas/ 这类按层划分的目录。
+   代码按两种方式组织：
+   - 业务域（session、user、memory、skill 等）按 feature 包组织，每个域一个顶层包，
+     内含 models.py、schemas.py、repository.py、service.py、api.py；分层是依赖约定，
+     不要新建 models/、services/、repositories/、schemas/ 这类按层划分的顶层目录。
+   - Agent 核心在 harness/ 内按层分包，依赖方向为 adapters → app → domain，外加组装根：
+     - harness/domain（领域层）：系统语言，消息、Context、工具、审核结论等值类型与角色，
+       纯逻辑、不做 I/O；新的值类型和纯规则放这里。
+     - harness/app（应用层）：声明端口并编排流程（ReAct 循环、AgentService、ToolSet）；
+       新的端口和不依赖具体实现的编排放这里。
+     - harness/adapters（适配层）：端口的具体实现（模型 SDK、内置工具、审核规则链、内置记忆）；
+       对接外部系统的新实现放这里。
+     - harness/bootstrap.py（组装根）：唯一实例化适配器、把实现接到运行时上的地方。
+     runtime/ 是 Agent 运行时的编排层（循环策略、子代理、Workflow、后台执行与租约），只认端口。
+     谁能导入谁以 docs/agent-architecture.md 第 1 节为准，由 tests/test_import_isolation.py
+     静态检查。
 2. API 层保持轻薄：负责路由、Depends 注入、认证/权限入口、Schema 转换和响应包装；
    业务校验与跨模块编排放在 Service，SQL 查询和持久化放在 Repository。
 3. Repository 持有 AsyncSession，写操作通常使用 add/flush/refresh，不得自行 commit。
@@ -35,6 +47,46 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK 和 pyte
     但仅限类型引用和关系声明，不得据此绕过 Service 直接改别域数据。
 14. 确实需要跨域读模型对象时优先返回本域 Schema；
     返回别域 ORM 实体仅限内部编排，不要直接透出到 API 响应。
+
+Agent 核心（harness）约定：
+1. 新的外部能力先在 harness/app 定义端口，实现放 harness/adapters，只在 harness/bootstrap.py
+   实例化；换实现用 `dataclasses.replace(default_harness(), 字段=...)`，不在调用方 new 适配器。
+2. runtime/ 与 harness/app 的端口类依赖（reviewer、memory、sessions、models、tools 等）由组装根
+   注入，构造参数必填，不得写「参数为 None 就现建默认实现」的回落。可选的 llm 只是测试替身的
+   覆盖项：注入时直接用它，不注入时经已注入的 ModelResolver 解析，而不是现建客户端。
+   测试经 tests/fixtures/harness_factory.py 走组装根的同一套工厂，不直接构造运行时。
+3. 已有端口：ModelClient、ModelResolver、ToolProvider、ToolCallReviewer、SubAgentLauncher 在
+   harness/app/ports.py；MemoryProvider 在 harness/app/memory_port.py；SessionStore 及
+   TurnContextStore、TurnStateStore、TurnLeaseStore 等窄端口在 harness/app/session_port.py。
+   端口只为多实现的外部能力和需要替身的 I/O 设立，其余 feature 域照旧 Service 调 Service。
+4. 扩展点：接 MCP 时实现 ToolProvider，并在 harness/bootstrap.py 的 platform_tool_set() 里追加；
+   接外部记忆时实现 MemoryProvider，在 harness/bootstrap.py 里替换 Harness 的 memory 字段。
+   命名、审核映射、事务语义等以 docs/agent-architecture.md 第 5 节为准。
+5. 角色（harness/domain/roles）是纯函数，只产出 Context，不做 I/O，不读配置；整个 harness/domain
+   都不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由运行时读好后传入。
+6. 主 Agent、子代理、队友共用 harness/app/loop.py 的 run_react_loop，差异写在 runtime 的
+   LeadLoopPolicy、SubAgentLoopPolicy、TeammateLoopPolicy 里，不要再复制一份循环。
+7. 运行时对会话的读写只经 SessionStore 端口；runtime/ 里只有 runtime/execution.py 可以构造
+   SessionService（lease_store(db)）。别域数据经该域 Service 的公开方法读写。
+8. HTTP 路由经 api/deps.py 的 get_agent_service 拿 AgentService，不得自己构造运行时；
+   Agent 工具经 ToolContext.subagents（SubAgentLauncher）启动子代理，不得导入 runtime。
+9. 分层与导入禁令由 tests/test_import_isolation.py 静态检查，新增或移动模块后先跑它。
+   最常踩的几条连函数体和 TYPE_CHECKING 内的导入也算：runtime/、harness/app、harness/domain
+   导入 harness.adapters；runtime/、harness/app 导入任何 *.repository；runtime/ 导入 memory 包；
+   在 harness/adapters/models 之外导入 anthropic / openai。
+10. 只有工具名的 feature 域（tools、permission）经 harness/app/tool_set.py 的 platform_tools()
+    按名查工具策略，不要自建工具集。任何新的进程入口（脚本、Worker）只要用到 tools 或
+    permission，必须先导入 harness.bootstrap（导入即登记进程级工具集），否则取用时抛中文异常。
+11. 七份黄金测试固化对外行为：发给模型的请求 tests/test_model_request_golden.py、工具描述
+    tests/test_tool_spec_golden.py、审核结果 tests/test_tool_review_golden.py、记忆接入
+    tests/test_memory_port_golden.py、角色上下文 tests/test_role_context_golden.py、循环事件与
+    落库 tests/test_react_loop_golden.py、HTTP 入口 tests/test_agent_service_golden.py。
+12. 改动黄金测试覆盖的行为时，先说明为什么要改，再用改动后代码的实际产出重新生成
+    tests/fixtures/ 下对应的 *_golden.py（带 SHA-256 的一并更新），不允许手改字面量。
+13. 已登记的已知依赖：memory/jobs/*、memory/recall/service.py、model_service/service.py
+    直接使用模型适配器（create_model_client、resolve_scenario_model、DatabaseModelResolver、
+    build_resolved_model）。memory job 由独立 Worker 运行，改成注入要动 Worker 的装配与生命周期，
+    收益不抵风险（见 docs/agent-architecture.md 第 7 节）；不要以此为先例在别处直接引用适配器。
 
 命名与类型：
 1. 文件、函数和变量使用 snake_case；类使用 PascalCase；常量使用 UPPER_SNAKE_CASE。
@@ -71,12 +123,14 @@ API、错误与日志：
    禁止使用可变字面量作为默认值。
 4. 内置工具继承 PydanticTool（harness/domain/tool.py），用 Pydantic BaseModel 定义输入，
    声明自身的 policy（ToolPolicy），通过 ToolContext 获取上下文，实现 async run，
-   并在 harness/adapters/tools/builtin/__init__.py 和 BuiltinToolProvider 中登记。
+   并在 harness/adapters/tools/builtin/__init__.py 导出、在 BuiltinToolProvider
+   （harness/adapters/tools/builtin_provider.py）中登记，列表顺序即发给模型的工具顺序；
+   组装根的 platform_tool_set() 经它装配进程级工具集。
 5. 文件类工具使用 pathlib.Path、显式 UTF-8，并先校验路径和参数。
 6. 发给模型的提示文案放 harness/domain/prompts/，由 harness/domain/roles/ 的角色
    （Assistant、SubAgent、Teammate、Compactor）组装成 Context；角色不做 I/O，不读配置、
    工作目录与日期，这些由运行时读好后传入。内置子代理规格在 harness/app/subagent_catalog.py，
-   上下文压缩编排在 harness/app/compaction.py，压缩快照经 SessionService 写入。
+   上下文压缩编排在 harness/app/compaction.py，压缩快照经会话端口 CompactSnapshotWriter 写入。
 
 测试与交付：
 1. 使用 pytest，测试放在 tests/test_*.py；覆盖成功路径、失败路径和关键副作用。
@@ -133,6 +187,67 @@ API、错误与日志：
 5. 环境变量继续使用 `AGENTOS_` 前缀，并确保名称能正确映射到 `Settings` 中的字段。
 6. 修改配置后，应验证 `Settings` 能成功加载，并检查必填项、类型转换和默认值是否符合预期。
 7. `.env.example` 不得包含 `.env` 中的真实密码、Token、密钥、数据库连接串或 Redis 凭证。
+
+多 Provider LLM 配置：
+1. AgentOS 同时支持 Anthropic 和 OpenAI 两个 LLM provider，由 `llm_provider`
+   （环境变量 `AGENTOS_LLM_PROVIDER`，取值 anthropic / openai）全局切换；
+   该开关必填且无默认值，配置固定、重启生效，不支持运行时切换或按场景混用 provider。
+2. 每个 provider 一组连接配置：`{provider}_base_url`、`{provider}_api_key`、
+   `{provider}_model`（主模型，所有场景的回落终点）、`{provider}_max_retries`
+   和 `{provider}_timeout_seconds`；重试与超时直接使用 SDK 内置机制，不要自造重试框架。
+3. 场景覆盖配置为 `{provider}_{scenario}_model`，scenario 共八个：agent、subagent、
+   subagent_fast、compact、memory_selector、memory_extractor、memory_dream、workflow；
+   场景覆盖未配置时回落到 `{provider}_model` 主模型。新增或调整这些配置项时，
+   同样遵守上文「配置同步规则」。
+4. token 上限读取 `llm_default_max_tokens`（流式调用）和
+   `llm_memory_selector_max_tokens` 等场景专用配置，不要在代码中硬编码 max_tokens。
+5. 运行时和应用层经组装根注入的 ModelResolver 端口（harness/app/ports.py）拿到
+   ResolvedModel(client, settings)，不得自行导入 harness/adapters/models 下的任何实现。
+   其实现是 harness/adapters/models/resolver.py 的 DatabaseModelResolver：工作区模型配置优先
+   （builder.py 按 ModelProviderRecord 构造端点），查不到再由 factory.py 的
+   create_model_client(scenario=...) 按 .env 建客户端。类型注解使用 ModelClient，不要直接实例化
+   AnthropicClient / OpenAIClient。测试替身经组装根工厂方法的 llm 覆盖项注入，注入后不走解析器，
+   调用参数用 ResolvedModel.from_client(llm) 取替身自带的模型名。只需模型名而不建客户端时使用
+   factory.py 的 resolve_scenario_model(scenario)；子代理规格的模型用 resolve_subagent_model(spec)，
+   运行时经组装根的 subagent_model 拿到它，不直接导入。
+6. 无静默兜底：provider 未配置或取值不支持、对应 api_key 缺失、场景名未知、
+   模型解析不出，一律抛具体中文 AgentException，不得回落到默认 provider 或硬编码模型。
+7. 需要判断当前使用哪家 provider 时，读客户端实例的 provider 属性
+   （ModelClient 的抽象属性），不要用 isinstance 判断具体客户端类，
+   也不要直接读 settings.llm_provider，注入测试替身时这两种方式都会失真。
+8. 两家 SDK 对 base_url 的拼接规则相反：Anthropic 的 base_url 不带 /v1，
+   SDK 内部路径已是 /v1/messages，多写会拼成 /v1/v1/messages 报 404；
+   OpenAI 的 base_url 必须带 /v1，SDK 内部路径是 /chat/completions，
+   少写会让网关返回 HTML，SDK 报出 'str' object has no attribute 'choices'
+   这类看似无关的错误。
+9. `{provider}_timeout_seconds` 留空表示交给 SDK 自动计算超时；
+   给 SDK 显式传 None 会被理解为禁用超时，现有代码统一转成 NOT_GIVEN 规避，
+   新代码沿用该写法；ModelSettings.timeout 为 None 时同样沿用客户端构造时的超时。
+10. 两家客户端均已实现 stream() 和 complete_structured()，主 Agent、SubAgent、Compact
+    三个流式场景两家 provider 都可用。OpenAI 侧流式走 create(stream=True) 裸 chunk 路径，
+    不用 SDK 的 .stream() helper：后者会强制校验工具的 strict 字段，在发出请求前就抛
+    ValueError，且 get_final_completion() 在截断时抛异常而非返回已生成内容。
+11. LLM 消息体使用中立形状，provider wire 形状只存在于各家客户端 _encode_messages()
+    之后。ModelClient 的签名是 stream(context, settings) 与 complete_structured(context,
+    settings)：context 为 harness/domain/context.py 的 Context（instruction、messages、
+    tools、output_type），messages 是领域消息元组，由调用边界用 messages_from_rows() 从
+    中立 dict 还原；session_messages.content 和 session_snapshots.messages 一律是中立形状，
+    不得写入或读取任何一家的 wire 形状。
+12. assistant 消息 content 为块数组，判别键用 kind 而非 type：
+    {"kind": "text", "text": ...} 和 {"kind": "tool_use", "id": ..., "name": ..., "input": ...}，
+    经 harness/domain/messages.py 的 AssistantMessage.from_turn() 构造、
+    AssistantMessage.from_content() 解析。
+    不要改用 type——两家 wire 的 type 取值恰好都叫 tool_use、入参字段也都叫 input，
+    用 type 会让残留的 provider 形状数据被静默误读并潜伏到运行时。
+13. tool 消息沿用 ToolResult，本身即自有协议，形状不变。
+14. 出站编码是 stream() 的内部步骤，_encode_messages / _encode_system / _encode_tools
+    是各家客户端的私有方法，不要提升到 ModelClient 抽象成员（维持 provider、stream、
+    complete_structured 三个）；也不要在调用方翻译消息形状。
+15. 模型名、思考强度和输出上限一律通过 ModelSettings(model_id, effort, max_tokens, timeout)
+    按调用传入，不得在客户端实例上修改（不得写 client.max_tokens、client.thinking_enabled
+    之类的属性）。客户端构造参数只放端点配置；effort 为 None 表示端点默认（.env 端点沿用
+    {provider}_thinking_*，工作区端点按 fast 处理），档位到各家参数的翻译在客户端内现场完成，
+    档位收敛（normalize_effort）由 builder 在构造工作区端点的档位映射表时完成。
 
 Anthropic SDK 使用规范：
 1. 新增或修改 Anthropic SDK 相关代码前，必须先查阅 Anthropic 官方文档：

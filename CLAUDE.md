@@ -7,9 +7,21 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK、OpenAI
 
 架构与职责：
 1. 保持 API -> Service -> Repository -> ORM Model 的分层依赖关系，Schema 与 ORM 分离。
-   分层是依赖约定，不是目录结构：代码按 feature 域组织，每个域一个顶层包，
-   内含 models.py、schemas.py、repository.py、service.py、api.py，
-   不要再新建 models/、services/、repositories/、schemas/ 这类按层划分的目录。
+   代码按两种方式组织：
+   - 业务域（session、user、memory、skill 等）按 feature 包组织，每个域一个顶层包，
+     内含 models.py、schemas.py、repository.py、service.py、api.py；分层是依赖约定，
+     不要新建 models/、services/、repositories/、schemas/ 这类按层划分的顶层目录。
+   - Agent 核心在 harness/ 内按层分包，依赖方向为 adapters → app → domain，外加组装根：
+     - harness/domain（领域层）：系统语言，消息、Context、工具、审核结论等值类型与角色，
+       纯逻辑、不做 I/O；新的值类型和纯规则放这里。
+     - harness/app（应用层）：声明端口并编排流程（ReAct 循环、AgentService、ToolSet）；
+       新的端口和不依赖具体实现的编排放这里。
+     - harness/adapters（适配层）：端口的具体实现（模型 SDK、内置工具、审核规则链、内置记忆）；
+       对接外部系统的新实现放这里。
+     - harness/bootstrap.py（组装根）：唯一实例化适配器、把实现接到运行时上的地方。
+     runtime/ 是 Agent 运行时的编排层（循环策略、子代理、Workflow、后台执行与租约），只认端口。
+     谁能导入谁以 docs/agent-architecture.md 第 1 节为准，由 tests/test_import_isolation.py
+     静态检查。
 2. API 层保持轻薄：负责路由、Depends 注入、认证/权限入口、Schema 转换和响应包装；
    业务校验与跨模块编排放在 Service，SQL 查询和持久化放在 Repository。
 3. Repository 持有 AsyncSession，写操作通常使用 add/flush/refresh，不得自行 commit。
@@ -35,6 +47,46 @@ Pydantic v2、SQLAlchemy 2 Async、PostgreSQL、Alembic、Anthropic SDK、OpenAI
     但仅限类型引用和关系声明，不得据此绕过 Service 直接改别域数据。
 14. 确实需要跨域读模型对象时优先返回本域 Schema；
     返回别域 ORM 实体仅限内部编排，不要直接透出到 API 响应。
+
+Agent 核心（harness）约定：
+1. 新的外部能力先在 harness/app 定义端口，实现放 harness/adapters，只在 harness/bootstrap.py
+   实例化；换实现用 `dataclasses.replace(default_harness(), 字段=...)`，不在调用方 new 适配器。
+2. runtime/ 与 harness/app 的端口类依赖（reviewer、memory、sessions、models、tools 等）由组装根
+   注入，构造参数必填，不得写「参数为 None 就现建默认实现」的回落。可选的 llm 只是测试替身的
+   覆盖项：注入时直接用它，不注入时经已注入的 ModelResolver 解析，而不是现建客户端。
+   测试经 tests/fixtures/harness_factory.py 走组装根的同一套工厂，不直接构造运行时。
+3. 已有端口：ModelClient、ModelResolver、ToolProvider、ToolCallReviewer、SubAgentLauncher 在
+   harness/app/ports.py；MemoryProvider 在 harness/app/memory_port.py；SessionStore 及
+   TurnContextStore、TurnStateStore、TurnLeaseStore 等窄端口在 harness/app/session_port.py。
+   端口只为多实现的外部能力和需要替身的 I/O 设立，其余 feature 域照旧 Service 调 Service。
+4. 扩展点：接 MCP 时实现 ToolProvider，并在 harness/bootstrap.py 的 platform_tool_set() 里追加；
+   接外部记忆时实现 MemoryProvider，在 harness/bootstrap.py 里替换 Harness 的 memory 字段。
+   命名、审核映射、事务语义等以 docs/agent-architecture.md 第 5 节为准。
+5. 角色（harness/domain/roles）是纯函数，只产出 Context，不做 I/O，不读配置；整个 harness/domain
+   都不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由运行时读好后传入。
+6. 主 Agent、子代理、队友共用 harness/app/loop.py 的 run_react_loop，差异写在 runtime 的
+   LeadLoopPolicy、SubAgentLoopPolicy、TeammateLoopPolicy 里，不要再复制一份循环。
+7. 运行时对会话的读写只经 SessionStore 端口；runtime/ 里只有 runtime/execution.py 可以构造
+   SessionService（lease_store(db)）。别域数据经该域 Service 的公开方法读写。
+8. HTTP 路由经 api/deps.py 的 get_agent_service 拿 AgentService，不得自己构造运行时；
+   Agent 工具经 ToolContext.subagents（SubAgentLauncher）启动子代理，不得导入 runtime。
+9. 分层与导入禁令由 tests/test_import_isolation.py 静态检查，新增或移动模块后先跑它。
+   最常踩的几条连函数体和 TYPE_CHECKING 内的导入也算：runtime/、harness/app、harness/domain
+   导入 harness.adapters；runtime/、harness/app 导入任何 *.repository；runtime/ 导入 memory 包；
+   在 harness/adapters/models 之外导入 anthropic / openai。
+10. 只有工具名的 feature 域（tools、permission）经 harness/app/tool_set.py 的 platform_tools()
+    按名查工具策略，不要自建工具集。任何新的进程入口（脚本、Worker）只要用到 tools 或
+    permission，必须先导入 harness.bootstrap（导入即登记进程级工具集），否则取用时抛中文异常。
+11. 七份黄金测试固化对外行为：发给模型的请求 tests/test_model_request_golden.py、工具描述
+    tests/test_tool_spec_golden.py、审核结果 tests/test_tool_review_golden.py、记忆接入
+    tests/test_memory_port_golden.py、角色上下文 tests/test_role_context_golden.py、循环事件与
+    落库 tests/test_react_loop_golden.py、HTTP 入口 tests/test_agent_service_golden.py。
+12. 改动黄金测试覆盖的行为时，先说明为什么要改，再用改动后代码的实际产出重新生成
+    tests/fixtures/ 下对应的 *_golden.py（带 SHA-256 的一并更新），不允许手改字面量。
+13. 已登记的已知依赖：memory/jobs/*、memory/recall/service.py、model_service/service.py
+    直接使用模型适配器（create_model_client、resolve_scenario_model、DatabaseModelResolver、
+    build_resolved_model）。memory job 由独立 Worker 运行，改成注入要动 Worker 的装配与生命周期，
+    收益不抵风险（见 docs/agent-architecture.md 第 7 节）；不要以此为先例在别处直接引用适配器。
 
 命名与类型：
 1. 文件、函数和变量使用 snake_case；类使用 PascalCase；常量使用 UPPER_SNAKE_CASE。
@@ -71,12 +123,14 @@ API、错误与日志：
    禁止使用可变字面量作为默认值。
 4. 内置工具继承 PydanticTool（harness/domain/tool.py），用 Pydantic BaseModel 定义输入，
    声明自身的 policy（ToolPolicy），通过 ToolContext 获取上下文，实现 async run，
-   并在 harness/adapters/tools/builtin/__init__.py 和 BuiltinToolProvider 中登记。
+   并在 harness/adapters/tools/builtin/__init__.py 导出、在 BuiltinToolProvider
+   （harness/adapters/tools/builtin_provider.py）中登记，列表顺序即发给模型的工具顺序；
+   组装根的 platform_tool_set() 经它装配进程级工具集。
 5. 文件类工具使用 pathlib.Path、显式 UTF-8，并先校验路径和参数。
 6. 发给模型的提示文案放 harness/domain/prompts/，由 harness/domain/roles/ 的角色
    （Assistant、SubAgent、Teammate、Compactor）组装成 Context；角色不做 I/O，不读配置、
    工作目录与日期，这些由运行时读好后传入。内置子代理规格在 harness/app/subagent_catalog.py，
-   上下文压缩编排在 harness/app/compaction.py，压缩快照经 SessionService 写入。
+   上下文压缩编排在 harness/app/compaction.py，压缩快照经会话端口 CompactSnapshotWriter 写入。
 
 测试与交付：
 1. 使用 pytest，测试放在 tests/test_*.py；覆盖成功路径、失败路径和关键副作用。
@@ -147,14 +201,15 @@ API、错误与日志：
    同样遵守上文「配置同步规则」。
 4. token 上限读取 `llm_default_max_tokens`（流式调用）和
    `llm_memory_selector_max_tokens` 等场景专用配置，不要在代码中硬编码 max_tokens。
-5. 新代码一律经 harness/adapters/models/resolver.py 的 DatabaseModelResolver（实现
-   harness/app/ports.py 的 ModelResolver）拿到 ResolvedModel(client, settings)：工作区模型
-   配置优先，查不到再由 factory.py 的 create_model_client(scenario=...) 按 .env 建客户端；
-   工作区端点由 builder.py 按 ModelProviderRecord 构造。类型注解使用 ModelClient，不要直接
-   实例化 AnthropicClient / OpenAIClient（位于 harness/adapters/models/）；Service 和
-   Runtime 的 __init__ 应接受可选 llm: ModelClient | None = None，注入替身时不走解析器，
-   调用参数用 ResolvedModel.from_client(llm) 取替身自带的模型名；只需模型名而不建客户端
-   时使用 resolve_scenario_model(scenario)，子代理规格的模型用 resolve_subagent_model(spec)。
+5. 运行时和应用层经组装根注入的 ModelResolver 端口（harness/app/ports.py）拿到
+   ResolvedModel(client, settings)，不得自行导入 harness/adapters/models 下的任何实现。
+   其实现是 harness/adapters/models/resolver.py 的 DatabaseModelResolver：工作区模型配置优先
+   （builder.py 按 ModelProviderRecord 构造端点），查不到再由 factory.py 的
+   create_model_client(scenario=...) 按 .env 建客户端。类型注解使用 ModelClient，不要直接实例化
+   AnthropicClient / OpenAIClient。测试替身经组装根工厂方法的 llm 覆盖项注入，注入后不走解析器，
+   调用参数用 ResolvedModel.from_client(llm) 取替身自带的模型名。只需模型名而不建客户端时使用
+   factory.py 的 resolve_scenario_model(scenario)；子代理规格的模型用 resolve_subagent_model(spec)，
+   运行时经组装根的 subagent_model 拿到它，不直接导入。
 6. 无静默兜底：provider 未配置或取值不支持、对应 api_key 缺失、场景名未知、
    模型解析不出，一律抛具体中文 AgentException，不得回落到默认 provider 或硬编码模型。
 7. 需要判断当前使用哪家 provider 时，读客户端实例的 provider 属性
