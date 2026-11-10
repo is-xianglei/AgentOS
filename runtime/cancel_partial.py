@@ -19,8 +19,8 @@ from typing import Any
 
 from core.events import ActorRole
 from core.run_state import ActorState, Block, TurnState
+from harness.app.session_port import MessageDraft
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
-from session.service import MessageDraft
 
 CANCELLED_TOOL_OUTPUT = "用户取消了本轮执行，该工具调用未完成，结果未知。"
 

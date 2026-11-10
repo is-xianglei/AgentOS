@@ -32,8 +32,9 @@ from core.run_events import START_CURSOR, get_run_event_store
 from core.run_state import TurnState, restore
 from database.engine import AsyncSessionLocal
 from harness.app.agent_service import ExecutionHandle
+from harness.app.session_port import MessageDraft, TurnLeaseStore, TurnTermination
 from runtime.cancel_partial import extract_unsaved_messages
-from session.service import MessageDraft, SessionService, TurnTermination
+from session.service import SessionService
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +63,23 @@ def lease_seconds() -> float:
     return float(settings.run_lease_seconds)
 
 
+def lease_store(db: AsyncSession) -> TurnLeaseStore:
+    """租约端口的数据库实现:SessionService 本身即满足 TurnLeaseStore,绑定传入的数据库会话。
+
+    执行包装层的租约操作都是模块级函数、各开一个短会话,没有运行时实例可供注入,
+    所以在这里集中构造;阶段 7 由组装根决定是否改为注入。
+    """
+    return SessionService(db)
+
+
 async def run_in_session[T](
-    action: Callable[[SessionService], Awaitable[T]],
+    action: Callable[[TurnLeaseStore], Awaitable[T]],
     *,
     commit: bool = False,
 ) -> T:
-    """在独立短会话里调用 SessionService;租约、心跳与订阅探测都不复用长事务。"""
+    """在独立短会话里调用租约端口;租约、心跳与订阅探测都不复用长事务。"""
     async with AsyncSessionLocal() as db:
-        result = await action(SessionService(db))
+        result = await action(lease_store(db))
         if commit:
             await db.commit()
         return result
@@ -90,7 +100,7 @@ class TurnOffsets:
     async def take(self) -> int:
         if self._remaining == 0:
             self._next = await run_in_session(
-                lambda service: service.reserve_turn_offsets(
+                lambda store: store.reserve_turn_offsets(
                     self._turn_id, self._owner, OFFSET_RESERVATION
                 ),
                 commit=True,
@@ -99,7 +109,7 @@ class TurnOffsets:
             self._verified_at = time.monotonic()
         elif time.monotonic() - self._verified_at >= CANCEL_VISIBILITY_SECONDS:
             await run_in_session(
-                lambda service: service.verify_turn_lease(self._turn_id, self._owner)
+                lambda store: store.verify_turn_lease(self._turn_id, self._owner)
             )
             self._verified_at = time.monotonic()
         offset = self._next
@@ -143,7 +153,7 @@ async def launch_turn_execution(
     if existing is not None and existing.task is not None and not existing.task.done():
         # 调用方已为本次请求提交了新租约,拒绝前先清掉,不让它挂到过期。
         await run_in_session(
-            lambda service: service.release_turn_lease(turn_id, owner),
+            lambda store: store.release_turn_lease(turn_id, owner),
             commit=True,
         )
         raise AgentException.message("该轮次已有执行中的任务", status_code=409)
@@ -248,7 +258,7 @@ async def _heartbeat(execution: _Execution) -> None:
         await asyncio.sleep(interval)
         try:
             renewed = await run_in_session(
-                lambda service: service.renew_turn_lease(
+                lambda store: store.renew_turn_lease(
                     execution.turn_id, execution.owner, lease_seconds()
                 ),
                 commit=True,
@@ -290,7 +300,7 @@ async def _finish(execution: _Execution) -> None:
         interrupted_session_status = "failed"
     try:
         termination = await run_in_session(
-            lambda service: service.finish_turn_execution(
+            lambda store: store.finish_turn_execution(
                 execution.session_id,
                 execution.turn_id,
                 execution.owner,
@@ -316,7 +326,7 @@ async def _finish(execution: _Execution) -> None:
         logger.exception("写入run_end失败", extra={"turn_id": turn_key})
     try:
         await run_in_session(
-            lambda service: service.release_turn_lease(execution.turn_id, execution.owner),
+            lambda store: store.release_turn_lease(execution.turn_id, execution.owner),
             commit=True,
         )
     except Exception:
@@ -377,8 +387,8 @@ async def cancel_turn(db: AsyncSession, session_id: int, turn_id: UUID) -> TurnT
     跨进程或等待超时:由本接口加锁,从事件流快照还原半截回答,与清租约、interrupted/idle
     同一事务提交后补写 run_end;持有者此后发现租约丢失即被隔离,不再写入。
     """
-    service = SessionService(db)
-    state = await service.get_session_turn_execution(session_id, turn_id)
+    store = lease_store(db)
+    state = await store.get_session_turn_execution(session_id, turn_id)
     execution = _executions.get(turn_id)
     if (
         execution is not None
@@ -397,7 +407,7 @@ async def cancel_turn(db: AsyncSession, session_id: int, turn_id: UUID) -> TurnT
                 extra={"turn_id": str(turn_id), "status": execution.termination.status},
             )
             return execution.termination
-    termination = await service.cancel_turn_execution(
+    termination = await store.cancel_turn_execution(
         session_id,
         turn_id,
         partial_loader=lambda: _captured_partial(turn_id),

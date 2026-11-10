@@ -356,7 +356,7 @@ async def test_abnormal_end_does_not_override_user_cancel(pg) -> None:
     async with shared.session() as db:
         runtime = AgentRuntime.__new__(AgentRuntime)
         runtime.db = db
-        runtime.session_service = SessionService(db)
+        runtime.sessions = SessionService(db)
         runtime.lease_owner = "owner-a"
         await runtime._mark_abnormal_end(session_id, turn_id, "interrupted")
 
@@ -374,7 +374,7 @@ async def test_abnormal_end_still_applies_while_lease_is_owned(pg) -> None:
     async with shared.session() as db:
         runtime = AgentRuntime.__new__(AgentRuntime)
         runtime.db = db
-        runtime.session_service = SessionService(db)
+        runtime.sessions = SessionService(db)
         runtime.lease_owner = "owner-a"
         await runtime._mark_abnormal_end(session_id, turn_id, "interrupted")
 

@@ -39,6 +39,7 @@ from harness.app.ports import (
     ResolvedModel,
     ToolCallReviewer,
 )
+from harness.app.session_port import SessionStore, StoredSession, StoredTurn
 from harness.app.subagent_catalog import get_subagent_spec
 from harness.domain.budget import ToolCallBudget
 from harness.domain.memory import MemoryWriteTicket, TurnRef
@@ -60,7 +61,6 @@ from runtime.lead_loop import LeadLoopDeps, TurnLoopResult, run_lead_turn
 from runtime.subagent import SubAgentRunner
 from runtime.tool_execution import LeadToolExecutor
 from runtime.turn_config import TurnConfiguration, configure_turn
-from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from task.service import TaskService
 from team.service import TeamService
@@ -101,20 +101,24 @@ class AgentRuntime:
         llm: ModelClient | None = None,
         reviewer: ToolCallReviewer | None = None,
         memory: MemoryProvider | None = None,
+        sessions: SessionStore | None = None,
     ):
         """初始化 Agent 主运行时依赖。
 
         llm 是注入的模型客户端，注入后不再按会话解析模型，后台重建运行时时随之传递；
-        reviewer 未注入时使用主 Agent 的规则链审核员；memory 未注入时使用绑定本会话的内置记忆。
+        reviewer 未注入时使用主 Agent 的规则链审核员；memory 未注入时使用绑定本会话的内置记忆；
+        sessions 未注入时使用绑定本会话的数据库实现（SessionService），注入的存储随后台执行传递。
         """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.llm = llm
-        self.session_service = SessionService(db)
-        # 压缩快照经会话域 Service 写入；未解析出压缩模型时按 .env 的 compact 场景现建客户端。
+        # 组装根（阶段 7）之前在这里回落数据库实现，与 memory 的处理一致。
+        self._sessions_injected = sessions is not None
+        self.sessions: SessionStore = SessionService(db) if sessions is None else sessions
+        # 压缩快照经会话存储写入；未解析出压缩模型时按 .env 的 compact 场景现建客户端。
         self.compact_service = ContextCompaction(
-            self.session_service,
+            self.sessions,
             default_model=lambda: ResolvedModel.from_client(
                 create_model_client(scenario="compact")
             ),
@@ -157,7 +161,13 @@ class AgentRuntime:
             return self.memory
         return None
 
-    async def _configure_agent(self, session: SessionRecord) -> None:
+    def _injected_sessions(self) -> SessionStore | None:
+        """返回构造时注入的会话存储，供后台执行重建运行时时沿用；未注入时返回 None，原因同记忆。"""
+        if getattr(self, "_sessions_injected", False):
+            return self.sessions
+        return None
+
+    async def _configure_agent(self, session: StoredSession) -> None:
         """按会话绑定刷新回合配置；解析出压缩模型与阈值时同步给上下文压缩。"""
         configuration = await configure_turn(
             self.db,
@@ -178,7 +188,7 @@ class AgentRuntime:
             configuration=self.configuration,
             reviewer=self.reviewer,
             plan_service=self.plan_service,
-            session_service=self.session_service,
+            messages=self.sessions,
             tool_service=self.tool_service,
             bus=self.bus,
             user_id=self.user_id,
@@ -188,7 +198,7 @@ class AgentRuntime:
             db=self.db,
             configuration=self.configuration,
             executor=executor,
-            session_service=self.session_service,
+            sessions=self.sessions,
             interaction_service=self.interaction_service,
             plan_service=self.plan_service,
             permission_service=self.permission_service,
@@ -216,7 +226,7 @@ class AgentRuntime:
         prepare_kwargs: dict[str, Any] = {}
         if model_options:
             prepare_kwargs["model_options"] = model_options
-        session = await self.session_service.prepare_for_message(
+        session = await self.sessions.prepare_for_message(
             session_id,
             user_content,
             self.user_id,
@@ -227,7 +237,7 @@ class AgentRuntime:
         # 准入前解析实际模型，缺配置通过普通 JSON 错误返回；注入客户端时不解析。
         if self.llm is None:
             await self._configure_agent(session)
-        turn, _ = await self.session_service.start_turn(
+        turn, _ = await self.sessions.start_turn(
             session,
             self.user_id,
             self.workspace_id,
@@ -248,21 +258,28 @@ class AgentRuntime:
     ) -> ExecutionHandle:
         """对轮次认领租约并提交，再在独立数据库会话里重建运行时、启动后台执行。"""
         owner = new_lease_owner()
-        start_offset = await self.session_service.claim_turn_lease(
+        start_offset = await self.sessions.claim_turn_lease(
             turn_id, owner, lease_seconds()
         )
         # 显式提交:请求作用域的 db 只用于准入;轮次与租约须在后台任务读取前可见,
         # 且 get_db 要等整个 SSE 发完才收尾,不能让连接在推流期间一直挂着事务。
         await self.db.commit()
-        # 只把构造时注入的客户端与记忆 Provider 传给后台任务；按会话解析的由后台运行时重新解析。
+        # 只把构造时注入的客户端、记忆 Provider 与会话存储传给后台任务；
+        # 按会话解析的由后台运行时重新解析，默认实现由后台运行时绑定自己的数据库会话重建。
         user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
         memory = self._injected_memory()
+        sessions = self._injected_sessions()
 
         async def body(bus: RunStreamBus) -> None:
             # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
             async with AsyncSessionLocal() as db:
                 runtime = AgentRuntime(
-                    db, user_id=user_id, workspace_id=workspace_id, llm=llm, memory=memory
+                    db,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    llm=llm,
+                    memory=memory,
+                    sessions=sessions,
                 )
                 runtime.bind_execution(bus, owner)
                 await run(runtime)
@@ -282,7 +299,7 @@ class AgentRuntime:
         lease_owner 为空表示运行时未绑定执行(单元测试直接驱动),不做隔离。
         """
         if self.lease_owner is not None:
-            await self.session_service.lock_owned_turn(session_id, turn_id, self.lease_owner)
+            await self.sessions.lock_owned_turn(session_id, turn_id, self.lease_owner)
 
     async def _produce(
         self,
@@ -291,11 +308,11 @@ class AgentRuntime:
         user_content: str,
     ) -> None:
         """后台执行体:准入已提交,跑完整流程并把事件 emit 到 bus;收尾由执行包装层负责。"""
-        turn: SessionTurnRecord | None = None
+        turn: StoredTurn | None = None
         suspension_committed = False
         try:
-            session = await self.session_service.get_required(session_id)
-            turn = await self.session_service.get_turn_required(turn_id)
+            session = await self.sessions.get_required(session_id)
+            turn = await self.sessions.get_turn_required(turn_id)
             await self._configure_agent(session)
 
             # Hook 只生成本次模型请求的临时上下文，绝不改写已保存的原始用户消息。
@@ -415,7 +432,7 @@ class AgentRuntime:
         """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
-        session = await self.session_service.lock_required(session_id)
+        session = await self.sessions.lock_required(session_id)
         await self._configure_agent(session)
         return await self._interactions().save_response(
             session_id,
@@ -437,14 +454,14 @@ class AgentRuntime:
 
     async def _produce_resume(self, session_id: int, request_id: UUID) -> None:
         """后台恢复执行体:响应已由请求阶段提交,应用 continuation 并续跑主循环。"""
-        turn: SessionTurnRecord | None = None
+        turn: StoredTurn | None = None
         continuation_applied = False
         idempotent_replay = False
         terminal_committed = False
         try:
             # 所有恢复者都按 Session -> Suspension 的顺序重新加锁。竞争者会在首个
             # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
-            session = await self.session_service.lock_required(session_id)
+            session = await self.sessions.lock_required(session_id)
             await self._configure_agent(session)
             interactions = self._interactions()
             point = await interactions.load_resume_point(session_id, request_id)
@@ -571,7 +588,7 @@ class AgentRuntime:
 
     async def _emit_resume_end(
         self,
-        session: SessionRecord,
+        session: StoredSession,
         session_id: int,
         stop_reason: str,
     ) -> None:
@@ -586,8 +603,8 @@ class AgentRuntime:
     async def _run_llm_loop(
         self,
         session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         additional_context: str | None,
         budget: ToolCallBudget | None = None,
     ) -> TurnLoopResult:
@@ -599,7 +616,7 @@ class AgentRuntime:
             interactions=self._interactions(),
             memory=self.memory,
             plan_service=self.plan_service,
-            session_service=self.session_service,
+            sessions=self.sessions,
             compaction=self.compact_service,
             stop_hooks=self._apply_stop_hooks,
             workspace_id=self.workspace_id,
@@ -608,8 +625,8 @@ class AgentRuntime:
 
     async def _complete_turn(
         self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         completed_message_id: int | None,
     ) -> MemoryWriteTicket | None:
         """原子完成 Turn、恢复 Session，并在同一事务里登记回合的记忆写入。
@@ -618,12 +635,12 @@ class AgentRuntime:
         """
         # 先按「会话 → 轮次」加锁隔离,与取消接口的加锁顺序一致。
         await self._fence_lease(session.id, turn.id)
-        await self.session_service.mark_turn_status(
+        await self.sessions.mark_turn_status(
             turn,
             "completed",
             completed_message_id=completed_message_id,
         )
-        await self.session_service.set_status(session, "idle")
+        await self.sessions.set_status(session, "idle")
         memory_ticket: MemoryWriteTicket | None = None
         # 极速模式不写入记忆；写入失败由 Provider 自行隔离，不影响下面提交的回合终态。
         if not self.configuration.turbo:
@@ -661,17 +678,17 @@ class AgentRuntime:
             return False
         try:
             if self.lease_owner is not None:
-                session, turn = await self.session_service.lock_owned_turn(
+                session, turn = await self.sessions.lock_owned_turn(
                     session_id, turn_id, self.lease_owner
                 )
             else:
-                session = await self.session_service.get(session_id)
-                turn = await self.session_service.get_turn(turn_id)
+                session = await self.sessions.get(session_id)
+                turn = await self.sessions.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
                 await self.db.rollback()
                 return False
-            await self.session_service.mark_turn_status(turn, turn_status)
-            await self.session_service.set_status(session, "failed")
+            await self.sessions.mark_turn_status(turn, turn_status)
+            await self.sessions.set_status(session, "failed")
             await self.db.commit()
         except LeaseLostError:
             await self.db.rollback()
@@ -738,7 +755,7 @@ class AgentRuntime:
     async def _wake_team_members(
         self,
         session_id: int,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
     ) -> None:
         """请求内单步唤醒队友。
 

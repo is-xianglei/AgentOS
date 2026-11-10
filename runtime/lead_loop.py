@@ -30,6 +30,7 @@ from harness.app.loop import (
 )
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import ModelSettings
+from harness.app.session_port import StoredMessage, StoredSession, StoredTurn, TurnContextStore
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.context import messages_from_rows
@@ -42,8 +43,6 @@ from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.tool_execution import default_tool_budget
 from runtime.turn_config import TurnConfiguration
-from session.models import SessionMessage, SessionRecord, SessionTurnRecord
-from session.service import SessionService
 from skill.service import SkillService
 
 logger = logging.getLogger(__name__)
@@ -74,7 +73,7 @@ class LeadLoopDeps:
     interactions: InteractionFlow
     memory: MemoryProvider
     plan_service: PlanService
-    session_service: SessionService
+    sessions: TurnContextStore
     compaction: ContextCompaction
     stop_hooks: StopHooks
     workspace_id: int | None
@@ -93,8 +92,8 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
         deps: LeadLoopDeps,
         *,
         session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         additional_context: str | None,
         rendered_memories: str | None,
         role: Assistant,
@@ -122,7 +121,7 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
         self._round_started = 0.0
         self._round_settings: ModelSettings | None = None
         self._context: list[dict[str, Any]] = []
-        self._assistant_message: SessionMessage | None = None
+        self._assistant_message: StoredMessage | None = None
         self._stop_reason: str | None = None
 
     async def load_context(self, loop_round: LoopRound) -> ModelRequest:
@@ -182,7 +181,7 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
             )
         if continuation is None:
             return LoopExit(await self._finish())
-        await self._deps.session_service.add_message(
+        await self._deps.sessions.add_message(
             self._session_id,
             "user",
             continuation,
@@ -226,7 +225,7 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
     async def _load_messages(self, *, compact: bool) -> list[dict[str, Any]]:
         """加载本轮上下文：可压缩的历史在前，本轮消息在后；compact 为 True 时先压缩历史。"""
         deps = self._deps
-        history, current, through_message_id = await deps.session_service.load_context_for_turn(
+        history, current, through_message_id = await deps.sessions.load_context_for_turn(
             self._turn,
             self._additional_context,
             rendered_memories=self._rendered_memories,
@@ -243,9 +242,9 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
         self,
         reply: StepResult,
         round_settings: ModelSettings,
-    ) -> SessionMessage:
+    ) -> StoredMessage:
         provider, effective_model = self._configuration.llm_attribution(round_settings)
-        return await self._deps.session_service.add_message(
+        return await self._deps.sessions.add_message(
             self._session_id,
             "assistant",
             reply.assistant_blocks,
@@ -254,7 +253,7 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
             model=effective_model,
         )
 
-    async def _finalize_without_tools(self) -> SessionMessage:
+    async def _finalize_without_tools(self) -> StoredMessage:
         """禁用工具再调一次 LLM,产出最终答复并落库。
 
         沿用同一装配器,使收尾这次调用的块 index 接在前面的块之后,不从 0 重来。
@@ -300,8 +299,8 @@ class LeadLoopPolicy(LoopPolicy[TurnLoopResult]):
 async def run_lead_turn(
     deps: LeadLoopDeps,
     session_id: int,
-    session: SessionRecord,
-    turn: SessionTurnRecord,
+    session: StoredSession,
+    turn: StoredTurn,
     additional_context: str | None,
     budget: ToolCallBudget | None = None,
 ) -> TurnLoopResult:

@@ -19,8 +19,8 @@ from core.run_events import (
 )
 from core.run_state import TurnState, restore, snapshot_frame
 from harness.app.agent_service import ExecutionHandle
+from harness.app.session_port import TurnExecutionState
 from runtime.execution import run_end_status, run_in_session
-from session.service import TurnExecutionState
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ _ORPHAN_IDLE_POLLS = 3
 
 
 async def _execution(turn_id: UUID) -> TurnExecutionState | None:
-    return await run_in_session(lambda service: service.get_turn_execution(turn_id))
+    return await run_in_session(lambda store: store.get_turn_execution(turn_id))
 
 
 def _synth_run_end(

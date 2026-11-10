@@ -33,6 +33,7 @@ FIRST_IMPORT_MODULES: tuple[str, ...] = (
     "interaction.service",
     "runtime.subagent",
     "harness.app.compaction",
+    "harness.app.session_port",
     "harness.app.subagent_catalog",
     "harness.domain.roles.assistant",
     "harness.domain.roles.subagent",
@@ -403,6 +404,7 @@ def test_app_layer_imports_respect_layering() -> None:
         "harness.app.subagent_catalog",
         "harness.app.loop",
         "harness.app.agent_service",
+        "harness.app.session_port",
     }
     assert expected_app <= set(app_modules), (
         f"模块枚举未覆盖 harness 应用层，仅发现: {app_modules}"
@@ -912,3 +914,82 @@ def test_runtime_entry_checker_reports_imports(source: str, expected: list[str])
     known = set(_first_party_module_files())
 
     assert _runtime_entry_imports(ast.parse(source), "session", known) == expected
+
+
+# 会话存储端口只描述运行时要的操作，数据库实现（session 域）反过来依赖它的值类型，
+# 所以端口模块任何位置都只能导入 harness.app、harness.domain 与 core，不碰框架、SDK 与 feature 包。
+_SESSION_PORT_MODULE = "harness.app.session_port"
+
+
+def test_session_port_imports_only_app_domain_and_core() -> None:
+    """分层防线：会话存储端口不得导入 SQLAlchemy、FastAPI、SDK、adapters、runtime 与 feature 包。"""
+    files = _first_party_module_files()
+    known = set(files)
+    path = files[_SESSION_PORT_MODULE]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    failures = _agent_service_violations(tree, known)
+
+    assert not failures, f"{_SESSION_PORT_MODULE} 导入了不该依赖的模块: {failures}"
+
+
+# runtime 只经会话存储端口使用会话，SessionService 只在构造默认实现的几处出现（阶段 7 由组装根接管）。
+# 值是允许的构造次数：AgentRuntime、WorkflowRuntime、SubAgentRunner 未注入时的回落，
+# 以及执行包装层按短会话取租约端口的 lease_store。
+_SESSION_SERVICE_CONSTRUCTION_ALLOWLIST: dict[str, int] = {
+    "runtime.agent": 1,
+    "runtime.workflow": 1,
+    "runtime.subagent": 1,
+    "runtime.execution": 1,
+}
+
+
+def _session_service_constructions(tree: ast.Module) -> int:
+    """统计模块中任何位置（含函数体）以 ``SessionService(...)`` 或 ``x.SessionService(...)`` 构造的次数。"""
+    count = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        direct = isinstance(func, ast.Name) and func.id == "SessionService"
+        qualified = isinstance(func, ast.Attribute) and func.attr == "SessionService"
+        if direct or qualified:
+            count += 1
+    return count
+
+
+def test_runtime_constructs_session_service_only_in_allowlist() -> None:
+    """分层防线：runtime 只在白名单的默认实现处构造 SessionService，其余协作者只认端口。"""
+    files = _first_party_module_files()
+    runtime_modules = sorted(
+        m for m in files if m == _RUNTIME_PACKAGE or m.startswith(f"{_RUNTIME_PACKAGE}.")
+    )
+    assert set(_SESSION_SERVICE_CONSTRUCTION_ALLOWLIST) <= set(runtime_modules), (
+        f"白名单里的模块已不存在: {set(_SESSION_SERVICE_CONSTRUCTION_ALLOWLIST) - set(runtime_modules)}"
+    )
+    failures: list[str] = []
+    for module in runtime_modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        found = _session_service_constructions(tree)
+        allowed = _SESSION_SERVICE_CONSTRUCTION_ALLOWLIST.get(module, 0)
+        if found != allowed:
+            failures.append(f"  - {module} 构造 SessionService {found} 次，白名单为 {allowed} 次")
+    assert not failures, "runtime 在白名单之外构造了 SessionService:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("SessionService(db)", 1),
+        ("def f(db):\n    return SessionService(db).get(1)", 1),
+        ("import session.service as s\ns.SessionService(db)", 1),
+        ("x = lambda db: SessionService(db)\ny = SessionService(db)", 2),
+        ("from session.service import SessionService\nSessionService.get_required", 0),
+        ("SessionServiceFactory(db)", 0),
+        ("isinstance(x, SessionService)", 0),
+    ],
+)
+def test_session_service_construction_counter(source: str, expected: int) -> None:
+    """检查器自测：直接构造、函数体与按模块属性构造都要计数，引用类本身与相似名不得误报。"""
+    assert _session_service_constructions(ast.parse(source)) == expected

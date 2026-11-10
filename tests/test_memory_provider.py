@@ -125,7 +125,7 @@ async def test_injected_provider_drives_recall_and_turn_write(
         prefixes.append(rendered_memories)
         return [], [{"role": "user", "content": "你好"}], None
 
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         load_context_for_turn=_load,
         add_message=AsyncMock(return_value=SimpleNamespace(id=9)),
         mark_turn_status=AsyncMock(),
@@ -157,7 +157,7 @@ async def test_turbo_mode_skips_injected_provider() -> None:
     db = _Db()
     runtime = AgentRuntime(db, user_id=3, workspace_id=2, llm=object(), memory=fake)  # type: ignore[arg-type]
     runtime.configuration = replace(runtime.configuration, mode_slug="turbo")
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         mark_turn_status=AsyncMock(), set_status=AsyncMock()
     )
     turn = SimpleNamespace(id=_TURN_ID, session_id=1, user_id=3, workspace_id=2)
@@ -174,7 +174,7 @@ async def test_injected_provider_survives_background_rebuild(
     fake = _FakeMemory()
     llm = object()
     runtime = AgentRuntime(_Db(), user_id=3, workspace_id=2, llm=llm, memory=fake)  # type: ignore[arg-type]
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         prepare_for_message=AsyncMock(return_value=SimpleNamespace(id=1)),
         start_turn=AsyncMock(return_value=(SimpleNamespace(id=_TURN_ID), None)),
         claim_turn_lease=AsyncMock(return_value=0),

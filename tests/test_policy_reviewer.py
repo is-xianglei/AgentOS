@@ -340,7 +340,7 @@ async def test_injected_reviewer_replaces_policy_reviewer_in_agent_runtime() -> 
     reviewer = _FakeReviewer()
     runtime = AgentRuntime(object(), user_id=1, workspace_id=2, llm=object(), reviewer=reviewer)  # type: ignore[arg-type]
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
-    runtime.session_service = SimpleNamespace(add_message=AsyncMock())
+    runtime.sessions = SimpleNamespace(add_message=AsyncMock())
     runtime.bus = SimpleNamespace(emit=AsyncMock())
     executed: list[dict[str, Any]] = []
 

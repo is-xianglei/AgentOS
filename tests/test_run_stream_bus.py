@@ -9,8 +9,8 @@ from core.errors import LeaseLostError
 from core.event_bus import RunStreamBus
 from core.events import ORCHESTRATOR_ACTOR, BlockType, RunEvent, StreamEvent, subagent_actor
 from core.run_state import TurnState, fold_all, restore
+from harness.app.session_port import TurnExecutionState
 from runtime import turn_follow
-from session.service import TurnExecutionState
 
 pytestmark = pytest.mark.anyio
 

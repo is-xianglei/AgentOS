@@ -134,7 +134,7 @@ def _runtime(
     """绕过 __init__ 的重依赖;_produce 与 _mark_abnormal_end 保持真实实现。"""
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = _Db()
-    runtime.session_service = sessions
+    runtime.sessions = sessions
     runtime.configuration = TurnConfiguration.for_lead(runtime.db)
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)

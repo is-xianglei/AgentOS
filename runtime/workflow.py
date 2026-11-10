@@ -37,6 +37,7 @@ from database.engine import AsyncSessionLocal
 from harness.adapters.models.factory import create_model_client
 from harness.app.agent_service import ExecutionHandle
 from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.app.session_port import SessionStore, StoredSession, StoredTurn
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
@@ -48,7 +49,6 @@ from runtime.orchestrator import OrchestrationContext, Orchestrator
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from runtime.subagent import SubAgentRunner, build_agent_spec
-from session.models import SessionRecord, SessionTurnRecord
 from session.service import SessionService
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
@@ -636,15 +636,21 @@ class WorkflowRuntime:
         user_id: int | None = None,
         workspace_id: int | None = None,
         llm: ModelClient | None = None,
+        sessions: SessionStore | None = None,
     ):
-        """初始化运行时依赖;llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端。"""
+        """初始化运行时依赖;llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端。
+
+        sessions 未注入时使用绑定本会话的数据库实现(SessionService),注入的存储随后台执行传递。
+        """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.llm = llm
         # 按会话解析出的调用参数;注入替身时为 None,由编排器取替身自带的模型名。
         self.model_settings: ModelSettings | None = None
-        self.session_service = SessionService(db)
+        # 组装根(阶段 7)之前在这里回落数据库实现;只有注入的存储才传给后台执行。
+        self._injected_sessions = sessions
+        self.sessions: SessionStore = SessionService(db) if sessions is None else sessions
         # 执行之外没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
         self.lease_owner: str | None = None
@@ -668,7 +674,7 @@ class WorkflowRuntime:
         prepare_kwargs: dict[str, Any] = {"workflow_id": workflow_id}
         if model_options:
             prepare_kwargs["model_options"] = model_options
-        session: SessionRecord = await self.session_service.prepare_for_message(
+        session: StoredSession = await self.sessions.prepare_for_message(
             session_id,
             user_content,
             self.user_id,
@@ -681,25 +687,32 @@ class WorkflowRuntime:
 
             # 准入只验证配置，不将工作区客户端当作测试注入冻结给后台任务。
             await DatabaseModelResolver(self.db).for_session(session, "workflow")
-        turn, _ = await self.session_service.start_turn(
+        turn, _ = await self.sessions.start_turn(
             session,
             self.user_id,
             self.workspace_id,
             user_content,
         )
         owner = new_lease_owner()
-        start_offset = await self.session_service.claim_turn_lease(
+        start_offset = await self.sessions.claim_turn_lease(
             turn.id, owner, lease_seconds()
         )
         # 显式提交:请求作用域的 db 只用于准入,轮次与租约须在后台任务读取前可见。
         await self.db.commit()
         target_session_id, turn_id = session.id, turn.id
         user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
+        sessions = self._injected_sessions
 
         async def body(bus: RunStreamBus) -> None:
             # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
             async with AsyncSessionLocal() as db:
-                runtime = WorkflowRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=llm)
+                runtime = WorkflowRuntime(
+                    db,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    llm=llm,
+                    sessions=sessions,
+                )
                 runtime.bind_execution(bus, owner)
                 await runtime._produce(target_session_id, turn_id, user_content, workflow_id)
 
@@ -714,7 +727,7 @@ class WorkflowRuntime:
     async def _fence_lease(self, session_id: int, turn_id: UUID) -> None:
         """提交终态前确认租约仍属于本次执行;未绑定执行(单元测试)时不做隔离。"""
         if self.lease_owner is not None:
-            await self.session_service.lock_owned_turn(session_id, turn_id, self.lease_owner)
+            await self.sessions.lock_owned_turn(session_id, turn_id, self.lease_owner)
 
     async def _produce(
         self,
@@ -725,12 +738,12 @@ class WorkflowRuntime:
     ) -> None:
         """后台执行体:编排 → 落最终回复,所有事件 emit 到 bus;收尾由执行包装层负责。"""
         try:
-            session = await self.session_service.get_required(session_id)
+            session = await self.sessions.get_required(session_id)
             # 会话级控制事件:前端据此拿 session 元信息建立 UI。
             await self.bus.emit(
                 RuntimeEvent.session_ready(session.id, session.title, session.status)
             )
-            turn = await self.session_service.get_turn_required(turn_id)
+            turn = await self.sessions.get_turn_required(turn_id)
             orchestrator = await self._build_orchestrator(session.id, turn.id, workflow_id)
             await self.bus.emit(StreamEvent.turn_start(ORCHESTRATOR_ACTOR, session.id))
             result = await orchestrator.run(user_content)
@@ -739,7 +752,7 @@ class WorkflowRuntime:
             )
 
             # 落库中立块:库中不存任何 provider wire 形状。
-            assistant_message = await self.session_service.add_message(
+            assistant_message = await self.sessions.add_message(
                 session.id,
                 "assistant",
                 AssistantMessage.from_turn(result.text, []).to_content(),
@@ -830,7 +843,7 @@ class WorkflowRuntime:
         if self.llm is None:
             from harness.adapters.models.resolver import DatabaseModelResolver
 
-            session = await self.session_service.get_required(session_id)
+            session = await self.sessions.get_required(session_id)
             resolved = await DatabaseModelResolver(self.db).for_session(session, "workflow")
             self.llm, self.model_settings = resolved.client, resolved.settings
         # 只有并行汇总和智能路由要调 LLM，顺序编排不接收客户端。
@@ -842,18 +855,18 @@ class WorkflowRuntime:
 
     async def _complete_turn(
         self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         completed_message_id: int,
     ) -> None:
         """原子完成 Turn 并恢复 Session。"""
         await self._fence_lease(session.id, turn.id)
-        await self.session_service.mark_turn_status(
+        await self.sessions.mark_turn_status(
             turn,
             "completed",
             completed_message_id=completed_message_id,
         )
-        await self.session_service.set_status(session, "idle")
+        await self.sessions.set_status(session, "idle")
         # 流式运行需要在生产者生命周期内明确提交最终状态,不能依赖请求收尾。
         await self.db.commit()
         logger.debug(
@@ -873,17 +886,17 @@ class WorkflowRuntime:
             return
         try:
             if self.lease_owner is not None:
-                session, turn = await self.session_service.lock_owned_turn(
+                session, turn = await self.sessions.lock_owned_turn(
                     session_id, turn_id, self.lease_owner
                 )
             else:
-                session = await self.session_service.get(session_id)
-                turn = await self.session_service.get_turn(turn_id)
+                session = await self.sessions.get(session_id)
+                turn = await self.sessions.get_turn(turn_id)
             if session is None or turn is None or turn.status == "completed":
                 await self.db.rollback()
                 return
-            await self.session_service.mark_turn_status(turn, turn_status)
-            await self.session_service.set_status(session, "failed")
+            await self.sessions.mark_turn_status(turn, turn_status)
+            await self.sessions.set_status(session, "failed")
             await self.db.commit()
         except LeaseLostError:
             await self.db.rollback()

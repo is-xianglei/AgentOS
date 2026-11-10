@@ -143,4 +143,4 @@ async def test_agent_runtime_compaction_uses_session_service() -> None:
     runtime = AgentRuntime(object(), user_id=3, workspace_id=2, llm=object())  # type: ignore[arg-type]
 
     assert isinstance(runtime.compact_service, ContextCompaction)
-    assert runtime.compact_service.snapshots is runtime.session_service
+    assert runtime.compact_service.snapshots is runtime.sessions

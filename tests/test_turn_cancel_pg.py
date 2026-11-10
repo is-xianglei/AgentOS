@@ -602,7 +602,7 @@ def _interaction_runtime(db: AsyncSession, ids) -> AgentRuntime:
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = db
     runtime.user_id, runtime.workspace_id = ids
-    runtime.session_service = SessionService(db)
+    runtime.sessions = SessionService(db)
     runtime.interaction_service = InteractionService(db)
     runtime.tool_service = ToolService(db, builtin_tool_set())
     runtime.bus = NullStreamBus()

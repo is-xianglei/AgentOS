@@ -85,7 +85,7 @@ def _loop_runtime(llm: _FakeLLM, delegate_catalog: str | None) -> AgentRuntime:
         database_model=True,
     )
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
     )
@@ -218,7 +218,7 @@ def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[Ag
     """真实 __init__ 的 lead 运行时;Plan 状态、动态权限与工具执行打桩,返回网关调用记录。"""
     runtime = _configure_runtime(2)
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=active_plan))
-    runtime.session_service = SimpleNamespace(add_message=AsyncMock())
+    runtime.sessions = SimpleNamespace(add_message=AsyncMock())
     runtime.bus = SimpleNamespace(emit=AsyncMock())
     runtime.permission_service.evaluate = AsyncMock(  # type: ignore[method-assign]
         return_value="allow"

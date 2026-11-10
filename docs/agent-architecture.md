@@ -27,7 +27,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | 文件 | 内容 |
 |---|---|
 | messages.py | 已落地（阶段 1）。`Message = UserMessage \| AssistantMessage \| ToolResult`；`AssistantMessage(blocks)` 的块为 `AssistantBlock = ThinkingBlock \| TextBlock \| ToolCall`；`ToolCall(id, tool_name, arguments)`；`ToolResult(tool_call_id, tool_name, arguments, content, is_error)`；`message_from_row(role, content)` 按角色还原 |
-| session.py | `Session(id, messages, append)`：一次上下文加载得到的会话视图，不是 ORM |
+| session.py | 未采用：视频里的 `Session(id, messages, append)` 整存整取模型装不下 AgentOS 的轮次状态机、租约与快照水位；会话的读写改由应用层 SessionStore 端口按操作表达，消息本身仍是 messages.py 的领域类型 |
 | context.py | 已落地（阶段 2b）。`Context[O](instruction: str \| tuple[PromptBlock, ...] \| None, messages: tuple[Message, ...], tools: tuple[ToolSpec, ...] = (), output_type: type[O] \| None = None)`，以及 `PromptBlock`、`ToolSpec` 两个值类型；`messages_from_rows(rows)` 在调用边界把中立 dict 还原为领域消息。记忆和项目规范不单列字段，由角色渲染进 instruction 或 messages，模型客户端不需要懂记忆的语义 |
 | tool.py | 已落地（阶段 3a）。`Tool(name, description, parameters, policy)`，抽象方法 `normalize_arguments`、`execute(arguments, ctx)`；`PydanticTool` 是内置工具基类，parameters 由 input_model 派生；`ToolPolicy`、`ToolProfile`、`ShellAccess`、`ToolContext`（db、bus 的类型只在 TYPE_CHECKING 下导入）；`tool_policy()`、`unknown_tool_policy()`、`requires_skill_allowlist()` |
 | review.py | 已落地（阶段 3b）。`Decision(behavior, arguments, source, message, reason, interaction, needs_approval)`，只经工厂方法 `Decision.allow(arguments, *, source)`、`Decision.deny(message, *, arguments, source, reason, needs_approval)`、`Decision.ask(interaction, *, arguments, reason, source)` 构造，`__post_init__` 拒绝非法组合；arguments 是审核后（可能已规范化）的入参；message 回给模型，reason 供日志和被拒摘要；needs_approval 标出「需审批但无审批通道而合并成的拒绝」。`ReviewRequest(session_id, profile, agent_type, budget, workspace_id, allowed_skill_names, plan_content, tools)`，plan_content 为 None 表示不在 Plan 模式，tools 只需满足 `ToolInputValidator`（validate_input）。纯函数 `check_capability(tool_name, policy, profile, arguments, allowed_skill_names) -> str \| None` 由审核规则和 ToolService 执行层兜底共用。另有 `PLAN_MODE_ALLOWED_TOOLS`、`INTERACTION_TOOL_KINDS`、`SOURCE_*` 规则来源名 |
@@ -64,7 +64,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | ModelClient | `stream(context: Context[None], settings) -> AsyncIterator[ModelStreamEvent]`、`complete_structured[O](context: Context[O], settings) -> O` | Anthropic、OpenAI | Google |
 | ModelSettings | `ModelSettings(model_id, effort: Effort \| None, max_tokens, timeout)`，每次调用时传入；effort 为 None 表示端点默认（.env 端点沿用 {provider}_thinking_*，工作区端点按 fast）；max_tokens 为 None 时流式取 llm_default_max_tokens、结构化取 256 | — | — |
 | ModelResolver | `resolve(workspace_id, user_id, scenario, *, provider_id, effort)`、`for_session(session, scenario)`、`for_frozen_job(..., model, provider_id)`，返回 `ResolvedModel(client, settings, provider_record_id, context_length)`：先查工作区模型配置，查不到再用 .env | DatabaseModelResolver（数据库 + .env） | — |
-| SessionStore | 按实际操作设计：加载本轮上下文、追加消息、写压缩快照；不做整存整取 | 数据库（包装 SessionService） | 测试用内存实现 |
+| SessionStore | 已落地（阶段 6c），在 `app/session_port.py`（单独成模块）。按职责拆窄端口：`TurnContextStore`（add_message、save_compact_snapshot、load_context_for_turn，前两个另单列为 MessageWriter、CompactSnapshotWriter）、`TurnStateStore`（会话与轮次的读写、加锁、准入，以及在运行时事务里执行的认领与隔离）、`TurnLeaseStore`（独立短会话里的续约、offset、收尾、取消、回收）；`SessionStore` = TurnContextStore + TurnStateStore。ORM 类型以只读视图 StoredSession / StoredTurn / StoredMessage 表达；TurnExecutionState、TurnTermination、MessageDraft、PartialLoader 也在这里。方法签名与 SessionService 一致，SessionService 结构化地满足端口，数据库实现就是它本身，不写转发器 | SessionService | tests/fixtures/in_memory_session_store.py（测试用内存实现） |
 | ToolProvider | `list_tools() -> list[Tool]`，代表一个工具来源；目前同步、不带 scope，接入 MCP 时扩展为 `async list_tools(scope)` | BuiltinToolProvider | MCP |
 | MemoryProvider | 在 `app/memory_port.py`（与模型端口无关，单独成模块）。`recall(turn)`、`inherited(turn)`、`on_turn_completed(turn) -> MemoryWriteTicket | None`、`after_commit(ticket)`；调用方持有会话并负责提交，recall 和 on_turn_completed 在调用方事务里执行、从不提交，after_commit 在提交后自管事务 | BuiltinMemoryProvider | 外部记忆框架 |
 | ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
@@ -81,7 +81,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | 目录 | 内容 |
 |---|---|
 | models/ | AnthropicClient、OpenAIClient：构造参数只放端点配置（地址、密钥、重试、超时、思考协议、档位映射表），effort 按调用翻译成各家参数；factory 解析 .env；builder 按工作区模型配置建客户端；resolver 实现 ModelResolver |
-| stores/ | DatabaseSessionStore |
+| stores/ | 不需要：SessionService 本身就是 SessionStore 的数据库实现 |
 | tools/ | builtin/（全部内置工具，Bash 的 shell 校验也在这里）、builtin_provider.py |
 | memory/ | 已落地（阶段 4）。BuiltinMemoryProvider 包装 memory 域的召回和提取，提取开关、SAVEPOINT、就地执行开关和日志保留在这里；AgentRuntime 与 SubAgentRunner 的构造参数 `memory` 未注入时回落到它，后台重建 runtime 时沿用注入值 |
 | reviewers/ | 已落地（阶段 3b）。`PolicyReviewer(rules)` 按序执行一组规则（每条规则本身也是 ToolCallReviewer），拒绝或挂起即终局，放行可改写入参交给下一条。`for_main_agent(permission_service)`：BudgetRule → PlanModeToolsRule → ArgumentsRule → CapabilityRule → PlanModeAgentRule → InteractionToolRule → PermissionRule。`for_subagent(permission_service)`：BudgetRule → NoApprovalChannelRule(CapabilityRule, PermissionRule)，后者把挂起合并为拒绝并换成子代理文案。AgentRuntime、SubAgentRunner 构造参数 `reviewer` 未注入时用对应组装入口 |
@@ -151,6 +151,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 各角色产出的系统指令与消息（主 Agent 组合矩阵、极速、Plan、收尾不带工具、子代理与队友、压缩）、子代理规格的全部字段与派生结果、输出协议解析与路由目录，由 tests/test_role_context_golden.py 固化（80 种情况，字面量取自阶段 5 之前的代码），后续阶段不得改动 tests/fixtures/role_context_golden.py。harness/domain 不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由 tests/test_import_isolation.py 静态检查。
 - 主循环、子代理和队友循环发出的 SSE 事件序列、落库与状态变化序列、commit / flush 顺序、模型请求、日志和返回值，由 tests/test_react_loop_golden.py 固化（27 种情况，字面量取自阶段 6a 之前的代码），后续阶段不得改动 tests/fixtures/react_loop_golden.py。runtime/ 和 harness/app/ 不得导入任何 `*.repository` 模块（函数体和 TYPE_CHECKING 里的导入也算），由 tests/test_import_isolation.py 静态检查。
 - HTTP 入口（发消息的 Agent / Workflow 分发、409、前置校验、model_options 透传、交互恢复与取消、轮次取消、鉴权失败与 422）到运行时边界的行为由 tests/test_agent_service_golden.py 固化（49 种情况，字面量取自阶段 6b 之前的代码），后续阶段不得改动 tests/fixtures/agent_service_golden.py。AgentService 只能导入 harness.app、harness.domain 与 core；session/api.py、interaction/api.py 不得导入 runtime.agent / workflow / orchestrator，均由 tests/test_import_isolation.py 静态检查。
+- 运行时对会话的读写只经 SessionStore 端口：AgentRuntime、WorkflowRuntime 可注入 `sessions`（默认 SessionService），SubAgentRunner 可注入 `sessions: SessionOptionsReader`；execution、recovery、turn_follow 经唯一构造点 `lease_store(db)` 拿到 TurnLeaseStore，短会话与提交时点不变。tests/test_session_store_in_memory.py 用内存实现驱动真实的 AgentRuntime._produce 跑通「工具调用 → 回答 → 压缩」，证明换存储不用改运行时、也不需要数据库。runtime/ 下 `SessionService(` 只允许出现在白名单位置（agent、workflow、subagent、execution 各一处），session_port 只能导入 harness.app、harness.domain 与 core，均由 tests/test_import_isolation.py 静态检查。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
 - 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
 
@@ -165,6 +166,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 阶段 4 起，就地执行记忆提取的 claim_scope 取回合自身的租户，而不是运行时实例上的 workspace_id / user_id；两者在所有路径上相等，黄金测试已固化。入队与就地执行的日志 logger 名从 runtime.agent 变为 harness.adapters.memory.builtin_provider，正文与 extra 不变。
 - 阶段 5 起，L1 微压缩返回新列表而不是原地改写入参（主循环入参本就是副本，观测结果一致）；压缩日志的 logger 名从 runtime.compact 变为 harness.app.compaction，正文与 extra 不变。队友的系统提示不追加子代理规格的 critical_reminder，这是现状，已在黄金测试中固化。
 - 阶段 6b 起这些日志的 logger 名改变，正文与 extra 不变：「LLM调用开始/完成」「回合结束」→ runtime.lead_loop；工具权限策略相关 → runtime.tool_execution；人工交互挂起/取消 → runtime.interaction_flow。同时带 agent_id 和 workflow_id、会话不存在两种请求返回 500（AgentException 默认状态码），是现状，已在 HTTP 黄金测试中固化。
+- 静态类型缺口：pyright 不把 SQLAlchemy 的 `Mapped[T]` 视为只读属性，SessionService 无法被静态证明满足 StoredSession 等视图（原 SessionModelOptions 同样如此），由运行期签名比对测试兜底。SessionService 有一个名为 `list` 的方法，Python 3.14 惰性注解求值时会遮蔽类体里的 `list[...]`，对其部分方法调用 inspect.signature / get_type_hints 会抛 TypeError。
 
 ## 8. 阶段
 
@@ -180,6 +182,6 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 | 5 | 已完成：角色与 Context 组装：Assistant、SubAgent、Teammate、Compactor，prompt/、tools/subagents/、runtime/compact.py 并入 harness |
 | 6a | 已完成：主 Agent、子代理、队友共用 app/loop.py；runtime 不再直接使用别域 Repository，改走新增的 Service 公开方法：SessionService.get / get_turn / set_status，ToolService.get_call / complete_call / mark_call_awaiting / reject_awaiting_call，TeamService.create_subagent_run / succeed_subagent_run / fail_subagent_run |
 | 6b | 已完成：AgentRuntime 拆出 TurnConfiguration、LeadToolExecutor、InteractionFlow、LeadLoopPolicy；新增应用层 AgentService（chat / resume / cancel_interaction / cancel_turn），吸收 TopLevelOrchestrator；HTTP 路由经 get_agent_service 调用 |
-| 6c | SessionStore 端口：把运行时用到的会话操作（加载本轮上下文、追加消息、写快照、状态与租约）收成端口，SessionService 作为数据库实现，再补一个测试用内存实现 |
+| 6c | 已完成：SessionStore 端口（app/session_port.py），SessionService 结构化满足；运行时只经端口读写会话；新增测试用内存实现与不连库的端到端测试 |
 | 7 | 组装根：bootstrap 装配，API 层通过依赖注入拿 AgentService，清理跨域直连 Repository |
 | 8 | 更新 CLAUDE.md、AGENTS.md、README |

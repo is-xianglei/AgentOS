@@ -1,31 +1,20 @@
-"""上下文压缩编排：L1 微压缩 → 判断阈值 → 用 Compactor 的 Context 调模型 → 经会话域写快照。
+"""上下文压缩编排：L1 微压缩 → 判断阈值 → 用 Compactor 的 Context 调模型 → 经会话存储写快照。
 
-压缩只要一段摘要文本，不往事件总线发事件，直接消费模型的中立流。快照由会话域 Service 的
-公开方法写入（只 flush 不提交），随调用方的事务生效。
+压缩只要一段摘要文本，不往事件总线发事件，直接消费模型的中立流。快照经会话存储端口的
+CompactSnapshotWriter 写入（只写不提交），随调用方的事务生效。
 """
 
 import logging
 import time
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any
 
 from core.errors import AgentException
 from harness.app.ports import ModelClient, ModelEventKind, ModelTurnResult, ResolvedModel
+from harness.app.session_port import CompactSnapshotWriter
 from harness.domain.roles.compactor import Compactor
 
 logger = logging.getLogger(__name__)
-
-
-class CompactSnapshotWriter(Protocol):
-    """写压缩快照的会话能力；session 域的 SessionService 天然满足。"""
-
-    async def save_compact_snapshot(
-        self,
-        session_id: int,
-        messages: list[dict[str, Any]],
-        summary: str,
-        through_message_id: int,
-    ) -> Any: ...
 
 
 class ContextCompaction:

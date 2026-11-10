@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 async def reap_orphan_turns(*, include_unleased_running: bool = False) -> int:
     """回收全部孤儿轮次,返回回收数;每个轮次独立事务,单个失败不影响其余。"""
     turn_ids = await run_in_session(
-        lambda service: service.list_reapable_turn_ids(
+        lambda store: store.list_reapable_turn_ids(
             include_unleased_running=include_unleased_running,
         )
     )
@@ -24,7 +24,7 @@ async def reap_orphan_turns(*, include_unleased_running: bool = False) -> int:
     for turn_id in turn_ids:
         try:
             termination = await run_in_session(
-                lambda service, turn_id=turn_id: service.reap_turn(
+                lambda store, turn_id=turn_id: store.reap_turn(
                     turn_id,
                     include_unleased_running=include_unleased_running,
                 ),

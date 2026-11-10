@@ -197,6 +197,7 @@ async def test_subagent_rejects_turbo_before_resolving_client(monkeypatch):
     runner = SubAgentRunner.__new__(SubAgentRunner)
     runner._llm_injected = False
     runner.db = object()
+    runner.sessions = SessionService(runner.db)
     with pytest.raises(AgentException, match="极速模式"):
         await runner._configure_model(1, SimpleNamespace(), 2, 3)
 
@@ -330,7 +331,7 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
         database_model=True,
     )
     runtime.bus = SimpleNamespace(emit=AsyncMock())
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         load_context_for_turn=AsyncMock(return_value=([], [], 1)),
         add_message=AsyncMock(return_value=SimpleNamespace(id=99)),
     )
@@ -363,7 +364,7 @@ async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
     runtime._fence_lease = AsyncMock()
     runtime.db = SimpleNamespace(commit=AsyncMock(), begin_nested=AsyncMock())
     runtime.memory = BuiltinMemoryProvider(runtime.db)
-    runtime.session_service = SimpleNamespace(
+    runtime.sessions = SimpleNamespace(
         mark_turn_status=AsyncMock(), set_status=AsyncMock(),
     )
     assert await runtime._complete_turn(SimpleNamespace(id=1), SimpleNamespace(id=uuid4()), 99) is None

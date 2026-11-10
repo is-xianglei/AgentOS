@@ -45,6 +45,7 @@ from harness.app.ports import (
     ResolvedModel,
     ToolCallReviewer,
 )
+from harness.app.session_port import SessionOptionsReader
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.context import messages_from_rows
@@ -57,6 +58,7 @@ from harness.domain.tool import ToolProfile
 from permission.service import PermissionService
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
+from session.service import SessionService
 from team.isolation import (
     new_team_task_instance_id,
     reset_team_task_instance_id,
@@ -310,10 +312,12 @@ class SubAgentRunner:
         llm: ModelClient | None = None,
         reviewer: ToolCallReviewer | None = None,
         memory: MemoryProvider | None = None,
+        sessions: SessionOptionsReader | None = None,
     ):
         """初始化子代理运行器依赖。
 
-        reviewer 未注入时使用子代理的规则链审核员；memory 未注入时使用绑定本会话的内置记忆。
+        reviewer 未注入时使用子代理的规则链审核员；memory 未注入时使用绑定本会话的内置记忆；
+        sessions 只用来读取所属会话冻结的模型选项，未注入时使用绑定本会话的数据库实现。
         """
         self.db = db
         self.bus = bus
@@ -331,6 +335,7 @@ class SubAgentRunner:
         if memory is None:
             memory = BuiltinMemoryProvider(db)
         self.memory = memory
+        self.sessions: SessionOptionsReader = SessionService(db) if sessions is None else sessions
 
     @staticmethod
     def _resolve_tools(
@@ -362,12 +367,11 @@ class SubAgentRunner:
             return self._override_model(ResolvedModel.from_client(self.llm).settings, spec)
         # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
         from harness.adapters.models.resolver import DatabaseModelResolver
-        from session.service import SessionService
 
         provider_id = None
         effort = None
         if workspace_id is not None:
-            session = await SessionService(self.db).runtime_model_options(session_id)
+            session = await self.sessions.runtime_model_options(session_id)
             if session.workspace_id != workspace_id or session.user_id != user_id:
                 raise AgentException.message("子智能体会话归属无效")
             if getattr(session, "mode_slug", "standard") == "turbo":

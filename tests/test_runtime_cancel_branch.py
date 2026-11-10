@@ -56,7 +56,7 @@ async def test_agent_cancel_defers_terminal_state_when_bound(
 ) -> None:
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = _Db()
-    runtime.session_service = _Service()
+    runtime.sessions = _Service()
     runtime.bus = NullStreamBus()
     runtime.lease_owner = owner
     runtime.configuration = TurnConfiguration.for_lead(runtime.db)
@@ -84,7 +84,7 @@ async def test_workflow_cancel_defers_terminal_state_when_bound(
     monkeypatch: pytest.MonkeyPatch, owner, expected
 ) -> None:
     runtime = WorkflowRuntime(_Db(), user_id=1, workspace_id=1)
-    runtime.session_service = _Service()
+    runtime.sessions = _Service()
     runtime.lease_owner = owner
     marked: list[str] = []
 

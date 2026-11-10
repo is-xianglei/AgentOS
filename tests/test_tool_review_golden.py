@@ -639,7 +639,7 @@ def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     session_service = _FakeSessionService(recorder)
     # 会话状态改经 SessionService.set_status 写入，替身的记录方法挂在 repo 上，这里转接过去。
     session_service.set_status = session_service.repo.update_status  # type: ignore[attr-defined]
-    runtime.session_service = session_service
+    runtime.sessions = session_service
     runtime.interaction_service = _FakeInteractionService(recorder)
     runtime.bus = _FakeBus(recorder)
 

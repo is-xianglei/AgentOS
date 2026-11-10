@@ -55,7 +55,7 @@ def _runtime(log: _Log, service: _SessionService) -> AgentRuntime:
     runtime.user_id = 1
     runtime.workspace_id = 1
     runtime.llm = object()
-    runtime.session_service = service
+    runtime.sessions = service
     return runtime
 
 

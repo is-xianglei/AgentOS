@@ -1282,7 +1282,7 @@ def _make_runtime(
     db = _FakeDb()
     runtime = WorkflowRuntime(db, user_id=_USER_ID, workspace_id=_WORKSPACE_ID)
     session_service = _FakeRuntimeSessionService()
-    runtime.session_service = session_service
+    runtime.sessions = session_service
     runtime.bus = _RecordingBus()
     monkeypatch.setattr(
         "harness.adapters.models.resolver.DatabaseModelResolver.for_session",

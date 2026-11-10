@@ -18,10 +18,11 @@ from core.events import ORCHESTRATOR_ACTOR, BlockType, RuntimeEvent, StreamEvent
 from core.run_events import LocalRunEventStore
 from core.run_state import TurnState, fold_all
 from core.sse import HEARTBEAT_FRAME, with_heartbeat
+from harness.app.session_port import TurnExecutionState, TurnTermination
 from runtime import execution, turn_follow
 from session import api as session_api
 from session.schemas import SessionSendMessageRequest
-from session.service import SessionService, TurnExecutionState, TurnTermination
+from session.service import SessionService
 
 pytestmark = pytest.mark.anyio
 

@@ -38,7 +38,7 @@ class CancelledSuspension(Protocol):
 
 
 class CancelledTurn(Protocol):
-    """被取消轮次的终态；session 域的 TurnTermination 天然满足。"""
+    """被取消轮次的终态；会话存储端口的 TurnTermination 天然满足。"""
 
     @property
     def turn_id(self) -> UUID: ...

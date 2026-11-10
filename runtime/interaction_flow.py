@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor, InteractionInfo, StreamEvent
+from harness.app.session_port import StoredSession, StoredTurn, TurnStateStore
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall
 from harness.domain.prompts.plan_mode import ENTER_PLAN_MODE_RESULT
@@ -25,8 +26,6 @@ from plan.service import PlanService
 from runtime.execution import write_detached_run_end
 from runtime.tool_execution import LeadToolExecutor, default_tool_budget
 from runtime.turn_config import TurnConfiguration
-from session.models import SessionRecord, SessionTurnRecord
-from session.service import SessionService
 from tools.models import ToolCallRecord
 from tools.service import ToolService
 
@@ -61,7 +60,7 @@ class InteractionFlow:
         db: AsyncSession,
         configuration: TurnConfiguration,
         executor: LeadToolExecutor,
-        session_service: SessionService,
+        sessions: TurnStateStore,
         interaction_service: InteractionService,
         plan_service: PlanService,
         permission_service: PermissionService,
@@ -73,7 +72,7 @@ class InteractionFlow:
         self._db = db
         self._configuration = configuration
         self._executor = executor
-        self._session_service = session_service
+        self._sessions = sessions
         self._interaction_service = interaction_service
         self._plan_service = plan_service
         self._permission_service = permission_service
@@ -85,8 +84,8 @@ class InteractionFlow:
     async def run_tool_calls(
         self,
         session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         actor: Actor,
         assistant_message_id: int,
         tool_calls: list[ToolCall],
@@ -128,8 +127,8 @@ class InteractionFlow:
     async def _suspend(
         self,
         session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         assistant_message_id: int,
         remaining: list[ToolCall],
         done_ids: list[str],
@@ -187,8 +186,8 @@ class InteractionFlow:
                     request_create,
                 )
             )
-        await self._session_service.set_status(session, "awaiting_interaction")
-        await self._session_service.mark_turn_status(turn, "awaiting_interaction")
+        await self._sessions.set_status(session, "awaiting_interaction")
+        await self._sessions.mark_turn_status(turn, "awaiting_interaction")
         logger.info(
             "人工交互挂起，等待用户响应",
             extra={
@@ -252,7 +251,7 @@ class InteractionFlow:
     async def save_response(
         self,
         session_id: int,
-        session: SessionRecord,
+        session: StoredSession,
         request_id: UUID,
         kind: str,
         response_payload: dict[str, Any],
@@ -282,7 +281,7 @@ class InteractionFlow:
             session_id=session_id,
             expected_kind=kind,
         )
-        turn = await self._session_service.get_turn_required(suspension.turn_id)
+        turn = await self._sessions.get_turn_required(suspension.turn_id)
         if turn.session_id != session_id:
             raise AgentException.message("人工交互对应的轮次不属于指定会话")
         if turn.user_id != self._user_id or turn.workspace_id != self._workspace_id:
@@ -327,12 +326,12 @@ class InteractionFlow:
         补写的 run_end(interrupted, cancelled=true)让快照离开 awaiting_interaction、
         不再显示待处理交互;取消之后才订阅的客户端同样拿到该终态。
         """
-        session = await self._session_service.ensure_interaction_resumable(session_id)
+        session = await self._sessions.ensure_interaction_resumable(session_id)
         suspension = await self._interaction_service.get_suspension_required(
             suspension_id,
             session_id=session_id,
         )
-        turn = await self._session_service.get_turn_required(suspension.turn_id)
+        turn = await self._sessions.get_turn_required(suspension.turn_id)
         if turn.session_id != session_id:
             raise AgentException.message("运行暂停点与交互轮次不匹配")
         if turn.user_id != self._user_id or turn.workspace_id != self._workspace_id:
@@ -344,7 +343,7 @@ class InteractionFlow:
             session_id=session_id,
         )
         await self._finish_cancelled(session, turn, requests, "用户取消了运行暂停点。")
-        termination = await self._session_service.release_turn_for_detached_end(session, turn)
+        termination = await self._sessions.release_turn_for_detached_end(session, turn)
         # 显式提交:数据库是事实来源,补写 run_end 必须在终态提交之后;
         # 与轮次取消接口一致,写事件流失败只记日志,不影响已提交的取消。
         await self._db.commit()
@@ -374,10 +373,10 @@ class InteractionFlow:
             request.suspension_id,
             session_id=session_id,
         )
-        turn = await self._session_service.get_turn_required(suspension.turn_id)
+        turn = await self._sessions.get_turn_required(suspension.turn_id)
         return ResumePoint(request=request, suspension=suspension, turn=turn)
 
-    def resume_step(self, session_id: int, session: SessionRecord, point: ResumePoint) -> str:
+    def resume_step(self, session_id: int, session: StoredSession, point: ResumePoint) -> str:
         """校验恢复现场并决定下一步，返回 RESUME_* 之一；现场不一致时抛中文异常。"""
         request, suspension, turn = point.request, point.suspension, point.turn
         if request.suspension_id != suspension.id or turn.session_id != session_id:
@@ -411,7 +410,7 @@ class InteractionFlow:
     async def cancel_question(
         self,
         session_id: int,
-        session: SessionRecord,
+        session: StoredSession,
         point: ResumePoint,
     ) -> None:
         """用户取消提问：取消暂停点并把本轮中断，不再续跑。"""
@@ -432,14 +431,14 @@ class InteractionFlow:
 
     async def mark_resumed(
         self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         suspension: RuntimeSuspensionRecord,
     ) -> None:
         """同一批工具全部处理完：暂停点完结，会话与轮次回到 running，接着续跑主循环。"""
         await self._interaction_service.mark_suspension_resolved(suspension.id)
-        await self._session_service.set_status(session, "running")
-        await self._session_service.mark_turn_status(turn, "running")
+        await self._sessions.set_status(session, "running")
+        await self._sessions.mark_turn_status(turn, "running")
 
     async def pending_interaction(self, session_id: int) -> SuspendedInteraction:
         """读取已提交的唯一待处理请求，用于幂等重放 SSE 通知。"""
@@ -481,8 +480,8 @@ class InteractionFlow:
     async def apply_and_continue(
         self,
         session_id: int,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         request: InteractionRequestRecord,
         suspension: RuntimeSuspensionRecord,
         *,
@@ -556,7 +555,7 @@ class InteractionFlow:
     async def _apply_tool_approval(
         self,
         session_id: int,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
         actor: Actor,
         assistant_message_id: int,
         target: ToolCall,
@@ -605,7 +604,7 @@ class InteractionFlow:
 
     async def _apply_user_question(
         self,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
         actor: Actor,
         target: ToolCall,
         record: ToolCallRecord,
@@ -653,7 +652,7 @@ class InteractionFlow:
 
     async def _apply_enter_plan_mode(
         self,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
         actor: Actor,
         target: ToolCall,
         record: ToolCallRecord,
@@ -681,7 +680,7 @@ class InteractionFlow:
 
     async def _apply_exit_plan_mode(
         self,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
         actor: Actor,
         target: ToolCall,
         record: ToolCallRecord,
@@ -734,8 +733,8 @@ class InteractionFlow:
 
     async def _finish_cancelled(
         self,
-        session: SessionRecord,
-        turn: SessionTurnRecord,
+        session: StoredSession,
+        turn: StoredTurn,
         requests: list[InteractionRequestRecord],
         message: str,
     ) -> None:
@@ -767,8 +766,8 @@ class InteractionFlow:
                         "人工交互关联的工具调用状态无效",
                         {"tool_call_id": record.id, "status": record.status},
                     )
-        await self._session_service.mark_turn_status(turn, "interrupted")
-        await self._session_service.set_status(session, "idle")
+        await self._sessions.mark_turn_status(turn, "interrupted")
+        await self._sessions.set_status(session, "idle")
 
 
 # 恢复执行的下一步：重放仍待处理的请求、重放已终结的暂停点、取消提问、应用响应后续跑。
@@ -785,7 +784,7 @@ class ResumePoint:
 
     request: InteractionRequestRecord
     suspension: RuntimeSuspensionRecord
-    turn: SessionTurnRecord
+    turn: StoredTurn
 
 
 def _format_question_answers(

@@ -1,6 +1,4 @@
-from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -9,43 +7,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException, LeaseLostError
 from department.service import DepartmentService
 from group.service import GroupService
+from harness.app.session_port import (
+    MessageDraft,
+    PartialLoader,
+    TurnExecutionState,
+    TurnTermination,
+)
 from session.models import SessionMessage, SessionRecord, SessionSnapshot, SessionTurnRecord
 from session.repository import SessionRepository
 from workspace.service import WorkspaceService
-
-
-@dataclass(frozen=True)
-class TurnExecutionState:
-    """轮次的业务状态与执行状态;executing 表示租约有效、有执行中的任务。"""
-
-    turn_id: UUID
-    session_id: int
-    status: str
-    executing: bool
-    last_event_offset: int
-
-
-@dataclass(frozen=True)
-class TurnTermination:
-    """清除租约后的收尾结果;offset 是为 run_end 分配的 offset。"""
-
-    turn_id: UUID
-    session_id: int
-    status: str
-    session_status: str
-    offset: int
-
-
-@dataclass(frozen=True)
-class MessageDraft:
-    """取消收尾时补写的一条中立形状消息(assistant 中立块数组或 tool 结果 dict)。"""
-
-    role: str
-    content: Any
-
-
-# 取消方在锁内按需读取未落库内容:只有轮次仍是 running 时才调用。
-type PartialLoader = Callable[[], Awaitable[list[MessageDraft]]]
 
 
 class SessionService:

@@ -11,10 +11,10 @@ from core.config import settings
 from core.errors import AgentException
 from database.engine import get_db
 from harness.app.agent_service import AgentService
+from harness.app.session_port import TurnTermination
 from runtime.agent import AgentRuntime
 from runtime.execution import cancel_turn
 from runtime.workflow import WorkflowRuntime
-from session.service import TurnTermination
 from user.models import UserRecord
 from workspace.service import WorkspaceService
 

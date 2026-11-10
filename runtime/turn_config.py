@@ -13,11 +13,11 @@ from agent.service import AgentDefinitionService, AgentRuntimeConfig
 from core.errors import AgentException
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.app.session_port import StoredSession
 from harness.app.tool_set import ToolSet
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.tool import ToolProfile
 from model_service.policy import TURBO_ALLOWED_TOOLS
-from session.models import SessionRecord
 from tools.gateway import ToolGateway
 
 
@@ -192,7 +192,7 @@ class TurnConfiguration:
             return self.tools.only(*PLAN_MODE_ALLOWED_TOOLS)
         return self.tools.without("ExitPlanMode", "WritePlan")
 
-    def model_override(self, session: SessionRecord) -> str | None:
+    def model_override(self, session: StoredSession) -> str | None:
         """本次 LLM 调用要覆盖的模型名；None 表示使用解析器给出的场景模型。
 
         数据库模型服务端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
@@ -203,7 +203,7 @@ class TurnConfiguration:
             return self.agent_model_name
         return session.model_name
 
-    def round_settings(self, session: SessionRecord) -> ModelSettings:
+    def round_settings(self, session: StoredSession) -> ModelSettings:
         """本轮调用参数：场景默认参数，叠加 Agent 或会话指定的模型名。"""
         base = self.require_model().settings
         override = self.model_override(session)
@@ -223,7 +223,7 @@ class TurnConfiguration:
 
 async def configure_turn(
     db: AsyncSession,
-    session: SessionRecord,
+    session: StoredSession,
     *,
     user_id: int | None,
     workspace_id: int | None,

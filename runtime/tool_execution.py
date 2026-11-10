@@ -12,13 +12,12 @@ from core.config import settings
 from core.event_bus import StreamBus
 from core.events import Actor, StreamEvent, ToolInfo
 from harness.app.ports import ToolCallReviewer
+from harness.app.session_port import MessageWriter, StoredTurn
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall, ToolResult
 from harness.domain.review import SOURCE_PERMISSION, ReviewRequest
 from plan.service import PlanService
 from runtime.turn_config import TurnConfiguration
-from session.models import SessionTurnRecord
-from session.service import SessionService
 from tools.models import ToolCallRecord
 from tools.service import ToolService
 
@@ -50,7 +49,7 @@ class LeadToolExecutor:
         configuration: TurnConfiguration,
         reviewer: ToolCallReviewer,
         plan_service: PlanService,
-        session_service: SessionService,
+        messages: MessageWriter,
         tool_service: ToolService,
         bus: StreamBus,
         user_id: int | None,
@@ -59,7 +58,7 @@ class LeadToolExecutor:
         self._configuration = configuration
         self._reviewer = reviewer
         self._plan_service = plan_service
-        self._session_service = session_service
+        self._messages = messages
         self._tool_service = tool_service
         self._bus = bus
         self._user_id = user_id
@@ -68,7 +67,7 @@ class LeadToolExecutor:
     async def execute(
         self,
         session_id: int,
-        turn: SessionTurnRecord,
+        turn: StoredTurn,
         actor: Actor,
         assistant_message_id: int,
         tool_calls: list[ToolCall],
@@ -209,7 +208,7 @@ class LeadToolExecutor:
                 ),
             )
         )
-        await self._session_service.add_message(
+        await self._messages.add_message(
             session_id,
             "tool",
             ToolResult(
@@ -252,7 +251,7 @@ class LeadToolExecutor:
                 ),
             )
         )
-        await self._session_service.add_message(
+        await self._messages.add_message(
             session_id,
             "tool",
             ToolResult(
