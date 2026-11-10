@@ -56,6 +56,9 @@ def _runtime(log: _Log, service: _SessionService) -> AgentRuntime:
     runtime.workspace_id = 1
     runtime.llm = object()
     runtime.sessions = service
+    # _launch 只读这两个属性搭后台闭包；fake launch 不执行 body，不会真打开会话或重建运行时。
+    runtime._session_factory = object()
+    runtime._rebuild = object()
     return runtime
 
 

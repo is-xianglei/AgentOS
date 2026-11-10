@@ -48,15 +48,14 @@ from memory.recall.repository import MemoryRecallRepository
 from memory.repository import MemoryCatalogEntry, MemoryCatalogSnapshot, MemoryRepository
 from model_service.service import ModelService
 from plan.service import PlanService
-from runtime.agent import AgentRuntime
 from runtime.interaction_flow import InteractionFlow
-from runtime.subagent import SubAgentRunner
 from session.repository import SessionRepository
 from session.service import SessionService
 from skill.service import SkillService
 from task.service import TaskService
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 from tests.fixtures.memory_port_golden import EXPECTED, EXPECTED_SHA256
 
 pytestmark = pytest.mark.anyio
@@ -1003,11 +1002,11 @@ def _install(
 async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     world = _main_world(case)
     _install(monkeypatch, _Fakes(world, _main_script(case)), _main_settings(case))
-    runtime = AgentRuntime(
-        _FakeDb(world),  # type: ignore[arg-type]
+    runtime = make_agent_runtime(
+        _FakeDb(world),
         user_id=_USER_ID,
         workspace_id=_WORKSPACE_ID,
-        llm=_FakeLLM(world, "本周周报如下。"),  # type: ignore[arg-type]
+        llm=_FakeLLM(world, "本周周报如下。"),
     )
     runtime.bind_execution(_FakeBus(world), _OWNER)  # type: ignore[arg-type]
     with _capture_logs() as logs:
@@ -1021,10 +1020,10 @@ async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[s
 async def _drive_sub(case: SubCase, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     world = _sub_world(case)
     _install(monkeypatch, _Fakes(world, _MemoryScript()), {})
-    runner = SubAgentRunner(
-        _FakeDb(world),  # type: ignore[arg-type]
-        bus=_FakeBus(world),  # type: ignore[arg-type]
-        llm=_FakeLLM(world, "子代理报告。"),  # type: ignore[arg-type]
+    runner = make_subagent_runner(
+        _FakeDb(world),
+        bus=_FakeBus(world),
+        llm=_FakeLLM(world, "子代理报告。"),
     )
     spec = get_subagent_spec(case.agent_type)
     scope: dict[str, Any] = {

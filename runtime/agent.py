@@ -24,23 +24,21 @@ from core.events import (
     StreamEvent,
     teammate_actor,
 )
-from database.engine import AsyncSessionLocal
-from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
-from harness.adapters.models.factory import create_model_client
-from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
-from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.agent_service import ExecutionHandle
 from harness.app.compaction import ContextCompaction
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
     ModelConnectionError,
+    ModelResolver,
     ModelStatusError,
     ResolvedModel,
+    SubAgentLauncher,
     ToolCallReviewer,
 )
 from harness.app.session_port import SessionStore, StoredSession, StoredTurn
 from harness.app.subagent_catalog import get_subagent_spec
+from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.memory import MemoryWriteTicket, TurnRef
 from harness.domain.roles.subagent import AgentType
@@ -58,10 +56,9 @@ from runtime.interaction_flow import (
     SuspendedInteraction,
 )
 from runtime.lead_loop import LeadLoopDeps, TurnLoopResult, run_lead_turn
-from runtime.subagent import SubAgentRunner
+from runtime.subagent import SessionFactory, SubAgentRunnerFactory
 from runtime.tool_execution import LeadToolExecutor
 from runtime.turn_config import TurnConfiguration, configure_turn
-from session.service import SessionService
 from task.service import TaskService
 from team.service import TeamService
 from tools.service import ToolService
@@ -99,48 +96,55 @@ class AgentRuntime:
         user_id: int | None = None,
         workspace_id: int | None = None,
         llm: ModelClient | None = None,
-        reviewer: ToolCallReviewer | None = None,
-        memory: MemoryProvider | None = None,
-        sessions: SessionStore | None = None,
+        *,
+        reviewer: ToolCallReviewer,
+        memory: MemoryProvider,
+        sessions: SessionStore,
+        permission_service: PermissionService,
+        models: ModelResolver,
+        tools: ToolSet,
+        compact_model: Callable[[], ResolvedModel],
+        subagents: SubAgentLauncher,
+        teammates: SubAgentRunnerFactory,
+        session_factory: SessionFactory,
+        rebuild: Callable[[AsyncSession], AgentRuntime],
     ):
-        """初始化 Agent 主运行时依赖。
+        """初始化 Agent 主运行时依赖，具体实现全部由组装根（harness/bootstrap.py）注入。
 
         llm 是注入的模型客户端，注入后不再按会话解析模型，后台重建运行时时随之传递；
-        reviewer 未注入时使用主 Agent 的规则链审核员；memory 未注入时使用绑定本会话的内置记忆；
-        sessions 未注入时使用绑定本会话的数据库实现（SessionService），注入的存储随后台执行传递。
+        reviewer 与 permission_service 共用同一份权限服务；models 按会话解析主模型与压缩模型；
+        tools 是完整工具集；compact_model 在未解析出压缩模型时现建 .env 的 compact 场景模型；
+        subagents 是 Agent 工具用的子代理启动器，teammates 为唤醒队友构造子代理运行器，
+        session_factory 为后台执行和队友打开独立数据库会话。rebuild 在独立会话里重建运行时：
+        组装根只把构造时显式注入的客户端、记忆与会话存储带进去，默认实现绑定新会话重建。
         """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.llm = llm
-        # 组装根（阶段 7）之前在这里回落数据库实现，与 memory 的处理一致。
-        self._sessions_injected = sessions is not None
-        self.sessions: SessionStore = SessionService(db) if sessions is None else sessions
-        # 压缩快照经会话存储写入；未解析出压缩模型时按 .env 的 compact 场景现建客户端。
-        self.compact_service = ContextCompaction(
-            self.sessions,
-            default_model=lambda: ResolvedModel.from_client(
-                create_model_client(scenario="compact")
-            ),
-        )
-        self.permission_service = PermissionService(db)
-        if reviewer is None:
-            reviewer = PolicyReviewer.for_main_agent(self.permission_service)
+        self.sessions = sessions
+        # 压缩快照经会话存储写入；未解析出压缩模型时调用组装根给的工厂现建。
+        self.compact_service = ContextCompaction(self.sessions, default_model=compact_model)
+        self.permission_service = permission_service
         self.reviewer = reviewer
         self.interaction_service = InteractionService(db)
         self.plan_service = PlanService(db)
+        self.models = models
+        self.tools = tools
+        self.subagents = subagents
+        self._teammates = teammates
+        self._session_factory = session_factory
+        self._rebuild = rebuild
         # 只做调用记录的状态流转，与工具边界无关；工具执行经回合配置里的网关。
-        self.tool_service = ToolService(db, builtin_tool_set())
-        # 组装根（阶段 7）之前在这里回落内置实现；注入的 Provider 随后台执行一并传递。
-        self._memory_injected = memory is not None
-        if memory is None:
-            memory = BuiltinMemoryProvider(db)
+        self.tool_service = ToolService(db, tools)
         self.memory = memory
         # 按会话配置之前的回合配置：默认 Agent、标准模式；注入客户端时模型取客户端自带的默认参数。
         model = None
         if llm is not None:
             model = ResolvedModel.from_client(llm)
-        self.configuration = TurnConfiguration.for_lead(db, model=model)
+        self.configuration = TurnConfiguration.for_lead(
+            db, tools=tools, subagents=subagents, model=model
+        )
         # 执行之外(准入、交互取消)没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
         # 当前执行的租约持有者;提交终态前据此隔离已被取消或回收的执行。
@@ -151,22 +155,6 @@ class AgentRuntime:
         self.bus = bus
         self.lease_owner = lease_owner
 
-    def _injected_memory(self) -> MemoryProvider | None:
-        """返回构造时注入的记忆 Provider，供后台执行重建运行时时沿用。
-
-        未注入时返回 None：内置实现绑定请求作用域的数据库会话，由后台运行时按自己的会话重建。
-        getattr 兜底：测试用 __new__ 构造的实例没有 _memory_injected 属性。
-        """
-        if getattr(self, "_memory_injected", False):
-            return self.memory
-        return None
-
-    def _injected_sessions(self) -> SessionStore | None:
-        """返回构造时注入的会话存储，供后台执行重建运行时时沿用；未注入时返回 None，原因同记忆。"""
-        if getattr(self, "_sessions_injected", False):
-            return self.sessions
-        return None
-
     async def _configure_agent(self, session: StoredSession) -> None:
         """按会话绑定刷新回合配置；解析出压缩模型与阈值时同步给上下文压缩。"""
         configuration = await configure_turn(
@@ -174,6 +162,9 @@ class AgentRuntime:
             session,
             user_id=self.user_id,
             workspace_id=self.workspace_id,
+            models=self.models,
+            tools=self.tools,
+            subagents=self.subagents,
             injected=self.llm,
         )
         if configuration.compact_model is not None:
@@ -264,23 +255,14 @@ class AgentRuntime:
         # 显式提交:请求作用域的 db 只用于准入;轮次与租约须在后台任务读取前可见,
         # 且 get_db 要等整个 SSE 发完才收尾,不能让连接在推流期间一直挂着事务。
         await self.db.commit()
-        # 只把构造时注入的客户端、记忆 Provider 与会话存储传给后台任务；
+        # 后台运行时由组装根给的 rebuild 重建：只沿用构造时注入的客户端、记忆 Provider 与会话存储，
         # 按会话解析的由后台运行时重新解析，默认实现由后台运行时绑定自己的数据库会话重建。
-        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
-        memory = self._injected_memory()
-        sessions = self._injected_sessions()
+        session_factory, rebuild = self._session_factory, self._rebuild
 
         async def body(bus: RunStreamBus) -> None:
-            # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
-            async with AsyncSessionLocal() as db:
-                runtime = AgentRuntime(
-                    db,
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    llm=llm,
-                    memory=memory,
-                    sessions=sessions,
-                )
+            # 后台任务用独立数据库会话,生命周期与任务一致。
+            async with session_factory() as db:
+                runtime = rebuild(db)
                 runtime.bind_execution(bus, owner)
                 await run(runtime)
 
@@ -761,7 +743,7 @@ class AgentRuntime:
 
         lead 主循环结束后,把本会话所有 status=='working' 的队友各唤醒一次,
         每人调一次 run_teammate 推进一步(单轮,不循环连锁唤醒;后台自动唤醒尚未实现)。
-        每个队友用独立 AsyncSessionLocal,共享 self.bus 让增量流式到前端 SSE。
+        每个队友用独立数据库会话,共享 self.bus 让增量流式到前端 SSE。
         任一队友异常用 try/except 包住,emit error 事件后继续,不中断主流程。
         """
         if self.configuration.turbo:
@@ -772,8 +754,8 @@ class AgentRuntime:
             try:
                 spec = get_subagent_spec(AgentType(member.agent_type or "general-purpose"))
                 # 独立 session 避免与主会话共用连接;共享 bus 让队友增量冒泡到 SSE。
-                async with AsyncSessionLocal() as sub_db:
-                    await SubAgentRunner(sub_db, bus=self.bus).run_teammate(
+                async with self._session_factory() as sub_db:
+                    await self._teammates(sub_db, bus=self.bus).run_teammate(
                         session_id,
                         member.name,
                         spec,

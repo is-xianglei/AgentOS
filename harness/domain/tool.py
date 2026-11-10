@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from core.event_bus import StreamBus
+    from harness.app.ports import SubAgentLauncher
 
 ToolProfile = Literal[
     "lead",
@@ -145,6 +146,8 @@ class ToolContext:
     # 主代理路径不设置,等价于 FULL。
     shell_access: ShellAccess = ShellAccess.FULL
     shell_tmp_root: Path | None = None
+    # 子代理启动器，由运行时经工具网关注入；只有 Agent 工具读取，缺失时 Agent 工具报错而不回落。
+    subagents: SubAgentLauncher | None = None
 
 
 class Tool(ABC):

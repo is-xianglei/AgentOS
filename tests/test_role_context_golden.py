@@ -43,6 +43,7 @@ from harness.app.ports import (
     ModelTurnResult,
     ResolvedModel,
 )
+from harness.app.subagent_catalog import build_agent_spec
 from harness.domain.memory import MemoryRecall
 from harness.domain.messages import ToolCall
 from harness.domain.roles import reports as subagent_reports
@@ -52,13 +53,12 @@ from harness.domain.roles.subagent import GLOBAL_SUBAGENT_DENIED_TOOLS, AgentTyp
 from harness.domain.tool import ShellAccess
 from hooks import HookEvent, HookOutcome, HookRegistry
 from plan.service import PlanService
-from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner, build_agent_spec
 from session.repository import SessionRepository
 from session.service import SessionService
 from skill.service import SkillService
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 from tests.fixtures.role_context_golden import EXPECTED, EXPECTED_SHA256
 
 pytestmark = pytest.mark.anyio
@@ -906,12 +906,12 @@ async def _drive_main(case: MainCase, monkeypatch: pytest.MonkeyPatch) -> dict[s
     fakes.plan = case.plan
     fakes.continuations = case.stop_continuations
     _install(monkeypatch, fakes, {"max_tool_iterations": case.max_tool_iterations})
-    runtime = AgentRuntime(
-        _FakeDb(world),  # type: ignore[arg-type]
+    runtime = make_agent_runtime(
+        _FakeDb(world),
         user_id=_USER_ID,
         workspace_id=_WORKSPACE_ID,
-        llm=_FakeLLM(world, "agent", "claude-golden", "本周周报如下。"),  # type: ignore[arg-type]
-        memory=_FakeMemory(world, case.memory),  # type: ignore[arg-type]
+        llm=_FakeLLM(world, "agent", "claude-golden", "本周周报如下。"),
+        memory=_FakeMemory(world, case.memory),
     )
     runtime.bus = _NullBus()  # type: ignore[assignment]
     overrides: dict[str, Any] = {
@@ -963,11 +963,11 @@ async def _drive_sub(case: SubCase, monkeypatch: pytest.MonkeyPatch) -> dict[str
     if case.memory is not None:
         # 父回合的目录不进子代理，这里故意带上，确认只继承正文。
         recall = MemoryRecall(instruction="- [tone](memory:13@1) - 父目录", message_prefix=case.memory)
-    runner = SubAgentRunner(
-        _FakeDb(world),  # type: ignore[arg-type]
-        bus=_NullBus(),  # type: ignore[arg-type]
-        llm=_FakeLLM(world, "subagent", "claude-sub", "子代理报告。"),  # type: ignore[arg-type]
-        memory=_FakeMemory(world, recall),  # type: ignore[arg-type]
+    runner = make_subagent_runner(
+        _FakeDb(world),
+        bus=_NullBus(),
+        llm=_FakeLLM(world, "subagent", "claude-sub", "子代理报告。"),
+        memory=_FakeMemory(world, recall),
     )
     spec = _sub_spec(case)
     scope: dict[str, Any] = {
@@ -1077,11 +1077,11 @@ async def _drive_enter_plan_mode(
     world = _World()
     fakes = _Fakes(world, [_row(1, "user", "占位")])
     _install(monkeypatch, fakes, {})
-    runtime = AgentRuntime(
-        _FakeDb(world),  # type: ignore[arg-type]
+    runtime = make_agent_runtime(
+        _FakeDb(world),
         user_id=_USER_ID,
         workspace_id=_WORKSPACE_ID,
-        llm=_FakeLLM(world, "agent", "claude-golden", "好的。"),  # type: ignore[arg-type]
+        llm=_FakeLLM(world, "agent", "claude-golden", "好的。"),
     )
     flow = runtime._interactions()
     flow._executor.record_response = fakes.record_tool_response  # type: ignore[method-assign]

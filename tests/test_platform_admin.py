@@ -14,7 +14,8 @@ from fastapi import Depends, FastAPI
 import database.registry  # noqa: F401  构造 ORM 实例前需全部映射在册
 from api import deps
 from auth.schemas import RegisterRequest
-from core.errors import AgentException, agent_error_handler
+from core.error_handlers import agent_error_handler
+from core.errors import AgentException
 from user.models import UserRecord
 from user.schemas import UserCreateRequest, UserUpdateRequest
 

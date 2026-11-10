@@ -26,14 +26,15 @@ from agent.service import AgentRuntimeConfig
 from core.config import settings as app_settings
 from core.events import ORCHESTRATOR_ACTOR, Actor, subagent_actor, teammate_actor
 from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.app.subagent_catalog import get_subagent_spec
+from harness.app.subagent_catalog import build_agent_spec, get_subagent_spec
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolProfile
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner, _render_denied_summary, build_agent_spec
+from runtime.subagent import _render_denied_summary
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 from tests.fixtures.tool_review_golden import EXPECTED, EXPECTED_SHA256
 
 pytestmark = pytest.mark.anyio
@@ -623,7 +624,9 @@ def _install_permissions(
 
 def _main_runtime(case: MainCase, recorder: _Recorder) -> AgentRuntime:
     """真实 __init__ 的主运行时；会话、交互、Plan、事件总线与工具网关换成记录替身。"""
-    runtime = AgentRuntime(object(), user_id=_USER_ID, workspace_id=_WORKSPACE_ID, llm=object())
+    runtime = make_agent_runtime(
+        object(), user_id=_USER_ID, workspace_id=_WORKSPACE_ID, llm=object()
+    )
     overrides: dict[str, Any] = {
         "profile": case.profile,
         "allowed_skill_names": case.allowed_skill_names,
@@ -687,7 +690,7 @@ async def _drive_sub(case: SubCase, monkeypatch: pytest.MonkeyPatch) -> dict[str
     recorder = _Recorder()
     _install_permissions(monkeypatch, recorder, case.permissions)
     spec, profile, actor, denied_calls = _runner_identity(case.runner)
-    runner = SubAgentRunner(object(), bus=_FakeBus(recorder), llm=object())  # type: ignore[arg-type]
+    runner = make_subagent_runner(object(), bus=_FakeBus(recorder), llm=object())
     gateway = _FakeGateway(recorder, profile, case.allowed_skill_names)
     budget = None
     if case.budget is not None:

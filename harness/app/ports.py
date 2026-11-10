@@ -1,4 +1,5 @@
-"""应用层端口：模型客户端、调用参数、模型解析器、工具来源、工具调用审核员，以及中立流事件与调用异常。
+"""应用层端口：模型客户端、调用参数、模型解析器、工具来源、工具调用审核员、子代理启动器，
+以及中立流事件与调用异常。
 
 全部类型不含任何 provider 的 wire 形状；各家 SDK 的适配在 harness.adapters.models 内部完成。
 """
@@ -7,7 +8,8 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -16,7 +18,12 @@ from core.events import BlockType, ToolInfo, Usage
 from harness.domain.context import Context
 from harness.domain.messages import ThinkingBlock, ToolCall
 from harness.domain.review import Decision, ReviewRequest
+from harness.domain.roles.subagent import SubAgentSpec
 from harness.domain.tool import Tool
+
+if TYPE_CHECKING:
+    # 仅作类型标注：事件总线的实现依赖 Redis 客户端，端口模块加载期不引入。
+    from core.event_bus import StreamBus
 
 
 class ModelEventKind(str, Enum):
@@ -304,3 +311,27 @@ class ToolCallReviewer(ABC):
     @abstractmethod
     async def review(self, call: ToolCall, request: ReviewRequest) -> Decision:
         """审核一个工具调用。可能扣减 request.budget 的额度；放行时按 Decision.arguments 执行。"""
+
+
+class SubAgentLauncher(Protocol):
+    """子代理启动器：Agent 工具经它启动一次性子代理，拿回子代理的最终报告。
+
+    工具只认这个端口，不认运行时；实现由组装根提供（独立数据库会话里构造子代理运行器执行），
+    事件经调用方传入的 bus 发到父回合的事件流。
+    """
+
+    async def run(
+        self,
+        session_id: int,
+        prompt: str,
+        spec: SubAgentSpec,
+        *,
+        bus: StreamBus | None,
+        parent_turn_id: UUID | None,
+        user_id: int | None,
+        workspace_id: int | None,
+        parent_allowed_tool_names: frozenset[str] | None,
+        allowed_skill_names: frozenset[str] | None,
+    ) -> str:
+        """按 spec 运行一次子代理并返回报告；子代理运行失败时原样上抛。"""
+        ...

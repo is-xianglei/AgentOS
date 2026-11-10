@@ -37,9 +37,9 @@ from memory.models import MemoryItemRecord, MemoryJobRecord
 from memory.repository import MemoryRepository
 from memory.service import MEMORY_CATALOG_MAX_BYTES, MEMORY_CATALOG_MAX_ITEMS, MemoryService
 from runtime import execution
-from runtime.agent import AgentRuntime
 from session.models import SessionMessage, SessionRecord
 from session.service import SessionService
+from tests.fixtures.harness_factory import make_agent_runtime
 from user.models import UserRecord
 from workspace.models import WorkspaceRecord
 
@@ -335,7 +335,9 @@ async def _run_turn(
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="runtime.agent"):
         async with shared.session() as db:
-            runtime = AgentRuntime(db, user_id=user_id, workspace_id=workspace_id, llm=scenario.llm)
+            runtime = make_agent_runtime(
+                db, user_id=user_id, workspace_id=workspace_id, llm=scenario.llm
+            )
             runtime.memory.recall_service.llm = scenario.llm
             runtime.bind_execution(bus, owner)
             await runtime._produce(session_id, turn_id, "继续")

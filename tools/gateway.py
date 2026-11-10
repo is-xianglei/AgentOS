@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.event_bus import StreamBus
 from core.events import Actor
-from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.app.tool_set import ToolSet
+from harness.app.ports import SubAgentLauncher
+from harness.app.tool_set import ToolSet, platform_tools
 from harness.domain.tool import ShellAccess, ToolProfile
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord
@@ -28,7 +28,7 @@ class ToolGateway:
 
     ``registry`` 是已经按 profile 和父级白名单裁剪后的集合；``run`` 仍然把
     profile 再传给 ``ToolService``，因此即使调用方持有旧的工具名，也会在执行层
-    再次经过策略检查。
+    再次经过策略检查。``subagents`` 是运行时注入的子代理启动器，随每次执行放进工具上下文。
     """
 
     db: AsyncSession
@@ -39,6 +39,7 @@ class ToolGateway:
     allowed_skill_names: frozenset[str] | None = None
     shell_access: ShellAccess = ShellAccess.FULL
     shell_tmp_root: Path | None = None
+    subagents: SubAgentLauncher | None = None
     context: ToolExecutionContext = field(init=False)
     service: ToolService = field(init=False)
 
@@ -78,8 +79,8 @@ class ToolGateway:
             # 安全降级为空注册表，避免把未知对象当成完整能力集合而绕过 profile。
             self.registry = ToolSet()
         else:
-            # 能力策略按完整的内置工具集查，与原按名查策略表的口径一致。
-            allowed_names = builtin_tool_set().callable_names(
+            # 能力策略按完整的进程级工具集查，与原按名查策略表的口径一致。
+            allowed_names = platform_tools().callable_names(
                 registry_names,
                 self.profile,
             )
@@ -99,6 +100,7 @@ class ToolGateway:
         allowed_skill_names: frozenset[str] | None = None,
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
+        subagents: SubAgentLauncher | None = None,
     ) -> ToolGateway:
         """创建网关并在构造期裁剪工具集合。
 
@@ -106,7 +108,7 @@ class ToolGateway:
         中出现当前 profile 不允许调用的工具时直接报错，避免静默丢失配置导致模型
         以为自己拥有某个工具却在运行时才发现不存在。
         """
-        registry = builtin_tool_set()
+        registry = platform_tools()
         if requested_names is not None:
             # 显式配置属于“绑定”动作，必须使用 bindable 策略；Skill 工具只能由
             # 运行时根据已绑定 Skill 自动注入，不能把 SkillRun 直接写进用户 Agent 配置。
@@ -131,6 +133,7 @@ class ToolGateway:
             allowed_skill_names=allowed_skill_names,
             shell_access=shell_access,
             shell_tmp_root=shell_tmp_root,
+            subagents=subagents,
         )
 
     @classmethod
@@ -146,6 +149,7 @@ class ToolGateway:
         allowed_skill_names: frozenset[str] | None = None,
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
+        subagents: SubAgentLauncher | None = None,
     ) -> ToolGateway:
         """从已有注册表构造网关，并严格校验其能力边界。
 
@@ -158,7 +162,7 @@ class ToolGateway:
             # 兼容旧的 _resolve_tools 替身；没有可审计的 names 时不暴露任何工具。
             safe_registry = ToolSet()
         else:
-            names = builtin_tool_set().callable_names(
+            names = platform_tools().callable_names(
                 registry_names,
                 profile,
                 strict=strict,
@@ -173,6 +177,7 @@ class ToolGateway:
             allowed_skill_names=allowed_skill_names,
             shell_access=shell_access,
             shell_tmp_root=shell_tmp_root,
+            subagents=subagents,
         )
 
     @property
@@ -259,4 +264,5 @@ class ToolGateway:
             shell_tmp_root=self.context.shell_tmp_root,
             execution_context=self.context,
             round_tool_names=round_tool_names,
+            subagents=self.subagents,
         )

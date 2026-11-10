@@ -22,7 +22,7 @@ from core.config import settings
 from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.domain.tool import ToolContext
-from runtime.agent import AgentRuntime
+from tests.fixtures.harness_factory import make_agent_runtime
 from tools.repository import ToolCatalogRepository
 from tools.service import ToolCatalogService
 from user.models import UserRecord
@@ -130,7 +130,7 @@ def _patch_dispatch(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """替换真正跑子代理的 _dispatch:它另开连接,看不到外层未提交的测试数据。"""
     dispatches: list[dict[str, Any]] = []
 
-    async def _fake_dispatch(self, session_id, prompt, spec, *args: Any) -> str:
+    async def _fake_dispatch(self, ctx, prompt, spec, *args: Any) -> str:
         dispatches.append({"spec": spec, "allowed_skill_names": args[-1]})
         return "委派报告"
 
@@ -182,7 +182,9 @@ async def test_runtime_injects_catalog_only_for_lead_session(pg) -> None:
     reviewer = await _agent(pg, "审稿人", tools=("Read",))
     await _agent(pg, "停用者", enabled=False)
     await _agent(pg, "别家", workspace_id=pg.other_workspace_id)
-    runtime = AgentRuntime(pg.db, user_id=pg.user_id, workspace_id=pg.workspace_id, llm=_FakeLLM())
+    runtime = make_agent_runtime(
+        pg.db, user_id=pg.user_id, workspace_id=pg.workspace_id, llm=_FakeLLM()
+    )
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
     lead_catalog = runtime.configuration.delegate_catalog
@@ -195,7 +197,9 @@ async def test_runtime_injects_catalog_only_for_lead_session(pg) -> None:
 
 async def test_runtime_without_enabled_agents_injects_no_catalog(pg) -> None:
     await _agent(pg, "停用者", enabled=False)
-    runtime = AgentRuntime(pg.db, user_id=pg.user_id, workspace_id=pg.workspace_id, llm=_FakeLLM())
+    runtime = make_agent_runtime(
+        pg.db, user_id=pg.user_id, workspace_id=pg.workspace_id, llm=_FakeLLM()
+    )
 
     await runtime._configure_agent(SimpleNamespace(agent_id=None, mode_slug="standard"))
 

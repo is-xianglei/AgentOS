@@ -933,13 +933,9 @@ def test_session_port_imports_only_app_domain_and_core() -> None:
     assert not failures, f"{_SESSION_PORT_MODULE} 导入了不该依赖的模块: {failures}"
 
 
-# runtime 只经会话存储端口使用会话，SessionService 只在构造默认实现的几处出现（阶段 7 由组装根接管）。
-# 值是允许的构造次数：AgentRuntime、WorkflowRuntime、SubAgentRunner 未注入时的回落，
-# 以及执行包装层按短会话取租约端口的 lease_store。
+# runtime 只经会话存储端口使用会话，会话存储由组装根注入；SessionService 只剩执行包装层
+# 按短会话取租约端口的 lease_store 这一处构造。值是允许的构造次数。
 _SESSION_SERVICE_CONSTRUCTION_ALLOWLIST: dict[str, int] = {
-    "runtime.agent": 1,
-    "runtime.workflow": 1,
-    "runtime.subagent": 1,
     "runtime.execution": 1,
 }
 
@@ -993,3 +989,211 @@ def test_runtime_constructs_session_service_only_in_allowlist() -> None:
 def test_session_service_construction_counter(source: str, expected: int) -> None:
     """检查器自测：直接构造、函数体与按模块属性构造都要计数，引用类本身与相似名不得误报。"""
     assert _session_service_constructions(ast.parse(source)) == expected
+
+
+# 业务异常被领域层、应用层广泛导入，加载期不得依赖 Web 框架；HTTP 异常处理器在 core.error_handlers。
+_ERRORS_MODULE = "core.errors"
+_WEB_FRAMEWORK_PACKAGES = frozenset({"fastapi", "starlette"})
+
+
+def _web_framework_load_time_imports(tree: ast.Module) -> list[str]:
+    """返回模块加载期（不含函数体与 ``if TYPE_CHECKING:`` 块）导入的 FastAPI / Starlette 模块名。"""
+    found: list[str] = []
+    for node in _iter_load_time_imports(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        found.extend(name for name in names if name.split(".")[0] in _WEB_FRAMEWORK_PACKAGES)
+    return sorted(found)
+
+
+def test_errors_module_does_not_load_web_framework() -> None:
+    """分层防线：core.errors 加载期不得导入 FastAPI / Starlette，领域层经它不再间接加载 Web 框架。"""
+    files = _first_party_module_files()
+    path = files[_ERRORS_MODULE]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    failures = _web_framework_load_time_imports(tree)
+
+    assert not failures, f"{_ERRORS_MODULE} 加载期导入了 Web 框架: {failures}"
+
+
+def test_domain_layer_does_not_load_web_framework_at_runtime() -> None:
+    """运行期复核：子进程只导入领域层全部模块后，sys.modules 里不得出现 fastapi、starlette。"""
+    files = _first_party_module_files()
+    domain_modules = sorted(
+        m for m in files if m == "harness.domain" or m.startswith("harness.domain.")
+    )
+    script = (
+        "import importlib, sys\n"
+        f"for name in {domain_modules!r}:\n"
+        "    importlib.import_module(name)\n"
+        "loaded = sorted(m for m in sys.modules if m.split('.')[0] in ('fastapi', 'starlette'))\n"
+        "print(','.join(loaded))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", f"导入领域层后加载了 Web 框架: {result.stdout.strip()}"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from fastapi import Request", ["fastapi"]),
+        ("import fastapi.responses", ["fastapi.responses"]),
+        ("from starlette.requests import Request", ["starlette.requests"]),
+        ("try:\n    from fastapi import Request\nexcept ImportError:\n    pass", ["fastapi"]),
+        ("from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from fastapi import Request", []),
+        ("def f():\n    from fastapi import Request", []),
+        ("import fastapi_utils", []),
+        ("from core.events import RunEvent", []),
+    ],
+)
+def test_web_framework_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：加载期导入 FastAPI / Starlette 必须报出，类型标注、函数体与相似包名不得误报。"""
+    assert _web_framework_load_time_imports(ast.parse(source)) == expected
+
+
+# 只有组装根（harness.bootstrap）实例化适配器：运行时、应用层、领域层任何位置都不得导入 harness.adapters。
+_ADAPTER_FREE_PACKAGES = ("runtime", "harness.app", "harness.domain")
+
+
+def _adapter_imports(tree: ast.Module, source_package: str, known: set[str]) -> list[str]:
+    """返回模块中任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）导入的 harness.adapters 模块名。
+
+    相对导入按所在包展开，``from harness import adapters`` 这种按包导入子包的写法同样报出。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, source_package, known)):
+            if name == "harness.adapters" or name.startswith("harness.adapters."):
+                found.append(name)
+    return found
+
+
+def test_runtime_app_and_domain_do_not_import_adapters() -> None:
+    """分层防线：runtime、harness.app、harness.domain 任何位置都不得导入 harness.adapters，具体实现由组装根注入。"""
+    files = _first_party_module_files()
+    known = set(files)
+    guarded = sorted(
+        module
+        for module in files
+        if any(
+            module == package or module.startswith(f"{package}.")
+            for package in _ADAPTER_FREE_PACKAGES
+        )
+    )
+    expected = {
+        "runtime.agent",
+        "runtime.subagent",
+        "runtime.workflow",
+        "runtime.turn_config",
+        "runtime.lead_loop",
+        "runtime.interaction_flow",
+        "runtime.tool_execution",
+        "harness.app.tool_set",
+        "harness.domain.tool",
+    }
+    assert expected <= set(guarded), f"模块枚举未覆盖 runtime、应用层与领域层，仅发现: {guarded}"
+    failures: list[str] = []
+    for module in guarded:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source_package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+        failures.extend(
+            f"  - {module} 导入了 {name}"
+            for name in _adapter_imports(tree, source_package, known)
+        )
+    assert not failures, "runtime、应用层或领域层导入了适配层:\n" + "\n".join(failures)
+
+
+_TYPE_CHECKING_ADAPTER_IMPORT = (
+    "from typing import TYPE_CHECKING\n"
+    "if TYPE_CHECKING:\n"
+    "    from harness.adapters.models.resolver import DatabaseModelResolver"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider",
+            ["harness.adapters.memory.builtin_provider"],
+        ),
+        ("import harness.adapters.tools.builtin_provider", ["harness.adapters.tools.builtin_provider"]),
+        ("from harness import adapters", ["harness.adapters"]),
+        ("from harness.adapters import models", ["harness.adapters.models"]),
+        (
+            "def f():\n    from harness.adapters.models.resolver import DatabaseModelResolver",
+            ["harness.adapters.models.resolver"],
+        ),
+        (_TYPE_CHECKING_ADAPTER_IMPORT, ["harness.adapters.models.resolver"]),
+        ("from ..adapters.reviewers import policy_reviewer", ["harness.adapters.reviewers.policy_reviewer"]),
+        ("from harness.app.ports import ModelResolver", []),
+        ("from harness.bootstrap import default_harness", []),
+        ("import harness_adapters", []),
+    ],
+)
+def test_adapter_import_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置、任何写法导入 harness.adapters 都必须报出，端口、组装根与相似名不得误报。"""
+    known = set(_first_party_module_files())
+
+    assert _adapter_imports(ast.parse(source), "harness.app", known) == expected
+
+
+# Agent 工具经 ToolContext 注入的子代理启动器运行子代理，不得反向依赖运行时或自行打开数据库会话。
+_AGENT_TOOL_MODULE = "harness.adapters.tools.builtin.agent"
+_AGENT_TOOL_FORBIDDEN = ("runtime", "database.engine")
+
+
+def _agent_tool_violations(tree: ast.Module, known: set[str]) -> list[str]:
+    """返回模块中任何位置导入 runtime 包或 database.engine 的模块名。"""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, "harness.adapters.tools.builtin", known)):
+            if any(name == item or name.startswith(f"{item}.") for item in _AGENT_TOOL_FORBIDDEN):
+                found.append(name)
+    return found
+
+
+def test_agent_tool_does_not_import_runtime_or_engine() -> None:
+    """依赖倒置防线：Agent 工具任何位置都不得导入 runtime 与 database.engine。"""
+    files = _first_party_module_files()
+    path = files[_AGENT_TOOL_MODULE]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    failures = _agent_tool_violations(tree, set(files))
+
+    assert not failures, f"{_AGENT_TOOL_MODULE} 导入了不该依赖的模块: {failures}"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("def f():\n    from runtime.subagent import SubAgentRunner", ["runtime.subagent"]),
+        ("def f():\n    from database.engine import AsyncSessionLocal", ["database.engine"]),
+        ("from runtime import subagent", ["runtime.subagent"]),
+        ("import database.engine", ["database.engine"]),
+        ("from harness.app.ports import SubAgentLauncher", []),
+        ("from database.base import Base", []),
+        ("import runtime_helpers", []),
+    ],
+)
+def test_agent_tool_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：函数体与按包导入同样报出，端口、database 的其他模块与相似名不得误报。"""
+    assert _agent_tool_violations(ast.parse(source), set(_first_party_module_files())) == expected

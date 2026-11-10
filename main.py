@@ -9,16 +9,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.router import api_router
 from core.config import settings
-from core.errors import (
-    AgentException,
+from core.error_handlers import (
     agent_error_handler,
     unhandled_error_handler,
     validation_error_handler,
 )
+from core.errors import AgentException
 from core.logging import request_context_middleware, setup_logging
 from core.run_events import check_run_event_store, close_run_event_store
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
+from harness.bootstrap import platform_tool_set
 from hooks.builtin import register_builtin_hooks
 from market.presets import sync_official_presets
 from runtime.execution import shutdown_executions
@@ -35,7 +36,7 @@ async def lifespan(app: FastAPI):
     # 启动阶段不经过 get_db，内置工具目录同步自行提交；失败则回滚并中止启动。
     async with AsyncSessionLocal() as db:
         try:
-            await ToolCatalogService(db).sync_builtins()
+            await ToolCatalogService(db).sync_builtins(platform_tool_set())
             await db.commit()
         except Exception:
             await db.rollback()

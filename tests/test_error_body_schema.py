@@ -10,12 +10,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 
-from core.errors import (
-    AgentException,
+from core.error_handlers import (
     agent_error_handler,
     unhandled_error_handler,
     validation_error_handler,
 )
+from core.errors import AgentException
 from core.logging import request_context_middleware
 from core.responses import ApiResponse
 

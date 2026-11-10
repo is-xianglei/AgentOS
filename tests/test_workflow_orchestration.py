@@ -40,6 +40,7 @@ from runtime.workflow import (
 from session import api as session_api
 from session.schemas import SessionSendMessageRequest
 from session.service import SessionService
+from tests.fixtures.harness_factory import install_runtime_classes, make_workflow_runtime
 from workflow.service import WorkflowRunMember
 
 pytestmark = pytest.mark.anyio
@@ -117,8 +118,22 @@ class _MemberCall:
     agent_id: int | None = None
 
 
+# 编排器的成员运行器工厂与独立会话工厂由组装根注入;当前用例的替身由 _Harness 登记在这里,
+# _deps 传给编排器的工厂按登记值构造,未建 _Harness 的用例不会触达成员执行。
+_member_runner_cls: Any = None
+_member_session_cls: Any = None
+
+
+def _member_runners(db: object, *, bus: object | None) -> Any:
+    return _member_runner_cls(db, bus=bus)
+
+
+def _member_sessions() -> Any:
+    return _member_session_cls()
+
+
 class _Harness:
-    """把 AgentDefinitionService / SubAgentRunner 替身接到 runtime.workflow 模块上,并记录调用。"""
+    """把 AgentDefinitionService 替身接到 runtime.workflow 模块上,登记成员运行器与独立会话替身,并记录调用。"""
 
     def __init__(
         self,
@@ -188,8 +203,8 @@ class _Harness:
                 return outputs.get(spec.display_name, f"{spec.display_name}的结论")
 
         monkeypatch.setattr("runtime.workflow.AgentDefinitionService", _FakeAgentDefinitionService)
-        monkeypatch.setattr("runtime.workflow.SubAgentRunner", _FakeSubAgentRunner)
-        monkeypatch.setattr("runtime.workflow.AsyncSessionLocal", _FakeSessionScope)
+        monkeypatch.setattr(f"{__name__}._member_runner_cls", _FakeSubAgentRunner)
+        monkeypatch.setattr(f"{__name__}._member_session_cls", _FakeSessionScope)
 
     def names(self) -> list[str]:
         return [call.display_name for call in self.calls]
@@ -264,6 +279,8 @@ def _deps(members: tuple[WorkflowRunMember, ...], bus: _RecordingBus | None = No
         "turn_id": uuid4(),
         "workflow_id": _WORKFLOW_ID,
         "members": members,
+        "runners": _member_runners,
+        "session_factory": _member_sessions,
     }
 
 
@@ -1111,8 +1128,7 @@ def _install_api_fakes(
         yield {"type": "run_started", "turn_id": str(handle.turn_id)}
 
     monkeypatch.setattr(session_api, "follow_execution", _fake_follow)
-    monkeypatch.setattr(api_deps, "WorkflowRuntime", workflow_rt.cls)
-    monkeypatch.setattr(api_deps, "AgentRuntime", agent_rt.cls)
+    install_runtime_classes(monkeypatch, agent=agent_rt.cls, workflow=workflow_rt.cls)
     monkeypatch.setattr(session_api, "SessionService", _FakeSessionService)
     monkeypatch.setattr(session_api, "WorkflowService", _FakeWorkflowService)
     return workflow_rt, agent_rt, workflow_checks
@@ -1280,14 +1296,12 @@ def _make_runtime(
 ) -> tuple[WorkflowRuntime, _FakeDb, _FakeRuntimeSessionService]:
     """构造带替身依赖的 WorkflowRuntime,并把 _build_orchestrator 替换为给定 run 协程的编排器。"""
     db = _FakeDb()
-    runtime = WorkflowRuntime(db, user_id=_USER_ID, workspace_id=_WORKSPACE_ID)
+    runtime = make_workflow_runtime(db, user_id=_USER_ID, workspace_id=_WORKSPACE_ID)
     session_service = _FakeRuntimeSessionService()
     runtime.sessions = session_service
     runtime.bus = _RecordingBus()
-    monkeypatch.setattr(
-        "harness.adapters.models.resolver.DatabaseModelResolver.for_session",
-        AsyncMock(return_value=None),
-    )
+    # 模型解析器由组装根注入;准入阶段只验证配置,这里换成不查库的替身。
+    runtime.models = SimpleNamespace(for_session=AsyncMock(return_value=None))
 
     async def _build(session_id: int, turn_id: Any, workflow_id: int) -> Any:
         return SimpleNamespace(run=orchestrator_run)

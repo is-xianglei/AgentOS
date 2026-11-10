@@ -40,6 +40,7 @@ from harness.app.ports import (
     ModelTurnResult,
     ResolvedModel,
 )
+from harness.app.subagent_catalog import build_agent_spec
 from harness.domain.memory import MemoryRecall
 from harness.domain.messages import ThinkingBlock, ToolCall
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
@@ -49,12 +50,12 @@ from interaction.service import InteractionService
 from permission.service import PermissionService
 from plan.service import PlanService
 from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner, build_agent_spec
 from session.repository import SessionRepository
 from skill.service import SkillService
 from task.service import TaskService
 from team.service import TeamService
 from team.subagent_run_repository import SubAgentRunRepository
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 from tests.fixtures.react_loop_golden import EXPECTED, EXPECTED_SHA256
 from tools.models import ToolCallRecord
 from tools.repository import ToolCatalogRepository, ToolRepository
@@ -1232,8 +1233,8 @@ def _install(monkeypatch: pytest.MonkeyPatch, fakes: _Fakes, overrides: dict[str
 
 
 def _main_runtime(case: MainCase, world: _World) -> AgentRuntime:
-    runtime = AgentRuntime(
-        _FakeDb(world),  # type: ignore[arg-type]
+    runtime = make_agent_runtime(
+        _FakeDb(world),
         user_id=_USER_ID,
         workspace_id=_WORKSPACE_ID,
         llm=_FakeLLM(world, "agent", "claude-loop", case.replies),  # type: ignore[arg-type]
@@ -1280,11 +1281,11 @@ async def _drive_sub(case: SubCase, monkeypatch: pytest.MonkeyPatch) -> dict[str
     fakes.inbox = case.inbox
     fakes.claimable = case.claimable
     _install(monkeypatch, fakes, {})
-    runner = SubAgentRunner(
-        _FakeDb(world),  # type: ignore[arg-type]
-        bus=_FakeBus(world),  # type: ignore[arg-type]
-        llm=_FakeLLM(world, "subagent", "claude-sub", case.replies),  # type: ignore[arg-type]
-        memory=_FakeMemory(world, None),  # type: ignore[arg-type]
+    runner = make_subagent_runner(
+        _FakeDb(world),
+        bus=_FakeBus(world),
+        llm=_FakeLLM(world, "subagent", "claude-sub", case.replies),
+        memory=_FakeMemory(world, None),
     )
     spec = _sub_spec(case)
     scope: dict[str, Any] = {

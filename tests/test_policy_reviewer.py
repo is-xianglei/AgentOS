@@ -28,8 +28,7 @@ from harness.domain.messages import ToolCall
 from harness.domain.review import Decision, ReviewRequest, check_capability
 from harness.domain.tool import ToolProfile
 from permission.service import PermissionService
-from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 
 pytestmark = pytest.mark.anyio
 
@@ -338,7 +337,7 @@ class _FakeReviewer(ToolCallReviewer):
 
 async def test_injected_reviewer_replaces_policy_reviewer_in_agent_runtime() -> None:
     reviewer = _FakeReviewer()
-    runtime = AgentRuntime(object(), user_id=1, workspace_id=2, llm=object(), reviewer=reviewer)  # type: ignore[arg-type]
+    runtime = make_agent_runtime(object(), user_id=1, workspace_id=2, llm=object(), reviewer=reviewer)
     runtime.plan_service = SimpleNamespace(get_active=AsyncMock(return_value=None))
     runtime.sessions = SimpleNamespace(add_message=AsyncMock())
     runtime.bus = SimpleNamespace(emit=AsyncMock())
@@ -380,8 +379,8 @@ async def test_injected_reviewer_replaces_policy_reviewer_in_agent_runtime() -> 
 
 
 def test_runtimes_default_to_policy_reviewer() -> None:
-    runtime = AgentRuntime(object(), user_id=1, workspace_id=2, llm=object())  # type: ignore[arg-type]
-    runner = SubAgentRunner(object(), llm=object())  # type: ignore[arg-type]
+    runtime = make_agent_runtime(object(), user_id=1, workspace_id=2, llm=object())
+    runner = make_subagent_runner(object(), llm=object())
 
     assert isinstance(runtime.reviewer, PolicyReviewer)
     assert isinstance(runner.reviewer, PolicyReviewer)
@@ -391,7 +390,7 @@ def test_runtimes_default_to_policy_reviewer() -> None:
 
 async def test_injected_reviewer_replaces_policy_reviewer_in_subagent_runner() -> None:
     reviewer = _FakeReviewer()
-    runner = SubAgentRunner(object(), llm=object(), reviewer=reviewer)  # type: ignore[arg-type]
+    runner = make_subagent_runner(object(), llm=object(), reviewer=reviewer)
     executed: list[dict[str, Any]] = []
 
     async def _gateway_run(session_id, tool_name, input_args, **kwargs):

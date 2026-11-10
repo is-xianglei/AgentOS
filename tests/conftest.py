@@ -7,6 +7,10 @@ Phase 0 的基线测试均为同步,本夹具为后续装配器等异步测试�
 
 import pytest
 
+# 组装根导入即登记进程级工具集；按名查工具策略的 feature 域（tools、permission）依赖它，
+# 生产入口 main.py 同样经导入组装根完成登记。导入本模块不连接任何外部服务。
+import harness.bootstrap  # noqa: F401
+
 
 @pytest.fixture(scope="session")
 def anyio_backend() -> str:

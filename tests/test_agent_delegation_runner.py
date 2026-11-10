@@ -4,7 +4,7 @@ LLM、权限规则查询与工具执行全部打桩,只保留运行器自身的�
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Self
 
 import pytest
@@ -14,12 +14,15 @@ from harness.adapters.tools.builtin.agent import AgentTool, AgentToolInput
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.loop import StepResult
 from harness.app.ports import ModelTurnResult
-from harness.app.subagent_catalog import get_subagent_spec
+from harness.app.subagent_catalog import build_agent_spec, get_subagent_spec
+from harness.bootstrap import IsolatedSubAgentLauncher, default_harness
 from harness.domain.messages import AssistantMessage, ToolCall
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import ToolContext
-from runtime.subagent import SubAgentRunner, build_agent_spec
+from permission.service import PermissionService
+from runtime.subagent import SubAgentRunner
+from tests.fixtures.harness_factory import make_subagent_runner
 from tools.gateway import ToolGateway
 
 pytestmark = pytest.mark.anyio
@@ -123,7 +126,7 @@ def _stub_runner(
     fake_loop: bool = True,
 ) -> tuple[SubAgentRunner, _RecordingRunRepo, _RecordingBus, _LoopCapture]:
     """构造跳过 LLM 的运行器;fake_loop=False 时保留真实 ReAct 循环与工具裁决。"""
-    runner = SubAgentRunner(_FakeDb(), bus=_RecordingBus(), llm=object())  # type: ignore[arg-type]
+    runner = make_subagent_runner(_FakeDb(), bus=_RecordingBus(), llm=object())
     repo = _RecordingRunRepo()
     runner.team_service.run_repo = repo  # type: ignore[assignment]
     capture = _LoopCapture()
@@ -249,7 +252,9 @@ def _script_permissions(
     evaluated_agent_types: list[str | None] = []
     executed: list[str] = []
 
-    async def _evaluate(session_id, tool_name, tool_input=None, agent_type=None, workspace_id=None):
+    async def _evaluate(
+        self, session_id, tool_name, tool_input=None, agent_type=None, workspace_id=None
+    ):
         evaluated_agent_types.append(agent_type)
         return behaviors[tool_name]
 
@@ -257,7 +262,8 @@ def _script_permissions(
         executed.append(tool_name)
         return "工具输出"
 
-    monkeypatch.setattr(runner.permission_service, "evaluate", _evaluate)
+    # 审核员持有的权限服务由组装根注入，按类替换动态权限查询。
+    monkeypatch.setattr(PermissionService, "evaluate", _evaluate)
     monkeypatch.setattr(ToolGateway, "run", _gateway_run)
     return evaluated_agent_types, executed
 
@@ -353,7 +359,6 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
         return await _capture_loop(capture, args[5], args[6])
 
     monkeypatch.setattr("agent.service.AgentDefinitionService", _FakeAgentDefinitionService)
-    monkeypatch.setattr("database.engine.AsyncSessionLocal", _FakeSessionScope)
     monkeypatch.setattr("team.service.SubAgentRunRepository", lambda db: _RecordingRunRepo())
     monkeypatch.setattr("runtime.subagent.TurnEventAssembler", _FakeAssembler)
     monkeypatch.setattr(SubAgentRunner, "_run_react_loop", _fake_loop)
@@ -364,6 +369,10 @@ async def test_plan_round_keeps_write_away_from_delegated_agent(
         profile="lead",
         allowed_tool_names=builtin_tool_set().names,
         round_tool_names=_PLAN_ROUND,
+        # 真实启动器：在替身会话里经组装根装配真实的子代理运行器。
+        subagents=IsolatedSubAgentLauncher(
+            replace(default_harness(), session_factory=_FakeSessionScope)
+        ),
     )
 
     output = await AgentTool().run(AgentToolInput(agent_id=7, prompt="审稿"), ctx)

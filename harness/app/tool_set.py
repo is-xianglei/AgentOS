@@ -2,6 +2,10 @@
 
 ToolSet 取代原 ToolRegistry。工具顺序就是发给模型的工具顺序，提示缓存依赖它保持稳定：
 多个来源按传入顺序拼接，来源内部保持各自 ``list_tools()`` 的顺序，裁剪后保持原有相对顺序。
+
+另持有一份进程级工具集（register_platform_tools / platform_tools）：只有工具名、拿不到运行时工具集的
+调用方（权限规则、工具目录）经它按名查策略。应用层只持有 ToolSet，不认识具体的工具来源，
+由组装根 harness/bootstrap.py 在导入时登记。
 """
 
 from collections.abc import Iterable
@@ -135,3 +139,20 @@ class ToolSet:
             for name in dict.fromkeys(tool_names)
             if not self.policy_for(name).can_call(profile)
         )
+
+
+# 进程级工具集，由组装根登记；未登记时取用直接报错，不回落到任何具体来源。
+_platform_tools: ToolSet | None = None
+
+
+def register_platform_tools(tools: ToolSet) -> None:
+    """登记进程级工具集；组装根导入时调用一次，重复登记以最后一次为准。"""
+    global _platform_tools
+    _platform_tools = tools
+
+
+def platform_tools() -> ToolSet:
+    """取进程级工具集，供只有工具名的调用方按名查策略；组装根尚未登记时抛中文异常。"""
+    if _platform_tools is None:
+        raise AgentException.message("进程级工具集尚未登记，需先由组装根 harness.bootstrap 装配")
+    return _platform_tools

@@ -25,14 +25,15 @@ from uuid import UUID
 import httpx
 import pytest
 
-from api import deps as api_deps
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
+from harness import bootstrap
 from interaction import api as interaction_api
 from main import app
 from session import api as session_api
 from session.service import SessionService
 from tests.fixtures.agent_service_golden import EXPECTED, EXPECTED_SHA256
+from tests.fixtures.harness_factory import install_runtime_classes
 from workflow.service import WorkflowService
 
 pytestmark = pytest.mark.anyio
@@ -551,15 +552,18 @@ def _observation(world: _World, logs: _LogCollector, response: httpx.Response) -
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
-    """会话与 Workflow 服务按类替换；运行时与轮次取消替换 get_agent_service 装配用的名字，
-    走真实的 AgentService 依赖；SSE 跟随按路由模块里的名字替换。"""
+    """会话与 Workflow 服务按类替换；运行时与轮次取消替换组装根装配用的名字，
+    get_agent_service 与 AgentService 走真实装配；SSE 跟随按路由模块里的名字替换。"""
     fakes = _session_fakes(world)
     monkeypatch.setattr(SessionService, "get_required", fakes["get_required"])
     monkeypatch.setattr(SessionService, "check_write_access", fakes["check_write_access"])
     monkeypatch.setattr(WorkflowService, "require_runnable", fakes["require_runnable"])
-    monkeypatch.setattr(api_deps, "AgentRuntime", _runtime_class(world, "AgentRuntime"))
-    monkeypatch.setattr(api_deps, "WorkflowRuntime", _runtime_class(world, "WorkflowRuntime"))
-    monkeypatch.setattr(api_deps, "cancel_turn", _cancel_turn_fake(world))
+    install_runtime_classes(
+        monkeypatch,
+        agent=_runtime_class(world, "AgentRuntime"),
+        workflow=_runtime_class(world, "WorkflowRuntime"),
+    )
+    monkeypatch.setattr(bootstrap, "cancel_turn", _cancel_turn_fake(world))
     monkeypatch.setattr(session_api, "follow_execution", _follow_fake(world))
     monkeypatch.setattr(interaction_api, "follow_execution", _follow_fake(world))
 

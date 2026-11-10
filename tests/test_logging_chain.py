@@ -74,7 +74,10 @@ class _FakeSessionScope:
 
 
 def _make_runtime() -> AgentRuntime:
-    """绕过 __init__ 组装 _wake_team_members 所需的最小运行时,避免建真实 LLM 客户端。"""
+    """绕过 __init__ 组装 _wake_team_members 所需的最小运行时,避免建真实 LLM 客户端。
+
+    独立会话工厂与队友运行器工厂由组装根注入,这里换成 _install_wake_fakes 装好的替身。
+    """
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = object()
     runtime.bus = _RecordingBus()
@@ -83,7 +86,17 @@ def _make_runtime() -> AgentRuntime:
         tools=_FakeRegistry(),
         allowed_skill_names=None,
     )
+    runtime._session_factory = _FakeSessionScope
+    runtime._teammates = _wake_runner_factory
     return runtime
+
+
+# 当前用例的队友运行器替身类,由 _install_wake_fakes 设置;运行时按 (db, bus=) 构造。
+_wake_runner_cls: Any = None
+
+
+def _wake_runner_factory(db: object, *, bus: object | None) -> Any:
+    return _wake_runner_cls(db, bus=bus)
 
 
 def _install_wake_fakes(
@@ -91,7 +104,7 @@ def _install_wake_fakes(
     members: list[_FakeMember],
     failing_names: set[str],
 ) -> list[str]:
-    """替换 _wake_team_members 函数内导入的三处依赖,返回唤醒调用顺序记录。"""
+    """替换 _wake_team_members 用到的三处依赖(团队服务、独立会话、队友运行器),返回唤醒调用顺序记录。"""
     calls: list[str] = []
 
     class _FakeTeamService:
@@ -118,8 +131,7 @@ def _install_wake_fakes(
             return "推进完成"
 
     monkeypatch.setattr("runtime.agent.TeamService", _FakeTeamService)
-    monkeypatch.setattr("runtime.agent.AsyncSessionLocal", _FakeSessionScope)
-    monkeypatch.setattr("runtime.agent.SubAgentRunner", _FakeSubAgentRunner)
+    monkeypatch.setattr(f"{__name__}._wake_runner_cls", _FakeSubAgentRunner)
     return calls
 
 

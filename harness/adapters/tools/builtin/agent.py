@@ -1,13 +1,12 @@
 import json
 import logging
 from dataclasses import asdict, dataclass
-from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
 from core.errors import AgentException
-from core.event_bus import StreamBus
-from harness.app.subagent_catalog import get_subagent_spec, routing_catalog
+from harness.app.ports import SubAgentLauncher
+from harness.app.subagent_catalog import build_agent_spec, get_subagent_spec, routing_catalog
 from harness.domain.roles.reports import validate_verification_report
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import LEAD_ONLY, PydanticTool, ToolContext, tool_policy
@@ -112,13 +111,9 @@ class AgentTool(PydanticTool):
             agent_type = AgentType.GENERAL_PURPOSE
         spec = get_subagent_spec(agent_type)
         report = await self._dispatch(
-            ctx.session_id,
+            ctx,
             self._compose_prompt(args),
             spec,
-            ctx.bus,
-            ctx.turn_id,
-            ctx.user_id,
-            ctx.workspace_id,
             ctx.allowed_tool_names,
             ctx.allowed_skill_names,
         )
@@ -144,7 +139,6 @@ class AgentTool(PydanticTool):
         """
         # 局部导入：agent.service -> tools.service -> builtin_provider -> 本模块，顶层导入成环。
         from agent.service import AgentDefinitionService
-        from runtime.subagent import build_agent_spec
 
         # 只有默认 Agent 能委派,深度为 1。user_agent 等档位本就调不到 Agent 工具,
         # 这里再显式拦一次,避免将来工具策略放宽时意外打开多级委派。
@@ -178,13 +172,9 @@ class AgentTool(PydanticTool):
         if parent_tool_names is None:
             parent_tool_names = ctx.allowed_tool_names
         report = await self._dispatch(
-            ctx.session_id,
+            ctx,
             prompt,
             spec,
-            ctx.bus,
-            ctx.turn_id,
-            ctx.user_id,
-            ctx.workspace_id,
             parent_tool_names,
             frozenset(config.skill_names),
         )
@@ -227,30 +217,25 @@ class AgentTool(PydanticTool):
 
     async def _dispatch(
         self,
-        session_id: int,
+        ctx: ToolContext,
         prompt: str,
         spec: SubAgentSpec,
-        bus: StreamBus | None,
-        parent_turn_id: UUID | None,
-        user_id: int | None,
-        workspace_id: int | None,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
     ) -> str:
-        """用独立 AsyncSession 运行子代理,避免与主会话共用连接。"""
-        # 局部导入：工具反向依赖运行时，改顶层仍成环 runtime.subagent -> builtin_provider
-        # -> harness.adapters.tools.builtin.agent，待依赖倒置任务处理。
-        from database.engine import AsyncSessionLocal
-        from runtime.subagent import SubAgentRunner
-
-        async with AsyncSessionLocal() as sub_db:
-            return await SubAgentRunner(sub_db, bus=bus).run(
-                session_id,
-                prompt,
-                spec,
-                parent_turn_id=parent_turn_id,
-                user_id=user_id,
-                workspace_id=workspace_id,
-                parent_allowed_tool_names=parent_allowed_tool_names,
-                allowed_skill_names=allowed_skill_names,
-            )
+        """经运行时注入的子代理启动器运行子代理；启动器负责开独立数据库会话，事件经父 bus 发出。"""
+        launcher: SubAgentLauncher | None = ctx.subagents
+        if launcher is None:
+            # 启动器由运行时经工具网关注入，缺失属装配错误，不回落到任何默认实现。
+            raise AgentException.message("Agent 工具缺少子代理启动器，无法启动子代理")
+        return await launcher.run(
+            ctx.session_id,
+            prompt,
+            spec,
+            bus=ctx.bus,
+            parent_turn_id=ctx.turn_id,
+            user_id=ctx.user_id,
+            workspace_id=ctx.workspace_id,
+            parent_allowed_tool_names=parent_allowed_tool_names,
+            allowed_skill_names=allowed_skill_names,
+        )

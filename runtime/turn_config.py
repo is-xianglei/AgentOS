@@ -11,8 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.service import AgentDefinitionService, AgentRuntimeConfig
 from core.errors import AgentException
-from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.app.ports import (
+    ModelClient,
+    ModelResolver,
+    ModelSettings,
+    ResolvedModel,
+    SubAgentLauncher,
+)
 from harness.app.session_port import StoredSession
 from harness.app.tool_set import ToolSet
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
@@ -29,7 +34,8 @@ class TurnConfiguration:
     - agent_id、agent_prompt、agent_model_name、skill_ids：会话绑定的自建 Agent，默认 Agent 时为 None；
     - profile、principal_name：工具档位与执行身份；allowed_skill_names 为 None 表示不限 Skill；
     - delegate_catalog：可委派 Agent 目录，只有默认 Agent 才有；
-    - tools、gateway：本回合可见的工具集，以及冻结了身份与边界的执行网关；
+    - tools、gateway：本回合可见的工具集，以及冻结了身份与边界的执行网关；网关带着子代理启动器，
+      Agent 工具经它启动子代理；
     - model：主模型，注入客户端时取客户端自带的默认参数，按会话配置之前为 None；
     - compact_model、compact_threshold：解析出的压缩模型与阈值，注入客户端时为 None，沿用压缩服务现值；
     - database_model：模型来自工作区模型配置，此时端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
@@ -56,6 +62,8 @@ class TurnConfiguration:
         cls,
         db: AsyncSession,
         *,
+        tools: ToolSet,
+        subagents: SubAgentLauncher | None,
         mode_slug: str = "standard",
         delegate_catalog: str | None = None,
         model: ResolvedModel | None = None,
@@ -63,9 +71,15 @@ class TurnConfiguration:
         compact_threshold: int | None = None,
         database_model: bool = False,
     ) -> TurnConfiguration:
-        """默认 Agent（会话未绑定自建 Agent）：完整内置工具，可以委派。"""
+        """默认 Agent（会话未绑定自建 Agent）：完整工具集，可以委派。
+
+        tools 是组装根注入的完整工具集；subagents 是 Agent 工具用的子代理启动器，None 表示本回合
+        不能启动子代理（Agent 工具被调用时报错）。
+        """
         return cls._assemble(
             db,
+            tools=tools,
+            subagents=subagents,
             mode_slug=mode_slug,
             agent=None,
             delegate_catalog=delegate_catalog,
@@ -81,6 +95,8 @@ class TurnConfiguration:
         db: AsyncSession,
         agent: AgentRuntimeConfig,
         *,
+        tools: ToolSet,
+        subagents: SubAgentLauncher | None,
         mode_slug: str = "standard",
         model: ResolvedModel | None = None,
         compact_model: ResolvedModel | None = None,
@@ -90,6 +106,8 @@ class TurnConfiguration:
         """绑定自建 Agent 的会话：工具与 Skill 以 Agent 配置为准，不能再委派（委派深度为 1）。"""
         return cls._assemble(
             db,
+            tools=tools,
+            subagents=subagents,
             mode_slug=mode_slug,
             agent=agent,
             delegate_catalog=None,
@@ -104,6 +122,8 @@ class TurnConfiguration:
         cls,
         db: AsyncSession,
         *,
+        tools: ToolSet,
+        subagents: SubAgentLauncher | None,
         mode_slug: str,
         agent: AgentRuntimeConfig | None,
         delegate_catalog: str | None,
@@ -112,7 +132,7 @@ class TurnConfiguration:
         compact_threshold: int | None,
         database_model: bool,
     ) -> TurnConfiguration:
-        base_tools = builtin_tool_set()
+        base_tools = tools
         if agent is None:
             agent_id = None
             profile: ToolProfile = "lead"
@@ -147,6 +167,7 @@ class TurnConfiguration:
             principal_name=principal_name,
             agent_id=agent_id,
             allowed_skill_names=allowed_skill_names,
+            subagents=subagents,
         )
         return cls(
             mode_slug=mode_slug,
@@ -227,10 +248,14 @@ async def configure_turn(
     *,
     user_id: int | None,
     workspace_id: int | None,
+    models: ModelResolver,
+    tools: ToolSet,
+    subagents: SubAgentLauncher | None,
     injected: ModelClient | None = None,
 ) -> TurnConfiguration:
     """按会话绑定解析本次运行的提示词、模型、Tool 与 Skill 边界。
 
+    models、tools、subagents 由运行时转交组装根注入的模型解析器、完整工具集与子代理启动器。
     injected 是构造运行时注入的客户端：此时不解析模型，模型参数取客户端自带的默认值，
     也不改压缩模型与阈值，但 Agent 绑定、委派目录与工具边界照常计算。
     """
@@ -241,17 +266,15 @@ async def configure_turn(
     if injected is not None:
         model = ResolvedModel.from_client(injected)
     else:
-        # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
-        from harness.adapters.models.resolver import DatabaseModelResolver
-
-        resolver = DatabaseModelResolver(db)
-        model = await resolver.for_session(session, "agent")
+        model = await models.for_session(session, "agent")
         database_model = model.provider_record_id is not None
-        compact_model = await resolver.resolve(workspace_id, user_id, "compact")
+        compact_model = await models.resolve(workspace_id, user_id, "compact")
         # 端点声明了上下文长度时，压缩阈值取其 3/4。
         if model.context_length is not None:
             compact_threshold = max(1, model.context_length * 3 // 4)
     model_fields: dict[str, Any] = {
+        "tools": tools,
+        "subagents": subagents,
         "mode_slug": mode_slug,
         "model": model,
         "compact_model": compact_model,

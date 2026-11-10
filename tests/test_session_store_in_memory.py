@@ -25,6 +25,7 @@ from harness.app.ports import (
     ToolCallReviewer,
 )
 from harness.app.session_port import SessionStore, TurnLeaseStore
+from harness.bootstrap import Harness, default_harness
 from harness.domain.memory import MemoryRecall, MemoryWriteTicket, TurnRef
 from harness.domain.messages import ToolCall
 from harness.domain.review import Decision, ReviewRequest
@@ -32,10 +33,13 @@ from hooks import HookRegistry
 from runtime import agent as agent_module
 from runtime import lead_loop as lead_loop_module
 from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner
 from runtime.turn_config import TurnConfiguration
-from runtime.workflow import WorkflowRuntime
 from session.service import SessionService
+from tests.fixtures.harness_factory import (
+    make_agent_runtime,
+    make_subagent_runner,
+    make_workflow_runtime,
+)
 from tests.fixtures.in_memory_session_store import InMemorySessionStore, MemorySnapshot
 
 pytestmark = pytest.mark.anyio
@@ -114,8 +118,12 @@ class _EchoGateway:
 def _install(monkeypatch: pytest.MonkeyPatch, gateway: _EchoGateway) -> None:
     """把会话以外的协作者换成替身：回合配置的查库、Hook、任务基线、Skill 目录与队友唤醒。"""
 
-    async def _configure(db: Any, session: Any, *, injected: Any, **_: Any) -> TurnConfiguration:
-        configuration = TurnConfiguration.for_lead(db, model=ResolvedModel.from_client(injected))
+    async def _configure(
+        db: Any, session: Any, *, injected: Any, tools: Any, subagents: Any, **_: Any
+    ) -> TurnConfiguration:
+        configuration = TurnConfiguration.for_lead(
+            db, tools=tools, subagents=subagents, model=ResolvedModel.from_client(injected)
+        )
         return replace(configuration, gateway=gateway)
 
     monkeypatch.setattr(agent_module, "configure_turn", _configure)
@@ -131,12 +139,18 @@ def _install(monkeypatch: pytest.MonkeyPatch, gateway: _EchoGateway) -> None:
     monkeypatch.setattr(lead_loop_module.SkillService, "get_catalog", AsyncMock(return_value=""))
 
 
-def _runtime(db: _Db, store: InMemorySessionStore, llm: _ScriptedLLM) -> AgentRuntime:
-    runtime = AgentRuntime(
-        db,  # type: ignore[arg-type]
+def _runtime(
+    db: _Db,
+    store: InMemorySessionStore,
+    llm: _ScriptedLLM,
+    harness: Harness | None = None,
+) -> AgentRuntime:
+    runtime = make_agent_runtime(
+        db,
         user_id=_USER_ID,
         workspace_id=_WORKSPACE_ID,
-        llm=llm,  # type: ignore[arg-type]
+        harness=harness,
+        llm=llm,
         reviewer=_AllowAll(),
         memory=_NoMemory(),
         sessions=store,
@@ -239,29 +253,28 @@ async def test_second_turn_compacts_history_into_snapshot(monkeypatch: pytest.Mo
 
 
 def test_runtimes_fall_back_to_session_service_and_keep_injected_store() -> None:
-    """未注入时回落数据库实现；注入的存储贯穿运行时的各个协作者。"""
+    """未注入时由组装根装配数据库实现；注入的存储贯穿运行时的各个协作者。"""
     db = object()
     store = InMemorySessionStore()
-    default = AgentRuntime(db, user_id=1, workspace_id=1, llm=object())  # type: ignore[arg-type]
-    injected = AgentRuntime(db, user_id=1, workspace_id=1, llm=object(), sessions=store)  # type: ignore[arg-type]
+    default = make_agent_runtime(db, user_id=1, workspace_id=1, llm=object())
+    injected = make_agent_runtime(db, user_id=1, workspace_id=1, llm=object(), sessions=store)
 
     assert isinstance(default.sessions, SessionService)
-    assert default._injected_sessions() is None
+    # 默认实现不随后台执行传递：后台重建时绑定新的数据库会话另建一个。
+    rebuilt_default = default._rebuild(object())
+    assert isinstance(rebuilt_default.sessions, SessionService)
+    assert rebuilt_default.sessions is not default.sessions
     assert injected.sessions is store
-    assert injected._injected_sessions() is store
+    assert injected._rebuild(object()).sessions is store
     assert injected.compact_service.snapshots is store
-    assert isinstance(WorkflowRuntime(db).sessions, SessionService)  # type: ignore[arg-type]
-    assert WorkflowRuntime(db, sessions=store).sessions is store  # type: ignore[arg-type]
-    assert isinstance(SubAgentRunner(db, llm=object()).sessions, SessionService)  # type: ignore[arg-type]
-    assert SubAgentRunner(db, llm=object(), sessions=store).sessions is store  # type: ignore[arg-type]
+    assert isinstance(make_workflow_runtime(db).sessions, SessionService)
+    assert make_workflow_runtime(db, sessions=store).sessions is store
+    assert isinstance(make_subagent_runner(db, llm=object()).sessions, SessionService)
+    assert make_subagent_runner(db, llm=object(), sessions=store).sessions is store
 
 
 async def test_injected_store_survives_background_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     """后台执行在独立数据库会话里重建运行时，注入的存储与注入的模型、记忆一样随之传递。"""
-    store = InMemorySessionStore()
-    store.create_session(_SESSION_ID, workspace_id=_WORKSPACE_ID, user_id=_USER_ID)
-    runtime = _runtime(_Db(), store, _ScriptedLLM())
-    rebuilt: list[AgentRuntime] = []
 
     class _Scope:
         async def __aenter__(self) -> _Db:
@@ -270,13 +283,18 @@ async def test_injected_store_survives_background_rebuild(monkeypatch: pytest.Mo
         async def __aexit__(self, *exc_info: object) -> bool:
             return False
 
+    store = InMemorySessionStore()
+    store.create_session(_SESSION_ID, workspace_id=_WORKSPACE_ID, user_id=_USER_ID)
+    harness = replace(default_harness(), session_factory=_Scope)
+    runtime = _runtime(_Db(), store, _ScriptedLLM(), harness)
+    rebuilt: list[AgentRuntime] = []
+
     async def _produce(self: AgentRuntime, *args: Any) -> None:
         rebuilt.append(self)
 
     async def _launch(*, body: Any, **kwargs: Any) -> None:
         await body(SimpleNamespace())
 
-    monkeypatch.setattr(agent_module, "AsyncSessionLocal", _Scope)
     monkeypatch.setattr(agent_module, "launch_turn_execution", _launch)
     monkeypatch.setattr(AgentRuntime, "_produce", _produce)
 

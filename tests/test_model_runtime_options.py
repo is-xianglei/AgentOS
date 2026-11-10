@@ -33,6 +33,7 @@ from runtime.subagent import SubAgentRunner
 from runtime.turn_config import TurnConfiguration
 from session.schemas import SessionRenameRequest, SessionSendMessageRequest
 from session.service import SessionService
+from tests.fixtures.harness_factory import make_agent_runtime, platform_tools
 from tests.fixtures.model_calls import structured, thinking_off, thinking_on
 
 pytestmark = pytest.mark.anyio
@@ -186,7 +187,9 @@ async def test_environment_fast_does_not_emit_unverified_private_protocol(monkey
 
 async def test_turbo_never_wakes_existing_team():
     runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.configuration = TurnConfiguration.for_lead(object(), mode_slug="turbo")
+    runtime.configuration = TurnConfiguration.for_lead(
+        object(), tools=platform_tools(), subagents=None, mode_slug="turbo"
+    )
     await runtime._wake_team_members(1, object())
 
 
@@ -198,6 +201,7 @@ async def test_subagent_rejects_turbo_before_resolving_client(monkeypatch):
     runner._llm_injected = False
     runner.db = object()
     runner.sessions = SessionService(runner.db)
+    runner.models = DatabaseModelResolver(runner.db)
     with pytest.raises(AgentException, match="极速模式"):
         await runner._configure_model(1, SimpleNamespace(), 2, 3)
 
@@ -323,9 +327,11 @@ async def test_turbo_loop_bypasses_skills_memory_plan_compact_and_stop(monkeypat
             )
 
     db = SimpleNamespace(commit=AsyncMock())
-    runtime = AgentRuntime(db, workspace_id=2, llm=_LLM())
+    runtime = make_agent_runtime(db, workspace_id=2, llm=_LLM())
     runtime.configuration = TurnConfiguration.for_lead(
         db,
+        tools=platform_tools(),
+        subagents=None,
         mode_slug="turbo",
         model=runtime.configuration.model,
         database_model=True,
@@ -360,7 +366,9 @@ async def test_turbo_completes_without_enqueuing_memory(monkeypatch):
     enqueue = AsyncMock()
     monkeypatch.setattr("memory.jobs.service.MemoryJobService.enqueue_extract", enqueue)
     runtime = AgentRuntime.__new__(AgentRuntime)
-    runtime.configuration = TurnConfiguration.for_lead(object(), mode_slug="turbo")
+    runtime.configuration = TurnConfiguration.for_lead(
+        object(), tools=platform_tools(), subagents=None, mode_slug="turbo"
+    )
     runtime._fence_lease = AsyncMock()
     runtime.db = SimpleNamespace(commit=AsyncMock(), begin_nested=AsyncMock())
     runtime.memory = BuiltinMemoryProvider(runtime.db)

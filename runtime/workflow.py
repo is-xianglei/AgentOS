@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -33,11 +33,10 @@ from core.events import (
     WorkflowProgressInfo,
     WorkflowProgressStatus,
 )
-from database.engine import AsyncSessionLocal
-from harness.adapters.models.factory import create_model_client
 from harness.app.agent_service import ExecutionHandle
-from harness.app.ports import ModelClient, ModelSettings, ResolvedModel
+from harness.app.ports import ModelClient, ModelResolver, ModelSettings, ResolvedModel
 from harness.app.session_port import SessionStore, StoredSession, StoredTurn
+from harness.app.subagent_catalog import build_agent_spec
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
 from runtime.execution import (
@@ -48,8 +47,7 @@ from runtime.execution import (
 from runtime.orchestrator import OrchestrationContext, Orchestrator
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
-from runtime.subagent import SubAgentRunner, build_agent_spec
-from session.service import SessionService
+from runtime.subagent import SessionFactory, SubAgentRunnerFactory
 from workflow.models import WorkflowMode
 from workflow.service import WorkflowRunMember, WorkflowService
 
@@ -126,7 +124,8 @@ class OrchestrationResult:
 class BaseOrchestrator(Orchestrator):
     """三种编排器的公共骨架:成员配置加载、成员执行与最终文本推送。
 
-    依赖全部以关键字传入,便于测试注入替身;子类只实现 run()。
+    依赖全部以关键字传入,便于测试注入替身;子类只实现 run()。runners 按数据库会话构造子代理运行器,
+    session_factory 为并发成员打开独立数据库会话,二者由组装根经 WorkflowRuntime 转交。
     """
 
     def __init__(
@@ -140,10 +139,14 @@ class BaseOrchestrator(Orchestrator):
         turn_id: UUID,
         workflow_id: int,
         members: Sequence[WorkflowRunMember],
+        runners: SubAgentRunnerFactory,
+        session_factory: SessionFactory,
         context: OrchestrationContext | None = None,
     ) -> None:
         self.db = db
         self.bus = bus
+        self.runners = runners
+        self.session_factory = session_factory
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.session_id = session_id
@@ -210,7 +213,7 @@ class BaseOrchestrator(Orchestrator):
             tool_profile="workflow_node",
         )
         try:
-            return await SubAgentRunner(db, bus=self.bus).run(
+            return await self.runners(db, bus=self.bus).run(
                 self.session_id,
                 prompt,
                 spec,
@@ -384,18 +387,15 @@ class SequentialOrchestrator(BaseOrchestrator):
 
 
 def _workflow_model(
-    llm: ModelClient | None,
+    llm: ModelClient,
     model_settings: ModelSettings | None,
 ) -> tuple[ModelClient, ModelSettings]:
-    """编排器的客户端与调用参数：未注入时按 workflow 场景用 .env 建客户端。
+    """编排器的客户端与调用参数。
 
     运行时按会话解析出的客户端连同其调用参数一起传入；只注入客户端（测试替身）时，
     参数取客户端自带的默认模型名，思考配置沿用端点默认。
     """
-    if llm is None:
-        resolved = ResolvedModel.from_client(create_model_client(scenario="workflow"))
-    else:
-        resolved = ResolvedModel.from_client(llm)
+    resolved = ResolvedModel.from_client(llm)
     return resolved.client, model_settings or resolved.settings
 
 
@@ -410,7 +410,7 @@ class ParallelOrchestrator(BaseOrchestrator):
     def __init__(
         self,
         *,
-        llm: ModelClient | None = None,
+        llm: ModelClient,
         model_settings: ModelSettings | None = None,
         **kwargs: Any,
     ) -> None:
@@ -464,10 +464,10 @@ class ParallelOrchestrator(BaseOrchestrator):
         """在独立数据库 Session 中执行单个已加载配置的成员,返回 (成员名, 输出)。
 
         AsyncSession 非并发安全,而 SubAgentRunner 持有 db,故每个并发成员必须用
-        AsyncSessionLocal 开独立 Session;只共享 self.bus,让各成员增量流到同一条 SSE。
+        session_factory 开独立 Session;只共享 self.bus,让各成员增量流到同一条 SSE。
         running 进度已由 run() 在派发前统一发出,这里只负责终态 done / failed。
         """
-        async with AsyncSessionLocal() as sub_db:
+        async with self.session_factory() as sub_db:
             try:
                 output = await self._execute_member(sub_db, config, prompt)
             except asyncio.CancelledError:
@@ -534,7 +534,7 @@ class LlmRoutingOrchestrator(BaseOrchestrator):
     def __init__(
         self,
         *,
-        llm: ModelClient | None = None,
+        llm: ModelClient,
         model_settings: ModelSettings | None = None,
         **kwargs: Any,
     ) -> None:
@@ -636,11 +636,18 @@ class WorkflowRuntime:
         user_id: int | None = None,
         workspace_id: int | None = None,
         llm: ModelClient | None = None,
-        sessions: SessionStore | None = None,
+        *,
+        sessions: SessionStore,
+        models: ModelResolver,
+        runners: SubAgentRunnerFactory,
+        session_factory: SessionFactory,
+        rebuild: Callable[[AsyncSession], WorkflowRuntime],
     ):
-        """初始化运行时依赖;llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端。
+        """初始化运行时依赖,具体实现全部由组装根(harness/bootstrap.py)注入。
 
-        sessions 未注入时使用绑定本会话的数据库实现(SessionService),注入的存储随后台执行传递。
+        llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端;未注入时按会话经 models 解析。
+        runners 为成员构造子代理运行器,session_factory 为后台执行与并发成员打开独立数据库会话。
+        rebuild 在独立会话里重建运行时:组装根只把构造时显式注入的客户端与会话存储带进去。
         """
         self.db = db
         self.user_id = user_id
@@ -648,9 +655,11 @@ class WorkflowRuntime:
         self.llm = llm
         # 按会话解析出的调用参数;注入替身时为 None,由编排器取替身自带的模型名。
         self.model_settings: ModelSettings | None = None
-        # 组装根(阶段 7)之前在这里回落数据库实现;只有注入的存储才传给后台执行。
-        self._injected_sessions = sessions
-        self.sessions: SessionStore = SessionService(db) if sessions is None else sessions
+        self.sessions = sessions
+        self.models = models
+        self._runners = runners
+        self._session_factory = session_factory
+        self._rebuild = rebuild
         # 执行之外没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
         self.bus: StreamBus = NullStreamBus()
         self.lease_owner: str | None = None
@@ -682,11 +691,8 @@ class WorkflowRuntime:
             **prepare_kwargs,
         )
         if self.llm is None:
-            # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
-            from harness.adapters.models.resolver import DatabaseModelResolver
-
             # 准入只验证配置，不将工作区客户端当作测试注入冻结给后台任务。
-            await DatabaseModelResolver(self.db).for_session(session, "workflow")
+            await self.models.for_session(session, "workflow")
         turn, _ = await self.sessions.start_turn(
             session,
             self.user_id,
@@ -700,19 +706,12 @@ class WorkflowRuntime:
         # 显式提交:请求作用域的 db 只用于准入,轮次与租约须在后台任务读取前可见。
         await self.db.commit()
         target_session_id, turn_id = session.id, turn.id
-        user_id, workspace_id, llm = self.user_id, self.workspace_id, self.llm
-        sessions = self._injected_sessions
+        session_factory, rebuild = self._session_factory, self._rebuild
 
         async def body(bus: RunStreamBus) -> None:
-            # 后台任务用独立 AsyncSessionLocal,生命周期与任务一致。
-            async with AsyncSessionLocal() as db:
-                runtime = WorkflowRuntime(
-                    db,
-                    user_id=user_id,
-                    workspace_id=workspace_id,
-                    llm=llm,
-                    sessions=sessions,
-                )
+            # 后台任务用独立数据库会话,生命周期与任务一致;运行时经组装根在该会话上重建。
+            async with session_factory() as db:
+                runtime = rebuild(db)
                 runtime.bind_execution(bus, owner)
                 await runtime._produce(target_session_id, turn_id, user_content, workflow_id)
 
@@ -839,12 +838,12 @@ class WorkflowRuntime:
             "turn_id": turn_id,
             "workflow_id": workflow_id,
             "members": members,
+            "runners": self._runners,
+            "session_factory": self._session_factory,
         }
         if self.llm is None:
-            from harness.adapters.models.resolver import DatabaseModelResolver
-
             session = await self.sessions.get_required(session_id)
-            resolved = await DatabaseModelResolver(self.db).for_session(session, "workflow")
+            resolved = await self.models.for_session(session, "workflow")
             self.llm, self.model_settings = resolved.client, resolved.settings
         # 只有并行汇总和智能路由要调 LLM，顺序编排不接收客户端。
         if issubclass(orchestrator_cls, ParallelOrchestrator | LlmRoutingOrchestrator):

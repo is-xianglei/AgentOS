@@ -24,6 +24,7 @@ from runtime import agent as agent_module
 from runtime.agent import AgentRuntime, TurnLoopResult
 from runtime.execution import run_end_status
 from runtime.turn_config import TurnConfiguration
+from tests.fixtures.harness_factory import platform_tools
 
 pytestmark = pytest.mark.anyio
 
@@ -135,7 +136,9 @@ def _runtime(
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime.db = _Db()
     runtime.sessions = sessions
-    runtime.configuration = TurnConfiguration.for_lead(runtime.db)
+    runtime.configuration = TurnConfiguration.for_lead(
+        runtime.db, tools=platform_tools(), subagents=None
+    )
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)
     monkeypatch.setattr(runtime, "_run_llm_loop", loop)

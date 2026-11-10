@@ -21,6 +21,7 @@ from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.assistant import Assistant
 from runtime.agent import AgentRuntime
 from runtime.turn_config import TurnConfiguration
+from tests.fixtures.harness_factory import make_agent_runtime, platform_tools
 
 pytestmark = pytest.mark.anyio
 
@@ -77,9 +78,11 @@ def test_empty_delegate_catalog_is_not_injected(catalog: str | None) -> None:
 def _loop_runtime(llm: _FakeLLM, delegate_catalog: str | None) -> AgentRuntime:
     """真实 __init__ 的非极速运行时，换掉 _run_llm_loop 用到的数据库、会话、记忆与 Plan 依赖。"""
     db: Any = SimpleNamespace(commit=AsyncMock())
-    runtime = AgentRuntime(db, workspace_id=2, llm=llm)  # type: ignore[arg-type]
+    runtime = make_agent_runtime(db, workspace_id=2, llm=llm)
     runtime.configuration = TurnConfiguration.for_lead(
         db,
+        tools=platform_tools(),
+        subagents=None,
         delegate_catalog=delegate_catalog,
         model=runtime.configuration.model,
         database_model=True,
@@ -165,7 +168,7 @@ _ENTRIES = (
 def _configure_runtime(workspace_id: int | None) -> AgentRuntime:
     db: Any = object()
     llm: Any = _FakeLLM()
-    return AgentRuntime(db, user_id=1, workspace_id=workspace_id, llm=llm)
+    return make_agent_runtime(db, user_id=1, workspace_id=workspace_id, llm=llm)
 
 
 async def test_lead_session_loads_and_renders_delegate_catalog(

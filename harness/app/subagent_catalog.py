@@ -8,6 +8,8 @@ verification 都需要 shell 跑 git diff、find 与测试,禁 shell 会直接�
 核心能力,因此只读由 harness/adapters/tools/builtin/shell_policy.py 在执行边界按命令强制。
 """
 
+from typing import TYPE_CHECKING
+
 from core.config import settings
 from core.errors import AgentException
 from harness.domain.prompts.subagents import (
@@ -22,7 +24,11 @@ from harness.domain.prompts.subagents import (
     VERIFICATION_WHEN_TO_USE,
 )
 from harness.domain.roles.subagent import AgentType, SubAgentSpec, render_routing_catalog
-from harness.domain.tool import ShellAccess
+from harness.domain.tool import ShellAccess, ToolProfile
+
+if TYPE_CHECKING:
+    # 仅作类型标注：agent 域经 tools 域加载内置工具，顶层导入会与 Agent 工具成环。
+    from agent.service import AgentRuntimeConfig
 
 # 只读检索类共用的工具集:能读能搜能跑只读 shell,不能写。
 _READ_ONLY_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep", "Bash")
@@ -103,3 +109,26 @@ def get_subagent_spec(agent_type: AgentType) -> SubAgentSpec:
 def routing_catalog() -> str:
     """给主代理的路由说明:每种内置类型的用途与实际工具范围。"""
     return render_routing_catalog(SUBAGENT_SPECS.values())
+
+
+def build_agent_spec(
+    config: AgentRuntimeConfig,
+    *,
+    display_name: str,
+    tool_profile: ToolProfile,
+) -> SubAgentSpec:
+    """把数据库 Agent 的运行配置桥接成 SubAgentSpec,Workflow 成员与默认 Agent 委派共用。
+
+    agent_type 只表示能力档位,display_name 才是运行标识(落运行记录、发事件、判权限);
+    tool_profile 决定工具按 workflow_node 还是 delegate 档位裁决。模型取 Agent 自身配置,
+    是否生效由子代理运行器按会话模型选项决定,两条调用路径规则一致。
+    """
+    return SubAgentSpec(
+        agent_type=AgentType.GENERAL_PURPOSE,
+        display_name=display_name,
+        agent_id=config.agent_id,
+        system_prompt=config.system_prompt,
+        allowed_tools=config.tool_runtime_names,
+        model=config.model_name,
+        tool_profile=tool_profile,
+    )

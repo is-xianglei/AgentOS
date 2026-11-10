@@ -1,5 +1,4 @@
 from typing import Annotated
-from uuid import UUID
 
 import jwt
 from fastapi import Depends
@@ -11,10 +10,7 @@ from core.config import settings
 from core.errors import AgentException
 from database.engine import get_db
 from harness.app.agent_service import AgentService
-from harness.app.session_port import TurnTermination
-from runtime.agent import AgentRuntime
-from runtime.execution import cancel_turn
-from runtime.workflow import WorkflowRuntime
+from harness.bootstrap import default_harness
 from user.models import UserRecord
 from workspace.service import WorkspaceService
 
@@ -120,27 +116,14 @@ async def get_agent_service(
     current_user: Annotated[UserRecord, Depends(get_current_active_user)],
     workspace_id: Annotated[int, Depends(get_current_workspace_id)],
 ) -> AgentService:
-    """按请求装配 AgentService：运行时绑定本次请求的数据库会话与可信用户、工作区。
+    """按请求经组装根装配 AgentService：运行时绑定本次请求的数据库会话与可信用户、工作区。
 
-    具体的 AgentRuntime / WorkflowRuntime 只在这里出现，路由只认 AgentService；
-    阶段 7 由组装根接管装配。
+    具体的运行时类只在组装根 harness/bootstrap.py 出现，路由只认 AgentService。
     """
-
-    async def _cancel_turn(session_id: int, turn_id: UUID) -> TurnTermination:
-        return await cancel_turn(db, session_id, turn_id)
-
-    return AgentService(
-        agent_runner=lambda: AgentRuntime(
-            db,
-            user_id=current_user.id,
-            workspace_id=workspace_id,
-        ),
-        workflow_runner=lambda: WorkflowRuntime(
-            db,
-            user_id=current_user.id,
-            workspace_id=workspace_id,
-        ),
-        cancel_turn=_cancel_turn,
+    return default_harness().agent_service(
+        db,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
     )
 
 

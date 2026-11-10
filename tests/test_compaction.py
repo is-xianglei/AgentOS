@@ -138,9 +138,9 @@ async def test_missing_turn_result_or_model_raises() -> None:
 
 
 async def test_agent_runtime_compaction_uses_session_service() -> None:
-    from runtime.agent import AgentRuntime
+    from tests.fixtures.harness_factory import make_agent_runtime
 
-    runtime = AgentRuntime(object(), user_id=3, workspace_id=2, llm=object())  # type: ignore[arg-type]
+    runtime = make_agent_runtime(object(), user_id=3, workspace_id=2, llm=object())
 
     assert isinstance(runtime.compact_service, ContextCompaction)
     assert runtime.compact_service.snapshots is runtime.sessions

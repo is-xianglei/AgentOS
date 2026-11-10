@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, computed_field
 
-from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.app.tool_set import platform_tools
 from harness.domain.tool import ToolProfile
 
 
@@ -25,7 +25,7 @@ class ToolResponse(BaseModel):
     @property
     def bindable_profiles(self) -> list[ToolProfile]:
         """目录与绑定校验共享策略源，停用状态仍由 is_enabled 单独表达。"""
-        return sorted(builtin_tool_set().policy_for(self.runtime_name).bindable_profiles)
+        return sorted(platform_tools().policy_for(self.runtime_name).bindable_profiles)
 
 
 class ToolDetailResponse(ToolResponse):

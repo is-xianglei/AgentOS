@@ -607,7 +607,9 @@ def _interaction_runtime(db: AsyncSession, ids) -> AgentRuntime:
     runtime.tool_service = ToolService(db, builtin_tool_set())
     runtime.bus = NullStreamBus()
     # 交互取消用不到审核、Plan、权限与回合模型，这里只给出流程组装需要的占位。
-    runtime.configuration = TurnConfiguration.for_lead(db)
+    runtime.configuration = TurnConfiguration.for_lead(
+        db, tools=builtin_tool_set(), subagents=None
+    )
     runtime.reviewer = None
     runtime.plan_service = None
     runtime.permission_service = None

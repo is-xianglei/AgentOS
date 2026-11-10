@@ -23,7 +23,7 @@ from core.events import (
 from harness.app.ports import ModelTurnResult
 from harness.app.subagent_catalog import get_subagent_spec
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
-from runtime.subagent import SubAgentRunner
+from tests.fixtures.harness_factory import make_subagent_runner
 
 _SID = 42
 
@@ -196,7 +196,7 @@ def _stub_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Any, _RecordingRunRepo, _RecordingBus]:
     """构造跳过 LLM / 工具 / 记忆 / 权限依赖的运行器,只保留建记录与发事件两步。"""
-    runner = SubAgentRunner(_FakeDb(), bus=_RecordingBus(), llm=object())  # type: ignore[arg-type]
+    runner = make_subagent_runner(_FakeDb(), bus=_RecordingBus(), llm=object())
     repo = _RecordingRunRepo()
     runner.team_service.run_repo = repo  # type: ignore[assignment]
 

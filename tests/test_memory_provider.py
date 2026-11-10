@@ -20,13 +20,14 @@ from harness.adapters.memory import builtin_provider as builtin_module
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import ModelEventKind, ModelStreamEvent, ModelTurnResult
+from harness.bootstrap import default_harness
 from harness.domain.memory import MemoryRecall, MemoryWriteTicket, TurnRef
 from memory.jobs.service import MemoryJobService
 from memory.recall.service import MemoryRecallService
 from runtime import agent as agent_module
 from runtime import lead_loop as lead_loop_module
 from runtime.agent import AgentRuntime
-from runtime.subagent import SubAgentRunner
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 
 pytestmark = pytest.mark.anyio
 
@@ -105,10 +106,13 @@ class _Db:
 
 
 def test_agent_runtime_defaults_to_builtin_provider() -> None:
-    runtime = AgentRuntime(object(), user_id=3, workspace_id=2, llm=object())  # type: ignore[arg-type]
+    runtime = make_agent_runtime(object(), user_id=3, workspace_id=2, llm=object())
 
     assert isinstance(runtime.memory, BuiltinMemoryProvider)
-    assert runtime._injected_memory() is None
+    # 默认实现不随后台执行传递：后台重建时绑定新的数据库会话另建一个。
+    rebuilt = runtime._rebuild(object())
+    assert isinstance(rebuilt.memory, BuiltinMemoryProvider)
+    assert rebuilt.memory is not runtime.memory
 
 
 async def test_injected_provider_drives_recall_and_turn_write(
@@ -118,7 +122,7 @@ async def test_injected_provider_drives_recall_and_turn_write(
     fake = _FakeMemory(MemoryRecall(instruction="- [k](memory:1@1) - 目录", message_prefix="正文"))
     db = _Db()
     llm = _RecordingLLM()
-    runtime = AgentRuntime(db, user_id=3, workspace_id=2, llm=llm, memory=fake)  # type: ignore[arg-type]
+    runtime = make_agent_runtime(db, user_id=3, workspace_id=2, llm=llm, memory=fake)
     prefixes: list[Any] = []
 
     async def _load(turn: Any, additional_context: Any, rendered_memories: Any = None) -> Any:
@@ -155,7 +159,7 @@ async def test_injected_provider_drives_recall_and_turn_write(
 async def test_turbo_mode_skips_injected_provider() -> None:
     fake = _FakeMemory()
     db = _Db()
-    runtime = AgentRuntime(db, user_id=3, workspace_id=2, llm=object(), memory=fake)  # type: ignore[arg-type]
+    runtime = make_agent_runtime(db, user_id=3, workspace_id=2, llm=object(), memory=fake)
     runtime.configuration = replace(runtime.configuration, mode_slug="turbo")
     runtime.sessions = SimpleNamespace(
         mark_turn_status=AsyncMock(), set_status=AsyncMock()
@@ -171,15 +175,6 @@ async def test_injected_provider_survives_background_rebuild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """后台执行用独立数据库会话重建运行时，注入的 Provider 与注入的客户端一样随之传递。"""
-    fake = _FakeMemory()
-    llm = object()
-    runtime = AgentRuntime(_Db(), user_id=3, workspace_id=2, llm=llm, memory=fake)  # type: ignore[arg-type]
-    runtime.sessions = SimpleNamespace(
-        prepare_for_message=AsyncMock(return_value=SimpleNamespace(id=1)),
-        start_turn=AsyncMock(return_value=(SimpleNamespace(id=_TURN_ID), None)),
-        claim_turn_lease=AsyncMock(return_value=0),
-    )
-    rebuilt: list[AgentRuntime] = []
 
     class _Scope:
         async def __aenter__(self) -> object:
@@ -188,13 +183,29 @@ async def test_injected_provider_survives_background_rebuild(
         async def __aexit__(self, *exc_info: object) -> bool:
             return False
 
+    fake = _FakeMemory()
+    llm = object()
+    runtime = make_agent_runtime(
+        _Db(),
+        user_id=3,
+        workspace_id=2,
+        harness=replace(default_harness(), session_factory=_Scope),
+        llm=llm,
+        memory=fake,
+    )
+    runtime.sessions = SimpleNamespace(
+        prepare_for_message=AsyncMock(return_value=SimpleNamespace(id=1)),
+        start_turn=AsyncMock(return_value=(SimpleNamespace(id=_TURN_ID), None)),
+        claim_turn_lease=AsyncMock(return_value=0),
+    )
+    rebuilt: list[AgentRuntime] = []
+
     async def _produce(self: AgentRuntime, *args: Any) -> None:
         rebuilt.append(self)
 
     async def _launch(*, body: Any, **kwargs: Any) -> None:
         await body(SimpleNamespace())
 
-    monkeypatch.setattr(agent_module, "AsyncSessionLocal", _Scope)
     monkeypatch.setattr(agent_module, "launch_turn_execution", _launch)
     monkeypatch.setattr(AgentRuntime, "_produce", _produce)
 
@@ -206,7 +217,7 @@ async def test_injected_provider_survives_background_rebuild(
 
 async def test_subagent_inherits_through_injected_provider() -> None:
     fake = _FakeMemory(MemoryRecall(instruction="目录", message_prefix="父回合正文"))
-    runner = SubAgentRunner(_Db(), llm=object(), memory=fake)  # type: ignore[arg-type]
+    runner = make_subagent_runner(_Db(), llm=object(), memory=fake)
 
     inherited = await runner._load_frozen_memories(1, _TURN_ID, 3, 2)
     skipped = await runner._load_frozen_memories(1, None, 3, 2)
@@ -217,7 +228,7 @@ async def test_subagent_inherits_through_injected_provider() -> None:
 
 
 def test_subagent_runner_defaults_to_builtin_provider() -> None:
-    runner = SubAgentRunner(object(), llm=object())  # type: ignore[arg-type]
+    runner = make_subagent_runner(object(), llm=object())
 
     assert isinstance(runner.memory, BuiltinMemoryProvider)
 

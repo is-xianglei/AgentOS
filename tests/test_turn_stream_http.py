@@ -23,6 +23,7 @@ from runtime import execution, turn_follow
 from session import api as session_api
 from session.schemas import SessionSendMessageRequest
 from session.service import SessionService
+from tests.fixtures.harness_factory import install_runtime_classes
 
 pytestmark = pytest.mark.anyio
 
@@ -185,7 +186,7 @@ async def env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(turn_follow, "get_run_event_store", lambda: store)
     monkeypatch.setattr(turn_follow, "STREAM_BLOCK_MS", 100)
     environment = _Env(leases, store, asyncio.Event(), asyncio.Event())
-    monkeypatch.setattr(api_deps, "AgentRuntime", _scripted_runtime(environment))
+    install_runtime_classes(monkeypatch, agent=_scripted_runtime(environment))
     yield environment
     await execution.shutdown_executions(timeout=1)
 

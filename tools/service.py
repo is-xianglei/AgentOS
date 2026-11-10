@@ -10,8 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.errors import AgentException
 from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
-from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.app.tool_set import ToolSet
+from harness.app.ports import SubAgentLauncher
+from harness.app.tool_set import ToolSet, platform_tools
 from harness.domain.review import check_capability
 from harness.domain.tool import ShellAccess, ToolContext, ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
@@ -71,7 +71,7 @@ class ToolCatalogService:
         self.repo = ToolCatalogRepository(db)
 
     async def sync_builtins(self, tool_set: ToolSet | None = None) -> None:
-        active_tool_set = tool_set or builtin_tool_set()
+        active_tool_set = tool_set or platform_tools()
         for tool in active_tool_set.tools:
             await self.repo.sync_builtin(
                 tool_key=tool.name,
@@ -133,7 +133,7 @@ class ToolCatalogService:
                 {"tool_ids": unavailable},
                 status_code=409,
             )
-        tool_set = builtin_tool_set()
+        tool_set = platform_tools()
         missing_runtime = [
             record.id for record in records if record.runtime_name not in tool_set.names
         ]
@@ -199,7 +199,7 @@ class ToolCatalogService:
         normalized = list(dict.fromkeys(tool_keys))
         records = await self.repo.list_by_tool_keys(normalized)
         records_by_key = {record.tool_key: record for record in records}
-        tool_set = builtin_tool_set()
+        tool_set = platform_tools()
 
         tool_ids: dict[str, int] = {}
         unavailable: dict[str, ToolUnavailableReason] = {}
@@ -229,7 +229,7 @@ class ToolCatalogService:
         normalized = list(dict.fromkeys(runtime_names))
         records = await self.repo.list_by_runtime_names(normalized)
         records_by_name = {record.runtime_name: record for record in records}
-        registry_names = builtin_tool_set().names
+        registry_names = platform_tools().names
         # 目录中不存在、已停用、或代码里没有实现，任一情况都视为不可用。
         unavailable: list[str] = []
         for name in normalized:
@@ -250,9 +250,9 @@ class ToolService:
         """初始化工具执行器依赖。"""
         self.db = db
         self.registry = registry
-        # 能力策略按工具名查完整的内置工具集，而不是 registry：registry 是裁剪后的
+        # 能力策略按工具名查完整的进程级工具集，而不是 registry：registry 是裁剪后的
         # 可见集合，被裁掉的工具若按它查会变成 unknown，从而跳过下面的能力检查。
-        self.policy_source = builtin_tool_set()
+        self.policy_source = platform_tools()
         self.tool_repo = ToolRepository(db)
         self.catalog_repo = ToolCatalogRepository(db)
 
@@ -348,6 +348,7 @@ class ToolService:
         principal_name: str | None = None,
         execution_context: ToolExecutionContext | None = None,
         round_tool_names: frozenset[str] | None = None,
+        subagents: SubAgentLauncher | None = None,
     ) -> str:
         """执行工具并记录调用状态。
 
@@ -356,7 +357,7 @@ class ToolService:
 
         record 非空时复用既有记录(如审批通过后复用之前的 awaiting 记录),
         回到 running 并以最新 input_args 覆盖(可能被审批时的 updated_input 修改过);
-        否则新建一条 running 记录。
+        否则新建一条 running 记录。subagents 是运行时注入的子代理启动器,原样放进工具上下文。
         """
         actor = actor or ORCHESTRATOR_ACTOR
         if execution_context is not None:
@@ -480,6 +481,7 @@ class ToolService:
                 allowed_skill_names=allowed_skill_names,
                 shell_access=shell_access,
                 shell_tmp_root=shell_tmp_root,
+                subagents=subagents,
             )
             output = await tool.execute(input_args, ctx)
         except Exception as exc:

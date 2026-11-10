@@ -5,14 +5,15 @@ import json
 import logging
 import tempfile
 import time
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.service import AgentRuntimeConfig
 from core.config import settings
 from core.errors import AgentException
 from core.event_bus import StreamBus
@@ -25,10 +26,6 @@ from core.events import (
     subagent_actor,
     teammate_actor,
 )
-from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
-from harness.adapters.models.factory import resolve_subagent_model
-from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
-from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.loop import (
     LoopExit,
     LoopPolicy,
@@ -41,6 +38,7 @@ from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     Effort,
     ModelClient,
+    ModelResolver,
     ModelSettings,
     ResolvedModel,
     ToolCallReviewer,
@@ -52,13 +50,11 @@ from harness.domain.context import messages_from_rows
 from harness.domain.memory import TurnRef
 from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from harness.domain.review import SOURCE_BUDGET, ReviewRequest
-from harness.domain.roles.subagent import AgentType, SubAgent, SubAgentSpec
+from harness.domain.roles.subagent import SubAgent, SubAgentSpec
 from harness.domain.roles.teammate import Teammate, is_identity_block
 from harness.domain.tool import ToolProfile
-from permission.service import PermissionService
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
-from session.service import SessionService
 from team.isolation import (
     new_team_task_instance_id,
     reset_team_task_instance_id,
@@ -92,27 +88,14 @@ def _get_concurrency_gate() -> asyncio.Semaphore:
     return _concurrency_gate
 
 
-def build_agent_spec(
-    config: AgentRuntimeConfig,
-    *,
-    display_name: str,
-    tool_profile: ToolProfile,
-) -> SubAgentSpec:
-    """把数据库 Agent 的运行配置桥接成 SubAgentSpec,Workflow 成员与默认 Agent 委派共用。
+# 打开一个独立数据库会话的工厂（如 async_sessionmaker），由组装根注入。
+type SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
-    agent_type 只表示能力档位,display_name 才是运行标识(落运行记录、发事件、判权限);
-    tool_profile 决定工具按 workflow_node 还是 delegate 档位裁决。模型取 Agent 自身配置,
-    是否生效由 _configure_model 按会话模型选项决定,两条调用路径规则一致。
-    """
-    return SubAgentSpec(
-        agent_type=AgentType.GENERAL_PURPOSE,
-        display_name=display_name,
-        agent_id=config.agent_id,
-        system_prompt=config.system_prompt,
-        allowed_tools=config.tool_runtime_names,
-        model=config.model_name,
-        tool_profile=tool_profile,
-    )
+
+class SubAgentRunnerFactory(Protocol):
+    """按数据库会话与事件总线构造子代理运行器，由组装根提供；运行时据此唤醒队友、运行 Workflow 成员。"""
+
+    def __call__(self, db: AsyncSession, *, bus: StreamBus | None) -> SubAgentRunner: ...
 
 
 @dataclass(frozen=True)
@@ -310,45 +293,46 @@ class SubAgentRunner:
         db: AsyncSession,
         bus: StreamBus | None = None,
         llm: ModelClient | None = None,
-        reviewer: ToolCallReviewer | None = None,
-        memory: MemoryProvider | None = None,
-        sessions: SessionOptionsReader | None = None,
+        *,
+        reviewer: ToolCallReviewer,
+        memory: MemoryProvider,
+        sessions: SessionOptionsReader,
+        models: ModelResolver,
+        tools: ToolSet,
+        subagent_model: Callable[[SubAgentSpec], str | None],
     ):
-        """初始化子代理运行器依赖。
+        """初始化子代理运行器依赖，具体实现全部由组装根（harness/bootstrap.py）注入。
 
-        reviewer 未注入时使用子代理的规则链审核员；memory 未注入时使用绑定本会话的内置记忆；
-        sessions 只用来读取所属会话冻结的模型选项，未注入时使用绑定本会话的数据库实现。
+        llm 是注入的模型客户端，注入后不再按会话解析模型；sessions 只用来读取所属会话冻结的模型选项；
+        tools 是按名查策略、做裁剪的完整工具集；subagent_model 按 spec 给出 .env 端点上要覆盖的模型名。
         """
         self.db = db
         self.bus = bus
-        # 客户端持 subagent 默认档模型;Explore 等速度档由 resolve_subagent_model()
+        # 客户端持 subagent 默认档模型;Explore 等速度档由 subagent_model
         # 写进每次调用的 ModelSettings.model_id,见 _configure_model。
         self.llm = llm
         self._llm_injected = llm is not None
         # 子代理运行记录属 team 域，经其 Service 写入。
         self.team_service = TeamService(db)
-        self.permission_service = PermissionService(db)
-        if reviewer is None:
-            reviewer = PolicyReviewer.for_subagent(self.permission_service)
         self.reviewer = reviewer
-        # 组装根（阶段 7）之前在这里回落内置实现。
-        if memory is None:
-            memory = BuiltinMemoryProvider(db)
         self.memory = memory
-        self.sessions: SessionOptionsReader = SessionService(db) if sessions is None else sessions
+        self.sessions = sessions
+        self.models = models
+        self.tools = tools
+        self._subagent_model = subagent_model
 
-    @staticmethod
     def _resolve_tools(
+        self,
         spec: SubAgentSpec,
         parent_allowed_tool_names: frozenset[str] | None,
         profile: ToolProfile = "subagent",
     ) -> ToolSet:
         """先继承父 Agent 工具边界，再叠加子代理自身规则。"""
-        registry = builtin_tool_set()
+        registry = self.tools
         if parent_allowed_tool_names is not None:
             registry = registry.only(*parent_allowed_tool_names)
         registry = spec.resolve_tools(registry)
-        names = builtin_tool_set().callable_names(registry.names, profile)
+        names = self.tools.callable_names(registry.names, profile)
         return registry.only(*names)
 
     async def _configure_model(
@@ -365,9 +349,6 @@ class SubAgentRunner:
         """
         if self._llm_injected:
             return self._override_model(ResolvedModel.from_client(self.llm).settings, spec)
-        # 局部导入：模型解析器属适配层，阶段 7 由组装根注入，运行时模块加载期不依赖它。
-        from harness.adapters.models.resolver import DatabaseModelResolver
-
         provider_id = None
         effort = None
         if workspace_id is not None:
@@ -379,7 +360,7 @@ class SubAgentRunner:
             if (session.extra or {}).get("model_provider_override"):
                 provider_id = session.model_provider_id
             effort = Effort.parse(getattr(session, "thinking_effort", Effort.FAST))
-        resolved = await DatabaseModelResolver(self.db).resolve(
+        resolved = await self.models.resolve(
             workspace_id,
             user_id,
             spec.model_scenario or "subagent",
@@ -391,10 +372,9 @@ class SubAgentRunner:
             return resolved.settings
         return self._override_model(resolved.settings, spec)
 
-    @staticmethod
-    def _override_model(settings: ModelSettings, spec: SubAgentSpec) -> ModelSettings:
+    def _override_model(self, settings: ModelSettings, spec: SubAgentSpec) -> ModelSettings:
         """spec 声明了模型名（固定模型或速度档）时覆盖场景模型，否则沿用。"""
-        model = resolve_subagent_model(spec)
+        model = self._subagent_model(spec)
         if model:
             return replace(settings, model_id=model)
         return settings
@@ -438,7 +418,7 @@ class SubAgentRunner:
         # 在默认子代理边界基础上再按自身档位做一次能力解析。
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         if profile != "subagent" and hasattr(tool_registry, "names"):
-            profile_names = builtin_tool_set().callable_names(
+            profile_names = self.tools.callable_names(
                 tool_registry.names,
                 profile,
             )

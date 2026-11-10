@@ -47,9 +47,9 @@ from model_service.service import ModelService
 from runtime.agent import AgentRuntime
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
-from runtime.subagent import SubAgentRunner
 from runtime.workflow import LlmRoutingOrchestrator, ParallelOrchestrator
 from session.service import SessionService
+from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 from tests.fixtures.model_request_golden import EXPECTED
 
 pytestmark = pytest.mark.anyio
@@ -693,7 +693,7 @@ class _FixedDate(date):
 
 async def _configured_agent(session: Any) -> AgentRuntime:
     """经真实 __init__ 与 _configure_agent 解析主 Agent 与压缩客户端，再换掉数据库依赖。"""
-    runtime = AgentRuntime(object(), user_id=3, workspace_id=2)
+    runtime = make_agent_runtime(object(), user_id=3, workspace_id=2)
     await runtime._configure_agent(session)
     runtime.configuration = replace(runtime.configuration, tools=ToolSet([EchoTool()]))
     runtime.bus = SimpleNamespace(emit=AsyncMock())
@@ -740,7 +740,7 @@ def _subagent_case(world: str, effort: str, agent_type: AgentType, spec_model: s
         spec = get_subagent_spec(agent_type)
         if spec_model is not None:
             spec = replace(spec, model=spec_model)
-        runner = SubAgentRunner(object())
+        runner = make_subagent_runner(object())
         settings = await runner._configure_model(1, spec, 2, 3)
         assembler = TurnEventAssembler(ORCHESTRATOR_ACTOR, 1, turn_id=_TURN_ID)
         role = SubAgent(spec=replace(spec, system_prompt="子代理系统提示", critical_reminder=""))
@@ -755,7 +755,7 @@ def _workflow_deps() -> dict[str, Any]:
     return {
         "db": object(), "bus": SimpleNamespace(emit=AsyncMock()), "user_id": 3,
         "workspace_id": 2, "session_id": 1, "turn_id": _TURN_ID, "workflow_id": 8,
-        "members": (),
+        "members": (), "runners": make_subagent_runner, "session_factory": AsyncMock(),
     }
 
 

@@ -74,13 +74,9 @@ def _install_fakes(
 
     async def _fake_dispatch(
         self: AgentTool,
-        session_id: int,
+        ctx: ToolContext,
         prompt: str,
         spec: Any,
-        bus: Any,
-        parent_turn_id: Any,
-        user_id: int | None,
-        workspace_id: int | None,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
     ) -> str:
@@ -90,7 +86,7 @@ def _install_fakes(
                 "spec": spec,
                 "parent_allowed_tool_names": parent_allowed_tool_names,
                 "allowed_skill_names": allowed_skill_names,
-                "workspace_id": workspace_id,
+                "workspace_id": ctx.workspace_id,
             }
         )
         return "委派报告"

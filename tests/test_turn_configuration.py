@@ -1,6 +1,6 @@
 """回合配置：默认 Agent、绑定自建 Agent、极速模式与注入客户端四种情况的配置结果。
 
-数据库与模型解析器全部打桩；网关与工具集走真实实现。
+数据库与模型解析器全部打桩（解析器替身经 models 参数注入）；网关与工具集走真实实现。
 """
 
 from dataclasses import FrozenInstanceError
@@ -10,7 +10,6 @@ from typing import Any, ClassVar
 import pytest
 
 from agent.service import AgentRuntimeConfig, DelegateCatalogEntry
-from harness.adapters.models import resolver as resolver_module
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ModelSettings, ResolvedModel
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
@@ -86,7 +85,6 @@ def _fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeAgentDefinitionService.calls = []
     _FakeResolver.calls = []
     monkeypatch.setattr(turn_config_module, "AgentDefinitionService", _FakeAgentDefinitionService)
-    monkeypatch.setattr(resolver_module, "DatabaseModelResolver", _FakeResolver)
 
 
 def _session(**overrides: Any) -> Any:
@@ -94,8 +92,20 @@ def _session(**overrides: Any) -> Any:
     return SimpleNamespace(**{**values, **overrides})
 
 
+async def _configure(db: Any, session: Any, **kwargs: Any) -> TurnConfiguration:
+    """按会话配置回合：模型解析器替身、完整内置工具集与空的子代理启动器由这里注入。"""
+    return await configure_turn(
+        db,
+        session,
+        models=_FakeResolver(db),  # type: ignore[arg-type]
+        tools=builtin_tool_set(),
+        subagents=None,
+        **kwargs,
+    )
+
+
 async def test_default_agent_resolves_models_and_loads_delegate_catalog() -> None:
-    configuration = await configure_turn(_DB, _session(), user_id=3, workspace_id=2)
+    configuration = await _configure(_DB, _session(), user_id=3, workspace_id=2)
 
     assert (configuration.mode_slug, configuration.turbo) == ("standard", False)
     assert (configuration.agent_id, configuration.profile, configuration.principal_name) == (
@@ -126,7 +136,7 @@ async def test_default_agent_resolves_models_and_loads_delegate_catalog() -> Non
 
 
 async def test_bound_agent_uses_agent_tools_skills_and_identity() -> None:
-    configuration = await configure_turn(_DB, _session(agent_id=7), user_id=3, workspace_id=2)
+    configuration = await _configure(_DB, _session(agent_id=7), user_id=3, workspace_id=2)
 
     assert (configuration.agent_id, configuration.profile, configuration.principal_name) == (
         7,
@@ -150,11 +160,11 @@ async def test_bound_agent_uses_agent_tools_skills_and_identity() -> None:
 
 async def test_bound_agent_requires_trusted_workspace() -> None:
     with pytest.raises(Exception, match="缺少可信工作区上下文"):
-        await configure_turn(_DB, _session(agent_id=7), user_id=3, workspace_id=None)
+        await _configure(_DB, _session(agent_id=7), user_id=3, workspace_id=None)
 
 
 async def test_turbo_limits_tools_and_skills() -> None:
-    configuration = await configure_turn(_DB, _session(mode_slug="turbo"), user_id=3, workspace_id=2)
+    configuration = await _configure(_DB, _session(mode_slug="turbo"), user_id=3, workspace_id=2)
 
     assert configuration.turbo is True
     # 极速放行名单目前为空：没有工具、不能用 Skill。
@@ -169,7 +179,7 @@ async def test_turbo_limits_tools_and_skills() -> None:
 async def test_injected_client_skips_model_resolution_but_still_binds_agent() -> None:
     client = _Client()
 
-    configuration = await configure_turn(
+    configuration = await _configure(
         _DB,
         _session(agent_id=7),
         user_id=3,
@@ -190,7 +200,7 @@ async def test_injected_client_skips_model_resolution_but_still_binds_agent() ->
 
 
 async def test_injected_client_on_default_agent_overrides_with_session_model() -> None:
-    configuration = await configure_turn(
+    configuration = await _configure(
         _DB, _session(), user_id=3, workspace_id=2, injected=_Client()  # type: ignore[arg-type]
     )
 
@@ -201,7 +211,7 @@ async def test_injected_client_on_default_agent_overrides_with_session_model() -
 
 
 def test_configuration_is_immutable_and_lead_tools_drop_plan_tools() -> None:
-    configuration = TurnConfiguration.for_lead(_DB)
+    configuration = TurnConfiguration.for_lead(_DB, tools=builtin_tool_set(), subagents=None)
 
     with pytest.raises(FrozenInstanceError):
         configuration.mode_slug = "turbo"  # type: ignore[misc]
