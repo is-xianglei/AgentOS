@@ -18,7 +18,7 @@ from harness.domain.context import Context, ToolSpec
 from harness.domain.messages import Message, UserMessage
 from harness.domain.prompts.memory import MEMORY_TRUST_RULES
 from harness.domain.prompts.teammate import IDENTITY_BLOCK_PREFIX
-from harness.domain.tool import ShellAccess, ToolProfile
+from harness.domain.tool import ScopedGrant, ShellAccess, ToolProfile
 
 
 class AgentType(str, Enum):
@@ -112,6 +112,25 @@ class SubAgentSpec:
             allowed = set(self.allowed_tools) - set(denied)
             return registry.only(*allowed)
         return registry.without(*denied)
+
+    def inherit_scoped(
+        self,
+        grant: ScopedGrant | None,
+        parent_names: Iterable[str] | None,
+    ) -> ScopedGrant | None:
+        """子代理、队友从父执行继承作用域工具（如 MCP）：没有工具白名单（general-purpose）时
+        继承父执行可见的，有白名单（Explore、Plan、verification）时一个都不可见。
+
+        全部作用域工具仍随 grant 下传，子执行据此查策略，审核结论与被裁掉的内置工具一致；
+        parent_names 是父执行本轮生效的工具名单（含 Plan Mode 裁剪），None 表示不再按它收窄。
+        """
+        if grant is None:
+            return None
+        if self.allowed_tools is not None:
+            return grant.narrowed(())
+        if parent_names is None:
+            return grant
+        return grant.narrowed(parent_names)
 
     def resolve_tools_names(self) -> tuple[str, ...]:
         """白名单模式下的实际工具名，用于给主代理展示能力范围。"""

@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 import database.registry  # noqa: F401  构造 ORM 实例前需全部映射在册
+from agent.service import AgentDefinitionService
 from core.config import settings
 from core.errors import AgentException
 from harness.app.mcp_port import McpServerRegistry
@@ -180,11 +181,21 @@ def service(monkeypatch: pytest.MonkeyPatch) -> McpServerService:
             raise AgentException.message("无权执行该工作区操作", status_code=403)
         return member
 
+    async def unbind(self: AgentDefinitionService, server_id: int) -> None:
+        _UNBOUND.append(server_id)
+
+    _UNBOUND.clear()
     monkeypatch.setattr(WorkspaceService, "require_active_membership", membership)
     monkeypatch.setattr(WorkspaceService, "require_workspace_role", role)
+    # 删除 server 时级联解除 Agent 绑定属 agent 域，这里只记下被解除的 server。
+    monkeypatch.setattr(AgentDefinitionService, "unbind_mcp_server", unbind)
     svc = McpServerService(db=None)  # type: ignore[arg-type]
     svc.repo = FakeRepository()  # type: ignore[assignment]
     return svc
+
+
+# 经 agent 域解除过绑定的 server_id，按调用顺序。
+_UNBOUND: list[int] = []
 
 
 def _draft(key: str = "github", *, private: bool = False, **overrides: Any) -> McpServerDraft:
@@ -409,6 +420,15 @@ async def test_delete_soft_deletes_server_and_secret_and_frees_key(
     assert service.repo.rows[server_id].is_deleted  # type: ignore[attr-defined]
     assert server_id not in service.repo.secrets  # type: ignore[attr-defined]
     await _create(service, ADMIN_ID, _draft())
+
+
+async def test_delete_cascades_unbind_through_agent_domain(service: McpServerService) -> None:
+    server_id = await _create(service, ADMIN_ID, _draft())
+
+    await service.delete_server(WORKSPACE_ID, ADMIN_ID, server_id)
+
+    # 绑定表归 agent 域：经 AgentDefinitionService.unbind_mcp_server 解除，不在本域直接改。
+    assert _UNBOUND == [server_id]
 
 
 async def test_record_probe_keeps_snapshot_on_failure(service: McpServerService) -> None:

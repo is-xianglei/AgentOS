@@ -1,6 +1,6 @@
 # AgentOS MCP 接入设计
 
-> 状态：设计稿（2026-11-11），M0、M1 已实现（M1 于 2026-11-13 完成），M2～M4 待实现，阶段见第 13 节。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
+> 状态：设计稿（2026-11-11），M0、M1、M2 已实现（M1、M2 于 2026-11-13 完成），M3、M4 待实现，阶段见第 13 节。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
 > 上位文档：[agent-architecture.md](agent-architecture.md)（分层规则、端口约定、组装根）。本文只写 MCP 的增量。
 > 本文推翻了上位文档和 CLAUDE.md 里关于 MCP 的几条预设，具体列在第 15 节；M0 开始时同步修改那几处，
 > 修改之前以本文为准。其余分层规则仍以上位文档为准。
@@ -477,6 +477,9 @@ class TurnToolResolver:
     None 即 `platform_only(tools)`。用 None 而不是 `platform_only(...)` 作默认值，是因为后者依赖 `tools` 参数。
     绑定按档位在 `turn_config._scoped_binding(profile, mode_slug)` 里定：`lead` 为 `ToolBinding.all()`，
     turbo 与 `user_agent` 为 `ToolBinding.none()`；`user_agent` 改读 Agent 绑定留到 M2。
+    **M2 落地**：签名改为 `_scoped_binding(agent: AgentRuntimeConfig | None, mode_slug)`：turbo 为 `none()`；
+    `agent is None`（默认 Agent）为 `all()`；否则为 `agent.tool_binding()`，即按 `mcp_bindings` 构造的 `ToolBinding.servers(...)`，
+    没有绑定时等于 `servers({})`，一个都不选。orchestrator 档位不经 `_assemble`，本来就不加载。
   - `_assemble` 还把 `ScopedGrant(tools=resolved.scoped, visible=可见的作用域工具名)` 作为网关的 `scoped` 字段；
     `resolved.scoped` 为空时网关的 `scoped` 为 None。
 - **合并顺序**：内置工具在前，作用域工具在后，作用域工具内部按模型名排序，保证工具定义逐字节稳定。对提示缓存的影响见 6.4 节。
@@ -484,7 +487,8 @@ class TurnToolResolver:
   按「无静默兜底」的约定处理。
 - **谁持有解析器**：只有 `AgentRuntime` 和 `WorkflowRuntime` 持有 `TurnToolResolver`。子代理、队友、委派不重新解析，
   直接用父执行传下来的结果（6.3 节）。M0b 只接入 `AgentRuntime`（构造参数 `tool_resolver` 必填）；
-  `WorkflowRuntime` 的解析推迟到 M2（第 13 节）。
+  `WorkflowRuntime` 的解析推迟到 M2（第 13 节）。M2 已接入：`WorkflowRuntime` 新增必填构造参数 `tool_resolver: TurnToolResolver`，
+  两个运行时都经组装根新增的 `Harness.tool_resolver()` 取得。
 - **M0b 落地的解析细节**：`sources` 为空时直接返回 `platform_only(platform)`，不建任务、不做 I/O；
   否则每个来源一个任务，用 `asyncio.wait(timeout=total_timeout)` 等待，到时未完成的取消并等其收尾。
   抛异常的来源记 `kind="unavailable"`、超时的记 `kind="timeout"`，`source` 取 `ScopedToolProvider.name`，`server_id` 为 None，
@@ -533,6 +537,8 @@ class McpAdminService:
   - `update_server`：`load_for_write` → `plan_update` → 地址或认证有变化时探测，失败抛 400 → `apply_update` → `config_rev` 变化时 `invalidate`。
     改名、改描述、改审批模式都不探测，也不让连接失效。
   - `delete_server`：软删 server 与凭证 → `invalidate`。软删时级联解除 Agent 绑定，要等 M2 建了绑定表才有。
+    **M2 已接**：`McpServerService.delete_server` 在软删 server 与凭证之后，于函数体内局部导入 `AgentDefinitionService`，
+    调用 `unbind_mcp_server(server_id)` 软删全部 Agent 对它的绑定，三者在同一请求事务里。
   - `refresh_tools`：`load_for_write` → 探测 → `record_probe`。探测成功时替换快照，返回与旧快照的差异；
     失败时只记 `last_probe_at` / `last_probe_error`、保留快照，返回 `error`，不抛异常。
 - 与上表不同的两处：
@@ -877,7 +883,7 @@ M0 是纯重构，不引入任何 MCP 代码，对外行为不变，七份黄金
      - 查策略用 `self.tools.with_tools(*scoped.tools)`；
      - 可见集在平台工具裁剪结果的基础上，加上 `scoped.visible` 里列出的作用域工具；
    - `BaseOrchestrator`（Workflow）新增参数 `resolved`，带默认值。`test_model_request_golden.py:754-758` 直接构造了编排器，不能因此报错。
-     **M0b 调整**：这一项推迟到 M2，见第 13 节。
+     **M0b 调整**：这一项推迟到 M2，见第 13 节。**M2 已落地**：关键字参数 `resolved: ResolvedScope | None = None`，排在 `context` 之后。
    - 所有新参数为 None 时，行为和现在完全一样。
    - M0b 落地的形状：
      - `ToolGateway` 新增构造字段 `scoped: ScopedGrant | None = None`，`create`、`from_registry` 同样新增关键字参数 `scoped`；
@@ -886,12 +892,13 @@ M0 是纯重构，不引入任何 MCP 代码，对外行为不变，七份黄金
        `_with_scoped(registry, scoped)` 在平台工具裁剪结果之后接上 `scoped.visible_tools()`；
        策略全集经 `SubAgentLoopRun.policies` 传给 `_execute_tool_calls(..., policies=...)`，它同时是 `ReviewRequest.policies`
        和网关的 `policies`。`_execute_tool_calls` 的 `policies` 默认 None 即 `self.policies`：tool_review 黄金测试直接调用它，不传这个参数；
-     - Agent 工具本阶段不往下传 `scoped`，各子执行继承什么在 M2 按 6.2 节决定。
+     - Agent 工具本阶段不往下传 `scoped`，各子执行继承什么在 M2 按 6.2 节决定（M2 已实现，见 6.3 节）。
 5. **回合工具解析的接口**：
    - 新增 `ToolScope`、`ToolBinding`、`ScopedGrant`（都放在 `harness/domain/tool.py`，M0 就要用到）、`ScopedToolProvider`、`ResolvedScope`、`TurnToolResolver`；
    - `AgentRuntime._produce` / `_produce_resume` 和 WorkflowRuntime 在 `_configure_agent` 之前先 `resolve`；
      M0b 落地为 `AgentRuntime._resolve_scope()`：用运行时可信的 `user_id` / `workspace_id` 构造 `ToolScope`，
-     结果作为 `_configure_agent(session, resolved)` 的第二个参数；WorkflowRuntime 推迟到 M2；
+     结果作为 `_configure_agent(session, resolved)` 的第二个参数；WorkflowRuntime 推迟到 M2，M2 落地为同名的
+     `WorkflowRuntime._resolve_scope()`，在 `_produce` 里 `_build_orchestrator` 之前调用；
    - `Harness.scoped_tools` 默认 `()`，此时 `resolve` 直接返回 `ResolvedScope.platform_only`，没有任何 I/O。
 
 替换之后，内置工具查到的策略和原来一样：`scoped_tools=()` 时，`policies` 就是进程级工具集本身。
@@ -957,6 +964,30 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   server 是工作区私有的，地址和凭证都不能跨工作区带走。Agent 导出导入的方案目前搁置，到时再一起设计。
 - **M1 到 M2 之间的过渡**：M1 还没有绑定表，这段时间只有 `lead` 用 `ToolBinding.all()`，其他所有档位一律 `ToolBinding.none()`。
   M0b 已按此实现主回合的绑定；子执行（子代理、队友、委派）本阶段都收不到 `scoped`，等同 `none()`。
+- **M2 落地的形状**（`agent/service.py`）：
+
+  ```python
+  @dataclass(frozen=True)
+  class AgentMcpBinding:                      # 运行时用的一条绑定
+      source: str                             # Tool.source，即 mcp:{server_key}
+      tool_names: frozenset[str] | None = None  # 模型可见名；None 表示该 server 全部工具
+
+  @dataclass(frozen=True)
+  class AgentRuntimeConfig:
+      ...                                     # 原有八个字段不变
+      mcp_bindings: tuple[AgentMcpBinding, ...] = ()   # 按 source 排序
+      def tool_binding(self) -> ToolBinding: ...       # ToolBinding.servers({source: tool_names})
+  ```
+
+  - `get_runtime_config` 只返回仍可用的绑定：经 `McpServerService.enabled_shared_keys(workspace_id, server_ids)` 取出本工作区、未删除、
+    已启用的共享 server 的 `server_id → server_key`，查不到的直接略过、不报错（停用的 server 绑定保留，重新启用后恢复）；
+    `source = mcp_source(server_key)`，原名经领域层新增的 `bound_model_names(server_key, 原名) -> frozenset[str] | None`
+    换成模型名，内部就是去重后调用 `model_tool_names`，每个名字只由 `(server_key, 原名)` 决定。
+  - 领域层新增两个收窄方法，都只动 `visible`、保留 `tools`（子执行仍按全部作用域工具查策略）：
+    `ScopedGrant.narrowed(names) -> ScopedGrant`（与 names 取交集）、`ScopedGrant.bound(binding) -> ScopedGrant`（只留绑定选中的）。
+  - 子代理与队友的继承规则放在规格上：`SubAgentSpec.inherit_scoped(grant, parent_names) -> ScopedGrant | None`。
+    `grant` 为 None 时返回 None；`allowed_tools` 非 None（Explore、Plan、verification）时 `visible` 为空；
+    否则（general-purpose）与 `parent_names` 取交集，`parent_names` 为 None 时原样返回。它是方法不是字段，`fields(SubAgentSpec)` 不变。
 
 ### 6.3 解析时机、冻结、传递与恢复
 
@@ -968,7 +999,7 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
 - 请求路径（`start`）不解析：`start` 要尽快返回 `run_started`，而解析远程工具可能要几秒；后台执行体本来就是流式的。
   `start` 里那次 `_configure_agent` 用的是 `ResolvedScope.platform_only`，只做准入校验，不触发任何 MCP I/O。
 - 恢复路径 `_produce_resume` 同样在 `_configure_agent` 之前解析。WorkflowRuntime 在自己的执行体开头解析一次，全部成员共用这一份结果
-  （M0b 调整：WorkflowRuntime 的解析推迟到 M2，本阶段 Workflow 成员一律只用平台工具，见第 13 节）。
+  （M0b 调整：WorkflowRuntime 的解析推迟到 M2，本阶段 Workflow 成员一律只用平台工具，见第 13 节；M2 已按原设计接入，见本节「传给子代理、队友、委派」）。
 - 请求路径里保存人工响应的 `prepare_interaction_response` 同样不解析，用 `platform_only`，与 `start` 一致。
 
 **回合内冻结**：一个回合里的多轮 ReAct 共用同一份工具集，中途不重新拉取。这对应 HugAgentOS 的「run 内冻结 schema」。
@@ -991,6 +1022,20 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   - 查策略用 `self.tools.with_tools(*scoped.tools)`；
   - 可见集是「平台工具按规格和父名单裁剪的结果」，再加上 `scoped.tools` 里名字在 `scoped.visible` 中的那些工具。
 - 来自 Workflow 的成员调用时，由 WorkflowRuntime 按成员的绑定构造 `ScopedGrant`。
+- **M2 落地**：
+  - Agent 工具（`harness/adapters/tools/builtin/agent.py`）的 `_dispatch` 新增必填关键字参数 `scoped: ScopedGrant | None`，原样交给
+    `SubAgentLauncher.run(..., scoped=...)`。父回合名单统一取 `_round_names(ctx)`：`ctx.round_tool_names`，未注入时退回 `ctx.allowed_tool_names`。
+    - 一次性子代理：`spec.inherit_scoped(ctx.scoped, _round_names(ctx))`；
+    - 委派：`ctx.scoped.bound(config.tool_binding())`，再 `.narrowed(_round_names(ctx))`；`ctx.scoped` 为 None 时传 None。
+  - 队友：`AgentRuntime._wake_team_members` 对每个成员规格调用 `spec.inherit_scoped(self.configuration.gateway.scoped, self.configuration.tools.names)`，
+    经 `run_teammate(..., scoped=...)` 交给队友。父名单与原来传的 `parent_allowed_tool_names` 是同一份。
+  - Workflow：`WorkflowRuntime._produce` 在 `_build_orchestrator` 之前调用一次 `_resolve_scope()`，结果作为 `_build_orchestrator` 新增的第四个参数
+    `resolved`，再作为 `BaseOrchestrator(resolved=...)` 交给编排器；`turn_start` 之后有 fault 时发 `tool_sources`，与主回合一致。
+    编排器的 `_member_scoped(config)` 按成员自己的 `config.tool_binding()` 选可见集，构造 `ScopedGrant(tools=resolved.scoped, visible=...)`，
+    经 `SubAgentRunner.run(scoped=...)` 交给成员；`resolved` 为 None 或没有作用域工具时传 None。
+  - Plan 模式：主回合的 `round_tool_names` 按 `PLAN_MODE_ALLOWED_TOOLS` 裁剪，本来就不含 MCP 工具，上面的交集自然为空。
+    另外审核链在 Plan 模式下只放行 Explore / Plan 子代理（都带白名单），委派与 general-purpose 在派发前就被拒，所以实际上 Plan 模式下
+    任何子执行都拿不到 MCP 工具。
 
 **挂起与恢复**：
 - ask 挂起时，只有当待执行的调用里有 MCP 工具，`continuation` 才新增 `mcp_refs` 这个键，
@@ -1112,9 +1157,33 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   由 agent 域软删相关绑定。这条在函数体内局部导入，用来打破导入环，仓库里已有先例 `harness/adapters/tools/builtin/agent.py:140-141`。
   `tests/test_import_isolation.py` 只检查模块级导入环。
 
+M2 落地（`agent/`，迁移 `alembic/versions/0033_agent_mcp_servers.py`，revision `0033_agent_mcp_servers`）：
+- ORM `AgentMcpServerRecord`（`agent/models.py`），`AgentRecord.mcp_bindings` 关系，已在 `database/registry.py` 登记。列按上表实现，另外：
+  - `tool_names` 用 `json_type(none_as_null=True)`（`database/base.py` 的 `json_type` 新增这个关键字参数，默认 False，其他列不受影响），
+    Python 的 None 写成 SQL NULL，而不是 JSON 的 `null`；
+  - 部分唯一索引 `uq_agent_mcp_servers_active_agent_server (agent_id, server_id) WHERE is_deleted = false`；
+  - CHECK `ck_agent_mcp_servers_tool_names`：`tool_names IS NULL OR tool_names <> '[]'::jsonb`，给 Service 层的空列表校验兜底；
+  - 普通索引 `agent_id`、`server_id`、`is_deleted`。
+- 迁移在开发库上执行过 `upgrade head` → `downgrade -1` → `upgrade head`；用 alembic 的 `compare_metadata` 比较，库表结构与 ORM 无差异。
+- 全量替换的写法与 `agent_tools` 不同：解除绑定是软删，重新绑定插新行，不复活旧行（`agent_tools` 是唯一约束，只能复活）。
+  `AgentRepository.soft_delete`（删 Agent）同时软删 MCP 绑定。
+- 跨域方法：
+  - `McpServerService.require_usable(workspace_id, server_ids, *, actor_user_id) -> dict[int, str]`（server_id → server_key）：
+    本工作区查不到（别的工作区、已删除、不存在）和别人的私有 server 一律 404「MCP server 不存在」，`details={"server_ids": [...]}`；
+    本人的私有 server 400「私有 MCP server 不能绑定到 Agent，只能绑定工作区共享的 server」；停用的共享 server 409「MCP server 已停用，不能绑定」。
+    多了 `actor_user_id`：要区分「本人的私有 server」（可以明说不能绑）和「别人的私有 server」（只能说不存在）。
+  - `McpServerService.enabled_shared_keys(workspace_id, server_ids) -> dict[int, str]`：运行配置用，只返回已启用的共享 server，不报错。
+  - `AgentDefinitionService.replace_mcp_bindings(workspace_id, agent_id, actor_user_id, bindings: list[AgentMcpBindingInput]) -> AgentRecord`：
+    权限与行锁同 `replace_tool_bindings`（owner / admin，`_get_required_for_update`）；`AgentMcpBindingInput(server_id, tool_names: tuple[str, ...] | None = None)`。
+    同一 server 出现两次报 400「同一个 MCP server 只能绑定一次」；`tool_names=()` 报 400「MCP 工具白名单不能为空列表；要绑定该 server 的全部工具请传 null」；
+    白名单去重保序。规范化在 `require_usable` 之前，失败时不查 server。
+  - `AgentDefinitionService.unbind_mcp_server(server_id) -> None`：按 server_id 软删全部有效绑定（server_id 全局唯一，不再限定工作区）。
+  - 依赖方向：`agent.service` 在模块级导入 `mcp_server.service`；`mcp_server.service` 在 `delete_server` 函数体内导入 `agent.service`。
+    `tests/test_import_isolation.py` 的模块级导入环检查通过。
+
 M1b 落地（`mcp_server/`，迁移 `alembic/versions/0031_mcp_servers.py`，revision `0031_mcp_servers`）：
 - 只建 `mcp_servers`（ORM `McpServerRecord`）和 `mcp_server_secrets`（`McpServerSecretRecord`）两张表，已在 `database/registry.py` 登记。
-  OAuth 的两张表留到 M3，`agent_mcp_servers` 留到 M2。
+  OAuth 的两张表留到 M3，`agent_mcp_servers` 留到 M2（已建，见本节末尾 M2 落地）。
 - 列按上表实现，另外：
   - 两个 CHECK 约束 `ck_mcp_servers_auth_type`、`ck_mcp_servers_approval_mode`；
   - 部分唯一索引 `uq_mcp_servers_active_workspace_key (workspace_id, server_key) WHERE is_deleted = false`，共享和私有 server 一起算；
@@ -1370,7 +1439,7 @@ MCP server 的工具描述、server 自报的 `instructions` 和工具结果都�
 | `POST /servers/{id}/oauth/authorize` | 工作区成员 | 前半程：返回授权地址（8.2 节） |
 | `POST /oauth/complete` | 工作区成员 | 后半程：前端提交 `{state, code, iss}`，核对 state 与当前用户一致后换取 token（8.2 节） |
 | `DELETE /servers/{id}/oauth` | 工作区成员 | 撤销自己的授权，软删自己的 token |
-| `PUT /api/agents/{id}/mcp-servers` | 与 `PUT /api/agents/{id}/tools` 相同 | 由 agent 域提供：绑定 server 和工具白名单（M2） |
+| `PUT /api/agents/{id}/mcp-servers` | 与 `PUT /api/agents/{id}/tools` 相同 | 由 agent 域提供：绑定 server 和工具白名单（M2，已实现） |
 
 - 别人的私有 server 一律按不存在处理，返回 404，不返回 403，避免泄露它的存在。
 - 所有接口都用 Bearer 鉴权，返回 `ApiResponse[T]` 外壳。错误统一用 `AgentException.message(...)`，
@@ -1401,6 +1470,13 @@ M1b 落地（`mcp_server/api.py`、`mcp_server/schemas.py`）：
   - 没有写权限的成员看到的 `url` 里，查询参数整段换成 `********`（查询参数可能带着凭证）。
 - 「附带自己的授权状态」属于 OAuth，留到 M3。
 
+M2 落地（`agent/api.py`、`agent/schemas.py`）：
+- `PUT /api/agents/{id}/mcp-servers`，请求体 `AgentMcpBindingsRequest`：`servers: list[AgentMcpBindingItem]`，每项 `server_id`（正整数）、
+  `tool_names: list[str] | None`（null 表示全部工具；元素非空串），两层都 `extra="forbid"`；`servers: []` 表示解除全部绑定。
+  响应与 `PUT /api/agents/{id}/tools` 相同，`data` 是 `AgentResponse`。
+- `AgentResponse` 新增 `mcp_servers: list[AgentMcpBindingResponse]`（`server_id`、`tool_names`，按 server_id 排序），列表、详情和各写接口都带。
+  默认空列表，原有字段不变。
+
 ### 10.2 组装根
 
 ```python
@@ -1420,6 +1496,8 @@ class Harness:
   M0b 只有 `agent_runtime(...)` 构造：`TurnToolResolver(self.tools, self.scoped_tools,
   total_timeout=settings.mcp_resolve_timeout_seconds)`，作为 `AgentRuntime` 的必填构造参数 `tool_resolver`；
   `workflow_runtime(...)` 推迟到 M2。`Harness.scoped_tools` 排在 `Harness` 字段的最后，带默认值 `()`。
+  **M2 已改**：新增方法 `Harness.tool_resolver() -> TurnToolResolver`（即上面的构造），`agent_runtime(...)` 与 `workflow_runtime(...)`
+  都用它注入；`WorkflowRuntime` 的构造参数 `tool_resolver` 必填，没有 None 回落。
   `AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS`（第 11 节）已在 M0b 加入 Settings，其余 MCP 配置留到 M1。
 - `tests/fixtures/harness_factory.py` 现在直接调用 `default_harness()`（`:25,38`），自己不带默认值，
   所以要改成 `replace(default_harness(), scoped_tools=())`，显式关掉作用域来源。测试需要 MCP 时再注入内存版假来源，
@@ -1475,6 +1553,9 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
   `status` 为 `error`，PostToolUse 的 `HookContext.is_error` 取 `output.is_error`。
 - `ToolInfo.source`：tool_use 由 `TurnEventAssembler(..., source_of=configuration.policies.source_of)` 填，tool_result 由
   `LeadToolExecutor.execute_one` / `record_response` 填。子代理路径本期收不到作用域工具（M2），不填。
+  **M2 已补**：子代理与队友的 `TurnEventAssembler` 传 `source_of=policies.source_of`（本次执行的策略全集），
+  `_emit_tool_result` 新增关键字参数 `source`，`_execute_tool_calls` 按 `policies.source_of(name)` 填，被拒、预算耗尽的结果同样带。
+  `tool_calls.source` 不用改：子代理网关的 `ToolService` 本来就用策略全集 `policies` 作 `policy_source`，`start_call` 照常写入。
 
 ## 11. 配置项
 
@@ -1613,6 +1694,23 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
     手动刷新（真实 `McpConnector` + `McpAdminService`）后下一回合看到新清单；`drop_cached_tools` 清全部分区且不影响别的 server。
   - `tests/test_mcp_runtime_pg.py`：真实 PostgreSQL（库可达且已升到 0032 时执行），`tool_calls.source` 与 failed / `error_message` 落库、
     按来源加状态的统计；`always_scope=global` 经真实 `WorkspaceService` 校验角色（member 403、admin 放行、会话级与内置工具不查）。
+- **M2 落地的测试文件**：
+  - `tests/test_agent_mcp_bindings.py`：不连数据库。`bound_model_names` 与 server 侧命名一致；`ScopedGrant.narrowed` / `bound`；
+    四种内置规格的 `inherit_scoped`；空白名单与重复 server 400 且不查 server、写入前先 `require_usable`、它的错误原样上抛；
+    运行配置只留可用 server 并换成来源与模型名、默认无绑定时 `tool_binding()` 等于 `none()`；市场快照不带 MCP 字段；
+    `require_usable` 对本人私有（400）、停用（409）、别人私有 / 跨工作区 / 已删除 / 不存在（404，同一句话）；
+    Agent 工具：general-purpose 继承、Explore 为空、委派取绑定与父回合的交集、Plan 模式本轮名单下交集为空、父回合无作用域工具时传 None。
+  - `tests/test_mcp_server_service.py` 新增一条：删除 server 时经 `AgentDefinitionService.unbind_mcp_server` 解除绑定。
+  - `tests/test_mcp_bindings_runtime.py`：内存假来源经 `harness_factory` 注入，复用 `tests/test_scoped_tools.py` 的内存现场。
+    user_agent 主回合只看到绑定的 server 与白名单内的工具；主回合经 Agent 工具启动真实 `SubAgentRunner`，general-purpose 拿到全部、Explore 一个没有；
+    委派取交集，Plan 模式下委派被审核链拒绝、启动器没被调用；子代理路径的 tool_use / tool_result 事件与 `tool_calls.source` 带来源、内置工具不带；
+    Explore 调用父回合有、自己不可见的 MCP 工具时，审核结论、文本与同等策略的内置工具一致（需审批与不需审批两种）；
+    队友按成员规格继承；Workflow 三个成员各按绑定拿到工具、执行体开头只解析一次；组装根给 Workflow 注入解析器；
+    编排器不传 `resolved` 时成员收不到作用域工具；Workflow 有 fault 时紧随 `turn_start` 发 `tool_sources`。
+  - `tests/test_agent_mcp_bindings_pg.py`：真实 PostgreSQL（库可达且已升到 0033 时执行）。部分唯一索引与 CHECK、软删后重新绑定插新行、
+    NULL 存成 SQL NULL；运行配置的名字换算与停用 server 暂时不可见；删除 server 时同一事务里软删绑定、预加载关系与下一回合都看不到；
+    绑定本人私有 / 别人私有 / 停用 / 跨工作区 server 报错且不写库；接口 `PUT /api/agents/{id}/mcp-servers` 的 200 与详情回显、空白名单 400、
+    成员 403、Agent 不存在与跨工作区 404、server 不存在 404。
 
 ### 12.3 黄金测试
 
@@ -1715,13 +1813,23 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
   打桩、只构造不执行），接上 MCP 来源后也不会连数据库或 MCP，不用改。
 - 新增测试：`tests/test_mcp_runtime.py`（内存现场与真实 `McpToolProvider` + 假 server），`tests/test_mcp_runtime_pg.py`（真实 PostgreSQL）。
 
+**M2 实际改动的核对结果**：
+- 八份黄金测试的文件和 `tests/fixtures/*_golden.py` 零改动。新增的一律带默认值或只在有 MCP 时生效：`AgentRuntimeConfig.mcp_bindings`（默认 `()`）、
+  `BaseOrchestrator(resolved=None)`、`_emit_tool_result(source=None)`（None 不序列化）、子代理装配器的 `source_of`（内置工具查出 None）。
+  `WorkflowRuntime.tool_resolver` 是必填构造参数，但黄金测试都经组装根构造或直接构造编排器，不受影响。
+- 非黄金测试只改替身签名与构造，断言语义不变：
+  - `_build_orchestrator` 多了第四个参数：`tests/test_workflow_orchestration.py`、`tests/test_runtime_cancel_branch.py` 的打桩补上 `resolved`；
+  - `AgentTool._dispatch` 多了关键字参数 `scoped`：`tests/test_agent_delegation_tool.py`、`tests/test_agent_delegation_pg.py` 的 `_fake_dispatch` 补上；
+  - `_wake_team_members` 读 `configuration.gateway.scoped`：`tests/test_logging_chain.py` 的配置替身补 `gateway=SimpleNamespace(scoped=None)`；
+  - `delete_server` 跨域调用 agent 域：`tests/test_mcp_server_service.py` 的夹具（`db=None` 加内存仓储）补一行 `monkeypatch` 记录解除绑定。
+
 ## 13. 阶段
 
 | 阶段 | 内容 | 完成判据 |
 |---|---|---|
 | M0 | 前置重构，即 6.1 节的第 1～5 步：按名查策略改为查本回合的 `policies`；`ToolOutput` 贯穿执行层；作用域工具的传递通道；`ToolScope`、`ToolBinding`、`ScopedGrant`、`ScopedToolProvider`、`ResolvedScope`、`TurnToolResolver`；删除审核员的 None 回落和 `dangerous_tools()`；12.3 节列出的一次性替身破例；修改第 15 节列出的上位文档 | 七份黄金测试字面量不变；用内存假来源跑通「解析 → 审核 → 执行 → 挂起 → 恢复」，以及子代理继承；完整测试通过 |
 | M1 | SDK 升级到 v2；`harness/domain/mcp.py`；`harness/adapters/mcp/`（连接池、McpTool、结果转换、SSRF 防护）；`mcp_server` 域的 `mcp_servers`、`mcp_server_secrets` 两张表、迁移和静态请求头认证；共享与私有 server（7.2 节）；管理接口与 `permission/api.py` 对 `mcp__` 名字的校验；组装根与 lifespan；`tool_sources` 事件；`tool_calls.source`、`ToolInfo.source` 和审批载荷里的 `tool.source`；挂起快照核对；MCP 审批 `can_update_input=False` 与 422；`always_scope=global` 的管理员限制；第八份黄金测试 `test_mcp_tool_golden.py`。本阶段只有 `lead` 加载 MCP 工具，其余档位一律 `ToolBinding.none()` | 进程内假 server 端到端、SSRF、新增静态检查、第八份黄金测试全部通过 |
-| M2 | 自建 Agent 绑定 server（`agent_mcp_servers`、agent 域接口）；委派、Workflow 成员、子代理、队友按 6.2 节加载 | 绑定、裁剪、各档位继承的运行时测试通过 |
+| M2（已实现） | 自建 Agent 绑定 server（`agent_mcp_servers`、agent 域接口）；委派、Workflow 成员、子代理、队友按 6.2 节加载 | 绑定、裁剪、各档位继承的运行时测试通过 |
 | M3 | OAuth：先做 spike（8.2 节），确认复用 SDK 的哪些工具函数；再建 `mcp_oauth_clients`、`mcp_oauth_tokens` 两张表和迁移；实现 `McpTokenAuth`、行锁刷新、授权的两个半程、`auth_required` fault，以及 OAuth server 的快照回填 | 用 ASGI 假授权服务器跑通授权码 + PKCE、刷新、并发刷新，以及撤销后重新授权 |
 | M4（后续） | MRTR / elicitation 接入 ask 挂起；订阅 list_changed；图片进模型；resources / prompts；审批时允许修改 MCP 工具的参数 | 单独立项 |
 
@@ -1744,10 +1852,18 @@ M1 分步实现：
   `ToolInfo.source` 和审批载荷里的 `tool.source`、挂起快照核对、MCP 审批 `can_update_input=False` 与 422、`always_scope=global` 的管理员限制、
   手动刷新清缓存入口、第八份黄金测试。签名回写在 4.3、5.3、6.3、10.2、10.3、12.3 节。
 
-**M1 全部完成**（M1a dd145ef、M1b 8abea39、M1c）。M1 只有 `lead` 加载 MCP 工具；子代理、队友、委派、Workflow 成员的加载与 Agent 绑定在 M2，
+**M1 全部完成**（M1a dd145ef、M1b 8abea39、M1c 74815b9）。M1 只有 `lead` 加载 MCP 工具；子代理、队友、委派、Workflow 成员的加载与 Agent 绑定在 M2，
 OAuth 在 M3。
 
-**M0b 对 Workflow 的调整**：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
+**M2 已实现**（2026-11-13）：`agent_mcp_servers` 表与迁移 `0033_agent_mcp_servers`、`McpServerService.require_usable` / `enabled_shared_keys`、
+`AgentDefinitionService.replace_mcp_bindings` / `unbind_mcp_server`、`PUT /api/agents/{id}/mcp-servers` 与详情里的 `mcp_servers`、
+`delete_server` 级联解除绑定、`AgentRuntimeConfig.mcp_bindings` 与 user_agent 档位按绑定加载、Agent 工具（子代理按规格、委派取交集）、
+队友按成员规格继承、WorkflowRuntime 解析并按成员绑定分发、子代理路径事件带 `source`。签名回写在 4.2、4.3、6.1、6.2、6.3、第 7 节、10.1～10.3、12.2、12.3。
+市场快照与官方预置不导出 MCP 绑定：`build_snapshot` 只读工具与 Skill 绑定，预置格式里没有 MCP 字段，均无需改动。
+留给 M3 及以后：OAuth 全部内容；OAuth server 绑定到 Agent 后，成员用这个 Agent 时各自授权的体验（`auth_required` fault 已有通道）；
+Agent 绑定接口按 `tools_snapshot` 校验白名单原名（本期不校验，不存在的原名只是匹配不到）；Agent 导出导入一并设计 MCP 绑定（14 节已搁置）。
+
+**M0b 对 Workflow 的调整**（M2 已按此接入）：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
 推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，
 平白给 Workflow 执行体加一次解析。所以 M0b 的 WorkflowRuntime 不持有解析器，成员执行一律只用平台工具（等同 `platform_only`），
 `workflow_runtime(...)` 也不构造 `TurnToolResolver`。M2 再一起接入：WorkflowRuntime 在执行体开头解析一次，

@@ -174,7 +174,7 @@ class TurnConfiguration:
             tools = tools.only(*TURBO_ALLOWED_TOOLS)
             allowed_skill_names = frozenset()
         # 作用域工具接在平台工具裁剪结果之后；Plan、极速的逐轮裁剪仍由 tools_for_mode 负责。
-        visible_scoped = select_scoped(resolved.scoped, _scoped_binding(profile, mode_slug))
+        visible_scoped = select_scoped(resolved.scoped, _scoped_binding(agent, mode_slug))
         if visible_scoped:
             tools = ToolSet((*tools.tools, *visible_scoped))
         grant: ScopedGrant | None = None
@@ -322,14 +322,13 @@ async def configure_turn(
     return TurnConfiguration.for_agent(db, agent, **model_fields)
 
 
-def _scoped_binding(profile: ToolProfile, mode_slug: str) -> ToolBinding:
-    """主回合加载哪些作用域工具：默认 Agent 全部加载；极速模式与自建 Agent 不加载。
-
-    自建 Agent 按 server 绑定加载留到 Agent 的 MCP 绑定落地后再接入。
-    """
-    if mode_slug == "turbo" or profile != "lead":
+def _scoped_binding(agent: AgentRuntimeConfig | None, mode_slug: str) -> ToolBinding:
+    """主回合加载哪些作用域工具：极速模式不加载；默认 Agent 全部加载；自建 Agent 只加载它绑定的 server。"""
+    if mode_slug == "turbo":
         return ToolBinding.none()
-    return ToolBinding.all()
+    if agent is None:
+        return ToolBinding.all()
+    return agent.tool_binding()
 
 
 async def load_delegate_catalog(db: AsyncSession, workspace_id: int | None) -> str | None:

@@ -91,7 +91,7 @@ async def test_workflow_cancel_defers_terminal_state_when_bound(
     runtime.lease_owner = owner
     marked: list[str] = []
 
-    async def _build(session_id, turn_id, workflow_id):
+    async def _build(session_id, turn_id, workflow_id, resolved):
         return SimpleNamespace(run=_cancelled)
 
     monkeypatch.setattr(runtime, "_build_orchestrator", _build)

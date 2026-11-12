@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TypeVar
 
@@ -6,9 +7,17 @@ from sqlalchemy import Select, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from agent.models import AgentRecord, AgentSkillRecord, AgentToolRecord
+from agent.models import AgentMcpServerRecord, AgentRecord, AgentSkillRecord, AgentToolRecord
 
 BindingRecord = TypeVar("BindingRecord", AgentToolRecord, AgentSkillRecord)
+
+
+@dataclass(frozen=True)
+class McpBindingRow:
+    """一条已校验的 MCP 绑定：tool_names 为 None 表示全部工具，非 None 时已去重且非空。"""
+
+    server_id: int
+    tool_names: list[str] | None
 
 
 class AgentRepository:
@@ -21,10 +30,11 @@ class AgentRepository:
     def _with_bindings(
         stmt: Select[tuple[AgentRecord]],
     ) -> Select[tuple[AgentRecord]]:
-        """预加载工具与 Skill 绑定，避免异步会话中访问关系时触发懒加载。"""
+        """预加载工具、Skill 与 MCP server 绑定，避免异步会话中访问关系时触发懒加载。"""
         return stmt.options(
             selectinload(AgentRecord.tool_bindings),
             selectinload(AgentRecord.skill_bindings),
+            selectinload(AgentRecord.mcp_bindings),
         )
 
     async def create(
@@ -156,7 +166,7 @@ class AgentRepository:
         return record
 
     async def soft_delete(self, record: AgentRecord) -> None:
-        """软删除 Agent，并用批量 UPDATE 同时软删除它的工具与 Skill 绑定。"""
+        """软删除 Agent，并用批量 UPDATE 同时软删除它的工具、Skill 与 MCP server 绑定。"""
         now = datetime.now(UTC)
         record.is_deleted = True
         record.deleted_at = now
@@ -173,6 +183,14 @@ class AgentRepository:
             .where(
                 AgentSkillRecord.agent_id == record.id,
                 AgentSkillRecord.is_deleted.is_(False),
+            )
+            .values(is_deleted=True, deleted_at=now)
+        )
+        await self.db.execute(
+            update(AgentMcpServerRecord)
+            .where(
+                AgentMcpServerRecord.agent_id == record.id,
+                AgentMcpServerRecord.is_deleted.is_(False),
             )
             .values(is_deleted=True, deleted_at=now)
         )
@@ -224,6 +242,47 @@ class AgentRepository:
                 AgentSkillRecord.is_deleted.is_(False),
             )
             .values(is_deleted=True, deleted_at=now)
+        )
+        await self.db.flush()
+
+    async def replace_mcp_bindings(self, agent_id: int, rows: list[McpBindingRow]) -> None:
+        """把 MCP 绑定全量替换为 rows：已有的更新白名单，多出的软删，缺的新建。
+
+        (agent_id, server_id) 只对有效行唯一，所以只读有效行；解除过又重新绑定时插新行，不复活旧行。
+        """
+        stmt = select(AgentMcpServerRecord).where(AgentMcpServerRecord.agent_id == agent_id)
+        existing = {record.server_id: record for record in await self.db.scalars(stmt)}
+        desired = {row.server_id: row for row in rows}
+        now = datetime.now(UTC)
+        for server_id, record in existing.items():
+            row = desired.get(server_id)
+            if row is None:
+                record.is_deleted = True
+                record.deleted_at = now
+            elif record.tool_names != row.tool_names:
+                record.tool_names = None if row.tool_names is None else list(row.tool_names)
+        new_records = [
+            AgentMcpServerRecord(
+                agent_id=agent_id,
+                server_id=row.server_id,
+                tool_names=None if row.tool_names is None else list(row.tool_names),
+            )
+            for server_id, row in desired.items()
+            if server_id not in existing
+        ]
+        if new_records:
+            self.db.add_all(new_records)
+        await self.db.flush()
+
+    async def soft_delete_mcp_bindings_for_server(self, server_id: int) -> None:
+        """软删全部 Agent 对该 MCP server 的有效绑定；server_id 全局唯一，不必再限定工作区。"""
+        await self.db.execute(
+            update(AgentMcpServerRecord)
+            .where(
+                AgentMcpServerRecord.server_id == server_id,
+                AgentMcpServerRecord.is_deleted.is_(False),
+            )
+            .values(is_deleted=True, deleted_at=datetime.now(UTC))
         )
         await self.db.flush()
 

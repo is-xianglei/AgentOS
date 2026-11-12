@@ -143,14 +143,19 @@ AgentOS 作为 MCP 客户端，按工作区接入远程 MCP server（只支持 S
   （`visibility=private`）由成员自己配置，只出现在本人的回合里，别人看不到，地址必须是公网地址。
 - 工具名为 `mcp__{server_key}__{tool}`，排在内置工具之后。审批按 server 的 `approval_mode`
   （默认每次审批）；MCP 工具审批时不能改参数，「始终允许」选全局作用域要求 owner / admin。
-  本期只有默认 Agent 加载 MCP 工具。
+- 谁能用 MCP 工具：默认 Agent 加载工作区全部已启用的共享 server 和本人的私有 server；
+  自建 Agent 只加载经 `PUT /api/agents/{id}/mcp-servers` 绑定的共享 server（可带工具白名单，
+  私有 server 不能绑定）；委派取被委派 Agent 的绑定与父回合可见工具的交集；general-purpose
+  子代理和队友继承父回合可见的 MCP 工具，Explore、Plan、verification 不带；Workflow 成员各按
+  自己的绑定加载。极速模式、Plan 模式下不可用。删除 server 时同时解除全部 Agent 绑定。
 
 ## 扩展
 
 - **接入新的作用域工具来源**：实现 `harness/app/ports.py` 的 `ScopedToolProvider`，按工作区和用户
   把每个远端工具包装成 `harness/domain/tool.py` 的 `Tool`，再经 `Harness.scoped_tools` 注入（MCP 即
   `harness/adapters/mcp/provider.py` 的 `McpToolProvider`）。主 Agent 运行时每回合由 `TurnToolResolver`
-  解析一次，作用域工具排在内置工具之后；`platform_tool_set()` 只放进程级工具。
+  解析一次（Workflow 运行时在执行体开头解析一次），作用域工具排在内置工具之后；
+  `platform_tool_set()` 只放进程级工具。
 - **接入外部记忆**（尚未实现）：设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
   实现 `harness/app/memory_port.py` 的 `MemoryProvider`（recall、inherited、
   on_turn_completed、after_commit），在 `harness/bootstrap.py` 里替换 `Harness` 的 `memory` 字段

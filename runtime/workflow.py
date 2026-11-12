@@ -37,8 +37,10 @@ from harness.app.agent_service import ExecutionHandle
 from harness.app.ports import ModelClient, ModelResolver, ModelSettings, ResolvedModel
 from harness.app.session_port import SessionStore, StoredSession, StoredTurn
 from harness.app.subagent_catalog import build_agent_spec
+from harness.app.tool_resolver import ResolvedScope, TurnToolResolver
 from harness.domain.context import Context
 from harness.domain.messages import AssistantMessage, UserMessage
+from harness.domain.tool import ScopedGrant, ToolScope, select_scoped
 from runtime.execution import (
     launch_turn_execution,
     lease_seconds,
@@ -126,6 +128,7 @@ class BaseOrchestrator(Orchestrator):
 
     依赖全部以关键字传入,便于测试注入替身;子类只实现 run()。runners 按数据库会话构造子代理运行器,
     session_factory 为并发成员打开独立数据库会话,二者由组装根经 WorkflowRuntime 转交。
+    resolved 是 WorkflowRuntime 在执行体开头解析出的作用域工具,全部成员共用;None 表示只用平台工具。
     """
 
     def __init__(
@@ -142,8 +145,10 @@ class BaseOrchestrator(Orchestrator):
         runners: SubAgentRunnerFactory,
         session_factory: SessionFactory,
         context: OrchestrationContext | None = None,
+        resolved: ResolvedScope | None = None,
     ) -> None:
         self.db = db
+        self.resolved = resolved
         self.bus = bus
         self.runners = runners
         self.session_factory = session_factory
@@ -221,6 +226,7 @@ class BaseOrchestrator(Orchestrator):
                 user_id=self.user_id,
                 workspace_id=self.workspace_id,
                 allowed_skill_names=frozenset(config.skill_names),
+                scoped=self._member_scoped(config),
             )
         except asyncio.CancelledError:
             raise
@@ -229,6 +235,16 @@ class BaseOrchestrator(Orchestrator):
                 "Workflow成员执行失败",
                 {"workflow_id": self.workflow_id, "member_name": config.name},
             ) from exc
+
+    def _member_scoped(self, config: AgentRuntimeConfig) -> ScopedGrant | None:
+        """成员可见的作用域工具只按它自己的 server 绑定选；全部作用域工具仍随之下传，供按名查策略。"""
+        if self.resolved is None or not self.resolved.scoped:
+            return None
+        visible = select_scoped(self.resolved.scoped, config.tool_binding())
+        return ScopedGrant(
+            tools=self.resolved.scoped,
+            visible=frozenset(tool.name for tool in visible),
+        )
 
     async def run_member(
         self,
@@ -640,13 +656,15 @@ class WorkflowRuntime:
         sessions: SessionStore,
         models: ModelResolver,
         runners: SubAgentRunnerFactory,
+        tool_resolver: TurnToolResolver,
         session_factory: SessionFactory,
         rebuild: Callable[[AsyncSession], WorkflowRuntime],
     ):
         """初始化运行时依赖,具体实现全部由组装根(harness/bootstrap.py)注入。
 
         llm 仅供需要汇总/路由的编排器使用,顺序模式不创建客户端;未注入时按会话经 models 解析。
-        runners 为成员构造子代理运行器,session_factory 为后台执行与并发成员打开独立数据库会话。
+        runners 为成员构造子代理运行器,tool_resolver 在执行体开头解析一次作用域工具,全部成员共用;
+        session_factory 为后台执行与并发成员打开独立数据库会话。
         rebuild 在独立会话里重建运行时:组装根只把构造时显式注入的客户端与会话存储带进去。
         """
         self.db = db
@@ -658,6 +676,7 @@ class WorkflowRuntime:
         self.sessions = sessions
         self.models = models
         self._runners = runners
+        self.tool_resolver = tool_resolver
         self._session_factory = session_factory
         self._rebuild = rebuild
         # 执行之外没有订阅方,事件直接丢弃;执行内由 bind_execution 替换。
@@ -743,8 +762,19 @@ class WorkflowRuntime:
                 RuntimeEvent.session_ready(session.id, session.title, session.status)
             )
             turn = await self.sessions.get_turn_required(turn_id)
-            orchestrator = await self._build_orchestrator(session.id, turn.id, workflow_id)
+            # 每回合解析一次作用域工具，全部成员共用；成员各按自己的 server 绑定选可见集。
+            resolved = await self._resolve_scope()
+            orchestrator = await self._build_orchestrator(
+                session.id, turn.id, workflow_id, resolved
+            )
             await self.bus.emit(StreamEvent.turn_start(ORCHESTRATOR_ACTOR, session.id))
+            # 与主 Agent 回合一致：有来源不可用时紧随 turn_start 通知前端，没有故障不发。
+            if resolved.faults:
+                await self.bus.emit(
+                    RuntimeEvent.tool_sources(
+                        session.id, [fault.to_dict() for fault in resolved.faults]
+                    )
+                )
             result = await orchestrator.run(user_content)
             await self.bus.emit(
                 StreamEvent.turn_end(ORCHESTRATOR_ACTOR, session.id, "end_turn", None)
@@ -804,13 +834,24 @@ class WorkflowRuntime:
                 )
             )
 
+    async def _resolve_scope(self) -> ResolvedScope:
+        """按运行时可信的用户与工作区解析本回合的作用域工具；请求路径（start）不调用。"""
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+        scope = ToolScope(workspace_id=self.workspace_id, user_id=self.user_id)
+        return await self.tool_resolver.resolve(scope)
+
     async def _build_orchestrator(
         self,
         session_id: int,
         turn_id: UUID,
         workflow_id: int,
+        resolved: ResolvedScope,
     ) -> BaseOrchestrator:
-        """按 Workflow 模式装配编排器;成员序列由 workflow 域给出,已按 (sort_order, agent_id) 排好。"""
+        """按 Workflow 模式装配编排器;成员序列由 workflow 域给出,已按 (sort_order, agent_id) 排好。
+
+        resolved 是执行体开头解析出的作用域工具，交给编排器按成员绑定分发。
+        """
         if self.user_id is None or self.workspace_id is None:
             raise AgentException.message("缺少可信用户或工作区上下文")
         workflow_service = WorkflowService(self.db)
@@ -840,6 +881,7 @@ class WorkflowRuntime:
             "members": members,
             "runners": self._runners,
             "session_factory": self._session_factory,
+            "resolved": resolved,
         }
         if self.llm is None:
             session = await self.sessions.get_required(session_id)

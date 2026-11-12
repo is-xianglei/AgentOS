@@ -130,7 +130,7 @@ def _patch_dispatch(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """替换真正跑子代理的 _dispatch:它另开连接,看不到外层未提交的测试数据。"""
     dispatches: list[dict[str, Any]] = []
 
-    async def _fake_dispatch(self, ctx, prompt, spec, *args: Any) -> str:
+    async def _fake_dispatch(self, ctx, prompt, spec, *args: Any, **kwargs: Any) -> str:
         dispatches.append({"spec": spec, "allowed_skill_names": args[-1]})
         return "委派报告"
 

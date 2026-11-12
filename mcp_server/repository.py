@@ -68,6 +68,21 @@ class McpServerRepository:
         )
         return list(await self.db.scalars(stmt))
 
+    async def list_by_ids(
+        self,
+        workspace_id: int,
+        server_ids: Sequence[int],
+    ) -> list[McpServerRecord]:
+        """本工作区内这些 ID 对应的有效 server（共享与私有都在内），按 ID 排序。"""
+        if not server_ids:
+            return []
+        stmt = (
+            self._in_workspace(workspace_id)
+            .where(McpServerRecord.id.in_(list(server_ids)))
+            .order_by(McpServerRecord.id)
+        )
+        return list(await self.db.scalars(stmt))
+
     async def key_taken(self, workspace_id: int, server_key: str) -> bool:
         """server_key 是否已被本工作区任一有效 server 占用，共享和私有一起算。"""
         stmt = (

@@ -5,8 +5,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.models import AgentRecord
-from agent.repository import AgentRepository
+from agent.repository import AgentRepository, McpBindingRow
 from core.errors import AgentException
+from harness.domain.mcp import bound_model_names, mcp_source
+from harness.domain.tool import ToolBinding
+from mcp_server.service import McpServerService
 from skill.service import SkillService
 from tools.service import ToolCatalogService
 from workspace.service import WorkspaceService
@@ -29,6 +32,25 @@ class AgentPage:
 
 
 @dataclass(frozen=True)
+class AgentMcpBindingInput:
+    """一条待写入的 MCP 绑定：tool_names 是 MCP 原名白名单，None 表示该 server 的全部工具。"""
+
+    server_id: int
+    tool_names: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class AgentMcpBinding:
+    """运行时用的一条 MCP 绑定：来源 Tool.source（mcp:{server_key}）与模型可见名白名单。
+
+    tool_names 为 None 表示该 server 的全部工具；原名已按 server_key 换算成模型名。
+    """
+
+    source: str
+    tool_names: frozenset[str] | None = None
+
+
+@dataclass(frozen=True)
 class AgentRuntimeConfig:
     agent_id: int
     system_prompt: str
@@ -39,6 +61,14 @@ class AgentRuntimeConfig:
     # 供 workflow 编排复用:name 作成员运行标识,description 作 LLM 路由的判断依据。
     name: str
     description: str | None
+    # 仍可用（已启用的共享 server）的 MCP 绑定，按来源排序。带默认值：黄金测试按全部旧字段构造本类型。
+    mcp_bindings: tuple[AgentMcpBinding, ...] = ()
+
+    def tool_binding(self) -> ToolBinding:
+        """这个 Agent 可见哪些作用域工具：只有绑定的 server，没有绑定时一个都不可见。"""
+        return ToolBinding.servers(
+            {binding.source: binding.tool_names for binding in self.mcp_bindings}
+        )
 
 
 @dataclass(frozen=True)
@@ -61,6 +91,7 @@ class AgentDefinitionService:
         self.workspace_service = WorkspaceService(db)
         self.tool_catalog_service = ToolCatalogService(db)
         self.skill_service = SkillService(db)
+        self.mcp_server_service = McpServerService(db)
 
     async def create_agent(
         self,
@@ -200,6 +231,63 @@ class AgentDefinitionService:
         await self.repo.replace_skill_bindings(agent.id, normalized_ids)
         return await self._get_required(workspace_id, agent.id)
 
+    async def replace_mcp_bindings(
+        self,
+        workspace_id: int,
+        agent_id: int,
+        actor_user_id: int,
+        bindings: list[AgentMcpBindingInput],
+    ) -> AgentRecord:
+        """全量替换 Agent 的 MCP server 绑定；权限与行锁同 replace_tool_bindings。
+
+        只能绑定本工作区已启用的共享 server，校验由 mcp_server 域的 require_usable 负责；
+        同一 server 不能出现两次，工具白名单写空列表报错（绑定全部工具请传 None）。
+        """
+        await self._require_write_access(workspace_id, actor_user_id)
+        agent = await self._get_required_for_update(workspace_id, agent_id)
+        rows = self._normalize_mcp_bindings(bindings)
+        await self.mcp_server_service.require_usable(
+            workspace_id,
+            [row.server_id for row in rows],
+            actor_user_id=actor_user_id,
+        )
+        await self.repo.replace_mcp_bindings(agent.id, rows)
+        return await self._get_required(workspace_id, agent.id)
+
+    @staticmethod
+    def _normalize_mcp_bindings(bindings: list[AgentMcpBindingInput]) -> list[McpBindingRow]:
+        """校验并规范化绑定：server 不重复、白名单非空且去重（保留顺序）。"""
+        seen: set[int] = set()
+        duplicated: list[int] = []
+        rows: list[McpBindingRow] = []
+        for binding in bindings:
+            if binding.server_id in seen:
+                duplicated.append(binding.server_id)
+                continue
+            seen.add(binding.server_id)
+            tool_names: list[str] | None = None
+            if binding.tool_names is not None:
+                if not binding.tool_names:
+                    # 空列表若当成「全部」就是放权，当成「一个都不给」又等于没绑定，两种理解都容易出错。
+                    raise AgentException.message(
+                        "MCP 工具白名单不能为空列表；要绑定该 server 的全部工具请传 null",
+                        {"server_id": binding.server_id},
+                        status_code=400,
+                    )
+                tool_names = list(dict.fromkeys(binding.tool_names))
+            rows.append(McpBindingRow(server_id=binding.server_id, tool_names=tool_names))
+        if duplicated:
+            raise AgentException.message(
+                "同一个 MCP server 只能绑定一次",
+                {"server_ids": sorted(set(duplicated))},
+                status_code=400,
+            )
+        return rows
+
+    async def unbind_mcp_server(self, server_id: int) -> None:
+        """供 mcp_server 域删除 server 时软删全部 Agent 对它的绑定；下一回合起这些 Agent 就看不到它。"""
+        await self.repo.soft_delete_mcp_bindings_for_server(server_id)
+
     async def require_runnable(self, agent_id: int, workspace_id: int) -> AgentRecord:
         """按可信工作区读取可运行Agent，供Session和运行时复用。"""
         agent = await self._get_required(workspace_id, agent_id)
@@ -237,7 +325,37 @@ class AgentDefinitionService:
             skill_names=skill_names,
             name=agent.name,
             description=agent.description,
+            mcp_bindings=await self._runtime_mcp_bindings(workspace_id, agent),
         )
+
+    async def _runtime_mcp_bindings(
+        self,
+        workspace_id: int,
+        agent: AgentRecord,
+    ) -> tuple[AgentMcpBinding, ...]:
+        """把绑定换成运行时形状：server_id 换成来源 mcp:{server_key}，原名换成模型名。
+
+        只留仍可用的 server（已启用的共享 server）：停用的 server 暂时不可见，但绑定保留，
+        重新启用后恢复；这里不报错，免得一个 server 被停用就让整个 Agent 跑不起来。
+        """
+        if not agent.mcp_bindings:
+            return ()
+        keys = await self.mcp_server_service.enabled_shared_keys(
+            workspace_id,
+            [binding.server_id for binding in agent.mcp_bindings],
+        )
+        result: list[AgentMcpBinding] = []
+        for binding in agent.mcp_bindings:
+            server_key = keys.get(binding.server_id)
+            if server_key is None:
+                continue
+            result.append(
+                AgentMcpBinding(
+                    source=mcp_source(server_key),
+                    tool_names=bound_model_names(server_key, binding.tool_names),
+                )
+            )
+        return tuple(sorted(result, key=lambda item: item.source))
 
     async def list_delegate_catalog(self, workspace_id: int) -> tuple[DelegateCatalogEntry, ...]:
         """返回工作区内全部已启用的 Agent,供默认 Agent 的可委派目录使用;不分页、不检索。

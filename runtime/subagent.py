@@ -492,7 +492,10 @@ class SubAgentRunner:
                 shell_tmp_root=spec.shell_tmp_root(Path(tempfile.gettempdir())),
                 scoped=scoped,
             )
-            assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
+            # tool_use 事件按策略全集查来源，作用域工具（如 MCP）带上 source，内置工具不变。
+            assembler = TurnEventAssembler(
+                actor, session_id, turn_id=parent_turn_id, source_of=policies.source_of
+            )
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
             try:
                 # 并发闸门只圈住 ReAct 循环本身(LLM + 工具),不含建记录与事件收尾,
@@ -597,14 +600,19 @@ class SubAgentRunner:
         output: str,
         *,
         is_error: bool = False,
+        source: str | None = None,
     ) -> None:
-        """发协议 tool_result 事件(actor 为该产出者自身)。"""
+        """发协议 tool_result 事件(actor 为该产出者自身);source 为作用域工具的来源,内置工具为 None 不输出。"""
         await self._emit_event(
             StreamEvent.tool_result(
                 actor,
                 session_id,
                 ToolInfo(
-                    id=tool_call.id, name=tool_call.tool_name, output=output, is_error=is_error
+                    id=tool_call.id,
+                    name=tool_call.tool_name,
+                    output=output,
+                    is_error=is_error,
+                    source=source,
                 ),
             )
         )
@@ -701,7 +709,14 @@ class SubAgentRunner:
                             reason=decision.reason,
                         )
                     )
-            await self._emit_tool_result(actor, session_id, tool_call, output, is_error=is_error)
+            await self._emit_tool_result(
+                actor,
+                session_id,
+                tool_call,
+                output,
+                is_error=is_error,
+                source=policies.source_of(tool_call.tool_name),
+            )
             # 中立协议下工具结果是独立的 tool 角色消息,编成各家 wire(Anthropic 的
             # tool_result 块 / OpenAI 的 role="tool" 消息)由客户端出站翻译负责。
             messages.append(
@@ -846,7 +861,9 @@ class SubAgentRunner:
         if member.team_id is not None:
             team_ref = TeamRef(id=member.team_id)
         actor = teammate_actor(name, run_id=instance_id, task=member.prompt, team=team_ref)
-        assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
+        assembler = TurnEventAssembler(
+            actor, session_id, turn_id=parent_turn_id, source_of=policies.source_of
+        )
         try:
             # 1) 从 member.history 反序列化历史;为空则用初始 prompt 起一条 user 消息。
             messages = self._load_history(member)

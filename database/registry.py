@@ -4,7 +4,12 @@ Alembic autogenerate 与字符串式 relationship() 都依赖此处的副作用�
 遗漏任一模块会导致自动迁移误判为删表，因此新增实体必须同步登记到这里。
 """
 
-from agent.models import AgentRecord, AgentSkillRecord, AgentToolRecord  # noqa: F401
+from agent.models import (  # noqa: F401
+    AgentMcpServerRecord,
+    AgentRecord,
+    AgentSkillRecord,
+    AgentToolRecord,
+)
 from department.models import DepartmentRecord  # noqa: F401
 from group.models import GroupMemberRecord, GroupRecord  # noqa: F401
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord  # noqa: F401

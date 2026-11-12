@@ -90,6 +90,33 @@ class AgentSkillBindingsRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class AgentMcpBindingItem(BaseModel):
+    server_id: PositiveId = Field(description="MCP server ID，只能是本工作区已启用的共享 server")
+    tool_names: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        default=None,
+        description="MCP 原名白名单；null 表示该 server 的全部工具，不允许空列表",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentMcpBindingsRequest(BaseModel):
+    servers: list[AgentMcpBindingItem] = Field(
+        default_factory=list,
+        description="MCP server 绑定全集；空列表表示解除全部绑定",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentMcpBindingResponse(BaseModel):
+    server_id: int = Field(description="MCP server ID")
+    tool_names: list[str] | None = Field(
+        default=None,
+        description="MCP 原名白名单，null 表示该 server 的全部工具",
+    )
+
+
 class AgentResponse(BaseModel):
     id: int = Field(description="Agent ID")
     workspace_id: int = Field(description="所属工作区ID")
@@ -101,6 +128,10 @@ class AgentResponse(BaseModel):
     created_by_user_id: int = Field(description="创建者用户ID")
     tool_ids: list[int] = Field(default_factory=list, description="绑定工具ID")
     skill_ids: list[int] = Field(default_factory=list, description="绑定Skill ID")
+    mcp_servers: list[AgentMcpBindingResponse] = Field(
+        default_factory=list,
+        description="绑定的 MCP server 与工具白名单，按 server_id 排序",
+    )
     created_at: datetime = Field(description="创建时间")
     updated_at: datetime = Field(description="更新时间")
 

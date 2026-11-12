@@ -774,9 +774,12 @@ class AgentRuntime:
             return
         members = await TeamService(self.db).list_members(session_id)
         working = [m for m in members if m.status == "working"]
+        parent_names = self.configuration.tools.names
         for member in working:
             try:
                 spec = get_subagent_spec(AgentType(member.agent_type or "general-purpose"))
+                # 作用域工具（如 MCP）按队友成员的规格继承，规则同一次性子代理。
+                scoped = spec.inherit_scoped(self.configuration.gateway.scoped, parent_names)
                 # 独立 session 避免与主会话共用连接;共享 bus 让队友增量冒泡到 SSE。
                 async with self._session_factory() as sub_db:
                     await self._teammates(sub_db, bus=self.bus).run_teammate(
@@ -786,8 +789,9 @@ class AgentRuntime:
                         parent_turn_id=turn.id,
                         user_id=turn.user_id,
                         workspace_id=turn.workspace_id,
-                        parent_allowed_tool_names=self.configuration.tools.names,
+                        parent_allowed_tool_names=parent_names,
                         allowed_skill_names=self.configuration.allowed_skill_names,
+                        scoped=scoped,
                     )
             except Exception as exc:
                 # 单个队友失败隔离:发 error 事件后继续唤醒其余成员。

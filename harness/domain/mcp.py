@@ -152,6 +152,18 @@ def model_tool_names(server_key: str, remote_names: Iterable[str]) -> McpToolNam
     )
 
 
+def bound_model_names(server_key: str, remote_names: Iterable[str] | None) -> frozenset[str] | None:
+    """Agent 绑定的 MCP 原名白名单换成模型可见名，供 ToolBinding.servers 做集合匹配；None 表示全部工具。
+
+    经 model_tool_names 换算，每个模型名只由 (server_key, 它自己的原名) 决定，与 server 当前的工具清单无关；
+    先去重，免得重复的原名被当成撞名剔除。server 上已不存在或因撞名被剔除的工具匹配不到，自然不可见。
+    """
+    if remote_names is None:
+        return None
+    naming = model_tool_names(server_key, dict.fromkeys(remote_names))
+    return frozenset(naming.names.values())
+
+
 def _model_tool_name(prefix: str, remote_name: str) -> str:
     """清洗有损或超长时加原名的 sha1 前 8 位作后缀；超长时先从右侧截短清洗结果。"""
     clean = _UNSAFE_NAME_CHARS.sub("_", remote_name)

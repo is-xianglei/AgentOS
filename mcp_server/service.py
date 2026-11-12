@@ -8,7 +8,7 @@
 """
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
 from sqlalchemy.exc import IntegrityError
@@ -352,10 +352,14 @@ class McpServerService:
         return list(headers)
 
     async def delete_server(self, workspace_id: int, actor_user_id: int, server_id: int) -> None:
-        """软删 server 与它的凭证；Agent 绑定在 M2 建表后由 agent 域一并解除。"""
+        """软删 server 与它的凭证，并经 agent 域解除全部 Agent 对它的绑定，三者同一事务。"""
+        # 局部导入打破导入环：agent.service 在模块级导入本模块（绑定时校验 server）。
+        from agent.service import AgentDefinitionService
+
         record = await self._require_writable(workspace_id, actor_user_id, server_id)
         await self.repo.soft_delete_secrets(record.id)
         await self.repo.soft_delete(record)
+        await AgentDefinitionService(self.db).unbind_mcp_server(record.id)
         logger.info(
             "MCP server 已删除，server_key=%s",
             record.server_key,
@@ -408,6 +412,70 @@ class McpServerService:
             )
             for record in records
         ]
+
+    async def require_usable(
+        self,
+        workspace_id: int,
+        server_ids: Sequence[int],
+        *,
+        actor_user_id: int,
+    ) -> dict[int, str]:
+        """校验这些 server 都能绑定到 Agent，返回 server_id → server_key。
+
+        - 查不到（别的工作区、已删除）报 404；别人的私有 server 同样 404，不泄露它的存在；
+        - 本人的私有 server 报 400：Agent 是工作区共享资源，别的成员用它时并没有这个 server；
+        - 停用的共享 server 报 409。
+        调用方（agent 域）已校验过写权限，这里只按 actor_user_id 判断私有 server 是不是本人的。
+        """
+        normalized = list(dict.fromkeys(server_ids))
+        records = {
+            record.id: record for record in await self.repo.list_by_ids(workspace_id, normalized)
+        }
+        missing = [
+            server_id
+            for server_id in normalized
+            if server_id not in records
+            or records[server_id].owner_user_id not in (None, actor_user_id)
+        ]
+        if missing:
+            raise AgentException.message(
+                "MCP server 不存在",
+                {"server_ids": missing},
+                status_code=404,
+            )
+        private = [
+            server_id for server_id in normalized if records[server_id].owner_user_id is not None
+        ]
+        if private:
+            raise AgentException.message(
+                "私有 MCP server 不能绑定到 Agent，只能绑定工作区共享的 server",
+                {"server_ids": private},
+                status_code=400,
+            )
+        disabled = [server_id for server_id in normalized if not records[server_id].is_enabled]
+        if disabled:
+            raise AgentException.message(
+                "MCP server 已停用，不能绑定",
+                {"server_ids": disabled},
+                status_code=409,
+            )
+        return {server_id: records[server_id].server_key for server_id in normalized}
+
+    async def enabled_shared_keys(
+        self,
+        workspace_id: int,
+        server_ids: Sequence[int],
+    ) -> dict[int, str]:
+        """这些 server 里仍可用（本工作区、未删除、已启用的共享 server）的 server_id → server_key。
+
+        给 Agent 的运行配置用：不可用的直接略过、不报错，停用的 server 重新启用后绑定随之恢复。
+        """
+        records = await self.repo.list_by_ids(workspace_id, list(dict.fromkeys(server_ids)))
+        return {
+            record.id: record.server_key
+            for record in records
+            if record.owner_user_id is None and record.is_enabled
+        }
 
     async def is_known_shared_tool(self, workspace_id: int, tool_name: str) -> bool:
         """权限规则的工具名校验（9.1 节）：工具名是否属于本工作区某个共享 server。

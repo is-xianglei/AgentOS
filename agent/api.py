@@ -8,12 +8,14 @@ from agent.schemas import (
     AgentCreateRequest,
     AgentDeleteResult,
     AgentListResponse,
+    AgentMcpBindingResponse,
+    AgentMcpBindingsRequest,
     AgentResponse,
     AgentSkillBindingsRequest,
     AgentToolBindingsRequest,
     AgentUpdateRequest,
 )
-from agent.service import AgentDefinitionService, AgentUpdateFields
+from agent.service import AgentDefinitionService, AgentMcpBindingInput, AgentUpdateFields
 from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.responses import ApiResponse, ok
 from user.models import UserRecord
@@ -25,11 +27,20 @@ CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 
 def _agent_response(record: AgentRecord) -> AgentResponse:
-    """ORM 上只有绑定关系，响应里的 tool_ids / skill_ids 需要从绑定中取出并排序。"""
+    """ORM 上只有绑定关系，响应里的 tool_ids / skill_ids / mcp_servers 需要从绑定中取出并排序。"""
     response = AgentResponse.model_validate(record)
     tool_ids = sorted(binding.tool_id for binding in record.tool_bindings)
     skill_ids = sorted(binding.skill_id for binding in record.skill_bindings)
-    return response.model_copy(update={"tool_ids": tool_ids, "skill_ids": skill_ids})
+    mcp_servers = [
+        AgentMcpBindingResponse(
+            server_id=binding.server_id,
+            tool_names=None if binding.tool_names is None else list(binding.tool_names),
+        )
+        for binding in sorted(record.mcp_bindings, key=lambda item: item.server_id)
+    ]
+    return response.model_copy(
+        update={"tool_ids": tool_ids, "skill_ids": skill_ids, "mcp_servers": mcp_servers}
+    )
 
 
 @router.post(
@@ -179,5 +190,34 @@ async def replace_agent_skills(
         agent_id,
         current_user.id,
         payload.skill_ids,
+    )
+    return ok(_agent_response(record), request)
+
+
+@router.put(
+    "/{agent_id}/mcp-servers",
+    summary="全量替换Agent MCP server绑定",
+    response_model=ApiResponse[AgentResponse],
+)
+async def replace_agent_mcp_servers(
+    agent_id: int,
+    payload: AgentMcpBindingsRequest,
+    request: Request,
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    workspace_id: CurrentWorkspaceId,
+):
+    bindings = [
+        AgentMcpBindingInput(
+            server_id=item.server_id,
+            tool_names=None if item.tool_names is None else tuple(item.tool_names),
+        )
+        for item in payload.servers
+    ]
+    record = await AgentDefinitionService(db).replace_mcp_bindings(
+        workspace_id,
+        agent_id,
+        current_user.id,
+        bindings,
     )
     return ok(_agent_response(record), request)

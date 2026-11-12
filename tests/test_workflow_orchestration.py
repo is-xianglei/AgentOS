@@ -1303,7 +1303,7 @@ def _make_runtime(
     # 模型解析器由组装根注入;准入阶段只验证配置,这里换成不查库的替身。
     runtime.models = SimpleNamespace(for_session=AsyncMock(return_value=None))
 
-    async def _build(session_id: int, turn_id: Any, workflow_id: int) -> Any:
+    async def _build(session_id: int, turn_id: Any, workflow_id: int, resolved: Any) -> Any:
         return SimpleNamespace(run=orchestrator_run)
 
     monkeypatch.setattr(runtime, "_build_orchestrator", _build)

@@ -305,6 +305,14 @@ class ScopedGrant:
         """可见的作用域工具，保持 tools 的顺序。"""
         return tuple(tool for tool in self.tools if tool.name in self.visible)
 
+    def narrowed(self, names: Iterable[str]) -> ScopedGrant:
+        """可见名单收窄为与 names 的交集；tools 原样保留，子执行仍按全部作用域工具查策略。"""
+        return ScopedGrant(tools=self.tools, visible=self.visible & frozenset(names))
+
+    def bound(self, binding: ToolBinding) -> ScopedGrant:
+        """可见名单再按绑定收窄，只留绑定选中的工具（委派自建 Agent 时用它的 server 绑定）。"""
+        return self.narrowed(tool.name for tool in select_scoped(self.tools, binding))
+
 
 def select_scoped(tools: Iterable[Tool], binding: ToolBinding) -> tuple[Tool, ...]:
     """按绑定从作用域工具里选出本回合可见的，保持输入顺序；来源不在绑定里的一律不选。"""

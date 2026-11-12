@@ -2,10 +2,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.ext.mutable import MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from database.base import Base
+from database.base import Base, json_type
 
 if TYPE_CHECKING:
     from skill.models import SkillRecord
@@ -70,6 +81,10 @@ class AgentRecord(Base):
         back_populates="agent",
         cascade="all, delete-orphan",
     )
+    mcp_bindings: Mapped[list[AgentMcpServerRecord]] = relationship(
+        back_populates="agent",
+        cascade="all, delete-orphan",
+    )
 
 
 class AgentToolRecord(Base):
@@ -120,3 +135,47 @@ class AgentSkillRecord(Base):
 
     agent: Mapped[AgentRecord] = relationship(back_populates="skill_bindings")
     skill: Mapped[SkillRecord] = relationship()
+
+
+class AgentMcpServerRecord(Base):
+    """Agent 与 MCP server 的绑定，只能绑定本工作区已启用的共享 server。
+
+    tool_names 是 MCP 原名白名单，NULL 表示该 server 的全部工具；空列表在 Service 层报错，
+    库里再用 CHECK 兜底，避免「空等于全部」这种放权方向的歧义。
+    """
+
+    __tablename__ = "agent_mcp_servers"
+    __table_args__ = (
+        # 解除绑定是软删，重新绑定插新行，所以唯一性只约束有效行。
+        Index(
+            "uq_agent_mcp_servers_active_agent_server",
+            "agent_id",
+            "server_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        CheckConstraint(
+            "tool_names IS NULL OR tool_names <> '[]'::jsonb",
+            name="ck_agent_mcp_servers_tool_names",
+        ),
+        {"comment": "Agent MCP server绑定表"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="绑定ID")
+    agent_id: Mapped[int] = mapped_column(
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        index=True,
+        comment="Agent ID",
+    )
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"),
+        index=True,
+        comment="MCP server ID",
+    )
+    tool_names: Mapped[list[str] | None] = mapped_column(
+        MutableList.as_mutable(json_type(none_as_null=True)),
+        nullable=True,
+        comment="MCP 原名白名单，NULL 表示该 server 的全部工具，不允许空列表",
+    )
+
+    agent: Mapped[AgentRecord] = relationship(back_populates="mcp_bindings")

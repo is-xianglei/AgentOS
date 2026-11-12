@@ -85,6 +85,7 @@ def _make_runtime() -> AgentRuntime:
         turbo=False,
         tools=_FakeRegistry(),
         allowed_skill_names=None,
+        gateway=SimpleNamespace(scoped=None),
     )
     runtime._session_factory = _FakeSessionScope
     runtime._teammates = _wake_runner_factory

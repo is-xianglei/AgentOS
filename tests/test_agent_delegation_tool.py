@@ -79,6 +79,8 @@ def _install_fakes(
         spec: Any,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
+        *,
+        scoped: Any = None,
     ) -> str:
         dispatches.append(
             {
@@ -87,6 +89,7 @@ def _install_fakes(
                 "parent_allowed_tool_names": parent_allowed_tool_names,
                 "allowed_skill_names": allowed_skill_names,
                 "workspace_id": ctx.workspace_id,
+                "scoped": scoped,
             }
         )
         return "委派报告"

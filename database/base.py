@@ -5,12 +5,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-def json_type() -> JSONB:
+def json_type(*, none_as_null: bool = False) -> JSONB:
     """JSON 列类型的统一入口，便于后续按方言切换实现。
 
     历史上各 models 模块各自定义了同名函数，新代码统一从此处导入。
+    none_as_null=True 时 Python 的 None 写成 SQL NULL 而不是 JSON 的 null，可空列用它区分「未设置」。
     """
-    return JSONB()
+    return JSONB(none_as_null=none_as_null)
 
 
 class Base(DeclarativeBase):

@@ -9,7 +9,7 @@ from harness.app.ports import SubAgentLauncher
 from harness.app.subagent_catalog import build_agent_spec, get_subagent_spec, routing_catalog
 from harness.domain.roles.reports import validate_verification_report
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
-from harness.domain.tool import LEAD_ONLY, PydanticTool, ToolContext, tool_policy
+from harness.domain.tool import LEAD_ONLY, PydanticTool, ScopedGrant, ToolContext, tool_policy
 
 logger = logging.getLogger(__name__)
 
@@ -110,12 +110,14 @@ class AgentTool(PydanticTool):
         if agent_type is None:
             agent_type = AgentType.GENERAL_PURPOSE
         spec = get_subagent_spec(agent_type)
+        # 作用域工具（如 MCP）按规格继承：general-purpose 继承父回合本轮可见的，Explore 等有白名单的不给。
         report = await self._dispatch(
             ctx,
             self._compose_prompt(args),
             spec,
             ctx.allowed_tool_names,
             ctx.allowed_skill_names,
+            scoped=spec.inherit_scoped(ctx.scoped, self._round_names(ctx)),
         )
         verdict: str | None = None
         verdict_note: str | None = None
@@ -168,18 +170,30 @@ class AgentTool(PydanticTool):
         )
         # 父名单取主运行时注入的本轮生效名单(含 Plan Mode 裁剪),与 delegate 档位、
         # Agent 白名单三者取交集;未注入时退回父网关的工具边界。
-        parent_tool_names = ctx.round_tool_names
-        if parent_tool_names is None:
-            parent_tool_names = ctx.allowed_tool_names
+        parent_tool_names = self._round_names(ctx)
+        # 作用域工具同样取交集：被委派 Agent 自己的 server 绑定 ∩ 父回合本轮可见的。
+        scoped: ScopedGrant | None = None
+        if ctx.scoped is not None:
+            scoped = ctx.scoped.bound(config.tool_binding())
+            if parent_tool_names is not None:
+                scoped = scoped.narrowed(parent_tool_names)
         report = await self._dispatch(
             ctx,
             prompt,
             spec,
             parent_tool_names,
             frozenset(config.skill_names),
+            scoped=scoped,
         )
         result = SubAgentRunReport(agent=spec.runtime_name, report=report)
         return json.dumps(asdict(result), ensure_ascii=False)
+
+    @staticmethod
+    def _round_names(ctx: ToolContext) -> frozenset[str] | None:
+        """父回合本轮生效的工具名单（含 Plan Mode 裁剪）；未注入时退回父网关的工具边界。"""
+        if ctx.round_tool_names is not None:
+            return ctx.round_tool_names
+        return ctx.allowed_tool_names
 
     @staticmethod
     def _delegate_error(agent_id: int, message: str) -> str:
@@ -222,8 +236,13 @@ class AgentTool(PydanticTool):
         spec: SubAgentSpec,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
+        *,
+        scoped: ScopedGrant | None,
     ) -> str:
-        """经运行时注入的子代理启动器运行子代理；启动器负责开独立数据库会话，事件经父 bus 发出。"""
+        """经运行时注入的子代理启动器运行子代理；启动器负责开独立数据库会话，事件经父 bus 发出。
+
+        scoped 是按规格或绑定选好的作用域工具，None 表示父回合没有作用域工具。
+        """
         launcher: SubAgentLauncher | None = ctx.subagents
         if launcher is None:
             # 启动器由运行时经工具网关注入，缺失属装配错误，不回落到任何默认实现。
@@ -238,4 +257,5 @@ class AgentTool(PydanticTool):
             workspace_id=ctx.workspace_id,
             parent_allowed_tool_names=parent_allowed_tool_names,
             allowed_skill_names=allowed_skill_names,
+            scoped=scoped,
         )

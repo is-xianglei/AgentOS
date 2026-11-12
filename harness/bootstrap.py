@@ -203,17 +203,23 @@ class Harness:
             permission_service=permission_service,
             models=self.models(db),
             tools=self.tools,
-            # 只有主 Agent 运行时解析作用域工具；子执行用父执行交来的 ScopedGrant。
-            tool_resolver=TurnToolResolver(
-                self.tools,
-                self.scoped_tools,
-                total_timeout=settings.mcp_resolve_timeout_seconds,
-            ),
+            tool_resolver=self.tool_resolver(),
             compact_model=self.compact_model,
             subagents=self.subagent_launcher(self),
             teammates=self.subagent_runner,
             session_factory=self.session_factory,
             rebuild=rebuild,
+        )
+
+    def tool_resolver(self) -> TurnToolResolver:
+        """回合工具解析器：平台工具加本装配的作用域来源。
+
+        只有主 Agent 与 Workflow 运行时持有它；子代理、队友、委派不重新解析，用父执行交来的 ScopedGrant。
+        """
+        return TurnToolResolver(
+            self.tools,
+            self.scoped_tools,
+            total_timeout=settings.mcp_resolve_timeout_seconds,
         )
 
     def subagent_runner(
@@ -279,6 +285,7 @@ class Harness:
             sessions=resolved_sessions,
             models=self.models(db),
             runners=self.subagent_runner,
+            tool_resolver=self.tool_resolver(),
             session_factory=self.session_factory,
             rebuild=rebuild,
         )
