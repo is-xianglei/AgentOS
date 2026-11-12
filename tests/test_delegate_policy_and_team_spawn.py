@@ -100,9 +100,11 @@ async def test_team_spawn_with_invalid_agent_type_never_reaches_team_service(
     spawned = _install_team_service(monkeypatch)
     payload = {"name": "w", "role": "执行", "prompt": "干活", "agent_type": "Reviewer"}
 
-    output = await team_tools.TeamSpawnTool().execute(
-        payload, ToolContext(session_id=1, db=None, principal_name="lead")
-    )
+    output = (
+        await team_tools.TeamSpawnTool().execute(
+            payload, ToolContext(session_id=1, db=None, principal_name="lead")
+        )
+    ).text
 
     assert output.startswith("error:")
     assert "队友子代理类型无效" in output

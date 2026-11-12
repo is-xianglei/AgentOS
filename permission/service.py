@@ -3,7 +3,7 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AgentException
-from harness.app.tool_set import platform_tools
+from harness.domain.tool import ToolPolicy
 from permission.models import PermissionRuleRecord
 from permission.repository import PermissionRepository
 
@@ -15,19 +15,10 @@ Behavior = Literal["allow", "ask", "deny"]
 # 危险工具(可执行任意命令 / 有副作用)默认 ask;其余工具默认 allow。
 # SkillRun:进程内执行 skill 脚本,等同在主机跑任意代码(PRD §3.5 / §17),与 Bash 同级需审批。
 # Write/Edit:写入/修改文件有副作用,需审批。
-# Skill / SkillResource / Read / Glob / Grep 为只读能力,默认放行(未知工具默认 allow),不纳入本集合。
-# 审批默认值由工具能力策略派生，避免 PermissionService 与 ToolPolicy 各维护一份
-# 危险工具名单。新增工具只需在自己的 policy 声明 requires_approval=True。
-
-
-def dangerous_tools() -> frozenset[str]:
-    """默认需审批的危险工具名单，按进程级工具集的能力策略现算。
-
-    不在模块加载期计算：进程级工具集由组装根登记，本模块加载时可能尚未登记。
-    """
-    return frozenset(
-        tool.name for tool in platform_tools().tools if tool.policy.requires_approval
-    )
+# Skill / SkillResource / Read / Glob / Grep 为只读能力,默认放行(未知工具默认 allow)。
+# 审批默认值由调用方传入的工具能力策略决定，PermissionService 不另维护危险工具名单，
+# 也不自己按名查策略：策略由审核链按本回合的策略全集查好后传入。
+# 新增工具只需在自己的 policy 声明 requires_approval=True。
 
 
 DEFAULT_ALLOW: Behavior = "allow"
@@ -50,13 +41,19 @@ class PermissionService:
         self.db = db
         self.repo = PermissionRepository(db)
 
-    def default_behavior(self, tool_name: str, agent_type: str | None = None) -> Behavior:
-        """无规则命中时的默认判定;内置定向策略优先于按工具的粗粒度默认值。"""
+    def default_behavior(
+        self,
+        tool_name: str,
+        agent_type: str | None = None,
+        *,
+        policy: ToolPolicy,
+    ) -> Behavior:
+        """无规则命中时的默认判定;内置定向策略优先于按工具策略的粗粒度默认值。"""
         if agent_type is not None:
             builtin = BUILTIN_AGENT_DEFAULTS.get((agent_type, tool_name))
             if builtin is not None:
                 return builtin
-        if platform_tools().policy_for(tool_name).requires_approval:
+        if policy.requires_approval:
             return DEFAULT_ASK
         return DEFAULT_ALLOW
 
@@ -67,6 +64,8 @@ class PermissionService:
         tool_input: dict[str, Any] | None = None,
         agent_type: str | None = None,
         workspace_id: int | None = None,
+        *,
+        policy: ToolPolicy,
     ) -> Behavior:
         """判定某工具调用应 allow / ask / deny。
 
@@ -75,6 +74,7 @@ class PermissionService:
         agent_type=None 表示主代理,只会命中通用规则。
 
         workspace_id 是 global 规则的租户边界；未提供时不会读取任何 global 规则。
+        policy 是调用方按本回合策略全集查到的工具策略，按工具默认值读它的 requires_approval。
         """
         # 按优先级逐层查找，命中即返回；会话级规则命中时不会再查询 global 规则。
         session_rule = await self.repo.find_match(
@@ -85,7 +85,7 @@ class PermissionService:
             workspace_id,
         )
         if session_rule is not None:
-            return self._coerce(session_rule.behavior, tool_name, agent_type)
+            return self._coerce(session_rule.behavior, tool_name, agent_type, policy=policy)
         global_rule = await self.repo.find_match(
             "global",
             None,
@@ -94,8 +94,8 @@ class PermissionService:
             workspace_id,
         )
         if global_rule is not None:
-            return self._coerce(global_rule.behavior, tool_name, agent_type)
-        return self.default_behavior(tool_name, agent_type)
+            return self._coerce(global_rule.behavior, tool_name, agent_type, policy=policy)
+        return self.default_behavior(tool_name, agent_type, policy=policy)
 
     async def add_always_allow(
         self,
@@ -185,9 +185,14 @@ class PermissionService:
         return deleted
 
     def _coerce(
-        self, behavior: str, tool_name: str, agent_type: str | None = None
+        self,
+        behavior: str,
+        tool_name: str,
+        agent_type: str | None = None,
+        *,
+        policy: ToolPolicy,
     ) -> Behavior:
         """把落库的 behavior 收敛到合法取值;非法值退回默认策略。"""
         if behavior in ("allow", "ask", "deny"):
             return behavior  # type: ignore[return-value]
-        return self.default_behavior(tool_name, agent_type)
+        return self.default_behavior(tool_name, agent_type, policy=policy)

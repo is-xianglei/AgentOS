@@ -19,6 +19,7 @@ from harness.domain.messages import ToolCall
 from harness.domain.prompts.lead import DELEGATE_CATALOG_HEADER, SKILLS_CATALOG_HEADER
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.assistant import Assistant
+from harness.domain.tool import ToolOutput
 from runtime.agent import AgentRuntime
 from runtime.turn_config import TurnConfiguration
 from tests.fixtures.harness_factory import make_agent_runtime, platform_tools
@@ -230,7 +231,7 @@ def _tool_runtime(monkeypatch: pytest.MonkeyPatch, active_plan: Any) -> tuple[Ag
 
     async def _gateway_run(session_id, tool_name, input_args, **kwargs):
         gateway_calls.append({"tool_name": tool_name, **kwargs})
-        return "ok"
+        return ToolOutput.ok("ok")
 
     monkeypatch.setattr(runtime.configuration.gateway, "run", _gateway_run)
     return runtime, gateway_calls

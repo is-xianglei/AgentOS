@@ -1197,3 +1197,196 @@ def test_agent_tool_does_not_import_runtime_or_engine() -> None:
 def test_agent_tool_checker_reports_imports(source: str, expected: list[str]) -> None:
     """检查器自测：函数体与按包导入同样报出，端口、database 的其他模块与相似名不得误报。"""
     assert _agent_tool_violations(ast.parse(source), set(_first_party_module_files())) == expected
+
+
+# 按名查策略只能查本回合的策略全集（TurnConfiguration.policies / 网关的 policies），不能再查进程级
+# 工具集：MCP 这类按工作区解析的工具不在进程级工具集里，查它会被当成未知工具。platform_tools()
+# 只留给只有工具名、没有回合的管理场景（工具目录同步、绑定校验、权限规则配置等）。
+_PLATFORM_TOOLS_FREE_PACKAGES = ("runtime", "harness.adapters.reviewers")
+_PLATFORM_TOOLS_FREE_MODULES = ("tools.gateway",)
+# 这些模块里只有指定的类受限：同模块的其他类（如 ToolCatalogService）属于管理场景。
+_PLATFORM_TOOLS_FREE_CLASSES = {"tools.service": "ToolService"}
+
+
+def _class_node(tree: ast.Module, name: str) -> ast.ClassDef | None:
+    """取模块顶层的同名类定义，不存在时返回 None。"""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    return None
+
+
+def _platform_tools_uses(tree: ast.Module, scope: ast.AST | None = None) -> list[int]:
+    """返回 scope（缺省为整个模块）内引用 platform_tools 的行号，调用和取函数对象都算。
+
+    按本模块的 import 别名展开后看最后一段，``tool_set.platform_tools``、``as`` 别名同样报出；
+    import 语句本身不算，同模块的管理场景可以照常导入。
+    """
+    aliases = _import_aliases(tree)
+    lines: list[int] = []
+    for node in ast.walk(scope or tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            continue
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            continue
+        name = _dotted_name(node)
+        if name is None:
+            continue
+        head, _, rest = name.partition(".")
+        resolved = aliases.get(head, head)
+        full = f"{resolved}.{rest}" if rest else resolved
+        if full.rpartition(".")[2] == "platform_tools":
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_platform_tools_only_used_outside_turn_paths() -> None:
+    """策略来源防线：runtime、工具网关、ToolService 与审核员任何位置都不得引用 platform_tools()。"""
+    files = _first_party_module_files()
+    guarded = sorted(
+        module
+        for module in files
+        if module in _PLATFORM_TOOLS_FREE_MODULES
+        or any(
+            module == package or module.startswith(f"{package}.")
+            for package in _PLATFORM_TOOLS_FREE_PACKAGES
+        )
+    )
+    expected = {
+        "runtime.agent",
+        "runtime.subagent",
+        "runtime.turn_config",
+        "runtime.tool_execution",
+        "runtime.interaction_flow",
+        "harness.adapters.reviewers.policy_reviewer",
+        "tools.gateway",
+    }
+    assert expected <= set(guarded), f"模块枚举未覆盖受限模块，仅发现: {guarded}"
+    failures: list[str] = []
+    for module in guarded:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        failures.extend(
+            f"  - {module}:{line} 引用了 platform_tools" for line in _platform_tools_uses(tree)
+        )
+    for module, class_name in _PLATFORM_TOOLS_FREE_CLASSES.items():
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        scope = _class_node(tree, class_name)
+        assert scope is not None, f"{module} 里找不到受限的类 {class_name}"
+        failures.extend(
+            f"  - {module}.{class_name}:{line} 引用了 platform_tools"
+            for line in _platform_tools_uses(tree, scope)
+        )
+    assert not failures, "回合路径按进程级工具集查了策略:\n" + "\n".join(failures)
+
+
+_TOOL_SERVICE_SOURCE = (
+    "from harness.app.tool_set import platform_tools\n"
+    "class ToolCatalogService:\n"
+    "    def sync(self):\n"
+    "        return platform_tools().tools\n"
+    "class ToolService:\n"
+    "    def __init__(self):\n"
+    "        self.policy_source = platform_tools()\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from harness.app.tool_set import platform_tools\nplatform_tools()", [2]),
+        (
+            "from harness.app.tool_set import platform_tools\n"
+            "def f():\n    return platform_tools().names",
+            [3],
+        ),
+        ("from harness.app import tool_set\ntool_set.platform_tools()", [2]),
+        ("import harness.app.tool_set\nharness.app.tool_set.platform_tools()", [2]),
+        ("from harness.app.tool_set import platform_tools as pt\npt()", [2]),
+        ("from harness.app.tool_set import platform_tools\nsource = platform_tools", [2]),
+        ("from harness.app.tool_set import platform_tools", []),
+        ("from harness.app.tool_set import ToolSet\nToolSet().policy_for('Read')", []),
+        ("def platform_tools_count():\n    return 1\nplatform_tools_count()", []),
+    ],
+)
+def test_platform_tools_checker_reports_uses(source: str, expected: list[int]) -> None:
+    """检查器自测：直接调用、函数体、按模块属性与别名引用都必须报出，单纯导入与相似名不得误报。"""
+    assert _platform_tools_uses(ast.parse(source)) == expected
+
+
+def test_platform_tools_checker_limits_class_scope() -> None:
+    """检查器自测：限定类时只报该类里的引用（含 __init__），同模块其他类的管理场景不报。"""
+    tree = ast.parse(_TOOL_SERVICE_SOURCE)
+    scope = _class_node(tree, "ToolService")
+
+    assert scope is not None
+    assert _platform_tools_uses(tree, scope) == [7]
+    assert _class_node(tree, "Missing") is None
+
+
+# M0 删掉了 permission.service 里按进程级工具集现算危险工具名单的函数，审批原因改按本回合的策略全集判断；
+# 全仓（含测试与迁移脚本）不得再以标识符形式出现它，防止有人加回来。本文件是检查器自身，不在扫描范围内。
+_REMOVED_IDENTIFIER = "dangerous" + "_tools"
+
+
+def _removed_identifier_uses(tree: ast.Module, identifier: str) -> list[int]:
+    """返回以标识符形式出现 identifier 的行号：名称、属性、导入名与别名、函数与类定义都算。
+
+    只看语法树，注释、文档字符串与普通字符串不算。
+    """
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        hit = False
+        if isinstance(node, ast.Name):
+            hit = node.id == identifier
+        elif isinstance(node, ast.Attribute):
+            hit = node.attr == identifier
+        elif isinstance(node, ast.alias):
+            hit = identifier in (node.name.rpartition(".")[2], node.asname)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            hit = node.name == identifier
+        if hit:
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_removed_approval_list_function_stays_removed() -> None:
+    """删除防线：一方模块、迁移脚本与测试里都不得再出现已删除的危险工具名单函数。"""
+    this_file = Path(__file__).resolve()
+    paths = list(_first_party_module_files().values())
+    for extra_dir in ("tests", "alembic"):
+        paths.extend(
+            path
+            for path in sorted((PROJECT_ROOT / extra_dir).rglob("*.py"))
+            if not _SKIP_PATH_PARTS & set(path.relative_to(PROJECT_ROOT).parts)
+        )
+    failures: list[str] = []
+    for path in paths:
+        if path.resolve() == this_file:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        failures.extend(
+            f"  - {path.relative_to(PROJECT_ROOT)}:{line}"
+            for line in _removed_identifier_uses(tree, _REMOVED_IDENTIFIER)
+        )
+    assert not failures, f"已删除的 {_REMOVED_IDENTIFIER} 又出现了:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (f"def {_REMOVED_IDENTIFIER}():\n    return frozenset()", [1]),
+        (f"from permission.service import {_REMOVED_IDENTIFIER}", [1]),
+        (f"from permission.service import {_REMOVED_IDENTIFIER} as names", [1]),
+        (f"import permission.service as s\ns.{_REMOVED_IDENTIFIER}()", [2]),
+        (f"def f():\n    return name in {_REMOVED_IDENTIFIER}()", [2]),
+        (f"{_REMOVED_IDENTIFIER} = frozenset()", [1]),
+        (f"# {_REMOVED_IDENTIFIER} 已删除\nx = 1", []),
+        (f"message = '{_REMOVED_IDENTIFIER}'", []),
+        (f"def {_REMOVED_IDENTIFIER}_count():\n    return 0", []),
+    ],
+)
+def test_removed_identifier_checker_reports_uses(source: str, expected: list[int]) -> None:
+    """检查器自测：定义、导入、别名导入、属性调用与赋值都必须报出，注释、字符串与相似名不得误报。"""
+    assert _removed_identifier_uses(ast.parse(source), _REMOVED_IDENTIFIER) == expected

@@ -30,7 +30,7 @@ from harness.app.subagent_catalog import build_agent_spec, get_subagent_spec
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
-from harness.domain.tool import ToolProfile
+from harness.domain.tool import ToolOutput, ToolPolicy, ToolProfile
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
 from runtime.subagent import _render_denied_summary
@@ -471,7 +471,7 @@ class _FakeGateway:
 
     async def run(
         self, session_id: int, tool_name: str, input_args: dict[str, Any], **kwargs: Any
-    ) -> str:
+    ) -> ToolOutput:
         kwargs.pop("bus", None)
         self._recorder.executions.append(
             {
@@ -481,7 +481,7 @@ class _FakeGateway:
                 **_jsonable(kwargs),
             }
         )
-        return f"执行结果:{tool_name}"
+        return ToolOutput.ok(f"执行结果:{tool_name}")
 
     async def start_call(
         self,
@@ -604,6 +604,8 @@ def _install_permissions(
         tool_input: dict[str, Any] | None = None,
         agent_type: str | None = None,
         workspace_id: int | None = None,
+        *,
+        policy: ToolPolicy,
     ) -> str:
         recorder.evaluations.append(
             {

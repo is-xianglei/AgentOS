@@ -125,6 +125,24 @@ def unknown_tool_policy(name: str) -> ToolPolicy:
     )
 
 
+@dataclass(frozen=True)
+class ToolOutput:
+    """工具执行结果。is_error 表示执行失败，失败文本仍交给模型自行纠正。"""
+
+    text: str
+    is_error: bool = False
+
+    @classmethod
+    def ok(cls, text: str) -> ToolOutput:
+        """执行成功的结果。"""
+        return cls(text=text)
+
+    @classmethod
+    def error(cls, text: str) -> ToolOutput:
+        """执行失败的结果，文本照样回给模型。"""
+        return cls(text=text, is_error=True)
+
+
 @dataclass
 class ToolContext:
     session_id: int
@@ -175,7 +193,7 @@ class Tool(ABC):
         """按参数 schema 校验并规范化入参，供执行和人工恢复共用；不合法时抛中文异常。"""
 
     @abstractmethod
-    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> str:
+    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         """执行工具；参数不合法时把错误文本作为结果返回，让模型修正参数后重试。"""
 
 
@@ -201,13 +219,14 @@ class PydanticTool(Tool):
             ) from exc
         return value.model_dump(by_alias=True, exclude_none=True)
 
-    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> str:
+    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         # 参数校验失败不抛异常，把错误作为工具结果回给模型，让它修正参数后重试。
+        # 内置工具一律包成 ok：is_error 维持原来的 False，模型看到的结果不变。
         try:
             args = self.input_model.model_validate(arguments)
         except ValidationError as err:
-            return f"error: {err}. hint: Please fix the parameters and try again"
-        return await self.run(args, ctx)
+            return ToolOutput.ok(f"error: {err}. hint: Please fix the parameters and try again")
+        return ToolOutput.ok(await self.run(args, ctx))
 
     @abstractmethod
     async def run(self, args: BaseModel, ctx: ToolContext) -> str:

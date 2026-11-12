@@ -36,6 +36,8 @@ class TurnConfiguration:
     - delegate_catalog：可委派 Agent 目录，只有默认 Agent 才有；
     - tools、gateway：本回合可见的工具集，以及冻结了身份与边界的执行网关；网关带着子代理启动器，
       Agent 工具经它启动子代理；
+    - policies：本回合按名查策略的策略全集，取运行时注入的完整工具集，不按可见集裁剪：
+      被裁掉的工具按可见集查会变成未知工具，从而跳过能力检查；
     - model：主模型，注入客户端时取客户端自带的默认参数，按会话配置之前为 None；
     - compact_model、compact_threshold：解析出的压缩模型与阈值，注入客户端时为 None，沿用压缩服务现值；
     - database_model：模型来自工作区模型配置，此时端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
@@ -51,6 +53,7 @@ class TurnConfiguration:
     allowed_skill_names: frozenset[str] | None
     delegate_catalog: str | None
     tools: ToolSet
+    policies: ToolSet
     gateway: ToolGateway
     model: ResolvedModel | None
     compact_model: ResolvedModel | None
@@ -165,6 +168,7 @@ class TurnConfiguration:
             tools,
             profile,
             principal_name=principal_name,
+            policies=base_tools,
             agent_id=agent_id,
             allowed_skill_names=allowed_skill_names,
             subagents=subagents,
@@ -180,6 +184,7 @@ class TurnConfiguration:
             allowed_skill_names=allowed_skill_names,
             delegate_catalog=delegate_catalog,
             tools=tools,
+            policies=base_tools,
             gateway=gateway,
             model=model,
             compact_model=compact_model,

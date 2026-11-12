@@ -19,7 +19,7 @@ from harness.bootstrap import IsolatedSubAgentLauncher, default_harness
 from harness.domain.messages import AssistantMessage, ToolCall
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
-from harness.domain.tool import ToolContext
+from harness.domain.tool import ToolContext, ToolOutput
 from permission.service import PermissionService
 from runtime.subagent import SubAgentRunner
 from tests.fixtures.harness_factory import make_subagent_runner
@@ -253,14 +253,14 @@ def _script_permissions(
     executed: list[str] = []
 
     async def _evaluate(
-        self, session_id, tool_name, tool_input=None, agent_type=None, workspace_id=None
+        self, session_id, tool_name, tool_input=None, agent_type=None, workspace_id=None, *, policy
     ):
         evaluated_agent_types.append(agent_type)
         return behaviors[tool_name]
 
     async def _gateway_run(self, session_id, tool_name, input_args, **kwargs):
         executed.append(tool_name)
-        return "工具输出"
+        return ToolOutput.ok("工具输出")
 
     # 审核员持有的权限服务由组装根注入，按类替换动态权限查询。
     monkeypatch.setattr(PermissionService, "evaluate", _evaluate)

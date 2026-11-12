@@ -106,6 +106,7 @@ class LeadToolExecutor:
                     allowed_skill_names=configuration.allowed_skill_names,
                     plan_content=plan_content,
                     tools=configuration.tools,
+                    policies=configuration.policies,
                 ),
             )
             # 审核可能规范化了入参：执行、落库与挂起的续跑状态都用审核后的入参。
@@ -181,7 +182,7 @@ class LeadToolExecutor:
         透传给工具上下文,供 Agent 工具委派自建 Agent 时裁剪工具。
         """
         configuration = self._configuration
-        output = await configuration.gateway.run(
+        result = await configuration.gateway.run(
             session_id,
             tool_call.tool_name,
             tool_call.arguments,
@@ -203,8 +204,8 @@ class LeadToolExecutor:
                 ToolInfo(
                     id=tool_call.id,
                     name=tool_call.tool_name,
-                    output=output,
-                    is_error=False,
+                    output=result.text,
+                    is_error=result.is_error,
                 ),
             )
         )
@@ -215,12 +216,12 @@ class LeadToolExecutor:
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.tool_name,
                 arguments=tool_call.arguments,
-                content=output,
-                is_error=False,
+                content=result.text,
+                is_error=result.is_error,
             ).to_content(),
             turn_id=turn_id,
         )
-        return output
+        return result.text
 
     async def record_response(
         self,

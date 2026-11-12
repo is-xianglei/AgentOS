@@ -12,8 +12,8 @@ from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from harness.app.ports import SubAgentLauncher
 from harness.app.tool_set import ToolSet, platform_tools
-from harness.domain.review import check_capability
-from harness.domain.tool import ShellAccess, ToolContext, ToolProfile
+from harness.domain.review import ToolPolicyLookup, check_capability
+from harness.domain.tool import ShellAccess, ToolContext, ToolOutput, ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord, ToolRecord
@@ -246,13 +246,13 @@ class ToolCatalogService:
 
 
 class ToolService:
-    def __init__(self, db: AsyncSession, registry: ToolSet):
-        """初始化工具执行器依赖。"""
+    def __init__(self, db: AsyncSession, registry: ToolSet, policy_source: ToolPolicyLookup):
+        """初始化工具执行器依赖；policy_source 是本回合的策略全集，由网关或运行时传入。"""
         self.db = db
         self.registry = registry
-        # 能力策略按工具名查完整的进程级工具集，而不是 registry：registry 是裁剪后的
+        # 能力策略按工具名查策略全集，而不是 registry：registry 是裁剪后的
         # 可见集合，被裁掉的工具若按它查会变成 unknown，从而跳过下面的能力检查。
-        self.policy_source = platform_tools()
+        self.policy_source = policy_source
         self.tool_repo = ToolRepository(db)
         self.catalog_repo = ToolCatalogRepository(db)
 
@@ -349,7 +349,7 @@ class ToolService:
         execution_context: ToolExecutionContext | None = None,
         round_tool_names: frozenset[str] | None = None,
         subagents: SubAgentLauncher | None = None,
-    ) -> str:
+    ) -> ToolOutput:
         """执行工具并记录调用状态。
 
         这里是三类 actor(orchestrator / subagent / teammate)工具执行的唯一交汇点,
@@ -358,6 +358,7 @@ class ToolService:
         record 非空时复用既有记录(如审批通过后复用之前的 awaiting 记录),
         回到 running 并以最新 input_args 覆盖(可能被审批时的 updated_input 修改过);
         否则新建一条 running 记录。subagents 是运行时注入的子代理启动器,原样放进工具上下文。
+        能力拒绝与 Hook 拦截的文本以 ToolOutput.ok 返回,与原先回给模型的结果一致。
         """
         actor = actor or ORCHESTRATOR_ACTOR
         if execution_context is not None:
@@ -417,7 +418,7 @@ class ToolService:
                     is_error=True,
                 )
             )
-            return denied
+            return ToolOutput.ok(denied)
 
         # PreToolUse:可拦截(block)或改写入参(updated_input)。permission 已在
         # 更高层(orchestrator _execute_tool_calls)裁决过,此处 hook 只能更严,不能提权。
@@ -453,7 +454,7 @@ class ToolService:
             # 被 PreToolUse hook 拦截:不执行工具,把拦截理由作为结果回给模型。
             await self.tool_repo.fail(record, blocked)
             await self.db.flush()
-            return blocked
+            return ToolOutput.ok(blocked)
 
         # 三态日志只记工具名与结果,不记入参:入参可能含敏感路径、命令或密钥。
         logger.info(
@@ -511,7 +512,7 @@ class ToolService:
                 )
             )
             raise
-        await self.tool_repo.succeed(record, output)
+        await self.tool_repo.succeed(record, output.text)
         await self.db.flush()
         logger.info(
             "工具执行完成",
@@ -533,7 +534,7 @@ class ToolService:
                 turn_id=turn_id,
                 tool_name=tool_name,
                 tool_input=input_args,
-                tool_output=output,
+                tool_output=output.text,
             )
         )
         return output

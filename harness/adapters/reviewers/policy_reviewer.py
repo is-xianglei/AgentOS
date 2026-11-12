@@ -9,9 +9,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 from core.errors import AgentException
-from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.ports import ToolCallReviewer
-from harness.app.tool_set import ToolSet
 from harness.domain.messages import ToolCall
 from harness.domain.review import (
     INTERACTION_TOOL_KINDS,
@@ -25,8 +23,10 @@ from harness.domain.review import (
     SOURCE_PLAN_MODE_TOOLS,
     Decision,
     ReviewRequest,
+    ToolPolicyLookup,
     check_capability,
 )
+from harness.domain.tool import ToolPolicy
 from permission.service import PermissionService
 
 # Plan 模式下 Agent 工具只能派发的只读子代理类型。
@@ -50,15 +50,13 @@ class PolicyReviewer(ToolCallReviewer):
         cls,
         permission_service: PermissionService,
         *,
-        policy_source: ToolSet | None = None,
+        policy_source: ToolPolicyLookup,
     ) -> PolicyReviewer:
         """主 Agent 的规则链：预算 → Plan 白名单 → 入参规范化 → 能力 → Plan 下的 Agent 类型
         → 交互工具 → 权限规则。权限规则要求审批时挂起为 tool_approval。
 
-        policy_source 是按工具名查能力策略的完整工具集，缺省为内置工具集。
+        policy_source 是组装根注入的平台工具集，请求没带本回合的策略全集时按它查能力策略。
         """
-        if policy_source is None:
-            policy_source = builtin_tool_set()
         return cls(
             [
                 BudgetRule(),
@@ -67,7 +65,7 @@ class PolicyReviewer(ToolCallReviewer):
                 CapabilityRule(policy_source),
                 PlanModeAgentRule(),
                 InteractionToolRule(),
-                PermissionRule(permission_service),
+                PermissionRule(permission_service, policy_source),
             ]
         )
 
@@ -76,19 +74,18 @@ class PolicyReviewer(ToolCallReviewer):
         cls,
         permission_service: PermissionService,
         *,
-        policy_source: ToolSet | None = None,
+        policy_source: ToolPolicyLookup,
     ) -> PolicyReviewer:
         """子代理的规则链：预算 → 能力 + 权限规则。子代理没有审批通道，后两条的挂起合并为拒绝，
         拒绝时回给模型的文本换成子代理文案。子代理不做入参规范化、Plan 模式检查和交互工具处理。
+        policy_source 的含义同 for_main_agent。
         """
-        if policy_source is None:
-            policy_source = builtin_tool_set()
         return cls(
             [
                 BudgetRule(),
                 NoApprovalChannelRule(
                     CapabilityRule(policy_source),
-                    PermissionRule(permission_service),
+                    PermissionRule(permission_service, policy_source),
                 ),
             ]
         )
@@ -102,6 +99,18 @@ class PolicyReviewer(ToolCallReviewer):
             call = replace(call, arguments=decision.arguments)
             decision = await rule.review(call, request)
         return decision
+
+
+def _policy_for(
+    request: ReviewRequest,
+    policy_source: ToolPolicyLookup,
+    tool_name: str,
+) -> ToolPolicy:
+    """按名查能力策略：优先查请求带来的本回合策略全集，没带时查构造时注入的平台工具集。"""
+    policies = request.policies
+    if policies is None:
+        policies = policy_source
+    return policies.policy_for(tool_name)
 
 
 class BudgetRule(ToolCallReviewer):
@@ -157,17 +166,17 @@ class ArgumentsRule(ToolCallReviewer):
 class CapabilityRule(ToolCallReviewer):
     """静态能力检查：档位能否调用该工具，以及 Skill 类工具是否只访问已绑定的 skill。
 
-    策略按完整工具集查，而不是本轮可见集：被裁掉的工具按可见集查会变成未知工具。
+    策略按策略全集查，而不是本轮可见集：被裁掉的工具按可见集查会变成未知工具。
     交互工具会在后面提前挂起，所以这条排在它们之前，防止伪造的调用绕过档位边界。
     """
 
-    def __init__(self, policy_source: ToolSet) -> None:
+    def __init__(self, policy_source: ToolPolicyLookup) -> None:
         self._policy_source = policy_source
 
     async def review(self, call: ToolCall, request: ReviewRequest) -> Decision:
         denied = check_capability(
             call.tool_name,
-            self._policy_source.policy_for(call.tool_name),
+            _policy_for(request, self._policy_source, call.tool_name),
             request.profile,
             call.arguments,
             request.allowed_skill_names,
@@ -221,10 +230,18 @@ class InteractionToolRule(ToolCallReviewer):
 
 
 class PermissionRule(ToolCallReviewer):
-    """按工作区与会话的权限规则判定 allow / ask / deny；ask 挂起为 tool_approval。"""
+    """按工作区与会话的权限规则判定 allow / ask / deny；ask 挂起为 tool_approval。
 
-    def __init__(self, permission_service: PermissionService) -> None:
+    无规则命中时的默认判定取自工具能力策略，策略与 CapabilityRule 同样按策略全集查好后传入。
+    """
+
+    def __init__(
+        self,
+        permission_service: PermissionService,
+        policy_source: ToolPolicyLookup,
+    ) -> None:
         self._permission_service = permission_service
+        self._policy_source = policy_source
 
     async def review(self, call: ToolCall, request: ReviewRequest) -> Decision:
         behavior = await self._permission_service.evaluate(
@@ -233,6 +250,7 @@ class PermissionRule(ToolCallReviewer):
             call.arguments,
             agent_type=request.agent_type,
             workspace_id=request.workspace_id,
+            policy=_policy_for(request, self._policy_source, call.tool_name),
         )
         if behavior == "allow":
             return Decision.allow(call.arguments, source=SOURCE_PERMISSION)

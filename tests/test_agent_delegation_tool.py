@@ -134,7 +134,7 @@ async def test_agent_id_delegates_with_agent_runtime_config(
 ) -> None:
     config_requests, dispatches = _install_fakes(monkeypatch)
 
-    output = await AgentTool().execute({"agent_id": 7, "prompt": "审一下"}, _ctx())
+    output = (await AgentTool().execute({"agent_id": 7, "prompt": "审一下"}, _ctx())).text
 
     assert config_requests == [(_WORKSPACE_ID, 7)]
     (dispatch,) = dispatches
@@ -233,7 +233,7 @@ async def test_without_agent_id_keeps_builtin_subagent_path(
     config_requests, dispatches = _install_fakes(monkeypatch)
     ctx = _ctx()
 
-    output = await AgentTool().execute(payload, ctx)
+    output = (await AgentTool().execute(payload, ctx)).text
 
     spec = dispatches[0]["spec"]
     assert spec.agent_type is expected_type

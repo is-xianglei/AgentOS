@@ -151,6 +151,12 @@ class ToolInputValidator(Protocol):
     def validate_input(self, name: str, data: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class ToolPolicyLookup(Protocol):
+    """按工具名查能力策略；查不到时返回不可调用的未知工具策略。ToolSet 天然满足。"""
+
+    def policy_for(self, name: str) -> ToolPolicy: ...
+
+
 @dataclass(frozen=True)
 class ReviewRequest:
     """审核一个工具调用所需的上下文，只含领域值。
@@ -159,6 +165,7 @@ class ReviewRequest:
     budget 是本次运行共享的工具调用额度，审核会从中扣减。plan_content 为 None 表示不在 Plan 模式；
     调用方在每个工具审核前重新读取，因为同一批里前面的 Enter/ExitPlanMode 恢复后会改变它。
     tools 是本轮可见的工具集，规范化入参的规则用它；不规范化入参的规则链可以不传。
+    policies 是本回合按名查策略的策略全集（不按可见集裁剪）；为 None 时审核员用构造时注入的平台工具集。
     """
 
     session_id: int
@@ -169,6 +176,7 @@ class ReviewRequest:
     allowed_skill_names: frozenset[str] | None = None
     plan_content: str | None = None
     tools: ToolInputValidator | None = None
+    policies: ToolPolicyLookup | None = None
 
 
 def check_capability(

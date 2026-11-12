@@ -21,7 +21,7 @@ from harness.domain.prompts.plan_mode import ENTER_PLAN_MODE_RESULT
 from interaction.models import InteractionRequestRecord, RuntimeSuspensionRecord
 from interaction.schemas import AskUserQuestionRequestPayload, InteractionRequestCreate
 from interaction.service import InteractionService
-from permission.service import PermissionService, dangerous_tools
+from permission.service import PermissionService
 from plan.service import PlanService
 from runtime.execution import write_detached_run_end
 from runtime.tool_execution import LeadToolExecutor, default_tool_budget
@@ -206,10 +206,9 @@ class InteractionFlow:
             schema_version=request.schema_version,
         )
 
-    @staticmethod
-    def _ask_reason(tool_name: str) -> str:
-        """给前端展示的审批原因文案。"""
-        if tool_name in dangerous_tools():
+    def _ask_reason(self, tool_name: str) -> str:
+        """给前端展示的审批原因文案：按本回合策略全集判断该工具是否默认需审批。"""
+        if self._configuration.policies.policy_for(tool_name).requires_approval:
             return "危险工具默认需审批"
         return "该工具已被配置为需审批"
 

@@ -26,7 +26,7 @@ from harness.app.ports import ToolCallReviewer
 from harness.domain.budget import ToolCallBudget
 from harness.domain.messages import ToolCall
 from harness.domain.review import Decision, ReviewRequest, check_capability
-from harness.domain.tool import ToolProfile
+from harness.domain.tool import ToolOutput, ToolProfile
 from permission.service import PermissionService
 from tests.fixtures.harness_factory import make_agent_runtime, make_subagent_runner
 
@@ -70,6 +70,16 @@ def _permission_service(behavior: str, calls: list[str] | None = None) -> Permis
     return service
 
 
+def _main_reviewer(permission_service: PermissionService) -> PolicyReviewer:
+    """主 Agent 规则链；平台工具集取内置工具集，与组装根注入的一致。"""
+    return PolicyReviewer.for_main_agent(permission_service, policy_source=builtin_tool_set())
+
+
+def _subagent_reviewer(permission_service: PermissionService) -> PolicyReviewer:
+    """子代理规则链；平台工具集同上。"""
+    return PolicyReviewer.for_subagent(permission_service, policy_source=builtin_tool_set())
+
+
 # ---------- 静态能力：档位与 Skill 白名单 ----------
 
 
@@ -106,7 +116,7 @@ def test_static_capability_checks_profile_and_skill() -> None:
 
 
 async def test_permission_rule_preserves_three_states() -> None:
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("ask"))
+    reviewer = _main_reviewer(_permission_service("ask"))
 
     decision = await reviewer.review(
         _call("Write", {"file_path": "a.txt", "content": "x"}), _request()
@@ -119,7 +129,7 @@ async def test_permission_rule_preserves_three_states() -> None:
 
 async def test_static_denial_short_circuits_permission() -> None:
     calls: list[str] = []
-    reviewer = PolicyReviewer.for_subagent(_permission_service("allow", calls))
+    reviewer = _subagent_reviewer(_permission_service("allow", calls))
 
     decision = await reviewer.review(_call("TeamCreate"), _request())
 
@@ -131,7 +141,7 @@ async def test_static_denial_short_circuits_permission() -> None:
 
 
 def test_main_agent_rule_order() -> None:
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("allow"))
+    reviewer = _main_reviewer(_permission_service("allow"))
 
     assert [type(rule) for rule in reviewer.rules] == [
         BudgetRule,
@@ -145,7 +155,7 @@ def test_main_agent_rule_order() -> None:
 
 
 def test_subagent_rule_order() -> None:
-    reviewer = PolicyReviewer.for_subagent(_permission_service("allow"))
+    reviewer = _subagent_reviewer(_permission_service("allow"))
 
     assert [type(rule) for rule in reviewer.rules] == [BudgetRule, NoApprovalChannelRule]
     no_channel = reviewer.rules[1]
@@ -189,7 +199,7 @@ async def test_chain_stops_at_first_terminal_decision_and_passes_rewritten_argum
 
 async def test_budget_is_consumed_even_when_later_rule_denies() -> None:
     budget = ToolCallBudget(total_limit=5, per_tool_limit=5)
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("deny"))
+    reviewer = _main_reviewer(_permission_service("deny"))
 
     decision = await reviewer.review(_call("TeamCreate"), _request(budget=budget))
 
@@ -198,7 +208,7 @@ async def test_budget_is_consumed_even_when_later_rule_denies() -> None:
 
 
 async def test_plan_allowlist_runs_before_argument_validation() -> None:
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("allow"))
+    reviewer = _main_reviewer(_permission_service("allow"))
 
     decision = await reviewer.review(_call("Write"), _request("lead", plan_content="计划"))
 
@@ -206,7 +216,7 @@ async def test_plan_allowlist_runs_before_argument_validation() -> None:
 
 
 async def test_arguments_run_before_capability_and_interaction_after_capability() -> None:
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("allow"))
+    reviewer = _main_reviewer(_permission_service("allow"))
 
     invalid = await reviewer.review(_call("TeamCreate", {"team_name": 1}), _request())
     interaction = await reviewer.review(_call("EnterPlanMode"), _request())
@@ -217,7 +227,7 @@ async def test_arguments_run_before_capability_and_interaction_after_capability(
 
 async def test_interaction_tools_skip_permission_rule() -> None:
     calls: list[str] = []
-    reviewer = PolicyReviewer.for_main_agent(_permission_service("deny", calls))
+    reviewer = _main_reviewer(_permission_service("deny", calls))
 
     decision = await reviewer.review(_call("EnterPlanMode"), _request("lead"))
 
@@ -227,7 +237,7 @@ async def test_interaction_tools_skip_permission_rule() -> None:
 
 
 async def test_subagent_chain_collapses_ask_and_skips_argument_validation() -> None:
-    reviewer = PolicyReviewer.for_subagent(_permission_service("ask"))
+    reviewer = _subagent_reviewer(_permission_service("ask"))
 
     decision = await reviewer.review(_call("Read", {"offset": None}), _request("subagent"))
 
@@ -345,7 +355,7 @@ async def test_injected_reviewer_replaces_policy_reviewer_in_agent_runtime() -> 
 
     async def _gateway_run(session_id, tool_name, input_args, **kwargs):
         executed.append({"tool_name": tool_name, "input_args": input_args})
-        return "ok"
+        return ToolOutput.ok("ok")
 
     runtime.configuration.gateway.run = _gateway_run  # type: ignore[method-assign]
     done_ids: list[str] = []
@@ -395,7 +405,7 @@ async def test_injected_reviewer_replaces_policy_reviewer_in_subagent_runner() -
 
     async def _gateway_run(session_id, tool_name, input_args, **kwargs):
         executed.append({"tool_name": tool_name, "input_args": input_args})
-        return "ok"
+        return ToolOutput.ok("ok")
 
     gateway = SimpleNamespace(
         context=SimpleNamespace(profile="subagent", allowed_skill_names=None), run=_gateway_run

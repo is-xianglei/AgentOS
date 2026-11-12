@@ -136,7 +136,7 @@ class AgentRuntime:
         self._session_factory = session_factory
         self._rebuild = rebuild
         # 只做调用记录的状态流转，与工具边界无关；工具执行经回合配置里的网关。
-        self.tool_service = ToolService(db, tools)
+        self.tool_service = ToolService(db, tools, tools)
         self.memory = memory
         # 按会话配置之前的回合配置：默认 Agent、标准模式；注入客户端时模型取客户端自带的默认参数。
         model = None

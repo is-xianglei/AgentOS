@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.domain.tool import ShellAccess
 from tools.context import ToolExecutionContext
 from tools.gateway import ToolGateway
@@ -30,6 +31,7 @@ def test_gateway_exposes_the_same_frozen_context() -> None:
         None,
         "user_agent",
         principal_name="agent:7",
+        policies=builtin_tool_set(),
         agent_id=7,
         requested_names=["Read"],
         allowed_skill_names=frozenset({"approved"}),

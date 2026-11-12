@@ -6,14 +6,16 @@ import pytest
 
 from core.events import ORCHESTRATOR_ACTOR
 from harness.adapters.tools.builtin_provider import builtin_tool_set
-from harness.domain.tool import ShellAccess
+from harness.domain.tool import ShellAccess, ToolOutput
 from tools.gateway import ToolGateway
 
 pytestmark = pytest.mark.anyio
 
 
 def test_lead_gateway_exposes_control_plane_tools() -> None:
-    gateway = ToolGateway.create(None, "lead", principal_name="lead")
+    gateway = ToolGateway.create(
+        None, "lead", principal_name="lead", policies=builtin_tool_set()
+    )
 
     assert {"Agent", "TeamCreate", "TeamSpawn", "AskUserQuestion"} <= (
         gateway.registry.names
@@ -22,7 +24,9 @@ def test_lead_gateway_exposes_control_plane_tools() -> None:
 
 
 def test_user_agent_gateway_exposes_leaf_tools_but_hides_control_plane() -> None:
-    gateway = ToolGateway.create(None, "user_agent", principal_name="agent:7")
+    gateway = ToolGateway.create(
+        None, "user_agent", principal_name="agent:7", policies=builtin_tool_set()
+    )
 
     assert {"Read", "TaskGet", "TaskList", "Write", "Edit"} <= gateway.registry.names
     assert not (
@@ -37,13 +41,14 @@ async def test_gateway_run_uses_its_fixed_profile_and_principal(monkeypatch) -> 
         None,
         "user_agent",
         principal_name="agent:7",
+        policies=builtin_tool_set(),
         requested_names=["Read"],
     )
     captured: dict[str, object] = {}
 
-    async def fake_run(*args, **kwargs) -> str:
+    async def fake_run(*args, **kwargs) -> ToolOutput:
         captured.update(kwargs)
-        return "ok"
+        return ToolOutput.ok("ok")
 
     monkeypatch.setattr(gateway.service, "run", fake_run)
 
@@ -54,7 +59,7 @@ async def test_gateway_run_uses_its_fixed_profile_and_principal(monkeypatch) -> 
         actor=ORCHESTRATOR_ACTOR,
     )
 
-    assert result == "ok"
+    assert result == ToolOutput.ok("ok")
     assert captured["profile"] == "user_agent"
     assert captured["principal_name"] == "agent:7"
 
@@ -64,6 +69,7 @@ async def test_gateway_run_cannot_expand_frozen_resource_boundaries(monkeypatch,
         None,
         "user_agent",
         principal_name="agent:7",
+        policies=builtin_tool_set(),
         requested_names=["Read"],
         agent_id=7,
         allowed_skill_names=frozenset({"bound-skill"}),
@@ -72,9 +78,9 @@ async def test_gateway_run_cannot_expand_frozen_resource_boundaries(monkeypatch,
     )
     captured: dict[str, object] = {}
 
-    async def fake_run(*args, **kwargs) -> str:
+    async def fake_run(*args, **kwargs) -> ToolOutput:
         captured.update(kwargs)
-        return "ok"
+        return ToolOutput.ok("ok")
 
     monkeypatch.setattr(gateway.service, "run", fake_run)
 
@@ -88,7 +94,7 @@ async def test_gateway_run_cannot_expand_frozen_resource_boundaries(monkeypatch,
         shell_tmp_root=Path("/tmp/forged"),
     )
 
-    assert result == "ok"
+    assert result == ToolOutput.ok("ok")
     assert captured["agent_id"] == 7
     assert captured["allowed_skill_names"] == frozenset({"bound-skill"})
     assert captured["shell_access"] is ShellAccess.READ_ONLY
@@ -100,6 +106,7 @@ async def test_gateway_start_call_cannot_forge_agent_id(monkeypatch) -> None:
         None,
         "user_agent",
         principal_name="agent:7",
+        policies=builtin_tool_set(),
         requested_names=["Read"],
         agent_id=7,
     )
@@ -132,6 +139,7 @@ def test_user_agent_gateway_strict_creation_rejects_denied_or_unknown_tools(
             None,
             "user_agent",
             principal_name="agent:7",
+            policies=builtin_tool_set(),
             requested_names=["Read", tool_name],
         )
 
@@ -141,6 +149,7 @@ def test_lead_gateway_accepts_explicit_control_plane_allowlist() -> None:
         None,
         "lead",
         principal_name="lead",
+        policies=builtin_tool_set(),
         requested_names=["Read", "TeamCreate", "AskUserQuestion"],
     )
 
@@ -158,6 +167,7 @@ def test_user_agent_from_registry_rejects_control_plane_tools() -> None:
             registry,
             "user_agent",
             principal_name="agent:7",
+            policies=builtin_tool_set(),
         )
 
 
@@ -169,6 +179,7 @@ def test_skill_runtime_tool_is_runtime_injected_not_user_bound() -> None:
         registry,
         "user_agent",
         principal_name="agent:7",
+        policies=builtin_tool_set(),
         allowed_skill_names=frozenset({"approved-skill"}),
     )
 

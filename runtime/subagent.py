@@ -304,7 +304,8 @@ class SubAgentRunner:
         """初始化子代理运行器依赖，具体实现全部由组装根（harness/bootstrap.py）注入。
 
         llm 是注入的模型客户端，注入后不再按会话解析模型；sessions 只用来读取所属会话冻结的模型选项；
-        tools 是按名查策略、做裁剪的完整工具集；subagent_model 按 spec 给出 .env 端点上要覆盖的模型名。
+        tools 是完整工具集，既是裁剪的底集，也是网关与审核按名查策略的策略全集；
+        subagent_model 按 spec 给出 .env 端点上要覆盖的模型名。
         """
         self.db = db
         self.bus = bus
@@ -319,6 +320,8 @@ class SubAgentRunner:
         self.sessions = sessions
         self.models = models
         self.tools = tools
+        # 按名查策略的策略全集：本阶段就是注入的完整工具集，裁剪只作用于可见集，不作用于它。
+        self.policies = tools
         self._subagent_model = subagent_model
 
     def _resolve_tools(
@@ -332,7 +335,7 @@ class SubAgentRunner:
         if parent_allowed_tool_names is not None:
             registry = registry.only(*parent_allowed_tool_names)
         registry = spec.resolve_tools(registry)
-        names = self.tools.callable_names(registry.names, profile)
+        names = self.policies.callable_names(registry.names, profile)
         return registry.only(*names)
 
     async def _configure_model(
@@ -418,7 +421,7 @@ class SubAgentRunner:
         # 在默认子代理边界基础上再按自身档位做一次能力解析。
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         if profile != "subagent" and hasattr(tool_registry, "names"):
-            profile_names = self.tools.callable_names(
+            profile_names = self.policies.callable_names(
                 tool_registry.names,
                 profile,
             )
@@ -457,6 +460,7 @@ class SubAgentRunner:
                 tool_registry,
                 profile,
                 principal_name=actor.name,
+                policies=self.policies,
                 agent_id=spec.agent_id,
                 allowed_skill_names=allowed_skill_names,
                 shell_access=spec.shell_access,
@@ -617,13 +621,15 @@ class SubAgentRunner:
                     budget=budget,
                     workspace_id=workspace_id,
                     allowed_skill_names=tool_gateway.context.allowed_skill_names,
+                    # 与构造本次网关时传入的是同一份策略全集。
+                    policies=self.policies,
                 ),
             )
             # 审核员改写过入参时（默认规则链不改写），执行与落库都用审核后的入参。
             if decision.arguments is not tool_call.arguments:
                 tool_call = replace(tool_call, arguments=decision.arguments)
             if decision.behavior == "allow":
-                output = await tool_gateway.run(
+                result = await tool_gateway.run(
                     session_id,
                     tool_call.tool_name,
                     tool_call.arguments,
@@ -633,7 +639,8 @@ class SubAgentRunner:
                     workspace_id=workspace_id,
                     allowed_skill_names=allowed_skill_names,
                 )
-                is_error = False
+                output = result.text
+                is_error = result.is_error
             elif decision.source == SOURCE_BUDGET:
                 # 预算耗尽不执行工具，原因作为错误结果回给模型；不算权限裁决，不记被拒摘要。
                 output = decision.message
@@ -782,6 +789,7 @@ class SubAgentRunner:
             tool_registry,
             "teammate",
             principal_name=name,
+            policies=self.policies,
             agent_id=spec.agent_id,
             allowed_skill_names=allowed_skill_names,
             shell_access=spec.shell_access,

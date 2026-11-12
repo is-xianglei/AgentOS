@@ -29,6 +29,7 @@ from harness.bootstrap import Harness, default_harness
 from harness.domain.memory import MemoryRecall, MemoryWriteTicket, TurnRef
 from harness.domain.messages import ToolCall
 from harness.domain.review import Decision, ReviewRequest
+from harness.domain.tool import ToolOutput
 from hooks import HookRegistry
 from runtime import agent as agent_module
 from runtime import lead_loop as lead_loop_module
@@ -110,9 +111,11 @@ class _EchoGateway:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def run(self, session_id: int, tool_name: str, arguments: dict[str, Any], **_: Any) -> str:
+    async def run(
+        self, session_id: int, tool_name: str, arguments: dict[str, Any], **_: Any
+    ) -> ToolOutput:
         self.calls.append((tool_name, arguments))
-        return "晴"
+        return ToolOutput.ok("晴")
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, gateway: _EchoGateway) -> None:

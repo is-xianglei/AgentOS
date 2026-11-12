@@ -14,6 +14,7 @@ from harness.domain.tool import (
     PydanticTool,
     Tool,
     ToolContext,
+    ToolOutput,
     ToolPolicy,
     tool_policy,
     unknown_tool_policy,
@@ -73,10 +74,10 @@ class _JsonSchemaTool(Tool):
             raise AgentException.message("工具参数校验失败", {"tool_name": self.name})
         return {"query": arguments["query"]}
 
-    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> str:
+    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         if not isinstance(arguments.get("query"), str):
-            return "error: query 必须是字符串"
-        return f"找到 {arguments['query']}"
+            return ToolOutput.ok("error: query 必须是字符串")
+        return ToolOutput.ok(f"找到 {arguments['query']}")
 
 
 def _ctx() -> ToolContext:
@@ -151,8 +152,9 @@ def test_validate_input_delegates_to_tool_normalize_arguments() -> None:
 async def test_pydantic_tool_returns_validation_error_as_result() -> None:
     output = await _pydantic_tool("A").execute({}, _ctx())
 
-    assert output.startswith("error: ")
-    assert output.endswith(". hint: Please fix the parameters and try again")
+    assert output.is_error is False
+    assert output.text.startswith("error: ")
+    assert output.text.endswith(". hint: Please fix the parameters and try again")
 
 
 async def test_json_schema_tool_aggregates_specs_and_executes() -> None:
@@ -175,7 +177,7 @@ async def test_json_schema_tool_aggregates_specs_and_executes() -> None:
     assert tool_set.callable_names(["mcp__demo__lookup"], "user_agent") == ()
     assert tool_set.validate_input("mcp__demo__lookup", {"query": "x"}) == {"query": "x"}
     tool = tool_set.get("mcp__demo__lookup")
-    assert await tool.execute({"query": "订单"}, _ctx()) == "找到 订单"
+    assert await tool.execute({"query": "订单"}, _ctx()) == ToolOutput.ok("找到 订单")
 
 
 def test_callable_and_bindable_names_keep_input_order_and_strict_mode() -> None:

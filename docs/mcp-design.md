@@ -156,8 +156,9 @@ class ToolScope:
 - `source` 用 None 表示内置工具，和 `ToolInfo.source`、`tool_calls.source` 采用同一种表示，不需要来回映射。
 - `ToolScope` 只放身份。按档位和 Agent 绑定选择哪些工具，由 `ToolBinding` 表达（见 6.2 节）。
   这样同一个身份解析出的「策略全集」可以在一个回合里共用。
-- `PydanticTool.run` 仍返回 `str`，由 `PydanticTool.execute` 包成 `ToolOutput.ok(...)`。
+- `PydanticTool.run` 仍返回 `str`，由 `PydanticTool.execute` 包成 `ToolOutput.ok(...)`，参数校验失败的提示文本也用 `ok`。
   26 个内置工具的实现和描述一律不改，`tool_spec` 黄金测试不受影响。
+- `ToolOutput` 已在 M0a 落地，放在 `harness/domain/tool.py`，`ToolContext` 之前；`source` 和 `ToolScope` 留到 M0b。
 - 主路径 `execute_one`（`runtime/tool_execution.py:207,219`）和子代理路径（`runtime/subagent.py:626-636`）的 `is_error` 现在都写死为 False。
   改成取 `ToolOutput.is_error` 后，内置工具在任何情况下都得到 False，行为不变。
   `ToolService` 自己生成的能力拒绝和 Hook 拦截文本（`tools/service.py:397-420,452-456`）**继续用 `ok`**，不改变现有输出。
@@ -327,7 +328,9 @@ class TurnToolResolver:
   - 所以按名查策略只能查 `policies`。对内置工具，它就是进程级工具集，查出的结论和现在完全一样；
     对 MCP 工具，它能查到这个身份可以使用的全部 MCP 工具。
 - **可见集仍然叫 `TurnConfiguration.tools`**，不改名：`test_model_request_golden.py:698` 用 `replace(runtime.configuration, tools=...)`
-  替换可见集，改名会打破这份黄金测试。`TurnConfiguration` 只新增两个字段，都带默认值：`policies`（默认等于 `tools`）和 `scoped`（默认 `ResolvedScope.platform_only`）。
+  替换可见集，改名会打破这份黄金测试。`TurnConfiguration` 只新增两个字段：`policies` 和 `scoped`（默认 `ResolvedScope.platform_only`）。
+  `policies` 在 M0a 落地为必填字段，由 `_assemble` 填入裁剪之前的工具集，不能默认等于可见集 `tools`，
+  否则又回到「被裁掉的工具查成未知工具」；签名见 6.1 节第 1 步。
 - **`resolve` 只管解析，不管裁剪**：
   - 各个来源并发解析，总时长上限是 `total_timeout`。单个 server 的超时由 `McpToolProvider` 自己控制（5.3 节），
     一个慢 server 不会拖垮其他 server。超时或失败只记一条 fault，不会让回合失败。
@@ -557,29 +560,48 @@ M0 是纯重构，不引入任何 MCP 代码，对外行为不变，七份黄金
 
 1. **按名查策略改用「本回合的策略全集」**（4.2 节的 `ResolvedScope.policies`），不再查进程级工具集：
    - `ReviewRequest` 新增 `policies: ToolPolicyLookup | None = None`。`ToolPolicyLookup` 是一个只有 `policy_for(name)` 一个方法的 Protocol，
-     ToolSet 天然满足。新字段放在最后并带默认值，现有构造它的测试不用改。
+     放在 `harness/domain/review.py`，与 `ToolInputValidator` 并列，ToolSet 天然满足。新字段放在最后并带默认值，现有构造它的测试不用改。
      两处生产代码要显式传值：主路径 `runtime/tool_execution.py:100` 传 `configuration.policies`，
-     子代理路径 `runtime/subagent.py:613` 传网关的 `policies` 字段。
+     子代理路径 `runtime/subagent.py:613` 传 `SubAgentRunner.policies`（M0a 新增的属性，取值同下文）。
+     子代理路径不读网关的 `policies` 字段：tool_review 黄金测试把 `_FakeGateway` 直接交给 `_execute_tool_calls`，
+     这个替身在「不许改」段里，只有 `context`、`run`、`start_call`。两者是同一个对象，网关构造时传的就是 `self.policies`。
    - `CapabilityRule` 改为从请求中取 `policies`；请求里没有时，用审核员构造时注入的平台工具集。审核员的 `policy_source` 改为必填，
-     删掉 `policy_reviewer.py:60-61,84-85` 里 None 时回落到 `builtin_tool_set()` 的分支。
+     删掉 `policy_reviewer.py:60-61,84-85` 里 None 时回落到 `builtin_tool_set()` 的分支。实现后的签名：
+     - `PolicyReviewer.for_main_agent(permission_service, *, policy_source: ToolPolicyLookup)`，`for_subagent` 相同；
+     - `CapabilityRule(policy_source)`、`PermissionRule(permission_service, policy_source)`，两条规则都经
+       `_policy_for(request, policy_source, name)` 查策略：先查 `request.policies`，为 None 时查 `policy_source`。
    - `PermissionService.evaluate` 新增**必填**关键字参数 `policy: ToolPolicy`，由 `PermissionRule` 查好后传入；
      `default_behavior` 改为读这个参数，不再查 `platform_tools()`。生产代码里调用 `evaluate` 的只有 `policy_reviewer.py:230` 一处。
-     `tests/test_permission_service.py` 的两处调用同步补上这个参数。
+     实现后的签名：`evaluate(session_id, tool_name, tool_input=None, agent_type=None, workspace_id=None, *, policy)`，
+     `default_behavior(tool_name, agent_type=None, *, policy)`，`_coerce` 同样补上 `*, policy`。
+     `tests/test_permission_service.py` 的两处 `evaluate` 调用和 `default_behavior` 的调用同步补上这个参数。
    - 删掉 `dangerous_tools()`（`permission/service.py:23-30`）。它唯一的调用方 `interaction_flow.py:212` 的审批原因文案，
      改为按 `configuration.policies.policy_for(name).requires_approval` 判断。对内置工具，两种判断给出的结果相同。
+   - `TurnConfiguration` 新增字段 `policies: ToolSet`，**必填、不带默认值**，紧跟可见集 `tools`。
+     它只在 `_assemble` 里构造，M0a 取运行时注入的进程级工具集（`_assemble` 的 `base_tools`，即裁剪之前的那份），
+     M0b 起改取 `ResolvedScope.policies`。仓库里没有在 `_assemble` 之外直接构造它的地方，
+     测试都走 `for_lead` / `for_agent` 或 `replace(...)`，`replace(configuration, tools=...)` 会保留原来的 `policies`。
    - **`ToolGateway` 把 `policies` 和 `scoped` 作为构造字段**，和现有的 `subagents` 字段一样（`tools/gateway.py:42`）。
      `__post_init__`、`create`、`from_registry` 改为查 `policies`，`ToolService` 的 `policy_source` 也从网关取这个字段。
      **`gateway.run` 和 `gateway.start_call` 的签名一律不加参数**：tool_review 黄金测试的 `_FakeGateway.run` 会把所有关键字参数
      原样记进字面量（`test_tool_review_golden.py:481`）。
-     网关由 `TurnConfiguration._assemble` 和 `SubAgentRunner.run` 构造，在构造时传入这两个字段。
+     网关由 `TurnConfiguration._assemble`、`SubAgentRunner.run` 和 `run_teammate` 构造，在构造时传入这两个字段。
+     M0a 落地的签名（`scoped` 留到 M0b）：
+     - 字段 `policies: ToolSet` 必填、无默认值，排在 `principal_name` 之后；
+     - `create(db, profile, *, principal_name, policies, requested_names=None, strict=True, ...)`，`policies` 同时是裁剪的底集；
+     - `from_registry(db, registry, profile, *, principal_name, policies, strict=True, ...)`；
+     - `ToolService(db, registry, policy_source: ToolPolicyLookup)`，第三个参数必填，网关传 `self.policies`；
+       `AgentRuntime.tool_service` 只做调用记录的状态流转，传 `ToolService(db, tools, tools)`。
    - `SubAgentRunner._resolve_tools` 和 `:420-425` 的档位二次裁剪中的 `callable_names`，改为查 `policies`。
+     M0a 给 `SubAgentRunner` 加了属性 `policies`，取值就是注入的 `self.tools`；M0b 再按 `scoped` 合并作用域工具。
 2. **`platform_tools()` 只留给「只有工具名、没有回合」的管理场景**：工具目录同步、Agent 的 tool_id 绑定校验、
    市场与预置的 tool_key 解析、权限规则配置接口、`ToolResponse.bindable_profiles`。这些场景只涉及内置工具，
    MCP 工具不走这些路径（6.2 节、9.1 节）。12.1 节新增的静态检查会限制它的调用位置。
 3. **执行结果带上 `is_error`**：
    - `Tool.execute`、`ToolGateway.run`、`ToolService.run` 都改为返回 `ToolOutput`；
    - 主路径和子代理路径改为读取 `output.is_error`；
-   - `ToolService` 落库时把 `ToolOutput.text` 交给 `tool_repo.succeed`，落库内容不变。
+   - `ToolService` 落库时把 `ToolOutput.text` 交给 `tool_repo.succeed`，落库内容不变；PostToolUse 钩子的 `tool_output` 同样取 `.text`。
+   - `LeadToolExecutor.execute_one` 对外仍返回 `str`（即 `.text`），它的调用方 `InteractionFlow` 不用改。
 4. **作用域工具对象的传递通道**（6.3 节）：
    - `ToolContext` 新增 `scoped: ScopedGrant | None = None`，由 `ToolService.run` 从网关字段读出后放进去；
    - `SubAgentLauncher.run`、`IsolatedSubAgentLauncher.run`、`SubAgentRunner.run` / `run_teammate` 新增关键字参数 `scoped`，默认 None；
@@ -1076,6 +1098,12 @@ class Harness:
 
 每条规则都要配一个自测：故意写一段违规代码，确认检查确实会报错。
 
+最后两条已在 M0a 落地，其余四条与 `mcp`、`mcp_server` 包相关，留到 M1：
+- `platform_tools()` 检查按语法树找对 `platform_tools` 的引用，调用、按模块属性取用和 `as` 别名都算，单纯 import 不算；
+  `tools/service.py` 只查 `ToolService` 这一个类，同模块的 `ToolCatalogService` 属于管理场景。
+- `dangerous_tools` 检查扫描一方包、`tests/` 和 `alembic/`，只认标识符（名称、属性、导入名与别名、定义名），
+  注释、文档字符串和本文这类 Markdown 不算；检查器所在的 `test_import_isolation.py` 本身不扫。
+
 ### 12.2 替身与集成
 
 - **领域层**：
@@ -1127,8 +1155,9 @@ class Harness:
 **不用改的地方**：下列改动在设计上就避开了黄金测试，「不许改」段和驱动段都不需要动：
 - 网关的 `run` 和 `start_call` 不加参数，`policies` 和 `scoped` 都是网关的构造字段（6.1 节第 1 步）。
   `_FakeGateway.run` 会把收到的关键字参数原样写进 `executions` 字面量，所以加参数就会改变字面量。
-- 新增字段一律带默认值，包括 `AgentRuntimeConfig.mcp_bindings`、`ReviewRequest.policies`、`TurnConfiguration.policies` / `scoped`、
+- 新增字段一律带默认值，包括 `AgentRuntimeConfig.mcp_bindings`、`ReviewRequest.policies`、`TurnConfiguration.scoped`、
   `BaseOrchestrator` 的 `resolved`、`ToolContext.scoped` 和各个 `scoped` 参数。
+  `TurnConfiguration.policies` 是例外，必填（理由见 4.2 节）；它只在 `_assemble` 里构造，黄金测试只用 `replace`，不受影响。
 - 可见集仍然叫 `TurnConfiguration.tools`，`test_model_request_golden.py:698` 的 `replace(..., tools=...)` 照常可用。
 - continuation 只在有 MCP 调用时才多出 `mcp_refs` 这个键。
 - `ToolInfo.source` 为 None 时不会被序列化。
@@ -1158,6 +1187,18 @@ class Harness:
 
 以上清单是复审时查出来的。M0 的第一个提交还要跑一遍完整测试，再核对一次，遗漏的补进提交说明。
 
+**M0a 实际改动的核对结果**：
+- 三处替身按上表改完，另外只在两份黄金测试的 import 行补上 `ToolOutput`、`ToolPolicy`，期望字面量和 SHA-256 未动。
+- 清单之外还改了：
+  - `tests/test_permission_service.py` 里 `default_behavior` 的调用（`default_behavior` 也要传 `policy`）；
+  - `tests/test_tool_context.py` 的一处 `ToolGateway.create(...)`；
+  - `tests/test_tool_identity.py`、`tests/test_tool_set.py`、`tests/test_agent_delegation_tool.py`、
+    `tests/test_delegate_policy_and_team_spawn.py` 里读取 `execute` / `run` 结果的断言改取 `.text`，语义不变；
+  - `tests/test_agent_delegation_runner.py:255` 的 `_evaluate` 替身补上 `policy` 参数；
+  - `tests/test_turn_cancel_pg.py` 的 `ToolService` 构造补上第三个参数。
+- 清单里不用改的：`tests/test_agent_delegation_tool.py:74-81` 的 `_fake_dispatch`。`AgentTool._dispatch` 仍返回 `str`，
+  只有 `execute` 的返回值变了。
+
 **MCP 落地之后**：
 - 没有 MCP 来源（`scoped_tools=()`）时，七份黄金测试的输出保持不变。
 - M1 新增第八份黄金测试 `tests/test_mcp_tool_golden.py`，固化三样东西，字面量取自 M1 实现的实际产出：
@@ -1177,6 +1218,10 @@ class Harness:
 | M4（后续） | MRTR / elicitation 接入 ask 挂起；订阅 list_changed；图片进模型；resources / prompts；审批时允许修改 MCP 工具的参数 | 单独立项 |
 
 每个阶段单独提交。实现中细化出的签名回写到本文。
+
+M0 分两步提交：
+- M0a（已实现）：6.1 节第 1～3 步中与作用域无关的部分，即按名查策略改查 `policies`、`ToolOutput`、删除 `dangerous_tools()` 和审核员的 None 回落、12.1 节最后两条静态检查、12.3 节的三处替身；
+- M0b：其余部分，即 `Tool.source`、`ToolScope`、`ToolBinding`、`ScopedGrant`、作用域工具的传递通道、`TurnToolResolver`、`Harness.scoped_tools`、第 15 节的文档修订。
 
 ## 14. 决策记录与待定事项
 

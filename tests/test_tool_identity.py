@@ -8,7 +8,8 @@ import pytest
 from core.events import ORCHESTRATOR_ACTOR, teammate_actor
 from harness.adapters.tools.builtin import task as task_tools
 from harness.adapters.tools.builtin import team as team_tools
-from harness.domain.tool import ToolContext
+from harness.adapters.tools.builtin_provider import builtin_tool_set
+from harness.domain.tool import ToolContext, ToolOutput
 from tools import service as tool_service_module
 from tools.service import ToolService
 
@@ -134,7 +135,7 @@ async def test_tool_service_injects_actor_identity(monkeypatch) -> None:
     class FakeTool:
         async def execute(self, data, ctx):
             captured.append(ctx.principal_name)
-            return "ok"
+            return ToolOutput.ok("ok")
 
     class FakeRegistry:
         names = frozenset({"fake"})
@@ -152,7 +153,7 @@ async def test_tool_service_injects_actor_identity(monkeypatch) -> None:
             pass
 
     monkeypatch.setattr(tool_service_module, "get_hook_registry", lambda: FakeHooks())
-    service = ToolService(FakeDb(), FakeRegistry())
+    service = ToolService(FakeDb(), FakeRegistry(), builtin_tool_set())
     service.tool_repo = FakeToolRepo()
 
     async def fake_start_call(session_id, tool_name, input_args, **kwargs):
@@ -184,7 +185,7 @@ async def test_tool_service_rejects_user_agent_control_plane_call(monkeypatch) -
         names = frozenset({"TeamCreate"})
 
     monkeypatch.setattr(tool_service_module, "get_hook_registry", lambda: FakeHooks())
-    service = ToolService(FakeDb(), FakeRegistry())
+    service = ToolService(FakeDb(), FakeRegistry(), builtin_tool_set())
     service.tool_repo = FakeToolRepo()
 
     async def fake_start_call(session_id, tool_name, input_args, **kwargs):
@@ -200,7 +201,7 @@ async def test_tool_service_rejects_user_agent_control_plane_call(monkeypatch) -
         principal_name="agent:7",
     )
 
-    assert "能力策略拒绝" in output
+    assert "能力策略拒绝" in output.text
     assert denied and "profile=user_agent" in denied[0]
 
 
@@ -236,7 +237,7 @@ async def test_user_agent_skill_tools_require_bound_skill(
     class FakeTool:
         async def execute(self, data, ctx):
             called.append(data)
-            return "ok"
+            return ToolOutput.ok("ok")
 
     class FakeRegistry:
         names = frozenset({"SkillRun"})
@@ -246,7 +247,7 @@ async def test_user_agent_skill_tools_require_bound_skill(
             return FakeTool()
 
     monkeypatch.setattr(tool_service_module, "get_hook_registry", lambda: FakeHooks())
-    service = ToolService(FakeDb(), FakeRegistry())
+    service = ToolService(FakeDb(), FakeRegistry(), builtin_tool_set())
     service.tool_repo = FakeToolRepo()
 
     async def fake_start_call(session_id, tool_name, input_args, **kwargs):
@@ -265,9 +266,9 @@ async def test_user_agent_skill_tools_require_bound_skill(
 
     assert (called != []) is should_run
     if should_run:
-        assert output == "ok"
+        assert output.text == "ok"
     else:
-        assert "已绑定的 skill" in output
+        assert "已绑定的 skill" in output.text
 
 
 @pytest.mark.parametrize("profile", ["subagent", "workflow_node", "teammate", "orchestrator"])
@@ -293,7 +294,7 @@ async def test_non_lead_skill_tools_require_explicit_allowlist(monkeypatch, prof
     class FakeTool:
         async def execute(self, data, ctx):
             called.append(data)
-            return "ok"
+            return ToolOutput.ok("ok")
 
     class FakeRegistry:
         names = frozenset({"SkillRun"})
@@ -302,7 +303,7 @@ async def test_non_lead_skill_tools_require_explicit_allowlist(monkeypatch, prof
             return FakeTool()
 
     monkeypatch.setattr(tool_service_module, "get_hook_registry", lambda: FakeHooks())
-    service = ToolService(FakeDb(), FakeRegistry())
+    service = ToolService(FakeDb(), FakeRegistry(), builtin_tool_set())
     service.tool_repo = FakeToolRepo()
 
     async def fake_start_call(session_id, tool_name, input_args, **kwargs):
@@ -319,5 +320,5 @@ async def test_non_lead_skill_tools_require_explicit_allowlist(monkeypatch, prof
     )
 
     assert not called
-    assert "已绑定的 skill" in output
+    assert "已绑定的 skill" in output.text
 

@@ -560,10 +560,11 @@ async def _suspend(shared: _Shared, ids, store) -> tuple[int, uuid.UUID, uuid.UU
                 AssistantMessage.from_turn("需要审批", [_use("w")]).to_content(),
                 turn_id=turn_id,
             )
-            record = await ToolService(db, builtin_tool_set()).start_call(
+            tools = builtin_tool_set()
+            record = await ToolService(db, tools, tools).start_call(
                 session_id, "Read", {"path": "w.txt"}, message_id=message.id
             )
-            await ToolService(db, builtin_tool_set()).tool_repo.mark_awaiting_interaction(record)
+            await ToolService(db, tools, tools).tool_repo.mark_awaiting_interaction(record)
             suspension, request = await InteractionService(db).create_suspension_with_request(
                 session_id,
                 turn_id,
@@ -604,7 +605,7 @@ def _interaction_runtime(db: AsyncSession, ids) -> AgentRuntime:
     runtime.user_id, runtime.workspace_id = ids
     runtime.sessions = SessionService(db)
     runtime.interaction_service = InteractionService(db)
-    runtime.tool_service = ToolService(db, builtin_tool_set())
+    runtime.tool_service = ToolService(db, builtin_tool_set(), builtin_tool_set())
     runtime.bus = NullStreamBus()
     # 交互取消用不到审核、Plan、权限与回合模型，这里只给出流程组装需要的占位。
     runtime.configuration = TurnConfiguration.for_lead(

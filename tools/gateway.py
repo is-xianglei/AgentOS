@@ -15,8 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.event_bus import StreamBus
 from core.events import Actor
 from harness.app.ports import SubAgentLauncher
-from harness.app.tool_set import ToolSet, platform_tools
-from harness.domain.tool import ShellAccess, ToolProfile
+from harness.app.tool_set import ToolSet
+from harness.domain.tool import ShellAccess, ToolOutput, ToolProfile
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord
 from tools.service import ToolService
@@ -28,13 +28,15 @@ class ToolGateway:
 
     ``registry`` 是已经按 profile 和父级白名单裁剪后的集合；``run`` 仍然把
     profile 再传给 ``ToolService``，因此即使调用方持有旧的工具名，也会在执行层
-    再次经过策略检查。``subagents`` 是运行时注入的子代理启动器，随每次执行放进工具上下文。
+    再次经过策略检查。``policies`` 是本回合按名查策略的策略全集（不按可见集裁剪），
+    构造期裁剪与执行层兜底都查它。``subagents`` 是运行时注入的子代理启动器，随每次执行放进工具上下文。
     """
 
     db: AsyncSession
     registry: ToolSet
     profile: ToolProfile
     principal_name: str
+    policies: ToolSet
     agent_id: int | None = None
     allowed_skill_names: frozenset[str] | None = None
     shell_access: ShellAccess = ShellAccess.FULL
@@ -79,13 +81,13 @@ class ToolGateway:
             # 安全降级为空注册表，避免把未知对象当成完整能力集合而绕过 profile。
             self.registry = ToolSet()
         else:
-            # 能力策略按完整的进程级工具集查，与原按名查策略表的口径一致。
-            allowed_names = platform_tools().callable_names(
+            # 能力策略按策略全集查，与原按名查策略表的口径一致。
+            allowed_names = self.policies.callable_names(
                 registry_names,
                 self.profile,
             )
             self.registry = self.registry.only(*allowed_names)
-        self.service = ToolService(self.db, self.registry)
+        self.service = ToolService(self.db, self.registry, self.policies)
 
     @classmethod
     def create(
@@ -94,6 +96,7 @@ class ToolGateway:
         profile: ToolProfile,
         *,
         principal_name: str,
+        policies: ToolSet,
         requested_names: list[str] | tuple[str, ...] | frozenset[str] | None = None,
         strict: bool = True,
         agent_id: int | None = None,
@@ -104,11 +107,11 @@ class ToolGateway:
     ) -> ToolGateway:
         """创建网关并在构造期裁剪工具集合。
 
-        ``requested_names`` 表示父 Agent 或 Agent 配置给出的硬白名单。显式白名单
-        中出现当前 profile 不允许调用的工具时直接报错，避免静默丢失配置导致模型
-        以为自己拥有某个工具却在运行时才发现不存在。
+        ``policies`` 是策略全集，同时作为裁剪的底集。``requested_names`` 表示父 Agent
+        或 Agent 配置给出的硬白名单。显式白名单中出现当前 profile 不允许调用的工具时
+        直接报错，避免静默丢失配置导致模型以为自己拥有某个工具却在运行时才发现不存在。
         """
-        registry = platform_tools()
+        registry = policies
         if requested_names is not None:
             # 显式配置属于“绑定”动作，必须使用 bindable 策略；Skill 工具只能由
             # 运行时根据已绑定 Skill 自动注入，不能把 SkillRun 直接写进用户 Agent 配置。
@@ -129,6 +132,7 @@ class ToolGateway:
             registry.only(*names),
             profile,
             principal_name,
+            policies,
             agent_id=agent_id,
             allowed_skill_names=allowed_skill_names,
             shell_access=shell_access,
@@ -144,6 +148,7 @@ class ToolGateway:
         profile: ToolProfile,
         *,
         principal_name: str,
+        policies: ToolSet,
         strict: bool = True,
         agent_id: int | None = None,
         allowed_skill_names: frozenset[str] | None = None,
@@ -155,14 +160,14 @@ class ToolGateway:
 
         运行时通常已经根据 Plan Mode、父 Agent 白名单或 Workflow 节点得到一个
         裁剪后的 ``ToolSet``，此方法避免重新创建工具集，同时保证正式入口
-        不会静默吞掉 profile 不允许的工具。
+        不会静默吞掉 profile 不允许的工具。能力策略按 ``policies`` 查。
         """
         registry_names = cls._ordered_registry_names(registry)
         if registry_names is None:
             # 兼容旧的 _resolve_tools 替身；没有可审计的 names 时不暴露任何工具。
             safe_registry = ToolSet()
         else:
-            names = platform_tools().callable_names(
+            names = policies.callable_names(
                 registry_names,
                 profile,
                 strict=strict,
@@ -173,6 +178,7 @@ class ToolGateway:
             safe_registry,
             profile,
             principal_name,
+            policies,
             agent_id=agent_id,
             allowed_skill_names=allowed_skill_names,
             shell_access=shell_access,
@@ -235,7 +241,7 @@ class ToolGateway:
         agent_id: int | None = None,
         allowed_skill_names: frozenset[str] | None = None,
         round_tool_names: frozenset[str] | None = None,
-    ) -> str:
+    ) -> ToolOutput:
         """执行工具，profile、身份和资源边界只能来自网关自身。
 
         参数中的 ``allowed_skill_names``、``shell_access``、``shell_tmp_root``

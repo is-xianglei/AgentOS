@@ -44,7 +44,7 @@ from harness.app.subagent_catalog import build_agent_spec
 from harness.domain.memory import MemoryRecall
 from harness.domain.messages import ThinkingBlock, ToolCall
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
-from harness.domain.tool import ShellAccess
+from harness.domain.tool import ShellAccess, ToolPolicy
 from hooks import HookEvent, HookOutcome, HookRegistry
 from interaction.service import InteractionService
 from permission.service import PermissionService
@@ -888,6 +888,8 @@ class _Fakes:
         tool_input: dict[str, Any] | None = None,
         agent_type: str | None = None,
         workspace_id: int | None = None,
+        *,
+        policy: ToolPolicy,
     ) -> str:
         self.world.record(
             "permission.evaluate",
