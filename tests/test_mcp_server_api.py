@@ -3,7 +3,8 @@
 - 路由经 get_mcp_admin_service 取 McpAdminService，依赖内部调用组装根的 mcp_admin_service；
 - 响应走统一外壳，请求头的值不回显、错误里也不带；没有写权限的成员看不到地址的查询参数；
 - mcp_enabled=False 时管理接口返回中文错误；组装根缺少连接器时抛中文错误；
-- 本阶段 scoped_tools 仍为空，MCP 运行时惰性创建、lifespan 只在创建过时关闭；
+- MCP 关闭时 scoped_tools 为空（开启时的接线见 test_mcp_runtime.py），MCP 运行时惰性创建、
+  lifespan 只在创建过时关闭；
 - permission/api 对 mcp__ 名字不走「工具未注册」校验，改查 McpServerService。
 """
 
@@ -322,11 +323,13 @@ def test_harness_without_connector_raises_chinese_error() -> None:
         harness.mcp_admin_service(object(), user_id=1, workspace_id=2)  # type: ignore[arg-type]
 
 
-# ---------- 组装根：本阶段不接回合，运行时惰性创建 ----------
+# ---------- 组装根：MCP 关闭时不接回合，运行时惰性创建 ----------
 
 
-def test_default_harness_keeps_scoped_tools_empty_but_wires_connector() -> None:
-    harness = bootstrap.default_harness()
+def test_default_harness_keeps_scoped_tools_empty_but_wires_connector(monkeypatch) -> None:
+    # M1c 起 MCP 开关打开时 scoped_tools 带 MCP 来源，这里按关闭 MCP 构造。
+    monkeypatch.setattr(settings, "mcp_enabled", False)
+    harness = bootstrap.builtin_harness()
 
     assert harness.scoped_tools == ()
     assert harness.mcp_connector is bootstrap.mcp_connector

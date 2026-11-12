@@ -1,6 +1,6 @@
 # AgentOS MCP 接入设计
 
-> 状态：设计稿（2026-11-11），按第 13 节分阶段实现中。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
+> 状态：设计稿（2026-11-11），M0、M1 已实现（M1 于 2026-11-13 完成），M2～M4 待实现，阶段见第 13 节。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
 > 上位文档：[agent-architecture.md](agent-architecture.md)（分层规则、端口约定、组装根）。本文只写 MCP 的增量。
 > 本文推翻了上位文档和 CLAUDE.md 里关于 MCP 的几条预设，具体列在第 15 节；M0 开始时同步修改那几处，
 > 修改之前以本文为准。其余分层规则仍以上位文档为准。
@@ -539,6 +539,8 @@ class McpAdminService:
   - `refresh_tools` 只换快照、不改 `config_rev`，也**不调用 `invalidate`**。快照只用于管理界面和权限规则校验，回合不读它（第 7 节）；
     `McpRuntime.invalidate` 清不掉 SDK 响应缓存里的条目（键是 `target_id = {server_id}#rev={config_rev}`），调了也不会让下一回合立刻看到新清单。
     回合里的清单仍按 `mcp_tools_cache_seconds` 过期后再刷新。要做到「管理员手动刷新后立即生效」，需要在 M1c 给运行时补一个清 SDK 缓存条目的入口。
+    **M1c 已补**：`McpServerConnector.drop_cached_tools(server_id)`（`McpConnector` 转给 `McpRuntime.drop_cached_tools`），
+    `refresh_tools` 探测成功后调用，失败时不调用；仍不改 `config_rev`、不让连接失效。只作用于本进程，其他实例照旧按 TTL 过期。实现见 5.3 节末尾。
   - 停用状态下改地址也会探测，不留「重新启用时从没验证过新地址」的口子。
 - 写操作都先给 server 行加锁（`SELECT ... FOR UPDATE`），锁一直持有到请求事务结束：`load_for_write` 和 `apply_update` 各加一次，同一个请求里重入不会阻塞。
   同一个 server 的两个写请求因此串行执行，审批模式这类不改 `config_rev` 的字段也不会丢失更新。
@@ -677,6 +679,14 @@ M1a 落地（`provider.py`、`runtime.py`）：
   适配器看不到；旧版协议的连接 SDK 不查，适配器再用 SDK 的 `find_invalid_x_mcp_header` 查一次，剔除时记 invalid fault。
 - 翻页上限、重复 cursor 判定由 `list_all_tools(client, *, refresh=False)` 实现，探测（`refresh=True`）与回合解析共用。
 - 来源返回了不属于该身份的 server（`auth_partition` 抛异常）时，只让这一个 server 缺席并记 invalid fault，不让整个来源失败。
+
+M1c 落地的清缓存入口（`runtime.py`）：
+- `async McpRuntime.drop_cached_tools(server_id) -> int`：删掉这个 server 在本进程的 SDK 响应缓存条目（全部授权分区、全部协议版本）
+  和最近一次成功的清单，返回删掉的缓存条目数。`connection(...)` 每次借连接时记下用过的 `target_id`（`{server_id}#rev={config_rev}`）。
+- SDK 的 `CacheKey.partition` 是它内部编码的缓存臂，里面带着 `sha256(target_id)`（`client/client.py` 的 `arm_id`，`client/caching.py` 的 `_arm`），
+  `InMemoryResponseCacheStore` 也不提供按前缀删除。所以 `_CappedTtlStore` 另记一份写过的键，`evict_arms(arm_ids)` 删掉 partition 里含有这些
+  `arm_id` 的条目；只做子串匹配，不解析 SDK 的编码格式。记录与 store 同一上限，超出时丢最早的。
+- 没有采用「刷新时把 `config_rev` 加一」的做法：`config_rev` 是挂起快照核对的依据，只刷新清单就加一，会让所有挂起中的审批在恢复时被判为已变更。
 
 ### 5.4 调用
 
@@ -966,6 +976,10 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
 **故障通知**：有 fault 时，在 `turn_start` 之后发一条新事件 `RuntimeEvent.tool_sources`，内容是 `faults[{source, server_id, kind, message}]`。
 - `auth_required` 不携带授权地址。授权地址只能由用户自己发起请求来获取（8.2 节），前端拿到 `server_id` 后调用授权接口。
 - 这是新增的事件类型，现有事件不变。
+- M1c 落地：`RuntimeEvent.tool_sources(session_id, faults: list[dict])`（`core/events.py`），帧形如
+  `{"type": "tool_sources", "data": {"session_id": 7, "faults": [{"source": "mcp:jira", "server_id": 12, "kind": "timeout", "message": "..."}]}, "sequence": n}`；
+  每项由 `ToolSourceFault.to_dict()` 给出。发出点在 `runtime/lead_loop.py` 的 `run_lead_turn`：`turn_start` 之后紧接着发，取
+  `TurnConfiguration.scoped.faults`。恢复执行也走 `run_lead_turn`，所以恢复后的续跑回合同样会发。没有 fault 时不发，事件序列不变。
 
 **传给子代理、队友、委派**：同一个回合里身份不变，所以这些子执行都不重新解析。
 - 父回合把本身份的全部作用域工具（`ResolvedScope.scoped`），连同按 6.2 节为子执行选出的可见名单，一起往下传，
@@ -982,6 +996,15 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
 - ask 挂起时，只有当待执行的调用里有 MCP 工具，`continuation` 才新增 `mcp_refs` 这个键，
   值是这些调用的 `McpToolRef`，包括 `config_rev` 和 `schema_sha256`。没有 MCP 调用时，`continuation` 的形状和现在完全一样，
   黄金测试里固化的形状不受影响。
+- M1c 落地的形状：`mcp_refs = {tool_use_id: McpToolRef.to_dict()}`，即
+  `{"call-1": {"server_id": 11, "server_key": "github", "config_rev": 1, "remote_name": "delete_repo", "model_name": "mcp__github__delete_repo", "schema_sha256": "..."}}`，
+  覆盖 `pending` 里**全部** MCP 调用（不只是当前审批的那一个）。在同一暂停点上再次挂起时，已冻结的调用沿用原快照。
+  - 运行时不认识 `McpToolRef`：领域层 `Tool` 新增 `route_snapshot() -> dict | None`（内置工具为 None），`McpTool` 返回 `ref.to_dict()`；
+    `ToolSet.route_snapshot_of(name)` 按名取。runtime 只比对字典。
+  - 核对：`runtime/tool_execution.py` 的 `route_changed(configuration, call, expected_routes)`，用本回合 `policies` 里同名工具的快照与冻结值整体比较，
+    工具不在了也算不一致。被审批的那个调用在 `InteractionFlow._apply_tool_approval` 里核对（不一致时不写「始终允许」规则，审批记录记为 rejected）；
+    剩余调用经 `run_tool_calls(..., expected_routes=...)` → `LeadToolExecutor.execute(..., expected_routes=...)` 在审核之前核对。
+    不一致的调用记 `is_error=True` 的 tool_result，文本为 `ROUTE_CHANGED_MESSAGE`「MCP 工具已变更，本次审批的调用未执行」，并打一条 warning 日志。
 - 恢复时重新解析，通常命中缓存，不需要网络 I/O。然后逐个核对每个待执行的 MCP 调用：它的路由键是否还在，
   `config_rev` 和 schema 摘要是否都一致。
   - 不一致的情况包括：server 已删除、地址或认证改了、工具已下线、schema 已变化。
@@ -998,6 +1021,9 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   `AgentException.message(..., status_code=422)`。判断依据是载荷里的标志，不是工具名前缀；检查也不放在路由层，
   这样不会碰到 agent_service 黄金测试替身化的路由依赖。
 - 内置工具的载荷不变，`can_update_input` 仍为 True。要支持修改 MCP 工具的参数，需要把校验推迟到后台恢复时再做，这一项列入 M4。
+- M1c 落地：`_build_payload` 按 `configuration.policies.source_of(name)`（`ToolSet.source_of`）判断，来源非 None 时 `tool` 里多一个 `source`，
+  `can_update_input = source is None`。`_normalize_response(request, kind, response_payload)` 改为接收 `save_response` 已读出的请求，不再多查一次库；
+  422 的文案为「该工具不支持在审批时修改参数」，`details={"tool_name": ...}`。
 
 ### 6.4 提示缓存
 
@@ -1297,6 +1323,9 @@ M3 开始时先做一次 spike，确认具体能复用哪些函数，结论回�
     它的驱动只替换了 SessionService 和运行时类，路由里如果多查一次库就会报错。
 
   内置工具的这个现状保持不动（2026-11-11 拍板）。
+  M1c 落地：`InteractionFlow._normalize_response` 读已落库载荷的 `tool.source`，`mcp:` 开头且 `decision=always_allow`、`always_scope=global` 时
+  调 `WorkspaceService(db).require_workspace_role(workspace_id, user_id, {"owner", "admin"})`，非管理员得到它自带的 403「无权执行该工作区操作」，
+  响应不落库。runtime 经 workspace 域的 Service 校验，不碰它的 Repository。
 - 工作区 global 规则配置接口的工具名校验：`permission/api.py` 对 `mcp__` 开头的名字不走「工具未注册」校验，
   改为检查它是否属于本工作区某个共享 server 的 `tools_snapshot`；快照为空的 OAuth server，按 `mcp__{server_key}__` 前缀校验。
   私有 server 不参与这项校验，管理员看不到它们，校验结果也不能泄露它们的存在。
@@ -1419,6 +1448,8 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
   servers=McpServerCatalog(session_factory), limits=McpProviderLimits(list_timeout, call_timeout, max_output_chars, max_schema_bytes))`。
   **本阶段不接进 `scoped_tools`**，`builtin_harness()` 显式写着 `scoped_tools=()`。M1c 在 `mcp_enabled` 打开时改为
   `scoped_tools=(mcp_tool_provider(AsyncSessionLocal),)`。
+  **M1c 已接**：`builtin_harness()` 用 `_scoped_tool_sources()`，`settings.mcp_enabled` 为真时返回上述元组，否则 `()`。
+  `default_harness()` 有 `@cache`，开关在进程启动时读一次，与「配置重启生效」一致。
 - 导入组装根会连带导入 `harness.adapters.mcp`，也就会加载 mcp SDK，实测增加约 0.26 秒；但不会创建运行时，也不建连接。
   memory worker 不导入组装根，不受影响。
 
@@ -1433,6 +1464,17 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
 - SSE 的 `ToolInfo` 新增可选字段 `source`。内置工具的 `source` 为 None，按「只输出非 None 字段」的规则（`core/events.py:170-177`）
   不会被序列化，所以现有事件逐字节不变，react_loop 黄金测试不受影响。
 - 新增 `RuntimeEvent.tool_sources(session_id, faults)`，只在有 fault 时发出。
+
+M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `0032_tool_calls_source`）：
+- `tool_calls.source`：`String(64)`、可空、带索引 `ix_tool_calls_source`、中文 comment；ORM `ToolCallRecord.source`。不回填。
+  迁移在开发库上执行过 `upgrade head` → `downgrade -1` → `upgrade head`，autogenerate 比较 `tool_calls` 无差异。
+- 写入点是 `ToolService.start_call`：`tool_repo.start(...)` 建出记录后，`self.policy_source.source_of(tool_name)` 非空才赋值并 flush，
+  所以执行、挂起（`gateway.start_call`）两条路径都会写。`ToolService` 的第三个参数 `policy_source` 类型从 `ToolPolicyLookup` 收窄为 `ToolSet`
+  （要用 `source_of`；所有调用方本来传的就是 `ToolSet`）。
+- `is_error=True` 时 `tool_repo.fail(record, output.text)`（`status=failed`，`error_message` 是工具已截断过的文本），「工具执行完成」日志的
+  `status` 为 `error`，PostToolUse 的 `HookContext.is_error` 取 `output.is_error`。
+- `ToolInfo.source`：tool_use 由 `TurnEventAssembler(..., source_of=configuration.policies.source_of)` 填，tool_result 由
+  `LeadToolExecutor.execute_one` / `record_response` 填。子代理路径本期收不到作用域工具（M2），不填。
 
 ## 11. 配置项
 
@@ -1560,6 +1602,18 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
     - `McpServerCatalog` 只返回已启用的共享 server 加本人的私有 server；
     - 经 HTTP 调 `/api/permissions` 校验 `mcp__` 名字（快照名、有损清洗名、停用的共享 server、OAuth 空快照前缀都接受，私有 server 与未知名字报同一句话）。
 
+- **M1c 落地的测试文件**：
+  - `tests/test_mcp_runtime.py`：复用 `tests/test_scoped_tools.py` 的内存现场，作用域来源用按回合逐次给工具的假来源、工具用真实 `McpTool`
+    （调用回调换成内存实现）。覆盖：模型请求里 tools 的顺序（内置在前、MCP 按模型名排序）；`tool_sources` 紧跟 `turn_start`、无 fault 不发；
+    SSE 的 `ToolInfo.source`、`tool_calls.source`、`is_error` 记 failed 与 PostToolUse 的 `is_error`；MCP 审批载荷与 `mcp_refs`、内置工具载荷与
+    continuation 形状不变；恢复时路由未变照常执行，server 删除、`config_rev` 变化、schema 变化三种情况下被批准的调用与同批已变的调用都被拒、
+    其余调用（内置 Read）照常执行、回合完成；带 `updated_input` 的 MCP 审批 422；`always_scope=global` 成员 403、admin / owner 放行，
+    会话级与 `allow_once` 不查角色，内置工具照旧。另用真实 `McpToolProvider` + `tests/fixtures/mcp_fake.py` 的假 server（`ASGITransport`）
+    与内存版 `McpServerSource`：私有 server 只出现在 owner 的回合里；端到端从解析到模型调用 MCP 工具、结果回给模型；
+    手动刷新（真实 `McpConnector` + `McpAdminService`）后下一回合看到新清单；`drop_cached_tools` 清全部分区且不影响别的 server。
+  - `tests/test_mcp_runtime_pg.py`：真实 PostgreSQL（库可达且已升到 0032 时执行），`tool_calls.source` 与 failed / `error_message` 落库、
+    按来源加状态的统计；`always_scope=global` 经真实 `WorkspaceService` 校验角色（member 403、admin 放行、会话级与内置工具不查）。
+
 ### 12.3 黄金测试
 
 **期望字面量不变**：M0 不改变对外行为，七份黄金测试的期望字面量（`tests/fixtures/*_golden.py`，包括 SHA-256）**一个字都不改**。
@@ -1640,6 +1694,27 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
   - 结果转换的输出。
 - 同时把 CLAUDE.md、AGENTS.md、README 里的「七份」改成「八份」（第 15 节）。
 
+**M1c 实际改动的核对结果**：
+- 七份旧黄金测试的文件和 `tests/fixtures/*_golden.py` 零改动。新字段一律带默认值或只在有 MCP 时出现：`ToolInfo.source`（None 不输出）、
+  `mcp_refs`（无 MCP 调用不出现）、`tool_sources` 事件（无 fault 不发）、审批载荷的 `tool.source`（内置工具不出现）、
+  `tool_calls.source`（不经 `repo.start` 参数）、`TurnEventAssembler` 的 `source_of`、`execute` / `run_tool_calls` 的 `expected_routes`（关键字参数带默认值）。
+- 第八份 `tests/test_mcp_tool_golden.py` + `tests/fixtures/mcp_tool_golden.py`（`EXPECTED_TOOLS` / `EXPECTED_FAULTS` / `EXPECTED_APPROVAL` /
+  `EXPECTED_RESULTS`，三项带 SHA-256），字面量由脚本跑实现的实际产出生成：
+  - tools：9 个假 server 工具（含缺 properties、有损清洗、超长截短、描述超 2000 字符、schema 超限、模型名碰撞），经真实的 Streamable HTTP
+    与 `McpToolProvider` 处理后排在内置 echo 之后，再经 `AnthropicClient._encode_tools` / `OpenAIClient._encode_tools` 编码；被剔除的 3 个记 fault；
+  - 审批：三档模式 × `read_only` × `destructive`（各取 None / True / False）共 27 行，含 `mcp_tool_policy` 与 `PermissionService.default_behavior`；
+  - 结果：文本、`isError`、图片与音频占位、资源链接与内嵌资源、只有结构化内容、结构化加文本、空、截断共 8 种。
+- 非黄金测试只改构造方式与替身签名：
+  - `tests/test_scoped_tools.py::test_harness_defaults_to_no_scoped_sources`、`tests/test_mcp_server_api.py::test_default_harness_keeps_scoped_tools_empty_but_wires_connector`
+    断言「默认装配没有作用域来源」，M1c 起这只在 MCP 关闭时成立，改为 `monkeypatch` 关掉 `mcp_enabled` 后用 `builtin_harness()` 构造；
+  - `tests/test_mcp_admin.py` 的 `FakeConnector` 补 `drop_cached_tools`（端口新增的抽象方法），两个刷新用例各加一条断言；
+  - 例外一处：`tests/test_scoped_tools.py::test_scoped_tool_error_result_reaches_model_as_is` 原断言 `is_error` 的调用记录为 `succeeded`，
+    注释写明这是 M1c 之前的过渡行为；5.4 节要求 M1c 改为 `failed`，断言随之改为 `failed` 并核对 `error_message`。
+- 直接用 `default_harness()` 构造运行时的测试（`test_bootstrap.py`、`test_memory_provider.py`、`test_session_store_in_memory.py`、
+  `test_agent_delegation_runner.py`）逐个核对过：都不走真实 `_produce` 的解析（要么经 `harness_factory` 关掉作用域来源，要么把 `_produce`
+  打桩、只构造不执行），接上 MCP 来源后也不会连数据库或 MCP，不用改。
+- 新增测试：`tests/test_mcp_runtime.py`（内存现场与真实 `McpToolProvider` + 假 server），`tests/test_mcp_runtime_pg.py`（真实 PostgreSQL）。
+
 ## 13. 阶段
 
 | 阶段 | 内容 | 完成判据 |
@@ -1665,8 +1740,12 @@ M1 分步实现：
   `McpServerCatalog` 实现 `McpServerSource`）、`harness/domain/mcp_config.py`、`harness/app/mcp_admin.py` 的 `McpAdminService`、管理接口、
   `permission/api.py` 对 `mcp__` 名字的校验、组装根（`mcp_runtime()`、`Harness.mcp_connector`、`mcp_admin_service`、`mcp_tool_provider`）与 lifespan 关闭、
   `AGENTOS_MCP_MAX_PRIVATE_SERVERS_PER_USER`、第 15 节标 M1 的文档行（八份黄金测试除外）。主回合不加载 MCP 工具，`scoped_tools` 仍为 `()`。
-- M1c：运行时接线，即 `scoped_tools` 接上 `mcp_tool_provider(...)`、`tool_sources` 事件、`tool_calls.source`、`ToolInfo.source` 和审批载荷里的
-  `tool.source`、挂起快照核对、MCP 审批 `can_update_input=False` 与 422、`always_scope=global` 的管理员限制、第八份黄金测试。
+- M1c（已实现，2026-11-13）：运行时接线，即 `scoped_tools` 接上 `mcp_tool_provider(...)`、`tool_sources` 事件、`tool_calls.source`（迁移 `0032_tool_calls_source`）、
+  `ToolInfo.source` 和审批载荷里的 `tool.source`、挂起快照核对、MCP 审批 `can_update_input=False` 与 422、`always_scope=global` 的管理员限制、
+  手动刷新清缓存入口、第八份黄金测试。签名回写在 4.3、5.3、6.3、10.2、10.3、12.3 节。
+
+**M1 全部完成**（M1a dd145ef、M1b 8abea39、M1c）。M1 只有 `lead` 加载 MCP 工具；子代理、队友、委派、Workflow 成员的加载与 Agent 绑定在 M2，
+OAuth 在 M3。
 
 **M0b 对 Workflow 的调整**：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
 推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，
@@ -1698,7 +1777,7 @@ M1 分步实现：
 ## 15. 与上位文档的偏离
 
 以下几处现有文档和注释对 MCP 做了预设，本文的设计推翻了这些预设。M0 的第一个提交要同步修改这些地方，
-修改完成之前以本文为准。M0 的行已在 M0b 改完；标 M1 的部分中，`McpServerConnector`、`McpServerRegistry`、`mcp_connector`、导入禁令已在 M1b 改完，八份黄金测试留到 M1c：
+修改完成之前以本文为准。M0 的行已在 M0b 改完；标 M1 的部分中，`McpServerConnector`、`McpServerRegistry`、`mcp_connector`、导入禁令已在 M1b 改完，八份黄金测试已在 M1c 改完。全部行均已修改：
 
 | 位置 | 原来的预设 | 本文的设计 | 何时改 |
 |---|---|---|---|
@@ -1706,7 +1785,7 @@ M1 分步实现：
 | 同上第 4 条（扩展点） | 接 MCP 时实现 `ToolProvider`，并在 `platform_tool_set()` 里追加 | 实现 `ScopedToolProvider`，经 `Harness.scoped_tools` 注入；`platform_tool_set()` 只放内置工具 | 已改（M0b） |
 | 同上第 9 条（导入禁令，`:73-76`） | 只禁 anthropic / openai | 补上：`mcp` 只能在 `harness/adapters/mcp` 导入；runtime、app、domain 不得导入 `mcp_server` | 已改（M1b，另补 `mcp_server` 不得导入 adapters 与 SDK） |
 | 同上第 10 条（`:77-79`） | 只有工具名的 feature 域经 `platform_tools()` 查策略 | 收窄为只用于管理场景；运行时与审核链一律查本回合的 `policies` | 已改（M0b） |
-| 同上第 11 条（`:80`）、README.md:122 | 七份黄金测试 | 八份（新增 `test_mcp_tool_golden.py`） | M1c |
+| 同上第 11 条（`:80`）、README.md:122 | 七份黄金测试 | 八份（新增 `test_mcp_tool_golden.py`） | 已改（M1c，另补 `docs/agent-architecture.md` 黄金测试清单） |
 | `docs/agent-architecture.md:23`（组装根一段） | `Harness` 字段清单里没有作用域来源；「以后 MCP 连接管理器需要关闭钩子时再接入 lifespan」 | 补上 `scoped_tools`、`mcp_connector`；`mcp_runtime()` 惰性创建，由 lifespan 关闭 | 已改（M0b / M1b） |
 | `docs/agent-architecture.md:68`（ToolProvider 一行） | 接 MCP 时扩展为 `async list_tools(scope)` | ToolProvider 保持同步，另设 `ScopedToolProvider`（4.1 节） | 已改（M0b） |
 | `docs/agent-architecture.md:72`（SubAgentLauncher 一行） | 签名里没有作用域工具 | 增加 `scoped: ScopedGrant \| None` | 已改（M0b） |

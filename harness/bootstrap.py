@@ -106,8 +106,7 @@ def mcp_tool_provider(session_factory: SessionFactory) -> McpToolProvider:
     """MCP 作用域工具来源：用进程级运行时，按 Settings 组装上限；每回合经 session_factory
     开短会话读 server 配置与凭证（McpServerCatalog），不占用回合的事务。
 
-    本阶段（M1b）还没有接进 Harness.scoped_tools：挂起快照核对、422 / 403 等措施在 M1c 才有，
-    届时在 mcp_enabled 打开时以 (mcp_tool_provider(AsyncSessionLocal),) 接上。
+    mcp_enabled 打开时由 builtin_harness() 接进 Harness.scoped_tools；构造本身不建连接。
     """
     return McpToolProvider(
         runtime=mcp_runtime(),
@@ -366,6 +365,13 @@ class IsolatedSubAgentLauncher:
             )
 
 
+def _scoped_tool_sources() -> tuple[ScopedToolProvider, ...]:
+    """作用域工具来源：MCP 总开关打开时接上 MCP 来源，关闭时为空，回合不做任何 MCP I/O。"""
+    if not settings.mcp_enabled:
+        return ()
+    return (mcp_tool_provider(AsyncSessionLocal),)
+
+
 def builtin_harness() -> Harness:
     """内置实现的完整装配：数据库会话存储、内置记忆、数据库 + .env 模型解析、规则链审核员。"""
     tools = platform_tool_set()
@@ -385,8 +391,7 @@ def builtin_harness() -> Harness:
         compact_model=_env_compact_model,
         subagent_model=resolve_subagent_model,
         subagent_launcher=IsolatedSubAgentLauncher,
-        # 作用域工具来源保持为空：MCP 工具在 M1c 才接进回合，见 mcp_tool_provider()。
-        scoped_tools=(),
+        scoped_tools=_scoped_tool_sources(),
         mcp_connector=mcp_connector,
     )
 

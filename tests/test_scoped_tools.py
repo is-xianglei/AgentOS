@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent.service import AgentRuntimeConfig
+from core.config import settings
 from core.errors import AgentException
 from harness.app.ports import (
     ModelEventKind,
@@ -23,7 +24,7 @@ from harness.app.ports import (
     ToolSourceFault,
 )
 from harness.app.tool_resolver import ResolvedScope, TurnToolResolver
-from harness.bootstrap import IsolatedSubAgentLauncher, default_harness
+from harness.bootstrap import IsolatedSubAgentLauncher, builtin_harness, default_harness
 from harness.domain.messages import ToolCall, ToolResult
 from harness.domain.roles.subagent import AgentType, SubAgentSpec
 from harness.domain.tool import (
@@ -595,8 +596,9 @@ async def test_scoped_tool_error_result_reaches_model_as_is(
     tool_result = llm.requests[1].messages[-1]
     assert isinstance(tool_result, ToolResult)
     assert (tool_result.content, tool_result.is_error) == ("远程报错：参数不合法", True)
-    # 执行失败只是结果的属性，调用记录照常记为成功。
-    assert world.tool_calls[1].status == "succeeded"
+    # 执行失败的结果记为失败调用（M1c，设计 5.4 节），失败文本存进 error_message。
+    assert world.tool_calls[1].status == "failed"
+    assert world.tool_calls[1].error_message == "远程报错：参数不合法"
 
 
 async def test_approval_required_scoped_tool_suspends_and_resumes_after_approval(
@@ -774,8 +776,10 @@ async def test_hidden_scoped_call_is_reviewed_like_hidden_builtin(
 # ---------- 组装根 ----------
 
 
-def test_harness_defaults_to_no_scoped_sources() -> None:
-    harness = default_harness()
+def test_harness_defaults_to_no_scoped_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    # M1c 起 MCP 开关打开时默认装配带 MCP 来源，这里按关闭 MCP 构造。
+    monkeypatch.setattr(settings, "mcp_enabled", False)
+    harness = builtin_harness()
     runtime = make_agent_runtime(object(), user_id=_USER_ID, workspace_id=_WORKSPACE_ID)
 
     assert harness.scoped_tools == ()

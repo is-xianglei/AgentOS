@@ -75,6 +75,17 @@ class McpToolRef:
     model_name: str
     schema_sha256: str  # inputSchema 规范化序列化后的摘要，挂起快照核对用
 
+    def to_dict(self) -> dict[str, Any]:
+        """挂起时写进 continuation.mcp_refs 的形状，恢复时按字典整体比对。"""
+        return {
+            "server_id": self.server_id,
+            "server_key": self.server_key,
+            "config_rev": self.config_rev,
+            "remote_name": self.remote_name,
+            "model_name": self.model_name,
+            "schema_sha256": self.schema_sha256,
+        }
+
 
 @dataclass(frozen=True)
 class McpToolNaming:

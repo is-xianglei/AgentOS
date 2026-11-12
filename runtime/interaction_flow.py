@@ -2,9 +2,12 @@
 
 挂起时把剩余工具、已完成的调用、附加上下文与工具预算冻结进 continuation，恢复时据此还原；
 四类交互（工具审批、提问、进入与退出 Plan Mode）的响应在这里翻译成 tool_result。
+待执行的调用里有作用域工具（MCP）时，continuation 另带 mcp_refs 冻结它们的路由快照，
+恢复时与重新解析出的工具逐个核对，工具已变的调用不执行。
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import UUID
@@ -24,15 +27,26 @@ from interaction.service import InteractionService
 from permission.service import PermissionService
 from plan.service import PlanService
 from runtime.execution import write_detached_run_end
-from runtime.tool_execution import LeadToolExecutor, default_tool_budget
+from runtime.tool_execution import (
+    ROUTE_CHANGED_MESSAGE,
+    LeadToolExecutor,
+    default_tool_budget,
+    route_changed,
+)
 from runtime.turn_config import TurnConfiguration
 from tools.models import ToolCallRecord
 from tools.service import ToolService
+from workspace.service import WorkspaceService
 
 logger = logging.getLogger(__name__)
 
 # 已经终结的暂停点：相同响应再次恢复时只重放结束事件。
 _FINISHED_STATUSES = frozenset({"resolved", "cancelled", "failed"})
+# continuation 里冻结路由快照的键：{tool_use_id: 路由快照}，只在待执行调用里有作用域工具时出现。
+# 目前只有 MCP 工具冻结快照，值是 McpToolRef 的字典形状。
+_ROUTES_KEY = "mcp_refs"
+# 可以把「始终允许」写成工作区全局规则的角色：MCP 工具的 always_scope=global 只对它们开放。
+_GLOBAL_RULE_ROLES = {"owner", "admin"}
 
 
 @dataclass(frozen=True)
@@ -93,10 +107,13 @@ class InteractionFlow:
         additional_context: str | None,
         existing_suspension: RuntimeSuspensionRecord | None = None,
         budget: ToolCallBudget | None = None,
+        *,
+        expected_routes: Mapping[str, Any] | None = None,
     ) -> SuspendedInteraction | None:
         """按原始顺序执行工具；需要人工输入时挂起并返回可发布的交互事件快照。
 
         主循环与恢复后的续跑都走这里；existing_suspension 非空表示在同一暂停点上继续挂起。
+        expected_routes 是恢复时 continuation 里冻结的路由快照，主循环不传。
         """
         if budget is None:
             budget = default_tool_budget()
@@ -108,6 +125,7 @@ class InteractionFlow:
             tool_calls,
             done_ids,
             budget,
+            expected_routes=expected_routes,
         )
         if approval is None:
             return None
@@ -122,6 +140,7 @@ class InteractionFlow:
             approval.kind,
             existing_suspension,
             budget,
+            expected_routes or {},
         )
 
     async def _suspend(
@@ -136,8 +155,12 @@ class InteractionFlow:
         kind: str,
         existing_suspension: RuntimeSuspensionRecord | None,
         budget: ToolCallBudget,
+        expected_routes: Mapping[str, Any],
     ) -> SuspendedInteraction:
-        """冻结 continuation 并创建一项业务交互请求。"""
+        """冻结 continuation 并创建一项业务交互请求。
+
+        在同一暂停点上再次挂起时，沿用上次冻结的路由快照：剩余调用以模型最初看到的工具为准。
+        """
         target = remaining[0]
         record = await self._configuration.gateway.start_call(
             session_id,
@@ -162,6 +185,10 @@ class InteractionFlow:
             "additional_context": additional_context,
             "tool_budget": budget.to_dict(),
         }
+        # 只有待执行调用里有作用域工具才多出这个键，内置工具的 continuation 形状不变。
+        routes = self._route_snapshots(remaining, expected_routes)
+        if routes:
+            continuation[_ROUTES_KEY] = routes
         request_payload = await self._build_payload(session_id, kind, target)
         request_create = InteractionRequestCreate(
             kind=kind,
@@ -206,6 +233,23 @@ class InteractionFlow:
             schema_version=request.schema_version,
         )
 
+    def _route_snapshots(
+        self,
+        calls: list[ToolCall],
+        expected_routes: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """待执行调用里冻结了路由快照的那些（MCP 工具），按 tool_use_id 存，内置工具不出现。
+
+        上次挂起已冻结过的调用沿用原快照，不用本回合的覆盖。
+        """
+        policies = self._configuration.policies
+        routes: dict[str, Any] = {}
+        for call in calls:
+            snapshot = expected_routes.get(call.id) or policies.route_snapshot_of(call.tool_name)
+            if snapshot is not None:
+                routes[call.id] = snapshot
+        return routes
+
     def _ask_reason(self, tool_name: str) -> str:
         """给前端展示的审批原因文案：按本回合策略全集判断该工具是否默认需审批。"""
         if self._configuration.policies.policy_for(tool_name).requires_approval:
@@ -219,15 +263,21 @@ class InteractionFlow:
         target: ToolCall,
     ) -> dict[str, Any]:
         if kind == "tool_approval":
+            tool: dict[str, Any] = {
+                "id": target.id,
+                "name": target.tool_name,
+                "input": target.arguments,
+            }
+            # 作用域工具（MCP）带来源供前端标注；审批响应的请求路径只装配平台工具，
+            # 没法按它的 schema 校验改过的入参，所以本期不允许审批时改参数。内置工具的载荷不变。
+            source = self._configuration.policies.source_of(target.tool_name)
+            if source is not None:
+                tool["source"] = source
             return {
-                "tool": {
-                    "id": target.id,
-                    "name": target.tool_name,
-                    "input": target.arguments,
-                },
+                "tool": tool,
                 "reason": self._ask_reason(target.tool_name),
                 "allowed_decisions": ["allow_once", "always_allow", "deny"],
-                "can_update_input": True,
+                "can_update_input": source is None,
             }
         if kind == "user_question":
             return AskUserQuestionRequestPayload.model_validate(target.arguments).model_dump(
@@ -267,12 +317,7 @@ class InteractionFlow:
         if not is_replay and session.status != "awaiting_interaction":
             raise AgentException.message("会话当前没有待处理的人工交互")
 
-        normalized = await self._normalize_response(
-            session_id,
-            request_id,
-            kind,
-            response_payload,
-        )
+        normalized = await self._normalize_response(current, kind, response_payload)
         request, suspension = await self._interaction_service.resolve_request(
             request_id,
             normalized,
@@ -296,28 +341,59 @@ class InteractionFlow:
 
     async def _normalize_response(
         self,
-        session_id: int,
-        request_id: UUID,
+        request: InteractionRequestRecord,
         kind: str,
         response_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """在响应落库前完成依赖工具集的校验。"""
-        if kind != "tool_approval" or response_payload.get("updated_input") is None:
+        """在响应落库前完成依赖工具集与审批身份的校验；request 是调用方刚按会话读出的请求。
+
+        判断依据是已落库的请求载荷，不是工具名前缀：载荷声明不能改参数（MCP 工具）却带了
+        updated_input 时报 422；来源是 MCP 的工具要写工作区全局的「始终允许」规则时，
+        只有工作区 owner / admin 可以，其余成员 403。内置工具的行为不变。
+        """
+        if kind != "tool_approval":
             return response_payload
-        request = await self._interaction_service.get_request_required(
-            request_id,
-            session_id=session_id,
+        has_updated_input = response_payload.get("updated_input") is not None
+        global_rule = (
+            response_payload.get("decision") == "always_allow"
+            and response_payload.get("always_scope") == "global"
         )
+        if not has_updated_input and not global_rule:
+            return response_payload
         tool = request.request_payload.get("tool") or {}
         tool_name = tool.get("name")
         if not isinstance(tool_name, str):
             raise AgentException.message("工具审批请求缺少有效工具名")
+        source = tool.get("source")
+        if global_rule and isinstance(source, str) and source.startswith("mcp:"):
+            await self._require_global_rule_role()
+        if not has_updated_input:
+            return response_payload
+        if request.request_payload.get("can_update_input") is False:
+            raise AgentException.message(
+                "该工具不支持在审批时修改参数",
+                {"tool_name": tool_name},
+                status_code=422,
+            )
         normalized = dict(response_payload)
         normalized["updated_input"] = self._configuration.tools.validate_input(
             tool_name,
             response_payload["updated_input"],
         )
         return normalized
+
+    async def _require_global_rule_role(self) -> None:
+        """MCP 工具的「始终允许」写成工作区全局规则前，核对当前用户是工作区 owner / admin（否则 403）。
+
+        否则任何成员审批一次，就能把管理员给 server 设的「每次审批」变成全工作区放行。
+        """
+        if self._user_id is None or self._workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+        await WorkspaceService(self._db).require_workspace_role(
+            self._workspace_id,
+            self._user_id,
+            _GLOBAL_RULE_ROLES,
+        )
 
     async def cancel(self, session_id: int, suspension_id: UUID) -> RuntimeSuspensionRecord:
         """取消当前暂停点，原子收尾关联的 Turn 与工具调用，提交后补写 run_end。
@@ -516,6 +592,8 @@ class InteractionFlow:
         if response is None:
             raise AgentException.message("人工交互缺少已持久化的响应")
 
+        # 挂起时冻结的路由快照：批准的与执行的必须是同一个工具、同一个地址、同一份 schema。
+        expected_routes: Mapping[str, Any] = pending.get(_ROUTES_KEY) or {}
         actor = ORCHESTRATOR_ACTOR
         if request.kind == "tool_approval":
             await self._apply_tool_approval(
@@ -527,6 +605,7 @@ class InteractionFlow:
                 tool_calls,
                 record,
                 response,
+                expected_routes,
             )
         elif request.kind == "user_question":
             await self._apply_user_question(turn, actor, target, record, request, response)
@@ -549,6 +628,7 @@ class InteractionFlow:
             additional_context=pending.get("additional_context"),
             existing_suspension=suspension,
             budget=budget,
+            expected_routes=expected_routes,
         )
 
     async def _apply_tool_approval(
@@ -561,6 +641,7 @@ class InteractionFlow:
         tool_calls: list[ToolCall],
         record: ToolCallRecord,
         response: dict[str, Any],
+        expected_routes: Mapping[str, Any],
     ) -> None:
         decision = response["decision"]
         if decision == "deny":
@@ -571,6 +652,27 @@ class InteractionFlow:
                 actor,
                 target,
                 message,
+                is_error=True,
+                record=record,
+            )
+            return
+        # 审批通过后不再重新审核，靠路由快照保证执行的就是批准的那个工具；
+        # 已变更的记为拒绝、不写「始终允许」规则，剩下的调用照常续跑。
+        if route_changed(self._configuration, target, expected_routes):
+            logger.warning(
+                "MCP 工具在审批期间已变更，已批准的调用未执行",
+                extra={
+                    "session_id": session_id,
+                    "turn_id": str(turn.id),
+                    "tool_name": target.tool_name,
+                },
+            )
+            await self._executor.record_response(
+                session_id,
+                turn.id,
+                actor,
+                target,
+                ROUTE_CHANGED_MESSAGE,
                 is_error=True,
                 record=record,
             )

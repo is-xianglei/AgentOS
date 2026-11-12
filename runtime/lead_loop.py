@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from core.event_bus import StreamBus
-from core.events import ORCHESTRATOR_ACTOR, Actor, StreamEvent
+from core.events import ORCHESTRATOR_ACTOR, Actor, RuntimeEvent, StreamEvent
 from harness.app.compaction import ContextCompaction
 from harness.app.loop import (
     LoopExit,
@@ -312,10 +312,22 @@ async def run_lead_turn(
     configuration = deps.configuration
     # 装配器跨本回合多次 LLM 调用共用:块 index 需在 turn 内全局递增连号,
     # 这是它唯一的跨调用状态(详见装配器 docstring)。
-    assembler = TurnEventAssembler(actor, session_id, turn_id=turn.id)
+    assembler = TurnEventAssembler(
+        actor,
+        session_id,
+        turn_id=turn.id,
+        source_of=configuration.policies.source_of,
+    )
 
     # 回合开始(开场事件,带完整 actor)。
     await deps.bus.emit(StreamEvent.turn_start(actor, session_id))
+    # 本回合有作用域工具来源不可用(如 MCP server 连不上)时紧随其后通知前端;没有故障不发,
+    # 现有事件序列不变。故障文本可直接展示,不带地址与凭证,授权地址由前端凭 server_id 自己请求。
+    faults = configuration.scoped.faults
+    if faults:
+        await deps.bus.emit(
+            RuntimeEvent.tool_sources(session_id, [fault.to_dict() for fault in faults])
+        )
 
     if deps.workspace_id is None:
         raise AgentException.message("缺少可信工作区上下文")

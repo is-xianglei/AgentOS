@@ -157,6 +157,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 阶段 7 起：runtime/、harness/app/、harness/domain/ 任何位置都不得导入 harness.adapters；Agent 工具不得导入 runtime 或 database.engine；core/errors.py 加载期不得导入 fastapi / starlette，且子进程实测只导入领域层时不会加载它们。均由 tests/test_import_isolation.py 静态检查并带自测。
 - 发给模型的工具描述（26 个内置工具的名称、描述、JSON Schema、顺序）和每个工具的 ToolPolicy 由 tests/test_tool_spec_golden.py 固化（字面量取自阶段 3a 之前的代码），后续阶段不得改动 tests/fixtures/tool_spec_golden.py。
 - 主 Agent 与子代理逐个工具调用的审核结果（tool_result 文本与 is_error、done_ids、挂起与续跑状态、网关收到的入参、权限规则查询参数、被拒摘要、日志的级别/正文/extra、预算计数）由 tests/test_tool_review_golden.py 固化（49 种情况，字面量取自阶段 3b 之前的代码），后续阶段不得改动 tests/fixtures/tool_review_golden.py。
+- MCP 工具的对外行为（假 server 工具经命名与 schema 预处理后经两家 `_encode_tools` 发给模型的 tools、被剔除工具的 fault、三档审批模式 × 注解的推导矩阵、结果转换）由 tests/test_mcp_tool_golden.py 固化（第八份，字面量取自 MCP M1c 实现的实际产出），后续阶段不得改动 tests/fixtures/mcp_tool_golden.py。
 
 已知、有意保留的行为差异和不对称（后续单独处理，不在重构中顺手改）：
 - 未知的 effort 字符串在 `Effort.parse` 处抛中文异常；之前在工作区路径会回落到默认档位，在 .env 路径会原样下发。

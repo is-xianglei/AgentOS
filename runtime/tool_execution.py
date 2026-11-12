@@ -2,10 +2,13 @@
 
 主循环与人工交互恢复后的续跑共用这一份实现。审核要求人工交互时只停在该调用并返回
 ToolApprovalRequired，冻结续跑状态与挂起由人工交互流程负责，这里不碰交互的持久化。
+恢复续跑时，挂起时冻结了路由快照的调用（MCP 工具）先核对快照，工具已变的不再审核和执行。
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Any
 from uuid import UUID
 
 from core.config import settings
@@ -22,6 +25,21 @@ from tools.models import ToolCallRecord
 from tools.service import ToolService
 
 logger = logging.getLogger(__name__)
+
+# 挂起时冻结的路由快照与恢复时重新解析出的不一致（server 删除、配置版本或 schema 变化）时回给模型的文本。
+ROUTE_CHANGED_MESSAGE = "MCP 工具已变更，本次审批的调用未执行"
+
+
+def route_changed(
+    configuration: TurnConfiguration,
+    tool_call: ToolCall,
+    expected_routes: Mapping[str, Any],
+) -> bool:
+    """该调用挂起时冻结了路由快照，且与本回合重新解析出的同名工具不一致（含工具已不存在）。"""
+    expected = expected_routes.get(tool_call.id)
+    if expected is None:
+        return False
+    return configuration.policies.route_snapshot_of(tool_call.tool_name) != expected
 
 
 def default_tool_budget() -> ToolCallBudget:
@@ -73,10 +91,14 @@ class LeadToolExecutor:
         tool_calls: list[ToolCall],
         done_ids: list[str],
         budget: ToolCallBudget | None = None,
+        *,
+        expected_routes: Mapping[str, Any] | None = None,
     ) -> ToolApprovalRequired | None:
         """按原始顺序审核并执行工具；需要人工交互时停在该调用，返回待挂起的剩余调用。
 
         审核规范化后的入参会写回 tool_calls，完成（含被拒）的调用 ID 追加到 done_ids。
+        expected_routes 是恢复时 continuation 里冻结的路由快照（按 tool_use_id）：
+        与本回合不一致的调用直接记为拒绝，不审核也不执行，其余调用照常处理。
         """
         if budget is None:
             budget = default_tool_budget()
@@ -84,6 +106,25 @@ class LeadToolExecutor:
         for idx, tool_call in enumerate(tool_calls):
             # 恢复人工交互时，挂起前已完成的工具不再重复执行。
             if tool_call.id in done_ids:
+                continue
+            if expected_routes and route_changed(configuration, tool_call, expected_routes):
+                logger.warning(
+                    "MCP 工具在挂起期间已变更，该调用未执行",
+                    extra={
+                        "session_id": session_id,
+                        "turn_id": str(turn.id),
+                        "tool_name": tool_call.tool_name,
+                    },
+                )
+                await self.record_response(
+                    session_id,
+                    turn.id,
+                    actor,
+                    tool_call,
+                    ROUTE_CHANGED_MESSAGE,
+                    is_error=True,
+                )
+                done_ids.append(tool_call.id)
                 continue
 
             # 每个工具前重新读取 Plan 状态：同一批工具中前面的 Enter/ExitPlanMode
@@ -206,6 +247,7 @@ class LeadToolExecutor:
                     name=tool_call.tool_name,
                     output=result.text,
                     is_error=result.is_error,
+                    source=configuration.policies.source_of(tool_call.tool_name),
                 ),
             )
         )
@@ -249,6 +291,7 @@ class LeadToolExecutor:
                     name=tool_call.tool_name,
                     output=output,
                     is_error=is_error,
+                    source=self._configuration.policies.source_of(tool_call.tool_name),
                 ),
             )
         )

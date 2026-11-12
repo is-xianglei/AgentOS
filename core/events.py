@@ -158,7 +158,8 @@ class ToolInfo:
     """工具调用 / 结果信息。
 
     tool_use 用 id/name/input;tool_result 用 id/name/output/is_error。
-    用同一个对象承载,序列化时按非 None 字段输出。
+    用同一个对象承载,序列化时按非 None 字段输出。source 是工具来源(MCP 工具为
+    "mcp:{server_key}"),内置工具为 None 不输出,现有事件逐字节不变。
     """
 
     id: str
@@ -166,6 +167,7 @@ class ToolInfo:
     input: dict[str, Any] | None = None
     output: str | None = None
     is_error: bool | None = None
+    source: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"id": self.id, "name": self.name}
@@ -175,6 +177,8 @@ class ToolInfo:
             data["output"] = self.output
         if self.is_error is not None:
             data["is_error"] = self.is_error
+        if self.source is not None:
+            data["source"] = self.source
         return data
 
 
@@ -494,6 +498,15 @@ class RuntimeEvent:
         if reason is not None:
             data["reason"] = reason
         return cls(type="task_snapshot", data=data)
+
+    @classmethod
+    def tool_sources(cls, session_id: int, faults: list[dict[str, Any]]) -> RuntimeEvent:
+        """本回合不可用的作用域工具来源(如 MCP server),只在有故障时于 turn_start 之后发出。
+
+        faults 每项为 {source, server_id, kind, message}:message 是可直接展示的中文,
+        不带地址、请求头或异常细节;auth_required 也不带授权地址,前端凭 server_id 自己发起授权。
+        """
+        return cls(type="tool_sources", data={"session_id": session_id, "faults": faults})
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"type": self.type, "data": self.data}

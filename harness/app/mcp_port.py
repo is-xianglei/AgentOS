@@ -35,6 +35,13 @@ class McpServerConnector(ABC):
     async def invalidate(self, server_id: int) -> None:
         """配置变更后让本进程里这个 server 的连接和目录缓存失效；其他实例靠 config_rev 变化自然失效。"""
 
+    @abstractmethod
+    async def drop_cached_tools(self, server_id: int) -> None:
+        """清掉本进程里这个 server 的工具清单缓存（全部授权分区），连接与 config_rev 不动。
+
+        管理员手动刷新探测成功后调用，下一回合重新拉取清单；其他实例仍按缓存 TTL 过期。
+        """
+
 
 class McpServerSource(Protocol):
     """按身份列出可用 server 配置与凭证的窄接口，M1b 由 mcp_server 域实现。

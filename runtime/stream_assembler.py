@@ -2,7 +2,8 @@
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from uuid import UUID
 
 from core.errors import AgentException
@@ -33,11 +34,21 @@ class TurnEventAssembler:
     runtime 自己 emit,装配器只负责「LLM 一次调用产出的内容块」这一段。
     """
 
-    def __init__(self, actor: Actor, session_id: int, *, turn_id: UUID | None) -> None:
+    def __init__(
+        self,
+        actor: Actor,
+        session_id: int,
+        *,
+        turn_id: UUID | None,
+        source_of: Callable[[str], str | None] | None = None,
+    ) -> None:
         self._actor = actor
         self._session_id = session_id
         # 仅供日志串链:设为必填关键字参数,避免新增调用点静默漏传导致链路断点。
         self._turn_id = turn_id
+        # 按工具名查来源(MCP 工具为 "mcp:{server_key}"),写进 tool_use 的 ToolInfo.source;
+        # 不传或内置工具查出 None 时事件不变。
+        self._source_of = source_of
         # turn 级游标:跨 consume 调用累加,保证 index 全 turn 连号。
         self._next_index = 0
         # 以下三项均为单次 consume 的调用内状态,进入 consume 时重置。
@@ -122,7 +133,12 @@ class TurnEventAssembler:
                         "LLM 流的 TOOL_USE 事件缺少工具信息",
                         {"block_ref": event.block_ref},
                     )
-                yield StreamEvent.tool_use(self._actor, self._session_id, index, event.tool)
+                tool = event.tool
+                if self._source_of is not None:
+                    source = self._source_of(tool.name)
+                    if source is not None:
+                        tool = replace(tool, source=source)
+                yield StreamEvent.tool_use(self._actor, self._session_id, index, tool)
                 # provider 不为 tool_use 块发 BLOCK_STOP,这里紧随其后补发,保持块边界成对。
                 self._open.discard(index)
                 yield StreamEvent.block_stop(self._actor, self._session_id, index)

@@ -119,25 +119,39 @@ uv run pytest
 
 PostgreSQL、Redis 集成测试（`tests/test_*_pg.py` 等）读取 `.env` 里的连接，连不上时自动跳过。
 
-- 黄金测试：七份 `tests/test_*_golden.py` 用 `tests/fixtures/*_golden.py` 里的期望字面量逐项比对对外行为
+- 黄金测试：八份 `tests/test_*_golden.py` 用 `tests/fixtures/*_golden.py` 里的期望字面量逐项比对对外行为
   （含字典键序），字面量取自重构前代码的实际产出。分别固化发给模型的请求（model_request）、
   工具描述（tool_spec）、审核结果（tool_review）、记忆接入（memory_port）、角色上下文（role_context）、
-  循环事件与落库（react_loop）以及 HTTP 入口（agent_service）。改这些行为时要先说明原因，
+  循环事件与落库（react_loop）、HTTP 入口（agent_service），以及 MCP 工具发给模型的 tools、
+  审批推导与结果转换（mcp_tool，`tests/test_mcp_tool_golden.py`）。改这些行为时要先说明原因，
   并重新生成字面量，不允许手改。
 - 分层静态检查：`tests/test_import_isolation.py` 用 AST 检查导入关系，例如 runtime、app、domain
   不得导入 adapters，runtime 和 app 不得导入 Repository，领域层不得读取 cwd、日期等进程状态；
   还会逐个起子进程导入全部模块，防止加载期出现循环导入。
 
+## MCP
+
+AgentOS 作为 MCP 客户端，按工作区接入远程 MCP server（只支持 Streamable HTTP），设计见
+[docs/mcp-design.md](docs/mcp-design.md)。
+
+- 开关：`AGENTOS_MCP_ENABLED`（默认 true）。关闭时回合不加载任何 MCP 工具，管理接口返回 403。
+  其余超时与上限见 `.env.example` 的 MCP 段。
+- 管理接口前缀 `/api/mcp`：`GET/POST /servers`、`GET/PUT/DELETE /servers/{id}`、
+  `POST /servers/{id}/probe`（重新探测，成功后本实例下一回合即用新清单）、`GET /servers/{id}/tools`。
+  新建时先探测，探测成功才写库。
+- 共享 server（`visibility=workspace`）由工作区 owner / admin 配置，成员都能用；私有 server
+  （`visibility=private`）由成员自己配置，只出现在本人的回合里，别人看不到，地址必须是公网地址。
+- 工具名为 `mcp__{server_key}__{tool}`，排在内置工具之后。审批按 server 的 `approval_mode`
+  （默认每次审批）；MCP 工具审批时不能改参数，「始终允许」选全局作用域要求 owner / admin。
+  本期只有默认 Agent 加载 MCP 工具。
+
 ## 扩展
 
-以下两种接入方式都还没有实现。
-
-- **接入 MCP**：设计见 [docs/mcp-design.md](docs/mcp-design.md)。实现 `harness/app/ports.py` 的
-  `ScopedToolProvider`，按工作区和用户把每个远端工具包装成 `harness/domain/tool.py` 的 `Tool`
-  （`source="mcp:{server_key}"`，命名为 `mcp__{server_key}__{tool}`，参数直接沿用 server 下发的
-  inputSchema），再经 `Harness.scoped_tools` 注入。主 Agent 运行时每回合由 `TurnToolResolver`
+- **接入新的作用域工具来源**：实现 `harness/app/ports.py` 的 `ScopedToolProvider`，按工作区和用户
+  把每个远端工具包装成 `harness/domain/tool.py` 的 `Tool`，再经 `Harness.scoped_tools` 注入（MCP 即
+  `harness/adapters/mcp/provider.py` 的 `McpToolProvider`）。主 Agent 运行时每回合由 `TurnToolResolver`
   解析一次，作用域工具排在内置工具之后；`platform_tool_set()` 只放进程级工具。
-- **接入外部记忆**：设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
+- **接入外部记忆**（尚未实现）：设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
   实现 `harness/app/memory_port.py` 的 `MemoryProvider`（recall、inherited、
   on_turn_completed、after_commit），在 `harness/bootstrap.py` 里替换 `Harness` 的 `memory` 字段
   （如 `dataclasses.replace(builtin_harness(), memory=...)`）。主循环只认召回和回合结束写入两个动作，

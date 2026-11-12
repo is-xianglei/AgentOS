@@ -60,6 +60,7 @@ class FakeConnector(McpServerConnector):
         self.result = result or _ok(_tool("a"))
         self.probed: list[tuple[McpServerConfig, McpSecret | None]] = []
         self.invalidated: list[int] = []
+        self.dropped: list[int] = []
         self.journal: list[str] | None = None
 
     async def probe(self, config: McpServerConfig, secret: McpSecret | None) -> McpProbeResult:
@@ -72,6 +73,9 @@ class FakeConnector(McpServerConnector):
         self.invalidated.append(server_id)
         if self.journal is not None:
             self.journal.append("invalidate")
+
+    async def drop_cached_tools(self, server_id: int) -> None:
+        self.dropped.append(server_id)
 
 
 class InMemoryRegistry:
@@ -374,9 +378,10 @@ async def test_refresh_returns_diff_against_snapshot() -> None:
     assert (result.diff.added, result.diff.removed) == (("c",), ("b",))
     assert [change.name for change in result.diff.schema_changed] == ["a"]
     assert [tool.name for tool in result.server.tools] == ["a", "c"]
-    # 只换快照不改配置：config_rev 不变，也不让连接失效。
+    # 只换快照不改配置：config_rev 不变，也不让连接失效；只清本进程的工具清单缓存。
     assert result.server.config.config_rev == 1
     assert connector.invalidated == []
+    assert connector.dropped == [server_id]
 
 
 async def test_failed_refresh_keeps_snapshot_and_reports_error() -> None:
@@ -390,6 +395,8 @@ async def test_failed_refresh_keeps_snapshot_and_reports_error() -> None:
     assert result.diff.is_empty
     assert [tool.name for tool in result.server.tools] == ["a"]
     assert result.server.last_probe_error == "连接 MCP server 失败"
+    # 探测失败时保留旧清单缓存，回合照常使用。
+    assert connector.dropped == []
 
 
 async def test_list_tools_reads_snapshot_without_probe() -> None:

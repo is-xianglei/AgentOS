@@ -12,7 +12,7 @@ from core.event_bus import StreamBus
 from core.events import ORCHESTRATOR_ACTOR, Actor
 from harness.app.ports import SubAgentLauncher
 from harness.app.tool_set import ToolSet, platform_tools
-from harness.domain.review import ToolPolicyLookup, check_capability
+from harness.domain.review import check_capability
 from harness.domain.tool import ScopedGrant, ShellAccess, ToolContext, ToolOutput, ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from tools.context import ToolExecutionContext
@@ -246,12 +246,13 @@ class ToolCatalogService:
 
 
 class ToolService:
-    def __init__(self, db: AsyncSession, registry: ToolSet, policy_source: ToolPolicyLookup):
+    def __init__(self, db: AsyncSession, registry: ToolSet, policy_source: ToolSet):
         """初始化工具执行器依赖；policy_source 是本回合的策略全集，由网关或运行时传入。"""
         self.db = db
         self.registry = registry
         # 能力策略按工具名查策略全集，而不是 registry：registry 是裁剪后的
         # 可见集合，被裁掉的工具若按它查会变成 unknown，从而跳过下面的能力检查。
+        # 工具来源（tool_calls.source）同样按策略全集查。
         self.policy_source = policy_source
         self.tool_repo = ToolRepository(db)
         self.catalog_repo = ToolCatalogRepository(db)
@@ -265,9 +266,13 @@ class ToolService:
         message_id: int | None = None,
         agent_id: int | None = None,
     ) -> ToolCallRecord:
-        """创建工具调用记录，并尽可能关联数据库工具目录。"""
+        """创建工具调用记录，并尽可能关联数据库工具目录。
+
+        作用域工具（如 MCP）不在工具目录里，tool_id 为 NULL；来源建出记录后再写，
+        不经仓储 start 的参数，内置工具的落库动作因此与原来逐个相同。
+        """
         tool_record = await self.catalog_repo.get_by_runtime_name(tool_name)
-        return await self.tool_repo.start(
+        record = await self.tool_repo.start(
             session_id,
             tool_name,
             input_args,
@@ -275,6 +280,11 @@ class ToolService:
             tool_id=tool_record.id if tool_record else None,
             agent_id=agent_id,
         )
+        source = self.policy_source.source_of(tool_name)
+        if source is not None:
+            record.source = source
+            await self.db.flush()
+        return record
 
     async def get_interaction_call_required(
         self,
@@ -515,7 +525,12 @@ class ToolService:
                 )
             )
             raise
-        await self.tool_repo.succeed(record, output.text)
+        # is_error 的结果（如 MCP 的 isError、调用超时）记为失败，失败文本仍原样交给模型；
+        # 文本已由工具自己截断（MCP 按 mcp_max_output_chars）。内置工具不会返回 is_error。
+        if output.is_error:
+            await self.tool_repo.fail(record, output.text)
+        else:
+            await self.tool_repo.succeed(record, output.text)
         await self.db.flush()
         logger.info(
             "工具执行完成",
@@ -523,7 +538,7 @@ class ToolService:
                 "session_id": session_id,
                 "turn_id": str(turn_id),
                 "tool_name": tool_name,
-                "status": "success",
+                "status": "error" if output.is_error else "success",
                 "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
             },
         )
@@ -538,6 +553,7 @@ class ToolService:
                 tool_name=tool_name,
                 tool_input=input_args,
                 tool_output=output.text,
+                is_error=output.is_error,
             )
         )
         return output

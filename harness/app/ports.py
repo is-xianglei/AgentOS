@@ -310,6 +310,15 @@ class ToolSourceFault:
     kind: Literal["unavailable", "auth_required", "timeout", "invalid"]
     message: str
 
+    def to_dict(self) -> dict[str, Any]:
+        """tool_sources 事件里的一项故障；不含授权地址、请求头和异常细节。"""
+        return {
+            "source": self.source,
+            "server_id": self.server_id,
+            "kind": self.kind,
+            "message": self.message,
+        }
+
 
 @dataclass(frozen=True)
 class ScopedTools:

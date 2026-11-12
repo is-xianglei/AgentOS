@@ -85,6 +85,12 @@ class ToolCallRecord(Base):
         comment="发起调用的Agent ID",
     )
     tool_name: Mapped[str] = mapped_column(String(120), index=True, comment="工具名称")
+    source: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+        comment="工具来源，NULL为内置工具，MCP工具为mcp:{server_key}",
+    )
     input_args: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(json_type()),
         default=dict,

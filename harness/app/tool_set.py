@@ -58,6 +58,20 @@ class ToolSet:
         """按工具参数 schema 校验并规范化输入，供执行和人工恢复共用。"""
         return self.get(name).normalize_arguments(data)
 
+    def source_of(self, name: str) -> str | None:
+        """按名查工具来源：内置工具或不在本工具集里时为 None，作用域工具如 "mcp:{server_key}"。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        return tool.source
+
+    def route_snapshot_of(self, name: str) -> dict[str, Any] | None:
+        """按名取工具的路由快照（见 Tool.route_snapshot）；不在本工具集里时为 None。"""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        return tool.route_snapshot()
+
     @property
     def names(self) -> frozenset[str]:
         return frozenset(self._tools)

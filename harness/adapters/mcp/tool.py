@@ -73,6 +73,10 @@ class McpTool(Tool):
         self._max_output_chars = max_output_chars
         self._validator: Validator | None = None
 
+    def route_snapshot(self) -> dict[str, Any]:
+        """路由键（含 config_rev 与 schema 摘要）：审批挂起时冻结，恢复时不一致就不执行。"""
+        return self.ref.to_dict()
+
     def normalize_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """按 inputSchema 校验入参（JSON Schema 2020-12），不合法时抛中文异常，审核链据此拒绝。
 

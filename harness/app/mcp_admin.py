@@ -1,7 +1,7 @@
 """McpAdminService：MCP server 管理的应用层入口，编排「持久化 + 网络」两件事。
 
 顺序固定为：先经 McpServerRegistry 在库里校验角色、可见性和重名 → 经 McpServerConnector 探测 →
-探测成功才写库 → 让本进程的连接与缓存失效。角色、上限与重名这些业务规则归数据所属域
+探测成功才写库 → 让本进程的连接与缓存失效（手动刷新只清工具清单缓存）。角色、上限与重名这些业务规则归数据所属域
 （mcp_server 的 McpServerService），这里只编排，不重复校验。
 
 管理接口照常走 get_db 的请求事务：探测期间事务空闲挂着，最长挂 mcp_probe_timeout_seconds；
@@ -106,8 +106,9 @@ class McpAdminService:
         """强制重新探测并拉取完整工具清单，返回与上次快照的差异（新增、删除、schema 变化）。
 
         探测失败不抛错：记下失败时间与错误、保留旧快照，结果里带中文错误。
-        只换快照（管理界面与权限规则校验用）不改配置，config_rev 不变，也不让连接失效：
-        回合里的工具清单走 SDK 响应缓存，按 mcp_tools_cache_seconds 过期后感知变化。
+        只换快照（管理界面与权限规则校验用）不改配置，config_rev 不变，也不让连接失效；
+        探测成功后清掉本进程里这个 server 的工具清单缓存，下一回合就拉到新清单，
+        其他实例仍按 mcp_tools_cache_seconds 过期后感知变化。
         """
         current = await self._registry.load_for_write(self._workspace_id, self._user_id, server_id)
         config = current.view.config
@@ -120,6 +121,7 @@ class McpAdminService:
         )
         if not probe.ok:
             return McpRefreshResult(server=server, diff=McpToolDiff(), error=probe.error)
+        await self._connector.drop_cached_tools(server_id)
         return McpRefreshResult(server=server, diff=diff_tools(current.view.tools, probe.tools))
 
     @staticmethod

@@ -194,6 +194,14 @@ class Tool(ABC):
             input_schema=self.parameters,
         )
 
+    def route_snapshot(self) -> dict[str, Any] | None:
+        """审批挂起时冻结的路由快照（JSON 可序列化），恢复时与重新解析出的同名工具比对。
+
+        不一致说明审批之后工具已变（删除、配置版本或 schema 变化），该调用不能执行。
+        内置工具是进程级的，挂起期间不会变化，返回 None 表示无需核对；MCP 工具返回路由键。
+        """
+        return None
+
     @abstractmethod
     def normalize_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """按参数 schema 校验并规范化入参，供执行和人工恢复共用；不合法时抛中文异常。"""

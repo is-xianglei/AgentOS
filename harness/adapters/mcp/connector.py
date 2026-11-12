@@ -1,4 +1,4 @@
-"""McpConnector：McpServerConnector 的实现，探测与缓存失效。
+"""McpConnector：McpServerConnector 的实现，探测、连接失效与工具清单缓存清除。
 
 探测不进连接池、不读写共享缓存：用一条临时连接建连并翻页拉完整工具清单（强制刷新），
 整体受 probe_timeout 限制，结束即关闭。失败不抛异常，结果里带可展示的中文错误；
@@ -80,6 +80,9 @@ class McpConnector(McpServerConnector):
 
     async def invalidate(self, server_id: int) -> None:
         self._runtime.invalidate(server_id)
+
+    async def drop_cached_tools(self, server_id: int) -> None:
+        await self._runtime.drop_cached_tools(server_id)
 
     @staticmethod
     def _failure(exc: Exception, context: dict[str, object]) -> McpProbeResult:

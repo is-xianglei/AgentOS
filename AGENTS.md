@@ -83,10 +83,11 @@ Agent 核心（harness）约定：
     管理场景（工具目录、绑定校验、权限规则配置），不要自建工具集。任何新的进程入口（脚本、Worker）
     只要用到 tools 或 permission，必须先导入 harness.bootstrap（导入即登记进程级工具集），
     否则取用时抛中文异常。
-11. 七份黄金测试固化对外行为：发给模型的请求 tests/test_model_request_golden.py、工具描述
+11. 八份黄金测试固化对外行为：发给模型的请求 tests/test_model_request_golden.py、工具描述
     tests/test_tool_spec_golden.py、审核结果 tests/test_tool_review_golden.py、记忆接入
     tests/test_memory_port_golden.py、角色上下文 tests/test_role_context_golden.py、循环事件与
-    落库 tests/test_react_loop_golden.py、HTTP 入口 tests/test_agent_service_golden.py。
+    落库 tests/test_react_loop_golden.py、HTTP 入口 tests/test_agent_service_golden.py、
+    MCP 工具（发给模型的 tools、审批推导、结果转换）tests/test_mcp_tool_golden.py。
 12. 改动黄金测试覆盖的行为时，先说明为什么要改，再用改动后代码的实际产出重新生成
     tests/fixtures/ 下对应的 *_golden.py（带 SHA-256 的一并更新），不允许手改字面量。
 13. 已登记的已知依赖：memory/jobs/*、memory/recall/service.py、model_service/service.py
