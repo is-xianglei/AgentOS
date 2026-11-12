@@ -184,8 +184,8 @@ class ApprovalMode(StrEnum):
 class McpToolAnnotations:
     """MCP ToolAnnotations 的领域投影。None 表示 server 没给，判定时按规范默认值处理。
     只保留参与判定的两项；idempotentHint、openWorldHint 本期不影响任何行为，不建模。"""
-    read_only: bool | None
-    destructive: bool | None
+    read_only: bool | None = None
+    destructive: bool | None = None
 
 @dataclass(frozen=True)
 class McpToolRef:
@@ -197,8 +197,13 @@ class McpToolRef:
     model_name: str
     schema_sha256: str              # inputSchema 规范化序列化后的摘要，挂起快照核对用
 
-def model_tool_names(server_key: str, remote_names: Iterable[str]) -> dict[str, str]:
-    """把一个 server 的工具原名映射为模型可见名（原名 → 模型名），结果与输入顺序无关。"""
+@dataclass(frozen=True)
+class McpToolNaming:
+    names: dict[str, str]               # 原名 → 模型名，已去掉相撞的工具，按原名排序
+    collided: tuple[str, ...] = ()      # 模型名相撞（含原名重复）被剔除的原名，调用方记 invalid fault
+
+def model_tool_names(server_key: str, remote_names: Iterable[str]) -> McpToolNaming:
+    """把一个 server 的工具原名映射为模型可见名，结果与输入顺序无关；server_key 不合法时抛中文异常。"""
 
 def requires_approval(mode: ApprovalMode, annotations: McpToolAnnotations) -> bool:
     """审批模式与注解 → ToolPolicy.requires_approval。"""
@@ -208,7 +213,63 @@ def mcp_tool_policy(model_name: str, *, requires_approval: bool) -> ToolPolicy:
     （即全部 7 个档位，含 orchestrator 和 delegate），bindable_profiles 为空。
     哪些档位能看到 MCP 工具由 ToolBinding 决定（见 6.2 节），不靠档位策略。Agent 按 server 绑定，
     不经 tools 表的 tool_id 绑定，所以不需要 bindable。"""
+
+def validate_server_key(server_key: str) -> str: ...           # 不合法抛中文 AgentException，合法原样返回
+def mcp_source(server_key: str) -> str: ...                    # "mcp:{server_key}"
+def schema_digest(schema: Mapping[str, Any]) -> str: ...       # 键排序、紧凑分隔后的 SHA-256
+def validate_static_headers(headers: Mapping[str, str]) -> None: ...  # 8.1 节的请求头规则，错误不带值
 ```
+
+M1a 落地的签名（`harness/domain/mcp.py`）：
+- `model_tool_names` 不返回 `dict`，改返回 `McpToolNaming`，把第 5 条「碰撞两个都剔除」的结果交给调用方记 fault，领域层不记日志。
+- 值类型（4.1 节提到的三项，外加 `McpServerEntry`、`McpToolSummary`、`McpAuthType`）：
+
+```python
+class McpAuthType(StrEnum): NONE = "none"; STATIC_HEADERS = "static_headers"; OAUTH = "oauth"
+
+@dataclass(frozen=True)
+class McpServerConfig:
+    server_id: int | None                 # None 表示尚未落库（创建前的探测）
+    workspace_id: int
+    owner_user_id: int | None             # None 为共享 server
+    server_key: str
+    url: str
+    auth_type: McpAuthType = McpAuthType.NONE
+    approval_mode: ApprovalMode = ApprovalMode.ALWAYS
+    tool_allowlist: tuple[str, ...] = ()
+    tool_denylist: tuple[str, ...] = ()
+    call_timeout_seconds: float | None = None
+    config_rev: int = 1
+    is_enabled: bool = True
+    # is_private / source 属性；require_id()、allows(remote_name)、call_timeout(global_cap) 方法
+
+@dataclass(frozen=True)
+class McpSecret:                          # 只经 McpSecret.from_headers(...) 构造，构造时按 8.1 节校验；repr 不输出值
+    headers: tuple[tuple[str, str], ...]
+
+@dataclass(frozen=True)
+class McpServerEntry:                     # McpServerSource 的返回元素：配置加凭证
+    config: McpServerConfig
+    secret: McpSecret | None = None
+
+@dataclass(frozen=True)
+class McpToolSummary:                     # tools_snapshot 的元素，to_dict() 即落库形状
+    name: str; description: str; input_schema_sha256: str; annotations: McpToolAnnotations
+
+@dataclass(frozen=True)
+class McpProbeResult:                     # success(...) / failure(error) 两个工厂方法
+    ok: bool
+    error: str | None = None
+    server_name: str | None = None
+    server_version: str | None = None
+    protocol_version: str | None = None
+    tools: tuple[McpToolSummary, ...] = ()
+```
+
+- 授权分区（5.2 节）：`workspace_partition(id) -> "ws:{id}"`、`user_partition(id) -> "user:{id}"`，以及
+  `auth_partition(config, *, workspace_id, user_id) -> str`：私有 server 取 `user:{owner_user_id}`，共享 server 的 OAuth 取
+  `user:{user_id}`（留给 M3），共享 server 的静态请求头和无认证取 `ws:{workspace_id}`。身份与配置不符（跨工作区、别人的私有 server）
+  抛中文 AgentException，不回落。
 
 **命名算法 `model_tool_names`**（参考 codex `codex-mcp/src/tools.rs` 与 openai-agents `mcp/util.py`）：
 
@@ -305,6 +366,26 @@ class McpServerRegistry(Protocol):
 
 `McpServerConfig`（地址、认证方式、审批模式、工具过滤、超时、`owner_user_id`）、`McpSecret`（静态请求头）、
 `McpProbeResult`（server 信息、工具清单摘要、错误）都是领域值类型，放在 `harness/domain/mcp.py`。
+
+M1a 落地（`harness/app/mcp_port.py`）：
+- `McpServerConnector` 只有 `probe` 和 `invalidate` 两个抽象方法，OAuth 的两个半程留到 M3；`McpServerRegistry` 留到 M1b。
+  `probe` 失败不抛异常，结果里带中文错误；只有地址不合法（SSRF 校验不通过）抛中文 AgentException，属于调用方输入错误。
+- 新增窄接口 `McpServerSource`，是 `McpToolProvider` 唯一的数据来源，**M1b 由 mcp_server 域按它实现**：
+
+```python
+class McpServerSource(Protocol):
+    """按身份列出可用 server 配置与凭证的窄接口，M1b 由 mcp_server 域实现。
+
+    返回 scope 所在工作区已启用的共享 server，加上 scope.user_id 本人的私有 server；
+    server_id 一律非空。实现自己开短数据库会话，读完即关，不占用回合的事务。
+    """
+
+    async def list_servers(self, scope: ToolScope) -> Sequence[McpServerEntry]: ...
+```
+
+  放在应用层而不是适配层：mcp_server 域不能导入 `harness.adapters`（12.1 节），而它要满足这个协议、构造 `McpServerEntry`。
+  这和 `SessionService` 结构化满足 `SessionStore` 是同一种做法。第 2 节说的「经 `session_factory` 开短会话」由实现方负责，
+  适配器只认这个协议。
 
 ### 4.2 编排：`TurnToolResolver`
 
@@ -415,6 +496,17 @@ harness/adapters/mcp/
 - `jsonschema` 要在 `ArgumentsRule` 里直接使用（9.1 节），改成直接依赖。`pyjwt` 现在是 mcp 带进来的传递依赖，
   而 `auth/service.py`、`api/deps.py` 直接 `import jwt`，借这次改依赖一并补成直接依赖。
 - 本文写到的 SDK 行为都以 v2.3 源码为准（本地克隆 commit `77001c9`），升级到新的小版本时要重新核对 5.3、5.6 和 8.2 节。
+- **M1a 实际安装与核对**（2026-11-12）：
+  - `pyproject.toml` 改为 `mcp>=2.3,<3`、`jsonschema>=4.26.0`、`pyjwt>=2.13.0`，`uv lock` 解析到 `mcp 2.3.0`。
+    lock 的变化：新增 `mcp-types 2.3.0`、`opentelemetry-api 1.45.2`；去掉 `mcp[cli]` 带进来的 `typer`、`rich`、`shellingham`、
+    `markdown-it-py`、`mdurl`，以及 v1 的 `httpx-sse`。starlette 1.3.0、sse-starlette 3.4.5、uvicorn 0.49.0、httpx2 2.10.0、
+    anyio 4.13.0、jsonschema 4.26.0、pyjwt 2.13.0 版本都没变，没有冲突。
+  - 已安装的 2.3.0 与克隆 `77001c9` 的差异只在 client extension（`Client.extension()`、`ClientExtensionBinding`、`client/extensions/`）、
+    `server/skills.py` 和若干 server 端文件；本文引用的 `client/streamable_http.py`、`client/caching.py`、`shared/_httpx_utils.py`、
+    `shared/inbound.py`、`client/auth/oauth2.py`、`client/auth/utils.py` 两边逐字节相同，`client/client.py`、`client/session.py`
+    里本文引用的段落也没变，不影响设计。
+  - SDK 的 `mcp` 日志器在 DEBUG 档会打出完整的 server 地址（`client/streamable_http.py:756`）和请求体（`:635`），
+    已加进 `core/logging.py` 的第三方日志下限，与 openai、anthropic、httpx2 同一处理。
 
 ### 5.2 连接生命周期
 
@@ -443,6 +535,20 @@ harness/adapters/mcp/
 - **关闭**：`McpRuntime.aclose()` 通知所有托管 task 退出，关闭时用 `CancelScope(shield=True)` 加
   `move_on_after(3)` 收尾，避免关闭过程被外层的取消打断。lifespan 退出时，在 `shutdown_executions()` 之后调用它。
 - **多实例**：连接和缓存都是进程本地的，不需要会话亲和。同一个用户的两个回合落在不同实例上，各自建连。
+
+M1a 落地（`pool.py`、`runtime.py`），与上文不同的三处：
+- **不用队列**：托管 task 只负责 `async with` 的进入与退出，调用方在自己的 task 里直接用 `Client` 发请求，
+  经 `Lease.run(awaitable)` 同时等「结果」和「托管 task 结束」；后者先到就取消调用并抛 `McpConnectionLost`。
+  实测 SDK v2 允许跨 task 在同一个 `Client` 上并发发请求（anyio 只约束 `async with` 的进出），
+  调用方被取消时请求也随调用方的 task 取消，不用再经队列转一手。
+- **`fail_after` 包在 `AsyncExitStack` 外面**：写成 `async with AsyncExitStack(): with fail_after(...): enter_async_context(Client)`
+  时，SDK 在栈里开的 task group 与 `fail_after` 的 cancel scope 交错退出，anyio 报
+  「Attempted to exit a cancel scope that isn't the current tasks's current cancel scope」。所以改成 `fail_after` 在外、
+  建连成功后把 deadline 设为无穷大，关闭时再设成 3 秒后。
+- **关闭**：在 asyncio 后端上，anyio 的 `CancelScope(shield=True)` 挡不住原生 `task.cancel()`（实测），
+  所以 `aclose()` 把收尾放进独立任务，再用 `asyncio.shield` 等它，3 秒后仍未退出的托管 task 直接取消。
+- 排队等空闲连接最多等 `mcp_connect_timeout_seconds`，到时报「连接数已满」，不无限挂起。
+- 池与 SDK 无关（`ConnectionPool[C]`，Client 类型是泛型参数），容量、LRU 和空闲回收可以脱离 SDK 单测。
 
 ### 5.3 工具发现与缓存
 
@@ -482,12 +588,26 @@ SDK v2 的 `Client` 按会话维护工具状态：
   - 存在 `x-mcp-header` 映射但不合法的工具定义，按规范要求剔除。
 - **过滤**：管理员配置的 `tool_allowlist` / `tool_denylist` 按 **MCP 原名**匹配，在命名之前就过滤掉。
 
+M1a 落地（`provider.py`、`runtime.py`）：
+- 构造签名 `McpToolProvider(*, runtime: McpRuntime, servers: McpServerSource, limits: McpProviderLimits)`，三项都必填；
+  `McpProviderLimits(list_timeout, call_timeout, max_output_chars, max_schema_bytes)`、
+  `McpRuntimeLimits(connect_timeout, idle_seconds, pool_max_connections, tools_cache_seconds)` 由组装根从 Settings 读好后传入，
+  适配器内部不读配置。`ScopedToolProvider.name` 为 `"mcp"`。
+- 「最近一次成功的清单」按 `(server_id, config_rev, partition)` 存在 `McpRuntime` 里（不是上文的 `(server_id, partition)`），
+  `config_rev` 变化或 `invalidate` 后旧清单立即作废：配置已变，旧清单不可信。
+- server 给的 `ttlMs` 由 `_CappedTtlStore`（`InMemoryResponseCacheStore` 的子类）在 `set` 时截断，过期时间不超过写入时刻加
+  `mcp_tools_cache_seconds`。SDK 自己还有 24 小时的硬上限（`client/caching.py` 的 `MAX_TTL_MS`）。
+- 非法 `x-mcp-header`：2026-07-28 的连接上 SDK 在 `_absorb_tool_listing` 里直接剔除（只记 SDK 日志，`client/session.py:1291-1302`），
+  适配器看不到；旧版协议的连接 SDK 不查，适配器再用 SDK 的 `find_invalid_x_mcp_header` 查一次，剔除时记 invalid fault。
+- 翻页上限、重复 cursor 判定由 `list_all_tools(client, *, refresh=False)` 实现，探测（`refresh=True`）与回合解析共用。
+- 来源返回了不属于该身份的 server（`auth_partition` 抛异常）时，只让这一个 server 缺席并记 invalid fault，不让整个来源失败。
+
 ### 5.4 调用
 
 `McpTool.execute(arguments, ctx)` 的流程：
 
-1. 用 `ctx.workspace_id`、`ctx.user_id` 重新算出授权分区，取得连接。冻结在工具里的 `McpToolRef` 只决定路由，
-   不携带凭证，所以工具对象可以安全地复用。
+1. 用 `ctx.workspace_id`、`ctx.user_id` 重新算出授权分区（同时核对 server 归属），取得连接。`McpToolRef` 只决定路由；
+   调用闭包里带着本回合解析时读到的配置和静态请求头，工具对象只在本回合（含子执行）内使用，不落库、不进续跑状态。
 2. `call_tool(remote_name, arguments, read_timeout_seconds=...)`。超时取 server 配置和全局 `mcp_call_timeout_seconds`
    中较小的那个。超时或者被取消时，SDK 会按传输方式通知 server：HTTP 关闭响应流，stdio 发 `notifications/cancelled`。
 3. 结果交给 `results.py` 转换，见 5.5 节。
@@ -510,6 +630,24 @@ SDK v2 的 `Client` 按会话维护工具状态：
   把 `tool_calls.status` 记为 `failed`，`error_message` 存截断后的文本，PostToolUse 钩子的载荷里带上 `is_error`。
   这样按 `source` 就能统计每个 server 的调用失败率。「工具执行完成」日志里的状态字段也按 `is_error` 取值。
   内置工具不会返回 `is_error=True`，现有的落库和日志都不变。
+
+M1a 落地（`tool.py`），按 SDK 2.3.0 的实际行为细化了上表：
+- 构造签名 `McpTool(*, ref, description, parameters, policy, call, call_timeout, max_output_chars)`；`call` 是
+  `(McpToolRef, arguments, ToolContext, timeout) -> CallToolResult` 的回调，由 `McpToolProvider` 给出，按回合身份算分区、借连接。
+  调用超时从借到连接之后才开始计，建连另受 `mcp_connect_timeout_seconds` 限制，建连慢不会被误报成「结果未知」。
+- 超时：SDK 读超时到期抛 `MCPError(REQUEST_TIMEOUT)`（`shared/jsonrpc_dispatcher.py:442`），不是 `TimeoutError`，两种都映射成上表的超时文本。
+  实测超时后 server 端的处理会被取消（HTTP 关闭响应流）。
+- 连接断开：调用中后台断开得到 `McpConnectionLost`，或 SDK 的 `MCPError(CONNECTION_CLOSED)`，或 httpx2 的 `TransportError`，
+  一律是「连接失败」、不重试；只有建连阶段的 `McpConnectFailed(retryable=True)` 自动重试 1 次。地址不合法（SSRF）属于不可重试的建连失败。
+- 401：静态请求头和无认证的 server 收到 401 / 403 / 5xx 时，SDK 把它们合成为 `MCPError(INTERNAL_ERROR, "Server returned an error response")`
+  （`client/streamable_http.py:400-432`），按「JSON-RPC 协议错误」返回。「401 且 OAuth 刷新失败」一行留到 M3。
+- outputSchema：SDK 校验失败抛 `RuntimeError("Invalid structured content ...")`（`client/session.py:1118-1154`），映射成上表文本。
+- `input_required`：`Client(input_required_max_rounds=0)`，SDK 一轮都不自动应答，直接抛 `InputRequiredRoundsExceededError`，
+  映射成「该工具需要交互输入，暂不支持」（9.2 节）。SDK 默认会把 elicitation 交给回调，这里不声明该能力。
+- 回合身份与 server 不符（别人的私有 server、跨工作区）由 `auth_partition` 抛中文 AgentException，转成 `ToolOutput.error`，不发请求。
+- `normalize_arguments`：按 schema 声明的方言编译校验器，未声明时用 2020-12（`Draft202012Validator`），`$ref` 只在 schema 文档内解析，
+  不联网（`registry=Registry()`）；不合法抛 `AgentException.message("工具参数校验失败", {tool_name, path, error})`，
+  `ArgumentsRule` 据此拒绝。入参原样返回，不做规范化。
 
 ### 5.5 结果转换（`results.py`）
 
@@ -543,8 +681,8 @@ HugAgentOS 漏掉了 `100.64.0.0/10`（阿里云元数据地址 `100.100.100.200
   
   这组地址全部写进测试用例。
 - **按 IP 连接，防 DNS rebinding**：校验用的那份解析结果，就是连接时用的地址。传输层固定连到校验过的 IP，
-  同时保留原主机名用于 SNI 和 Host 头。具体实现方式（自定义 `httpx2` transport，或者自定义 resolver）在 M1 阶段确定，
-  并回写到本文。固定 IP 按主机生效：OAuth 元数据、授权服务器这类不同主机的请求，各自解析、各自校验、各自固定。
+  同时保留原主机名用于 SNI 和 Host 头。M1a 选定自定义 `httpx2` transport（见本节末尾），
+  固定 IP 按主机生效：OAuth 元数据、授权服务器这类不同主机的请求，各自解析、各自校验、各自固定。
 - **重定向**：SDK v2 不看客户端的 `follow_redirects`，自己决定怎么跟随（`client/streamable_http.py:725-733`）。规则是：
   - 只跟随同源、且请求方法不变的重定向（POST 只认 307/308）；
   - 其他重定向一律不跟随，并报错；
@@ -555,6 +693,26 @@ HugAgentOS 漏掉了 `100.64.0.0/10`（阿里云元数据地址 `100.100.100.200
 - 内网 server 需要运维显式放行：`mcp_allowed_private_hosts` 是一份主机名精确匹配的白名单，默认为空。
   白名单只对共享 server 生效，私有 server 的地址必须是公网地址。
 - 每个请求的请求头只来自 server 配置和 OAuth，不转发入站请求的任何头。请求头的值禁止包含 CR 或 LF。
+
+M1a 落地（`http.py`）：**选定自定义 httpx2 transport**，不做自定义 resolver。
+- httpx2 没有可注入的 resolver 接口，`AsyncHTTPTransport` 也不接受 httpcore2 的 `network_backend`（`httpx2/_transports/default.py:274-305`），
+  自定义 resolver 只能改 httpcore2 的私有构造，所以选 transport 包装：
+  `PinnedTransport(inner, *, policy, resolver, pinned=None)` 是一个 `httpx2.AsyncBaseTransport`，把请求 URL 的主机换成校验过的 IP，
+  原主机名留在 Host 头（客户端构造请求时已写好）和 `sni_hostname` 请求扩展里。httpcore2 建 TLS 时优先用 `sni_hostname`
+  （`httpcore2/_async/connection.py:136`），证书照常按主机名校验。响应的 `request` 换回原请求，上层看到的仍是主机名，
+  SDK 的同源重定向判定按主机名做。
+- 固定结果按 `(主机, 端口)` 缓存在 transport 实例上，即跟着连接池里的一条连接走：
+  - `McpHttpFactory.check(config) -> PinnedOrigin` 做完整校验（地址格式加 DNS），返回的 IP 经 `create(config, secret, pinned)`
+    预置进 transport，建连时直接连这个 IP，不再解析第二次；
+  - 其他主机（OAuth 元数据、授权服务器）首次请求时由 transport 自己解析、校验、固定，校验不通过抛 `httpx2.ConnectError`，请求不发出。
+- 内层 transport 是 `httpx2.AsyncHTTPTransport(proxy=None, trust_env=False)`，客户端也 `trust_env=False`：环境代理会替我们解析主机，
+  固定 IP 就失效了；`.netrc` 也不读，凭证只来自配置。测试把内层换成挂着假 server 的 `httpx2.ASGITransport`。
+- DNS 经构造参数注入的 `Resolver = Callable[[str, int], Awaitable[Sequence[str]]]`，生产用 `system_resolver`（`anyio.getaddrinfo`），
+  测试用固定结果。多条记录里混有任一非公网地址就整体拒绝；IP 字面量不做 DNS。
+- 内嵌 IPv4 的还原：IPv4 映射、IPv4 兼容（`::/96`）、NAT64 `64:ff9b::/96`、6to4、Teredo（服务器和客户端地址都查）。
+  本地 NAT64 前缀 `64:ff9b:1::/48` 的前缀长度由运营方决定，按 RFC 6052 的 48、56、64、96 各还原一次，任一结果不是公网就拒绝。
+- URL 校验另外拒绝空白和控制字符：URL 解析器会悄悄剥掉它们，造成校验与连接看到的地址不一致。
+- 白名单经 `AddressPolicy.for_server(config, ...)` 生效，私有 server 一律传空集合；命中白名单的主机跳过公网校验，但仍固定 IP。
 
 ## 6. 回合内的工具集
 
@@ -1152,6 +1310,11 @@ class Harness:
 - `AGENTOS_PUBLIC_BASE_URL` 缺失时，Settings 仍然能加载，但第一次用到 OAuth 就会抛具体的中文错误，并指出缺的是哪个配置项。
   这样既不影响不用 MCP 的部署启动，也不会静默回落。
 - 超时之间必须满足 `CONNECT < LIST < RESOLVE`，Settings 校验时检查，不满足就启动失败。
+- M1a 已加入 `ENABLED`、`CONNECT`、`LIST`、`PROBE`、`CALL`、`IDLE`、`POOL_MAX_CONNECTIONS`、`TOOLS_CACHE`、`MAX_OUTPUT_CHARS`、
+  `MAX_SCHEMA_BYTES`、`ALLOW_INSECURE_HTTP`、`ALLOWED_PRIVATE_HOSTS`（`RESOLVE` 在 M0b 已加入），类型与默认值同上表，
+  超时校验是 `Settings._check_mcp_timeouts`（`model_validator`）。`PUBLIC_BASE_URL`、`OAUTH_REFRESH_SKEW_SECONDS` 留到 M3，
+  `MAX_PRIVATE_SERVERS_PER_USER` 留到 M1b。适配器不读 Settings，由组装根读好后经 `McpRuntimeLimits`、`McpProviderLimits`、
+  `McpHttpFactory` 和 `McpConnector` 的构造参数传入；`ALLOWED_PRIVATE_HOSTS` 经 `http.parse_allowed_hosts` 解析成小写集合。
 
 ## 12. 测试策略
 
@@ -1173,6 +1336,13 @@ class Harness:
   `tools/service.py` 只查 `ToolService` 这一个类，同模块的 `ToolCatalogService` 属于管理场景。
 - `dangerous_tools` 检查扫描一方包、`tests/` 和 `alembic/`，只认标识符（名称、属性、导入名与别名、定义名），
   注释、文档字符串和本文这类 Markdown 不算；检查器所在的 `test_import_isolation.py` 本身不扫。
+- M1a 落地其余四条，各配合成源码的违规自测：
+  - `mcp` 检查同时管 `mcp` 和 `mcp_types` 两个顶层包（`mcp_types` 是 v2 拆出的类型包，同样只能在适配层用），
+    `harness.domain.mcp`、`mcp_server` 这类项目内同名模块和相似包名不误报；另加一条互斥检查：MCP 适配器不导入模型 SDK，
+    模型适配器不导入 MCP SDK，两条 SDK 规则不冲突。
+  - `mcp_server` 包不存在时没有模块可查，三条相关检查直接通过；包存在时先断言它被模块枚举覆盖，防止空转。
+    自测用固定的合成模块集合，期望值在建包前后不变。已在临时工作树里放入违规文件实测三条检查都会报错。
+  - 测试夹具（`tests/`）不在一方模块扫描范围内，`tests/fixtures/mcp_fake.py` 可以直接导入 SDK 写假 server。
 
 ### 12.2 替身与集成
 
@@ -1191,6 +1361,19 @@ class Harness:
   - 跨源重定向；
   - rebinding（校验时和连接时解析结果不同）；
   - 私有 server 的地址命中 `mcp_allowed_private_hosts` 时仍然拒绝。
+- **M1a 落地的测试文件**：
+  - `tests/test_mcp_domain.py`：命名性质（顺序无关、≤64、字符合法、跨 server 不撞名、固定期望名、有损清洗加后缀、64 字符边界、碰撞剔除），
+    `requires_approval` 三档 × 注解 3×3 的完整真值表，`validate_server_key`，授权分区，配置过滤与超时，请求头校验。
+  - `tests/test_mcp_http.py`：5.6 节列出的全部地址（含 Teredo、本地 NAT64 /48、6to4），URL 校验，多 A 记录混私网、rebinding、
+    另一主机首次连接时解析到内网、跨源 3xx 不跟随、只发配置的请求头、私有 server 命中白名单仍拒绝。
+  - `tests/test_mcp_pool.py`：脱离 SDK 测连接池，复用与分区隔离、LRU、全忙排队及其上限、空闲回收、建连失败与超时、后台断开、失效、关闭被取消仍收尾。
+  - `tests/test_mcp_adapter.py`：走真实的 Streamable HTTP、`PinnedTransport` 和 SDK `Client`，内层用 `httpx2.ASGITransport` 挂
+    `tests/fixtures/mcp_fake.py` 的低层 `Server`（可编程的工具清单、分页、`ttlMs`、调用处理与故障闸门）。
+    覆盖分页、过滤、schema 预处理、命名碰撞、重复 cursor、`isError`、结构化结果、图片占位、入参校验、超时（server 端随之取消）、
+    调用方取消、连接断开、HTTP 错误、建连重试 1 次、回合身份重算分区、`input_required`、缓存按 partition 隔离、TTL 截断与 `config_rev` 换键、
+    刷新失败沿用旧清单、单个慢 server 只让自己超时、静态请求头、DNS 指向内网、池容量与空闲回收、outputSchema 不符、探测、失效与结果转换表。
+  - 上文说的 `Client(MCPServer)` 进程内直连走的是 SDK 的 `DirectDispatcher`，绕过了 HTTP 和 SSRF 层，所以 M1a 的适配层测试统一改用
+    `ASGITransport`，一条链路同时测到 transport 固定 IP 与 SDK 行为。
 - **运行时**：`tests/fixtures/` 新增一个内存版 `ScopedToolProvider`，测试时经 `harness_factory` 注入，验证：
   - 模型请求里 tools 的顺序；
   - fault 事件；
@@ -1301,6 +1484,14 @@ class Harness:
 M0 分两步提交：
 - M0a（已实现）：6.1 节第 1～3 步中与作用域无关的部分，即按名查策略改查 `policies`、`ToolOutput`、删除 `dangerous_tools()` 和审核员的 None 回落、12.1 节最后两条静态检查、12.3 节的三处替身；
 - M0b（已实现）：其余部分，即 `Tool.source`、`ToolScope`、`ToolBinding`、`ScopedGrant`、作用域工具的传递通道、`TurnToolResolver`、`Harness.scoped_tools`、`AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS`、第 15 节的文档修订。
+
+M1 分步实现：
+- M1a（已实现，未提交）：SDK 升级、`harness/domain/mcp.py`、`harness/app/mcp_port.py`（`McpServerConnector` 的 `probe` / `invalidate`
+  与 `McpServerSource`）、`harness/adapters/mcp/`（`http.py`、`pool.py`、`runtime.py`、`provider.py`、`tool.py`、`results.py`、
+  `connector.py`）、第 11 节中 M1 用得到的配置项、12.1 节其余四条静态检查与测试。不建表、不接组装根和 lifespan，
+  适配器只经端口和值类型对外，用进程内假 server 测通。
+- M1b：`mcp_server` 域（两张表、迁移、`McpServerService` 实现 `McpServerSource`、`McpServerRegistry`）、管理接口、组装根与 lifespan，
+  以及 M1 其余各项。
 
 **M0b 对 Workflow 的调整**：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
 推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，

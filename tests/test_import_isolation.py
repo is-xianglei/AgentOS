@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1390,3 +1391,211 @@ def test_removed_approval_list_function_stays_removed() -> None:
 def test_removed_identifier_checker_reports_uses(source: str, expected: list[int]) -> None:
     """检查器自测：定义、导入、别名导入、属性调用与赋值都必须报出，注释、字符串与相似名不得误报。"""
     assert _removed_identifier_uses(ast.parse(source), _REMOVED_IDENTIFIER) == expected
+
+
+# MCP SDK 顶层包名（mcp 与它的类型包 mcp_types），以及唯一允许导入它们的生产代码包。
+# 实测 import mcp 会连带加载 starlette、uvicorn、httpx2，放进应用层或领域层会破坏分层。
+_MCP_SDK_PACKAGES = frozenset({"mcp", "mcp_types"})
+_MCP_SDK_OWNER = "harness.adapters.mcp"
+# MCP 业务域包名；M1b 建包，包不存在时相关检查自然为空，建包后自动生效。
+_MCP_SERVER_PACKAGE = "mcp_server"
+
+
+def _mcp_sdk_imports(tree: ast.Module) -> list[str]:
+    """返回模块中任何位置（含函数体与 ``if TYPE_CHECKING:`` 块）导入 mcp / mcp_types 的模块名。
+
+    相对导入只能指向项目内模块（如 harness.domain.mcp），不计入；mcp_server 等相似包名不误报。
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        found.extend(name for name in names if name.split(".")[0] in _MCP_SDK_PACKAGES)
+    return sorted(found)
+
+
+def _package_imports(
+    tree: ast.Module,
+    source_package: str,
+    known: set[str],
+    package: str,
+) -> list[str]:
+    """返回模块中任何位置导入 package（含子模块）的模块名；相对导入按所在包展开后判断。"""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        for name in sorted(_imported_names(node, source_package, known)):
+            if name == package or name.startswith(f"{package}."):
+                found.append(name)
+    return found
+
+
+def _modules_under(files: dict[str, Path], *packages: str) -> list[str]:
+    return sorted(
+        module
+        for module in files
+        if any(module == package or module.startswith(f"{package}.") for package in packages)
+    )
+
+
+def _scan(
+    files: dict[str, Path],
+    modules: list[str],
+    check: Callable[[ast.Module, str], list[str]],
+) -> list[str]:
+    """对每个模块跑 check(语法树, 所在包)，返回「模块 导入了 名称」形式的违规清单。"""
+    failures: list[str] = []
+    for module in modules:
+        path = files[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        source_package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+        failures.extend(f"  - {module} 导入了 {name}" for name in check(tree, source_package))
+    return failures
+
+
+def _assert_mcp_server_enumerated(files: dict[str, Path]) -> list[str]:
+    """mcp_server 包存在时必须被枚举到，防止检查因枚举遗漏而空转；不存在时返回空清单。"""
+    modules = _modules_under(files, _MCP_SERVER_PACKAGE)
+    if (PROJECT_ROOT / _MCP_SERVER_PACKAGE / "__init__.py").exists():
+        assert _MCP_SERVER_PACKAGE in modules, f"模块枚举未覆盖 {_MCP_SERVER_PACKAGE} 包"
+    return modules
+
+
+def test_mcp_sdk_imported_only_by_mcp_adapters() -> None:
+    """分层防线：除 harness.adapters.mcp 外，生产代码任何位置都不得导入 mcp、mcp_types。"""
+    files = _first_party_module_files()
+    owners = set(_modules_under(files, _MCP_SDK_OWNER))
+    assert {"harness.adapters.mcp.provider", "harness.adapters.mcp.tool"} <= owners, (
+        f"模块枚举未覆盖 MCP 适配器，仅发现: {sorted(owners)}"
+    )
+    others = sorted(module for module in files if module not in owners)
+    failures = _scan(files, others, lambda tree, _package: _mcp_sdk_imports(tree))
+    assert not failures, "MCP 适配器以外的生产代码导入了 MCP SDK:\n" + "\n".join(failures)
+
+
+def test_sdk_owner_rules_do_not_overlap() -> None:
+    """两条 SDK 规则互不冲突：MCP 适配器不导入模型 SDK，模型适配器不导入 MCP SDK。"""
+    files = _first_party_module_files()
+    mcp_owners = _modules_under(files, _MCP_SDK_OWNER)
+    model_owners = _modules_under(files, _MODEL_SDK_OWNER)
+    failures = _scan(files, mcp_owners, lambda tree, _package: _model_sdk_imports(tree))
+    failures += _scan(files, model_owners, lambda tree, _package: _mcp_sdk_imports(tree))
+    assert not failures, "SDK 适配器导入了另一类 SDK:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import mcp", ["mcp"]),
+        ("from mcp import Client", ["mcp"]),
+        ("from mcp.client.caching import CacheConfig", ["mcp.client.caching"]),
+        ("import mcp_types as t", ["mcp_types"]),
+        ("def f():\n    from mcp import Client", ["mcp"]),
+        (
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from mcp_types import Tool",
+            ["mcp_types"],
+        ),
+        ("from harness.domain.mcp import McpToolRef", []),
+        ("from .mcp import provider", []),
+        ("from mcp_server.service import McpServerService", []),
+        ("import mcpx", []),
+    ],
+)
+def test_mcp_sdk_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置导入 mcp / mcp_types 都必须报出，项目内同名模块与相似包名不得误报。"""
+    assert _mcp_sdk_imports(ast.parse(source)) == expected
+
+
+def test_mcp_server_package_does_not_import_adapters_or_sdk() -> None:
+    """分层防线：mcp_server 业务域任何位置都不得导入 harness.adapters 与 MCP SDK，网络 I/O 归适配层。
+
+    包在 M1b 才建；不存在时没有模块可查，检查直接通过，建包后自动生效。
+    """
+    files = _first_party_module_files()
+    known = set(files)
+    modules = _assert_mcp_server_enumerated(files)
+
+    def check(tree: ast.Module, source_package: str) -> list[str]:
+        return [
+            *_adapter_imports(tree, source_package, known),
+            *_mcp_sdk_imports(tree),
+        ]
+
+    failures = _scan(files, modules, check)
+    assert not failures, "mcp_server 包导入了适配层或 MCP SDK:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from harness.adapters.mcp.runtime import McpRuntime", ["harness.adapters.mcp.runtime"]),
+        ("from harness import adapters", ["harness.adapters"]),
+        ("def f():\n    import harness.adapters.mcp.http", ["harness.adapters.mcp.http"]),
+        ("import mcp", ["mcp"]),
+        ("from mcp_types import Tool", ["mcp_types"]),
+        ("from harness.domain.mcp import McpServerConfig", []),
+        ("from harness.app.mcp_port import McpServerSource", []),
+    ],
+)
+def test_mcp_server_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：mcp_server 包里导入适配层或 SDK 的各种写法都必须报出，领域层与端口不得误报。"""
+    known = set(_first_party_module_files())
+    tree = ast.parse(source)
+
+    found = [*_adapter_imports(tree, "mcp_server", known), *_mcp_sdk_imports(tree)]
+
+    assert found == expected
+
+
+# runtime 只经 ScopedToolProvider 端口拿 MCP 工具；应用层经端口访问 server 配置，领域层完全不认识它。
+_MCP_SERVER_FREE_PACKAGES = ("runtime", "harness.app", "harness.domain")
+_MCP_SERVER_SAMPLE_MODULES = frozenset({"mcp_server", "mcp_server.models", "mcp_server.service"})
+_TYPE_CHECKING_MCP_SERVER_IMPORT = (
+    "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from mcp_server.models import X"
+)
+
+
+def test_runtime_app_and_domain_do_not_import_mcp_server() -> None:
+    """分层防线：runtime、harness.app、harness.domain 任何位置都不得导入 mcp_server 包。"""
+    files = _first_party_module_files()
+    known = set(files)
+    guarded = _modules_under(files, *_MCP_SERVER_FREE_PACKAGES)
+    expected = {"runtime.agent", "harness.app.mcp_port", "harness.domain.mcp"}
+    assert expected <= set(guarded), f"模块枚举未覆盖 runtime、应用层与领域层，仅发现: {guarded}"
+
+    def check(tree: ast.Module, source_package: str) -> list[str]:
+        return _package_imports(tree, source_package, known, _MCP_SERVER_PACKAGE)
+
+    failures = _scan(files, guarded, check)
+    assert not failures, "runtime、应用层或领域层导入了 mcp_server 包:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from mcp_server.service import McpServerService", ["mcp_server.service"]),
+        ("import mcp_server", ["mcp_server"]),
+        ("from mcp_server import models", ["mcp_server.models"]),
+        ("def f():\n    from mcp_server.service import X", ["mcp_server.service"]),
+        (_TYPE_CHECKING_MCP_SERVER_IMPORT, ["mcp_server.models"]),
+        ("from ..mcp_server import service", ["mcp_server.service"]),
+        ("from harness.domain.mcp import McpServerConfig", []),
+        ("import mcp", []),
+        ("import mcp_server_utils", []),
+    ],
+)
+def test_mcp_server_package_checker_reports_imports(source: str, expected: list[str]) -> None:
+    """检查器自测：任何位置、任何写法导入 mcp_server 都必须报出，SDK 与相似包名不得误报。
+
+    mcp_server 在 M1b 才建包，这里补上它的子模块名，使期望值在建包前后保持一致。
+    """
+    known = set(_first_party_module_files()) | _MCP_SERVER_SAMPLE_MODULES
+
+    found = _package_imports(ast.parse(source), "runtime", known, _MCP_SERVER_PACKAGE)
+
+    assert found == expected

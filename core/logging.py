@@ -22,6 +22,7 @@ _BUILTIN_FIELDS = set(
 # 这些第三方 SDK 在 DEBUG 档会把完整请求体(system prompt 与对话正文)打进日志,
 # 违反「日志不记录 Prompt 正文」的规范,故其级别设 INFO 下限,不随根级别下探。
 # httpx2/httpcore2 是本项目实际使用的分发名,httpx/httpcore 一并覆盖以防依赖切换。
+# mcp 在 DEBUG 档会打出完整的 server 地址(可能带凭证)和工具调用入参。
 _THIRD_PARTY_FLOOR_LOGGERS = (
     "openai",
     "anthropic",
@@ -29,6 +30,7 @@ _THIRD_PARTY_FLOOR_LOGGERS = (
     "httpcore",
     "httpx2",
     "httpcore2",
+    "mcp",
 )
 
 

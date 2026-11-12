@@ -19,7 +19,9 @@ dependencies = [
     "redis>=5.2.0",
     "greenlet>=3.5.2",
     "pydantic-settings>=2.14.2",
-    "mcp[cli]>=1.28.1",
+    "mcp>=2.3,<3",
+    "jsonschema>=4.26.0",
+    "pyjwt>=2.13.0",
 ]
 
 [tool.pytest.ini_options]

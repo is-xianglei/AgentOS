@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -94,8 +94,24 @@ class Settings(BaseSettings):
     subagent_max_concurrency: int = 3
 
     # --- MCP -----------------------------------------------------------------
+    # 总开关;关闭时不加载任何 MCP 工具。
+    mcp_enabled: bool = True
+    # 超时须满足 CONNECT < LIST < RESOLVE,启动时校验,见 _check_mcp_timeouts()。
+    mcp_connect_timeout_seconds: float = Field(default=10.0, gt=0)  # 建立连接
+    mcp_list_timeout_seconds: float = Field(default=15.0, gt=0)  # 每回合解析单个 server(含建连、翻页)
     # 每回合解析全部作用域工具（MCP）的总超时;超时的来源记为故障,回合照常进行。
     mcp_resolve_timeout_seconds: float = Field(default=20.0, gt=0)
+    mcp_probe_timeout_seconds: float = Field(default=30.0, gt=0)  # 管理员探测(建连加翻页)
+    mcp_call_timeout_seconds: float = Field(default=120.0, gt=0)  # 单次工具调用超时上限
+    mcp_idle_seconds: int = Field(default=300, ge=1)  # 连接空闲多久后回收
+    mcp_pool_max_connections: int = Field(default=64, ge=1)  # 进程内连接总数上限
+    # 工具清单缓存 TTL:server 没给 ttlMs 时用它,给了也不超过它。
+    mcp_tools_cache_seconds: int = Field(default=300, ge=0)
+    mcp_max_output_chars: int = Field(default=20000, ge=1)  # 单次结果交给模型的字符上限
+    mcp_max_schema_bytes: int = Field(default=16384, ge=1)  # 单个工具参数 schema 的大小上限
+    mcp_allow_insecure_http: bool = False  # 只用于开发,允许 http 地址;生产必须为 false
+    # 逗号分隔的内网主机名白名单(精确匹配),只对共享 server 生效。
+    mcp_allowed_private_hosts: str = ""
 
     # --- 数据库 --------------------------------------------------------------
     database_url: str | None = None
@@ -178,6 +194,20 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _check_mcp_timeouts(self) -> Settings:
+        """MCP 超时须满足 CONNECT < LIST < RESOLVE:否则建连还没超时就先被外层打断,启动即失败。"""
+        connect = self.mcp_connect_timeout_seconds
+        list_timeout = self.mcp_list_timeout_seconds
+        resolve = self.mcp_resolve_timeout_seconds
+        if not connect < list_timeout < resolve:
+            raise ValueError(
+                "MCP 超时配置须满足 AGENTOS_MCP_CONNECT_TIMEOUT_SECONDS < "
+                "AGENTOS_MCP_LIST_TIMEOUT_SECONDS < AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS,"
+                f"当前为 {connect} / {list_timeout} / {resolve}"
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(
