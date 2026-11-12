@@ -38,10 +38,12 @@ from harness.app.ports import (
 )
 from harness.app.session_port import SessionStore, StoredSession, StoredTurn
 from harness.app.subagent_catalog import get_subagent_spec
+from harness.app.tool_resolver import ResolvedScope, TurnToolResolver
 from harness.app.tool_set import ToolSet
 from harness.domain.budget import ToolCallBudget
 from harness.domain.memory import MemoryWriteTicket, TurnRef
 from harness.domain.roles.subagent import AgentType
+from harness.domain.tool import ToolScope
 from hooks import HookContext, HookEvent, get_hook_registry
 from interaction.models import RuntimeSuspensionRecord
 from interaction.service import InteractionService
@@ -103,6 +105,7 @@ class AgentRuntime:
         permission_service: PermissionService,
         models: ModelResolver,
         tools: ToolSet,
+        tool_resolver: TurnToolResolver,
         compact_model: Callable[[], ResolvedModel],
         subagents: SubAgentLauncher,
         teammates: SubAgentRunnerFactory,
@@ -113,7 +116,8 @@ class AgentRuntime:
 
         llm 是注入的模型客户端，注入后不再按会话解析模型，后台重建运行时时随之传递；
         reviewer 与 permission_service 共用同一份权限服务；models 按会话解析主模型与压缩模型；
-        tools 是完整工具集；compact_model 在未解析出压缩模型时现建 .env 的 compact 场景模型；
+        tools 是平台工具集，tool_resolver 在后台执行体里每回合解析一次作用域工具；
+        compact_model 在未解析出压缩模型时现建 .env 的 compact 场景模型；
         subagents 是 Agent 工具用的子代理启动器，teammates 为唤醒队友构造子代理运行器，
         session_factory 为后台执行和队友打开独立数据库会话。rebuild 在独立会话里重建运行时：
         组装根只把构造时显式注入的客户端、记忆与会话存储带进去，默认实现绑定新会话重建。
@@ -131,6 +135,7 @@ class AgentRuntime:
         self.plan_service = PlanService(db)
         self.models = models
         self.tools = tools
+        self.tool_resolver = tool_resolver
         self.subagents = subagents
         self._teammates = teammates
         self._session_factory = session_factory
@@ -155,8 +160,15 @@ class AgentRuntime:
         self.bus = bus
         self.lease_owner = lease_owner
 
-    async def _configure_agent(self, session: StoredSession) -> None:
-        """按会话绑定刷新回合配置；解析出压缩模型与阈值时同步给上下文压缩。"""
+    async def _configure_agent(
+        self,
+        session: StoredSession,
+        resolved: ResolvedScope | None = None,
+    ) -> None:
+        """按会话绑定刷新回合配置；解析出压缩模型与阈值时同步给上下文压缩。
+
+        resolved 是后台执行体本回合解析出的作用域工具；请求路径不解析，传 None 只用平台工具。
+        """
         configuration = await configure_turn(
             self.db,
             session,
@@ -166,12 +178,23 @@ class AgentRuntime:
             tools=self.tools,
             subagents=self.subagents,
             injected=self.llm,
+            resolved=resolved,
         )
         if configuration.compact_model is not None:
             self.compact_service.model = configuration.compact_model
         if configuration.compact_threshold is not None:
             self.compact_service.threshold = configuration.compact_threshold
         self.configuration = configuration
+
+    async def _resolve_scope(self) -> ResolvedScope:
+        """后台执行体每回合解析一次作用域工具，身份取运行时可信的用户与工作区。
+
+        请求路径（start、保存人工响应）不调用：解析远程工具可能要几秒，不能拖慢准入。
+        """
+        if self.user_id is None or self.workspace_id is None:
+            raise AgentException.message("缺少可信用户或工作区上下文")
+        scope = ToolScope(workspace_id=self.workspace_id, user_id=self.user_id)
+        return await self.tool_resolver.resolve(scope)
 
     def _interactions(self) -> InteractionFlow:
         """按当前回合配置、事件总线与各域 Service 组装工具执行者与人工交互流程。"""
@@ -295,7 +318,7 @@ class AgentRuntime:
         try:
             session = await self.sessions.get_required(session_id)
             turn = await self.sessions.get_turn_required(turn_id)
-            await self._configure_agent(session)
+            await self._configure_agent(session, await self._resolve_scope())
 
             # Hook 只生成本次模型请求的临时上下文，绝不改写已保存的原始用户消息。
             # 极速模式不触发 Hook。
@@ -444,7 +467,8 @@ class AgentRuntime:
             # 所有恢复者都按 Session -> Suspension 的顺序重新加锁。竞争者会在首个
             # 恢复事务提交后读取最新状态，不会重复应用工具或 Plan Mode 副作用。
             session = await self.sessions.lock_required(session_id)
-            await self._configure_agent(session)
+            # 恢复同样重新解析，回合内的工具集冻结在新的回合配置里。
+            await self._configure_agent(session, await self._resolve_scope())
             interactions = self._interactions()
             point = await interactions.load_resume_point(session_id, request_id)
             turn, suspension = point.turn, point.suspension

@@ -55,13 +55,14 @@ Agent 核心（harness）约定：
    注入，构造参数必填，不得写「参数为 None 就现建默认实现」的回落。可选的 llm 只是测试替身的
    覆盖项：注入时直接用它，不注入时经已注入的 ModelResolver 解析，而不是现建客户端。
    测试经 tests/fixtures/harness_factory.py 走组装根的同一套工厂，不直接构造运行时。
-3. 已有端口：ModelClient、ModelResolver、ToolProvider、ToolCallReviewer、SubAgentLauncher 在
-   harness/app/ports.py；MemoryProvider 在 harness/app/memory_port.py；SessionStore 及
-   TurnContextStore、TurnStateStore、TurnLeaseStore 等窄端口在 harness/app/session_port.py。
+3. 已有端口：ModelClient、ModelResolver、ToolProvider、ScopedToolProvider、ToolCallReviewer、
+   SubAgentLauncher 在 harness/app/ports.py；MemoryProvider 在 harness/app/memory_port.py；
+   SessionStore 及 TurnContextStore、TurnStateStore、TurnLeaseStore 等窄端口在
+   harness/app/session_port.py。
    端口只为多实现的外部能力和需要替身的 I/O 设立，其余 feature 域照旧 Service 调 Service。
-4. 扩展点：接 MCP 时实现 ToolProvider，并在 harness/bootstrap.py 的 platform_tool_set() 里追加；
-   接外部记忆时实现 MemoryProvider，在 harness/bootstrap.py 里替换 Harness 的 memory 字段。
-   命名、审核映射、事务语义等以 docs/agent-architecture.md 第 5 节为准。
+4. 扩展点：接 MCP 时实现 ScopedToolProvider，经 Harness.scoped_tools 注入，platform_tool_set()
+   只放进程级工具；接外部记忆时实现 MemoryProvider，在 harness/bootstrap.py 里替换 Harness 的
+   memory 字段。MCP 以 docs/mcp-design.md 为准，外部记忆以 docs/agent-architecture.md 第 5 节为准。
 5. 角色（harness/domain/roles）是纯函数，只产出 Context，不做 I/O，不读配置；整个 harness/domain
    都不得读取进程状态（cwd、当前日期时间、临时目录、环境变量、uuid、随机数），由运行时读好后传入。
 6. 主 Agent、子代理、队友共用 harness/app/loop.py 的 run_react_loop，差异写在 runtime 的
@@ -74,9 +75,11 @@ Agent 核心（harness）约定：
    最常踩的几条连函数体和 TYPE_CHECKING 内的导入也算：runtime/、harness/app、harness/domain
    导入 harness.adapters；runtime/、harness/app 导入任何 *.repository；runtime/ 导入 memory 包；
    在 harness/adapters/models 之外导入 anthropic / openai。
-10. 只有工具名的 feature 域（tools、permission）经 harness/app/tool_set.py 的 platform_tools()
-    按名查工具策略，不要自建工具集。任何新的进程入口（脚本、Worker）只要用到 tools 或
-    permission，必须先导入 harness.bootstrap（导入即登记进程级工具集），否则取用时抛中文异常。
+10. 运行时与审核链按名查工具策略一律查本回合的策略全集（TurnConfiguration.policies：平台工具加
+    本回合的作用域工具）；harness/app/tool_set.py 的 platform_tools() 只留给只有工具名、没有回合的
+    管理场景（工具目录、绑定校验、权限规则配置），不要自建工具集。任何新的进程入口（脚本、Worker）
+    只要用到 tools 或 permission，必须先导入 harness.bootstrap（导入即登记进程级工具集），
+    否则取用时抛中文异常。
 11. 七份黄金测试固化对外行为：发给模型的请求 tests/test_model_request_golden.py、工具描述
     tests/test_tool_spec_golden.py、审核结果 tests/test_tool_review_golden.py、记忆接入
     tests/test_memory_port_golden.py、角色上下文 tests/test_role_context_golden.py、循环事件与

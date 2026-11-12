@@ -16,6 +16,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import settings
 from core.event_bus import StreamBus
 from database.engine import AsyncSessionLocal
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
@@ -29,12 +30,15 @@ from harness.app.ports import (
     ModelClient,
     ModelResolver,
     ResolvedModel,
+    ScopedToolProvider,
     SubAgentLauncher,
     ToolCallReviewer,
 )
 from harness.app.session_port import SessionStore, TurnTermination
+from harness.app.tool_resolver import TurnToolResolver
 from harness.app.tool_set import ToolSet, register_platform_tools
 from harness.domain.roles.subagent import SubAgentSpec
+from harness.domain.tool import ScopedGrant
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
 from runtime.execution import cancel_turn
@@ -45,7 +49,7 @@ from session.service import SessionService
 
 @cache
 def platform_tool_set() -> ToolSet:
-    """进程级工具集：目前只有内置工具；接入 MCP 时在这里追加工具来源。"""
+    """进程级工具集：只放进程级工具（目前是内置工具）；作用域来源见 Harness.scoped_tools。"""
     return builtin_tool_set()
 
 
@@ -58,7 +62,9 @@ def _env_compact_model() -> ResolvedModel:
 class Harness:
     """一套完整装配：每个字段是一项可替换的实现，按数据库会话现建的依赖以工厂函数给出。
 
-    - tools：完整工具集，按名查策略、按档位裁剪都以它为准；
+    - tools：平台工具集（进程级），按档位裁剪以它为底；按名查策略查本回合的策略全集；
+    - scoped_tools：作用域工具来源（如 MCP），主 Agent 运行时每回合经 TurnToolResolver 解析；
+      为空时不做任何 I/O，策略全集就是 tools；
     - session_factory：打开独立数据库会话，后台执行、队友唤醒、并发成员与子代理启动器用它；
     - sessions、memory、models、permissions：按数据库会话构造会话存储、记忆、模型解析器与权限服务；
     - main_reviewer、subagent_reviewer：基于同一份权限服务构造主 Agent 与子代理的工具调用审核员；
@@ -78,6 +84,7 @@ class Harness:
     compact_model: Callable[[], ResolvedModel]
     subagent_model: Callable[[SubAgentSpec], str | None]
     subagent_launcher: Callable[[Harness], SubAgentLauncher]
+    scoped_tools: tuple[ScopedToolProvider, ...] = ()
 
     def agent_runtime(
         self,
@@ -127,6 +134,12 @@ class Harness:
             permission_service=permission_service,
             models=self.models(db),
             tools=self.tools,
+            # 只有主 Agent 运行时解析作用域工具；子执行用父执行交来的 ScopedGrant。
+            tool_resolver=TurnToolResolver(
+                self.tools,
+                self.scoped_tools,
+                total_timeout=settings.mcp_resolve_timeout_seconds,
+            ),
             compact_model=self.compact_model,
             subagents=self.subagent_launcher(self),
             teammates=self.subagent_runner,
@@ -250,6 +263,7 @@ class IsolatedSubAgentLauncher:
         workspace_id: int | None,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
+        scoped: ScopedGrant | None = None,
     ) -> str:
         async with self._harness.session_factory() as sub_db:
             return await self._harness.subagent_runner(sub_db, bus=bus).run(
@@ -261,6 +275,7 @@ class IsolatedSubAgentLauncher:
                 workspace_id=workspace_id,
                 parent_allowed_tool_names=parent_allowed_tool_names,
                 allowed_skill_names=allowed_skill_names,
+                scoped=scoped,
             )
 
 

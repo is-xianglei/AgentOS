@@ -130,13 +130,15 @@ PostgreSQL、Redis 集成测试（`tests/test_*_pg.py` 等）读取 `.env` 里�
 
 ## 扩展
 
-以下两种接入方式都还没有实现，设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
+以下两种接入方式都还没有实现。
 
-- **接入 MCP**：实现 `harness/app/ports.py` 的 `ToolProvider`，把每个远端工具包装成
-  `harness/domain/tool.py` 的 `Tool`，命名为 `mcp__{server}__{tool}`，参数直接沿用 server 下发的
-  inputSchema。然后在 `harness/bootstrap.py` 的 `platform_tool_set()` 里追加这个工具来源，
-  由 `ToolSet` 统一做重名校验和排序。
-- **接入外部记忆**：实现 `harness/app/memory_port.py` 的 `MemoryProvider`（recall、inherited、
+- **接入 MCP**：设计见 [docs/mcp-design.md](docs/mcp-design.md)。实现 `harness/app/ports.py` 的
+  `ScopedToolProvider`，按工作区和用户把每个远端工具包装成 `harness/domain/tool.py` 的 `Tool`
+  （`source="mcp:{server_key}"`，命名为 `mcp__{server_key}__{tool}`，参数直接沿用 server 下发的
+  inputSchema），再经 `Harness.scoped_tools` 注入。主 Agent 运行时每回合由 `TurnToolResolver`
+  解析一次，作用域工具排在内置工具之后；`platform_tool_set()` 只放进程级工具。
+- **接入外部记忆**：设计见 [docs/agent-architecture.md](docs/agent-architecture.md) 第 5 节。
+  实现 `harness/app/memory_port.py` 的 `MemoryProvider`（recall、inherited、
   on_turn_completed、after_commit），在 `harness/bootstrap.py` 里替换 `Harness` 的 `memory` 字段
   （如 `dataclasses.replace(builtin_harness(), memory=...)`）。主循环只认召回和回合结束写入两个动作，
   运行时代码不用改。

@@ -13,7 +13,7 @@ from core.events import ORCHESTRATOR_ACTOR, Actor
 from harness.app.ports import SubAgentLauncher
 from harness.app.tool_set import ToolSet, platform_tools
 from harness.domain.review import ToolPolicyLookup, check_capability
-from harness.domain.tool import ShellAccess, ToolContext, ToolOutput, ToolProfile
+from harness.domain.tool import ScopedGrant, ShellAccess, ToolContext, ToolOutput, ToolProfile
 from hooks import HookContext, HookEvent, get_hook_registry
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord, ToolRecord
@@ -349,6 +349,7 @@ class ToolService:
         execution_context: ToolExecutionContext | None = None,
         round_tool_names: frozenset[str] | None = None,
         subagents: SubAgentLauncher | None = None,
+        scoped: ScopedGrant | None = None,
     ) -> ToolOutput:
         """执行工具并记录调用状态。
 
@@ -357,7 +358,8 @@ class ToolService:
 
         record 非空时复用既有记录(如审批通过后复用之前的 awaiting 记录),
         回到 running 并以最新 input_args 覆盖(可能被审批时的 updated_input 修改过);
-        否则新建一条 running 记录。subagents 是运行时注入的子代理启动器,原样放进工具上下文。
+        否则新建一条 running 记录。subagents 是运行时注入的子代理启动器,scoped 是本执行的作用域工具,
+        两者原样放进工具上下文。
         能力拒绝与 Hook 拦截的文本以 ToolOutput.ok 返回,与原先回给模型的结果一致。
         """
         actor = actor or ORCHESTRATOR_ACTOR
@@ -483,6 +485,7 @@ class ToolService:
                 shell_access=shell_access,
                 shell_tmp_root=shell_tmp_root,
                 subagents=subagents,
+                scoped=scoped,
             )
             output = await tool.execute(input_args, ctx)
         except Exception as exc:

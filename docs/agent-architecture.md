@@ -20,7 +20,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
   其余 feature 域照 CLAUDE.md 继续「Service 调 Service」，不额外造端口。
 - 分层规则由 tests/test_import_isolation.py 做静态检查（目前覆盖领域层，按阶段扩展到 app、adapters）。
   阶段 7 已把 HTTP 异常处理器拆到 core/error_handlers.py，core/errors.py 加载期不再导入 fastapi，领域层不再间接加载 Web 框架。
-- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service 按数据库会话装配。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`），不走 lifespan：测试、Worker、alembic 都不经过 lifespan，而内置工具集是纯内存对象；以后 MCP 连接管理器需要关闭钩子时再接入 lifespan。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
+- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher、scoped_tools（作用域工具来源，默认 `()`，见 [mcp-design.md](mcp-design.md) 10.2 节）；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service 按数据库会话装配。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`），不走 lifespan：测试、Worker、alembic 都不经过 lifespan，而内置工具集是纯内存对象；MCP 运行时 `mcp_runtime()` 首次取用时惰性创建，由 lifespan 负责关闭（M1）。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
 
 ## 2. 领域层（harness/domain/）
 
@@ -29,7 +29,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | messages.py | 已落地（阶段 1）。`Message = UserMessage \| AssistantMessage \| ToolResult`；`AssistantMessage(blocks)` 的块为 `AssistantBlock = ThinkingBlock \| TextBlock \| ToolCall`；`ToolCall(id, tool_name, arguments)`；`ToolResult(tool_call_id, tool_name, arguments, content, is_error)`；`message_from_row(role, content)` 按角色还原 |
 | session.py | 未采用：视频里的 `Session(id, messages, append)` 整存整取模型装不下 AgentOS 的轮次状态机、租约与快照水位；会话的读写改由应用层 SessionStore 端口按操作表达，消息本身仍是 messages.py 的领域类型 |
 | context.py | 已落地（阶段 2b）。`Context[O](instruction: str \| tuple[PromptBlock, ...] \| None, messages: tuple[Message, ...], tools: tuple[ToolSpec, ...] = (), output_type: type[O] \| None = None)`，以及 `PromptBlock`、`ToolSpec` 两个值类型；`messages_from_rows(rows)` 在调用边界把中立 dict 还原为领域消息。记忆和项目规范不单列字段，由角色渲染进 instruction 或 messages，模型客户端不需要懂记忆的语义 |
-| tool.py | 已落地（阶段 3a）。`Tool(name, description, parameters, policy)`，抽象方法 `normalize_arguments`、`execute(arguments, ctx)`；`PydanticTool` 是内置工具基类，parameters 由 input_model 派生；`ToolPolicy`、`ToolProfile`、`ShellAccess`、`ToolContext`（db、bus 的类型只在 TYPE_CHECKING 下导入）；`tool_policy()`、`unknown_tool_policy()`、`requires_skill_allowlist()` |
+| tool.py | 已落地（阶段 3a）。`Tool(name, description, parameters, policy)`，抽象方法 `normalize_arguments`、`execute(arguments, ctx)`；`PydanticTool` 是内置工具基类，parameters 由 input_model 派生；`ToolPolicy`、`ToolProfile`、`ShellAccess`、`ToolContext`（db、bus 的类型只在 TYPE_CHECKING 下导入）；`tool_policy()`、`unknown_tool_policy()`、`requires_skill_allowlist()`；作用域工具（M0b）：`Tool.source`（None 即内置）、`ToolScope(workspace_id, user_id)`、`ToolBinding`（all / servers / none）、`ScopedGrant(tools, visible)`、纯函数 `select_scoped(tools, binding)` |
 | review.py | 已落地（阶段 3b）。`Decision(behavior, arguments, source, message, reason, interaction, needs_approval)`，只经工厂方法 `Decision.allow(arguments, *, source)`、`Decision.deny(message, *, arguments, source, reason, needs_approval)`、`Decision.ask(interaction, *, arguments, reason, source)` 构造，`__post_init__` 拒绝非法组合；arguments 是审核后（可能已规范化）的入参；message 回给模型，reason 供日志和被拒摘要；needs_approval 标出「需审批但无审批通道而合并成的拒绝」。`ReviewRequest(session_id, profile, agent_type, budget, workspace_id, allowed_skill_names, plan_content, tools)`，plan_content 为 None 表示不在 Plan 模式，tools 只需满足 `ToolInputValidator`（validate_input）。纯函数 `check_capability(tool_name, policy, profile, arguments, allowed_skill_names) -> str \| None` 由审核规则和 ToolService 执行层兜底共用。另有 `PLAN_MODE_ALLOWED_TOOLS`、`INTERACTION_TOOL_KINDS`、`SOURCE_*` 规则来源名 |
 | roles/ | 已落地（阶段 5），一个角色一个模块，全部是纯函数，不做 I/O、不读配置、不读进程状态。`Assistant(cwd, today, skills_catalog, delegate_catalog, session_prompt, memory, plan_content, turbo)` 提供 `instruction()`、`context(messages, tools)`、`final_context(messages)`（收尾，不带工具）；`SubAgent(spec, memory_prefix)`、`Teammate(spec, session_id, name, role, memory_prefix)`；`Compactor` 提供 L1 `micro_compact` 和 L2 压缩提示词的 `context`；`SubAgentSpec`、`AgentType` 在 roles/subagent.py；子代理输出协议解析在 roles/reports.py，验收触发判定在 roles/verification_trigger.py。记忆正文 message_prefix 仍由会话加载按消息 ID 拼接（它要和 additional_context 拼在同一条消息两端），角色只用 memory.instruction |
 | budget.py | 已落地（阶段 3a）。`ToolCallBudget`：循环额度，可序列化进挂起的续跑状态 |
@@ -65,16 +65,17 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | ModelSettings | `ModelSettings(model_id, effort: Effort \| None, max_tokens, timeout)`，每次调用时传入；effort 为 None 表示端点默认（.env 端点沿用 {provider}_thinking_*，工作区端点按 fast）；max_tokens 为 None 时流式取 llm_default_max_tokens、结构化取 256 | — | — |
 | ModelResolver | `resolve(workspace_id, user_id, scenario, *, provider_id, effort)`、`for_session(session, scenario)`、`for_frozen_job(..., model, provider_id)`，返回 `ResolvedModel(client, settings, provider_record_id, context_length)`：先查工作区模型配置，查不到再用 .env | DatabaseModelResolver（数据库 + .env） | — |
 | SessionStore | 已落地（阶段 6c），在 `app/session_port.py`（单独成模块）。按职责拆窄端口：`TurnContextStore`（add_message、save_compact_snapshot、load_context_for_turn，前两个另单列为 MessageWriter、CompactSnapshotWriter）、`TurnStateStore`（会话与轮次的读写、加锁、准入，以及在运行时事务里执行的认领与隔离）、`TurnLeaseStore`（独立短会话里的续约、offset、收尾、取消、回收）；`SessionStore` = TurnContextStore + TurnStateStore。ORM 类型以只读视图 StoredSession / StoredTurn / StoredMessage 表达；TurnExecutionState、TurnTermination、MessageDraft、PartialLoader 也在这里。方法签名与 SessionService 一致，SessionService 结构化地满足端口，数据库实现就是它本身，不写转发器 | SessionService | tests/fixtures/in_memory_session_store.py（测试用内存实现） |
-| ToolProvider | `list_tools() -> list[Tool]`，代表一个工具来源；目前同步、不带 scope，接入 MCP 时扩展为 `async list_tools(scope)` | BuiltinToolProvider | MCP |
+| ToolProvider | `list_tools() -> list[Tool]`，代表一个进程级工具来源，同步、不带 scope | BuiltinToolProvider | — |
+| ScopedToolProvider | `async list_tools(scope: ToolScope) -> ScopedTools(tools, faults)`，按工作区和用户列出作用域工具，每回合由 `TurnToolResolver`（app/tool_resolver.py）解析一次；见 [mcp-design.md](mcp-design.md) 4.1 节 | — | MCP |
 | MemoryProvider | 在 `app/memory_port.py`（与模型端口无关，单独成模块）。`recall(turn)`、`inherited(turn)`、`on_turn_completed(turn) -> MemoryWriteTicket | None`、`after_commit(ticket)`；调用方持有会话并负责提交，recall 和 on_turn_completed 在调用方事务里执行、从不提交，after_commit 在提交后自管事务 | BuiltinMemoryProvider | 外部记忆框架 |
 | ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
-| SubAgentLauncher | `async run(session_id, prompt, spec, *, bus, parent_turn_id, user_id, workspace_id, parent_allowed_tool_names, allowed_skill_names) -> str`；经 `ToolContext.subagents` 注入给 Agent 工具，缺失时抛中文异常，消除了 Agent 工具对 runtime 的反向依赖 | IsolatedSubAgentLauncher（组装根，独立数据库会话 + 共享 bus） | — |
+| SubAgentLauncher | `async run(session_id, prompt, spec, *, bus, parent_turn_id, user_id, workspace_id, parent_allowed_tool_names, allowed_skill_names, scoped: ScopedGrant \| None = None) -> str`；经 `ToolContext.subagents` 注入给 Agent 工具，缺失时抛中文异常，消除了 Agent 工具对 runtime 的反向依赖 | IsolatedSubAgentLauncher（组装根，独立数据库会话 + 共享 bus） | — |
 
 编排：
 - `AgentService`（已落地，阶段 6b，harness/app/agent_service.py）对外提供 `chat`、`resume`、`cancel_interaction`、`cancel_turn`，吸收了原 TopLevelOrchestrator 的 Agent / Workflow 分发。它只依赖端口：`AgentRunner`（start / start_resume / cancel_interaction）、`WorkflowRunner`（start），以工厂形式注入，轮次取消注入 `TurnCanceller` 函数；`ExecutionHandle` 移到 app 层。视频里的 new_session / list_session 由 SessionService 的会话接口承担，没有进 AgentService。HTTP 路由经 `api/deps.py` 的 `get_agent_service` 拿到 AgentService，具体运行时类只在这里出现（组装根的前身，阶段 7 接管）；鉴权与 409 校验仍在路由。
 - `app/loop.py`（已落地，阶段 6a）是唯一的 ReAct 循环骨架：`run_react_loop(policy, step, *, max_rounds)`。每轮依次执行 `before_round` → `load_context` → 调模型 → `record_assistant`，之后有工具调用就走 `execute_tools` + `flush`，没有就走 `on_no_tool_calls`；钩子返回 `LoopExit` 时立即结束（结束前也会先 `flush`），跑满轮次后走 `on_exhausted`。三种循环策略都放在 runtime：`LeadLoopPolicy`（runtime/lead_loop.py）、`SubAgentLoopPolicy` / `TeammateLoopPolicy`（runtime/subagent.py），因为它们要用到 session、team 等 feature 域的 Service。
 - `ToolSet`（已落地，阶段 3a）聚合多个 ToolProvider，负责重名校验、按模式和档位裁剪，并保证工具顺序稳定（提示缓存依赖这一点）。提供 to_specs、get、validate_input、only、without、with_tools，以及按名查策略的 policy_for、callable_names、bindable_names、denied_names（吸收了原 ToolCapabilityResolver）。
-  只有工具名、拿不到 ToolSet 的 feature 域（permission、tools 的 gateway / service / schemas）经应用层的 `platform_tools()` 查策略；完整工具集由组装根在导入时用 `register_platform_tools(...)` 登记，未登记时抛中文异常。接入 MCP 时只需在 `platform_tool_set()` 里追加工具来源。任何新的进程入口（脚本、Worker）只要会用到 tools 或 permission，必须先导入 harness.bootstrap。
+  运行时、网关、ToolService 与审核链按名查策略一律查本回合的策略全集 `TurnConfiguration.policies`（即 `ResolvedScope.policies`：平台工具加本回合解析出的作用域工具）；`platform_tools()` 只留给只有工具名、没有回合的管理场景（工具目录、绑定校验、权限规则配置），进程级工具集由组装根在导入时用 `register_platform_tools(...)` 登记，未登记时抛中文异常。`platform_tool_set()` 只放进程级工具，MCP 这类作用域来源经 `Harness.scoped_tools` 注入。任何新的进程入口（脚本、Worker）只要会用到 tools 或 permission，必须先导入 harness.bootstrap。
 - 后台执行与租约、SSE 跟随、孤儿回收、取消还原、Workflow 编排、Hook 注册表目前仍在 runtime/、hooks/，阶段 7 再决定是否迁入 harness/app。
 
 ## 4. 适配层（harness/adapters/）
@@ -92,14 +93,13 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 
 ## 5. 扩展点
 
-### MCP（后续实现）
-- 以 ToolProvider 接入。`McpToolProvider` 读取工作区的 MCP server 配置，连接后把每个远端工具包装成 `Tool`。
-- 命名用 `mcp__{server}__{tool}`，由 ToolSet 统一做命名空间和重名校验。
-- 参数直接用 server 下发的 inputSchema，这也是领域层 Tool 以 JSON Schema 为准的原因。
-- 审核按工具自带的 policy 判定。MCP 工具按 annotations（readOnlyHint、destructiveHint）映射，没有标注的一律需要审批。
-- 连接管理器是进程级单例，在 main.py 的 lifespan 里创建和关闭；Provider 每轮只取用连接。
-- 领域层 ToolResult.content 目前是 str。MCP 返回的图片、资源怎么呈现，实现 MCP 时再定。
-- MCP 工具要不要进 tools 表供 Agent 绑定，实现 MCP 时再定。
+### MCP（分阶段实现中）
+设计见 [mcp-design.md](mcp-design.md)，这里只列要点，括号里的节号指该文：
+- 以 `ScopedToolProvider` 接入（不是 ToolProvider），经 `Harness.scoped_tools` 注入；每回合由 `TurnToolResolver` 解析一次并冻结进回合配置。
+- 命名用 `mcp__{server_key}__{tool}`，重名直接报错（3.2 节）。参数直接用 server 下发的 inputSchema。
+- 审批按 server 级三档模式（`always` / `trust_annotations` / `never`），默认全部需要审批（3.2 节）。
+- 连接运行时 `mcp_runtime()` 惰性创建，lifespan 只负责关闭（10.2 节）。
+- 结果中的非文本内容转成文本，`ToolResult.content` 仍是 str（5.5 节）；MCP 工具不进 tools 表，自建 Agent 按 server 绑定（6.2 节）。
 
 ### 外部记忆框架（后续实现）
 - 以 MemoryProvider 接入。主循环只认召回和回合结束写入两个动作，不关心记忆怎么存、怎么检索。

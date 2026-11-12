@@ -158,7 +158,9 @@ class ToolScope:
   这样同一个身份解析出的「策略全集」可以在一个回合里共用。
 - `PydanticTool.run` 仍返回 `str`，由 `PydanticTool.execute` 包成 `ToolOutput.ok(...)`，参数校验失败的提示文本也用 `ok`。
   26 个内置工具的实现和描述一律不改，`tool_spec` 黄金测试不受影响。
-- `ToolOutput` 已在 M0a 落地，放在 `harness/domain/tool.py`，`ToolContext` 之前；`source` 和 `ToolScope` 留到 M0b。
+- `ToolOutput` 已在 M0a 落地，放在 `harness/domain/tool.py`，`ToolContext` 之前。`Tool.source` 和 `ToolScope` 在 M0b 落地：
+  `source` 是 `Tool` 的类属性，默认 None；`ToolScope` 与 `ToolBinding`、`ScopedGrant`、`select_scoped` 一起放在
+  `tool.py` 末尾的「作用域工具」一节。
 - 主路径 `execute_one`（`runtime/tool_execution.py:207,219`）和子代理路径（`runtime/subagent.py:626-636`）的 `is_error` 现在都写死为 False。
   改成取 `ToolOutput.is_error` 后，内置工具在任何情况下都得到 False，行为不变。
   `ToolService` 自己生成的能力拒绝和 Hook 拦截文本（`tools/service.py:397-420,452-456`）**继续用 `ok`**，不改变现有输出。
@@ -254,14 +256,18 @@ class ScopedToolProvider(ABC):
     """按身份异步列出工具的来源（MCP）。每回合调用一次，结果冻结进回合配置。
     返回该身份能用的全部工具，不按档位和绑定裁剪；超时由实现按来源内部的单个 server 控制。"""
 
+    @property
+    @abstractmethod
+    def name(self) -> str: ...      # M0b 补上：整个来源失败或超时时，解析器记进 fault 的 source
+
     @abstractmethod
     async def list_tools(self, scope: ToolScope) -> ScopedTools: ...
 
 @dataclass(frozen=True)
 class ToolSourceFault:
     """某个来源本回合不可用的原因，只放能给用户看的文本，不放异常细节和凭证。"""
-    source: str                  # "mcp:{server_key}"
-    server_id: int | None        # 前端据此发起授权或跳到管理页；后台不预先生成授权地址
+    source: str                  # "mcp:{server_key}"；整个来源失败时为 ScopedToolProvider.name
+    server_id: int | None        # 前端据此发起授权或跳到管理页；后台不预先生成授权地址；来源整体失败时为 None
     kind: Literal["unavailable", "auth_required", "timeout", "invalid"]
     message: str                 # 中文，可以直接展示
 
@@ -302,13 +308,15 @@ class McpServerRegistry(Protocol):
 
 ### 4.2 编排：`TurnToolResolver`
 
+两者都在 `harness/app/tool_resolver.py`（M0b 落地）。
+
 ```python
 @dataclass(frozen=True)
 class ResolvedScope:
     """一个身份在本回合解析出的作用域工具，同一回合的主执行和子执行共用。"""
     policies: ToolSet                       # 策略全集：平台工具 + 本身份的全部作用域工具，不裁剪
     scoped: tuple[Tool, ...]                # 本身份的全部作用域工具，按模型名排序
-    faults: tuple[ToolSourceFault, ...]
+    faults: tuple[ToolSourceFault, ...] = ()
 
     @classmethod
     def platform_only(cls, platform: ToolSet) -> ResolvedScope: ...   # 无作用域来源时用：policies 就是 platform
@@ -328,7 +336,11 @@ class TurnToolResolver:
   - 所以按名查策略只能查 `policies`。对内置工具，它就是进程级工具集，查出的结论和现在完全一样；
     对 MCP 工具，它能查到这个身份可以使用的全部 MCP 工具。
 - **可见集仍然叫 `TurnConfiguration.tools`**，不改名：`test_model_request_golden.py:698` 用 `replace(runtime.configuration, tools=...)`
-  替换可见集，改名会打破这份黄金测试。`TurnConfiguration` 只新增两个字段：`policies` 和 `scoped`（默认 `ResolvedScope.platform_only`）。
+  替换可见集，改名会打破这份黄金测试。`TurnConfiguration` 只新增两个字段：`policies` 和 `scoped: ResolvedScope`。
+  `scoped` 实际落地为必填字段、不设 dataclass 默认值，和 `policies` 一样只在 `_assemble` 里填：
+  `ResolvedScope.platform_only(...)` 需要平台工具集作参数，写不成字段默认值；仓库里也没有在 `_assemble` 之外构造它的地方，
+  黄金测试只用 `replace(...)`，不受影响。「默认 `platform_only`」落在入参上：`resolved` 为 None 时 `_assemble` 用
+  `ResolvedScope.platform_only(tools)`。
   `policies` 在 M0a 落地为必填字段，由 `_assemble` 填入裁剪之前的工具集，不能默认等于可见集 `tools`，
   否则又回到「被裁掉的工具查成未知工具」；签名见 6.1 节第 1 步。
 - **`resolve` 只管解析，不管裁剪**：
@@ -338,11 +350,23 @@ class TurnToolResolver:
     和 `tools_for_mode` 里。`_assemble` 多接收一个 `ResolvedScope` 参数，用 `select_scoped(resolved.scoped, binding)` 选出作用域工具，
     再并入可见集，不另写第二套裁剪逻辑。
   - `configure_turn` 多接收一个 `resolved: ResolvedScope` 参数，默认值为 `platform_only`；user_agent 的绑定在这里拿到，再传给 `_assemble`。
+  - M0b 落地的签名：`configure_turn(db, session, *, user_id, workspace_id, models, tools, subagents, injected=None,
+    resolved: ResolvedScope | None = None)`，`for_lead` / `for_agent` 同样新增 `resolved: ResolvedScope | None = None`，
+    None 即 `platform_only(tools)`。用 None 而不是 `platform_only(...)` 作默认值，是因为后者依赖 `tools` 参数。
+    绑定按档位在 `turn_config._scoped_binding(profile, mode_slug)` 里定：`lead` 为 `ToolBinding.all()`，
+    turbo 与 `user_agent` 为 `ToolBinding.none()`；`user_agent` 改读 Agent 绑定留到 M2。
+  - `_assemble` 还把 `ScopedGrant(tools=resolved.scoped, visible=可见的作用域工具名)` 作为网关的 `scoped` 字段；
+    `resolved.scoped` 为空时网关的 `scoped` 为 None。
 - **合并顺序**：内置工具在前，作用域工具在后，作用域工具内部按模型名排序，保证工具定义逐字节稳定。对提示缓存的影响见 6.4 节。
 - **重名**：作用域工具和平台工具重名时直接报错。命名算法保证正常情况下不会发生，真发生了就说明有 bug，
   按「无静默兜底」的约定处理。
 - **谁持有解析器**：只有 `AgentRuntime` 和 `WorkflowRuntime` 持有 `TurnToolResolver`。子代理、队友、委派不重新解析，
-  直接用父执行传下来的结果（6.3 节）。
+  直接用父执行传下来的结果（6.3 节）。M0b 只接入 `AgentRuntime`（构造参数 `tool_resolver` 必填）；
+  `WorkflowRuntime` 的解析推迟到 M2（第 13 节）。
+- **M0b 落地的解析细节**：`sources` 为空时直接返回 `platform_only(platform)`，不建任务、不做 I/O；
+  否则每个来源一个任务，用 `asyncio.wait(timeout=total_timeout)` 等待，到时未完成的取消并等其收尾。
+  抛异常的来源记 `kind="unavailable"`、超时的记 `kind="timeout"`，`source` 取 `ScopedToolProvider.name`，`server_id` 为 None，
+  `message` 是固定中文文案，异常类型只进服务端日志。作用域工具之间重名同样抛中文异常。
 
 ### 4.3 驱动端口：`McpAdminService`
 
@@ -609,10 +633,21 @@ M0 是纯重构，不引入任何 MCP 代码，对外行为不变，七份黄金
      - 查策略用 `self.tools.with_tools(*scoped.tools)`；
      - 可见集在平台工具裁剪结果的基础上，加上 `scoped.visible` 里列出的作用域工具；
    - `BaseOrchestrator`（Workflow）新增参数 `resolved`，带默认值。`test_model_request_golden.py:754-758` 直接构造了编排器，不能因此报错。
+     **M0b 调整**：这一项推迟到 M2，见第 13 节。
    - 所有新参数为 None 时，行为和现在完全一样。
+   - M0b 落地的形状：
+     - `ToolGateway` 新增构造字段 `scoped: ScopedGrant | None = None`，`create`、`from_registry` 同样新增关键字参数 `scoped`；
+       `ToolService.run` 新增关键字参数 `scoped`，由网关 `run` 内部传 `self.scoped`，网关的 `run` / `start_call` 签名不变；
+     - `SubAgentRunner._policies(scoped)` 给出策略全集（`scoped` 为 None 时就是 `self.policies`），
+       `_with_scoped(registry, scoped)` 在平台工具裁剪结果之后接上 `scoped.visible_tools()`；
+       策略全集经 `SubAgentLoopRun.policies` 传给 `_execute_tool_calls(..., policies=...)`，它同时是 `ReviewRequest.policies`
+       和网关的 `policies`。`_execute_tool_calls` 的 `policies` 默认 None 即 `self.policies`：tool_review 黄金测试直接调用它，不传这个参数；
+     - Agent 工具本阶段不往下传 `scoped`，各子执行继承什么在 M2 按 6.2 节决定。
 5. **回合工具解析的接口**：
    - 新增 `ToolScope`、`ToolBinding`、`ScopedGrant`（都放在 `harness/domain/tool.py`，M0 就要用到）、`ScopedToolProvider`、`ResolvedScope`、`TurnToolResolver`；
    - `AgentRuntime._produce` / `_produce_resume` 和 WorkflowRuntime 在 `_configure_agent` 之前先 `resolve`；
+     M0b 落地为 `AgentRuntime._resolve_scope()`：用运行时可信的 `user_id` / `workspace_id` 构造 `ToolScope`，
+     结果作为 `_configure_agent(session, resolved)` 的第二个参数；WorkflowRuntime 推迟到 M2；
    - `Harness.scoped_tools` 默认 `()`，此时 `resolve` 直接返回 `ResolvedScope.platform_only`，没有任何 I/O。
 
 替换之后，内置工具查到的策略和原来一样：`scoped_tools=()` 时，`policies` 就是进程级工具集本身。
@@ -636,10 +671,37 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
 | turbo 模式 | 不加载 | `ToolBinding.none()` |
 | Plan 模式 | 解析照常进行，但按 `PLAN_MODE_ALLOWED_TOOLS` 白名单裁剪可见集时会被剔除，所以 Plan 模式下不可用 | 现有的 `tools_for_mode` |
 
-- `ToolBinding` 是领域值类型，有三种构造：`ToolBinding.all()`、`ToolBinding.servers({server_id: frozenset[str] | None})`、`ToolBinding.none()`。
+- `ToolBinding` 是领域值类型，有三种构造：`ToolBinding.all()`、`ToolBinding.servers(...)`、`ToolBinding.none()`。
   选择函数 `select_scoped(tools, binding) -> tuple[Tool, ...]` 是纯函数。两者都放在 `harness/domain/tool.py`，M0 就要用到。
-  因为领域层的 `Tool` 不认识 server_id，`select_scoped` 改为按 `Tool.source`（`mcp:{server_key}`）配合映射表来选。
-  具体签名在 M0 实现时回写到本文。
+  M0b 落地的签名：
+
+  ```python
+  @dataclass(frozen=True)
+  class ToolBinding:
+      grants: tuple[tuple[str, frozenset[str] | None], ...] | None   # None 即 all()，() 即 none()
+
+      @classmethod
+      def all(cls) -> ToolBinding: ...
+      @classmethod
+      def servers(cls, grants: Mapping[str, Iterable[str] | None]) -> ToolBinding: ...  # 键为 Tool.source
+      @classmethod
+      def none(cls) -> ToolBinding: ...
+
+  @dataclass(frozen=True)
+  class ScopedGrant:
+      tools: tuple[Tool, ...]
+      visible: frozenset[str]
+      def visible_tools(self) -> tuple[Tool, ...]: ...     # tools 中名字在 visible 里的，保持顺序
+
+  def select_scoped(tools: Iterable[Tool], binding: ToolBinding) -> tuple[Tool, ...]: ...
+  ```
+
+  - 键用 `Tool.source`（`mcp:{server_key}`），不用 server_id：领域层的 `Tool` 不认识 server_id，而 `server_key` 创建后不可改，
+    source 稳定。M2 构造绑定时由 agent 域按 `agent_mcp_servers` 的 server_id 查出 server_key，拼成 `mcp:{server_key}`。
+  - 值是**模型可见名**的集合，None 表示该来源全部工具；空集合表示一个都不给，不等于全部。`agent_mcp_servers.tool_names`
+    存的 MCP 原名，由构造方经 `model_tool_names(server_key, 原名)` 换算成模型名再放进来；换算只依赖 `(server_key, 原名)`，
+    结果稳定。这样 `select_scoped` 只做集合匹配，领域层的 `Tool` 不用多带原名字段。
+  - `servers(...)` 按来源排序后存成元组，同样的绑定相等、可哈希；`select_scoped` 保持输入顺序，来源不在绑定里的工具一律不选。
 - 主回合的绑定，由 `configure_turn` 根据 `AgentDefinitionService.get_runtime_config` 的结果构造。
   `AgentRuntimeConfig` 新增字段 `mcp_bindings`，必须带默认值：四份黄金测试会用全部字段构造这个类型，
   分别在 react_loop :1141、tool_review :344、role_context :225、model_request :660，而且都在「不许改」段里。
@@ -650,6 +712,7 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
 - 自建 Agent 的绑定存在新表 `agent_mcp_servers`（见第 7 节）。市场快照和官方预置**本期不导出 MCP 绑定**：
   server 是工作区私有的，地址和凭证都不能跨工作区带走。Agent 导出导入的方案目前搁置，到时再一起设计。
 - **M1 到 M2 之间的过渡**：M1 还没有绑定表，这段时间只有 `lead` 用 `ToolBinding.all()`，其他所有档位一律 `ToolBinding.none()`。
+  M0b 已按此实现主回合的绑定；子执行（子代理、队友、委派）本阶段都收不到 `scoped`，等同 `none()`。
 
 ### 6.3 解析时机、冻结、传递与恢复
 
@@ -660,7 +723,9 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   结果写进 `TurnConfiguration`：`tools` 是可见集，另有 `policies` 和 `scoped` 两个字段；faults 留给发事件用（4.2 节）。
 - 请求路径（`start`）不解析：`start` 要尽快返回 `run_started`，而解析远程工具可能要几秒；后台执行体本来就是流式的。
   `start` 里那次 `_configure_agent` 用的是 `ResolvedScope.platform_only`，只做准入校验，不触发任何 MCP I/O。
-- 恢复路径 `_produce_resume` 同样在 `_configure_agent` 之前解析。WorkflowRuntime 在自己的执行体开头解析一次，全部成员共用这一份结果。
+- 恢复路径 `_produce_resume` 同样在 `_configure_agent` 之前解析。WorkflowRuntime 在自己的执行体开头解析一次，全部成员共用这一份结果
+  （M0b 调整：WorkflowRuntime 的解析推迟到 M2，本阶段 Workflow 成员一律只用平台工具，见第 13 节）。
+- 请求路径里保存人工响应的 `prepare_interaction_response` 同样不解析，用 `platform_only`，与 `start` 一致。
 
 **回合内冻结**：一个回合里的多轮 ReAct 共用同一份工具集，中途不重新拉取。这对应 HugAgentOS 的「run 内冻结 schema」。
 
@@ -1032,9 +1097,14 @@ class Harness:
 
 - 只有 `agent_runtime(...)` 和 `workflow_runtime(...)` 会构造 `TurnToolResolver(self.tools, self.scoped_tools, ...)` 并注入运行时；
   `subagent_runner(...)` 不构造，子执行直接用父执行传下来的 `ScopedGrant`（6.3 节）。
+  M0b 只有 `agent_runtime(...)` 构造：`TurnToolResolver(self.tools, self.scoped_tools,
+  total_timeout=settings.mcp_resolve_timeout_seconds)`，作为 `AgentRuntime` 的必填构造参数 `tool_resolver`；
+  `workflow_runtime(...)` 推迟到 M2。`Harness.scoped_tools` 排在 `Harness` 字段的最后，带默认值 `()`。
+  `AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS`（第 11 节）已在 M0b 加入 Settings，其余 MCP 配置留到 M1。
 - `tests/fixtures/harness_factory.py` 现在直接调用 `default_harness()`（`:25,38`），自己不带默认值，
   所以要改成 `replace(default_harness(), scoped_tools=())`，显式关掉作用域来源。测试需要 MCP 时再注入内存版假来源，
-  完全不碰网络和数据库。
+  完全不碰网络和数据库。M0b 已改：不传 `harness` 时三个工厂都用 `replace(default_harness(), scoped_tools=())`；
+  内存版假来源与 `source="mcp:fake"` 的假工具在 `tests/fixtures/scoped_tools.py`。
 - `IsolatedSubAgentLauncher.run` 把 `scoped` 参数原样转交给 `SubAgentRunner.run`（6.3 节）。
 - 新增 `mcp_admin_service(db, *, user_id, workspace_id) -> McpAdminService`。`mcp_connector` 为 None 时，
   调用它会抛中文 AgentException。
@@ -1199,6 +1269,15 @@ class Harness:
 - 清单里不用改的：`tests/test_agent_delegation_tool.py:74-81` 的 `_fake_dispatch`。`AgentTool._dispatch` 仍返回 `str`，
   只有 `execute` 的返回值变了。
 
+**M0b 实际改动的核对结果**：
+- 七份黄金测试的文件和 `tests/fixtures/*_golden.py` 都没有改动，期望字面量和 SHA-256 不变。新参数一律带默认值
+  （`configure_turn` / `for_lead` / `for_agent` 的 `resolved`、`_configure_agent` 的 `resolved`、网关与 `ToolContext` 的 `scoped`、
+  `_execute_tool_calls` 的 `policies`）；`AgentRuntime.tool_resolver` 是必填构造参数，但黄金测试都经组装根工厂构造运行时，不受影响。
+- 非黄金测试只改构造方式：`tests/test_runtime_cancel_branch.py`、`tests/test_turn_failure_error_event.py` 用 `__new__` 绕过
+  `__init__` 驱动 `_produce`，运行时没有身份和解析器，与已有的 `_configure_agent` 打桩并列补一行 `_resolve_scope` 打桩，断言不变。
+- `tests/fixtures/harness_factory.py` 按 10.2 节改为默认 `scoped_tools=()`；新增 `tests/fixtures/scoped_tools.py`（替身）和
+  `tests/test_scoped_tools.py`（绑定选择、解析合并与故障、回合配置、主回合端到端含审批恢复、子代理继承、组装根）。
+
 **MCP 落地之后**：
 - 没有 MCP 来源（`scoped_tools=()`）时，七份黄金测试的输出保持不变。
 - M1 新增第八份黄金测试 `tests/test_mcp_tool_golden.py`，固化三样东西，字面量取自 M1 实现的实际产出：
@@ -1221,7 +1300,13 @@ class Harness:
 
 M0 分两步提交：
 - M0a（已实现）：6.1 节第 1～3 步中与作用域无关的部分，即按名查策略改查 `policies`、`ToolOutput`、删除 `dangerous_tools()` 和审核员的 None 回落、12.1 节最后两条静态检查、12.3 节的三处替身；
-- M0b：其余部分，即 `Tool.source`、`ToolScope`、`ToolBinding`、`ScopedGrant`、作用域工具的传递通道、`TurnToolResolver`、`Harness.scoped_tools`、第 15 节的文档修订。
+- M0b（已实现）：其余部分，即 `Tool.source`、`ToolScope`、`ToolBinding`、`ScopedGrant`、作用域工具的传递通道、`TurnToolResolver`、`Harness.scoped_tools`、`AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS`、第 15 节的文档修订。
+
+**M0b 对 Workflow 的调整**：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
+推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，
+平白给 Workflow 执行体加一次解析。所以 M0b 的 WorkflowRuntime 不持有解析器，成员执行一律只用平台工具（等同 `platform_only`），
+`workflow_runtime(...)` 也不构造 `TurnToolResolver`。M2 再一起接入：WorkflowRuntime 在执行体开头解析一次，
+按成员绑定构造 `ScopedGrant`，经 `SubAgentRunner.run(scoped=...)` 交给成员。
 
 ## 14. 决策记录与待定事项
 
@@ -1247,24 +1332,24 @@ M0 分两步提交：
 ## 15. 与上位文档的偏离
 
 以下几处现有文档和注释对 MCP 做了预设，本文的设计推翻了这些预设。M0 的第一个提交要同步修改这些地方，
-修改完成之前以本文为准：
+修改完成之前以本文为准。M0 的行已在 M0b 改完；标 M1 的部分（`McpServerConnector`、`mcp_connector`、导入禁令、八份黄金测试）留到 M1：
 
 | 位置 | 原来的预设 | 本文的设计 | 何时改 |
 |---|---|---|---|
-| CLAUDE.md、AGENTS.md「Agent 核心（harness）约定」第 3 条（已有端口，`:58-61`） | 端口清单里没有作用域来源 | 补上 `ScopedToolProvider`（ports.py）；M1 再补 `McpServerConnector`、`McpServerRegistry`（mcp_port.py） | M0 / M1 |
-| 同上第 4 条（扩展点） | 接 MCP 时实现 `ToolProvider`，并在 `platform_tool_set()` 里追加 | 实现 `ScopedToolProvider`，经 `Harness.scoped_tools` 注入；`platform_tool_set()` 只放内置工具 | M0 |
+| CLAUDE.md、AGENTS.md「Agent 核心（harness）约定」第 3 条（已有端口，`:58-61`） | 端口清单里没有作用域来源 | 补上 `ScopedToolProvider`（ports.py）；M1 再补 `McpServerConnector`、`McpServerRegistry`（mcp_port.py） | M0 部分已改（M0b）/ M1 |
+| 同上第 4 条（扩展点） | 接 MCP 时实现 `ToolProvider`，并在 `platform_tool_set()` 里追加 | 实现 `ScopedToolProvider`，经 `Harness.scoped_tools` 注入；`platform_tool_set()` 只放内置工具 | 已改（M0b） |
 | 同上第 9 条（导入禁令，`:73-76`） | 只禁 anthropic / openai | 补上：`mcp` 只能在 `harness/adapters/mcp` 导入；runtime、app、domain 不得导入 `mcp_server` | M1 |
-| 同上第 10 条（`:77-79`） | 只有工具名的 feature 域经 `platform_tools()` 查策略 | 收窄为只用于管理场景；运行时与审核链一律查本回合的 `policies` | M0 |
+| 同上第 10 条（`:77-79`） | 只有工具名的 feature 域经 `platform_tools()` 查策略 | 收窄为只用于管理场景；运行时与审核链一律查本回合的 `policies` | 已改（M0b） |
 | 同上第 11 条（`:80`）、README.md:122 | 七份黄金测试 | 八份（新增 `test_mcp_tool_golden.py`） | M1 |
-| `docs/agent-architecture.md:23`（组装根一段） | `Harness` 字段清单里没有作用域来源；「以后 MCP 连接管理器需要关闭钩子时再接入 lifespan」 | 补上 `scoped_tools`、`mcp_connector`；`mcp_runtime()` 惰性创建，由 lifespan 关闭 | M0 / M1 |
-| `docs/agent-architecture.md:68`（ToolProvider 一行） | 接 MCP 时扩展为 `async list_tools(scope)` | ToolProvider 保持同步，另设 `ScopedToolProvider`（4.1 节） | M0 |
-| `docs/agent-architecture.md:72`（SubAgentLauncher 一行） | 签名里没有作用域工具 | 增加 `scoped: ScopedGrant \| None` | M0 |
-| `docs/agent-architecture.md:77`（ToolSet 一段） | 接 MCP 时只需在 `platform_tool_set()` 里追加 | 同上；运行时按名查策略改为查 `policies` | M0 |
-| `docs/agent-architecture.md:96-102`（第 5 节 MCP） | 未标注的工具一律需要审批；连接管理器在 lifespan 里创建；ToolResult 和 tools 表待定 | 改为指向本文：server 级三档审批（3.2 节）；惰性创建、lifespan 关闭（10.2 节）；结果转成文本、不进 tools 表（5.5、6.2 节） | M0 |
-| `harness/app/ports.py:294-296`（ToolProvider 的 docstring） | 接 MCP 时签名改为 `async list_tools(scope)` | 改为指向 `ScopedToolProvider` | M0 |
-| `harness/app/tool_set.py:6-8`（模块说明） | 平台工具集即完整工具集 | 说明平台工具集只含进程级工具，回合的策略全集见 `ResolvedScope.policies` | M0 |
-| `harness/bootstrap.py:48`（`platform_tool_set` 的 docstring） | 接 MCP 时在这里追加工具来源 | 改为「只放进程级工具；作用域来源见 `Harness.scoped_tools`」 | M0 |
-| README.md:133-142（「扩展」一节） | 同 CLAUDE.md 第 4 条；设计链接指向 agent-architecture.md 第 5 节 | 同上；链接改为指向本文 | M0 |
+| `docs/agent-architecture.md:23`（组装根一段） | `Harness` 字段清单里没有作用域来源；「以后 MCP 连接管理器需要关闭钩子时再接入 lifespan」 | 补上 `scoped_tools`、`mcp_connector`；`mcp_runtime()` 惰性创建，由 lifespan 关闭 | M0 部分已改（M0b）/ M1 |
+| `docs/agent-architecture.md:68`（ToolProvider 一行） | 接 MCP 时扩展为 `async list_tools(scope)` | ToolProvider 保持同步，另设 `ScopedToolProvider`（4.1 节） | 已改（M0b） |
+| `docs/agent-architecture.md:72`（SubAgentLauncher 一行） | 签名里没有作用域工具 | 增加 `scoped: ScopedGrant \| None` | 已改（M0b） |
+| `docs/agent-architecture.md:77`（ToolSet 一段） | 接 MCP 时只需在 `platform_tool_set()` 里追加 | 同上；运行时按名查策略改为查 `policies` | 已改（M0b） |
+| `docs/agent-architecture.md:96-102`（第 5 节 MCP） | 未标注的工具一律需要审批；连接管理器在 lifespan 里创建；ToolResult 和 tools 表待定 | 改为指向本文：server 级三档审批（3.2 节）；惰性创建、lifespan 关闭（10.2 节）；结果转成文本、不进 tools 表（5.5、6.2 节） | 已改（M0b） |
+| `harness/app/ports.py:294-296`（ToolProvider 的 docstring） | 接 MCP 时签名改为 `async list_tools(scope)` | 改为指向 `ScopedToolProvider` | 已改（M0b） |
+| `harness/app/tool_set.py:6-8`（模块说明） | 平台工具集即完整工具集 | 说明平台工具集只含进程级工具，回合的策略全集见 `ResolvedScope.policies` | 已改（M0b） |
+| `harness/bootstrap.py:48`（`platform_tool_set` 的 docstring） | 接 MCP 时在这里追加工具来源 | 改为「只放进程级工具；作用域来源见 `Harness.scoped_tools`」 | 已改（M0b） |
+| README.md:133-142（「扩展」一节） | 同 CLAUDE.md 第 4 条；设计链接指向 agent-architecture.md 第 5 节 | 同上；链接改为指向本文 | 已改（M0b） |
 
 ## 附录 A：调研出处
 

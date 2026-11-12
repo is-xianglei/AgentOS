@@ -1,5 +1,5 @@
-"""应用层端口：模型客户端、调用参数、模型解析器、工具来源、工具调用审核员、子代理启动器，
-以及中立流事件与调用异常。
+"""应用层端口：模型客户端、调用参数、模型解析器、工具来源（进程级与作用域）、工具调用审核员、
+子代理启动器，以及中立流事件与调用异常。
 
 全部类型不含任何 provider 的 wire 形状；各家 SDK 的适配在 harness.adapters.models 内部完成。
 """
@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ from harness.domain.context import Context
 from harness.domain.messages import ThinkingBlock, ToolCall
 from harness.domain.review import Decision, ReviewRequest
 from harness.domain.roles.subagent import SubAgentSpec
-from harness.domain.tool import Tool
+from harness.domain.tool import ScopedGrant, Tool, ToolScope
 
 if TYPE_CHECKING:
     # 仅作类型标注：事件总线的实现依赖 Redis 客户端，端口模块加载期不引入。
@@ -289,16 +289,50 @@ class ModelResolver(Protocol):
 
 
 class ToolProvider(ABC):
-    """工具来源：一个 provider 产出一组工具，由 ToolSet 聚合、做重名校验并保持顺序。
+    """进程级工具来源：一个 provider 产出一组工具，由 ToolSet 聚合、做重名校验并保持顺序。
 
-    目前只有内置工具一种来源，全部是静态的，所以签名同步、不带参数。之后接入 MCP 时，
-    远端工具要按工作区读取 server 配置并经网络连接解析，届时把签名扩展为按工作区异步解析
-    （形如 ``async list_tools(scope) -> list[Tool]``），内置 provider 一并跟进。
+    只给内置工具这类对所有人都一样的静态来源用，所以签名同步、不带参数。按工作区和用户
+    变化的来源（如 MCP）实现 ScopedToolProvider，每回合异步解析。
     """
 
     @abstractmethod
     def list_tools(self) -> list[Tool]:
         """按稳定顺序返回本来源的全部工具；顺序决定发给模型的工具顺序，提示缓存依赖它。"""
+
+
+@dataclass(frozen=True)
+class ToolSourceFault:
+    """某个作用域来源本回合不可用的原因，只放能给用户看的文本，不放异常细节和凭证。"""
+
+    source: str
+    # 前端据此发起授权或跳到管理页；来源整体失败、对不上具体 server 时为 None。
+    server_id: int | None
+    kind: Literal["unavailable", "auth_required", "timeout", "invalid"]
+    message: str
+
+
+@dataclass(frozen=True)
+class ScopedTools:
+    """一个作用域来源为某个身份列出的工具与故障。"""
+
+    tools: tuple[Tool, ...]
+    faults: tuple[ToolSourceFault, ...] = ()
+
+
+class ScopedToolProvider(ABC):
+    """作用域工具来源（如 MCP）：按身份异步列出工具，每回合调用一次，结果冻结进回合配置。
+
+    返回该身份能用的全部工具，不按档位和绑定裁剪；单个 server 的超时由实现自己控制。
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """来源标识（如 "mcp"）；整个来源失败或超时时，解析器记进故障的 source。"""
+
+    @abstractmethod
+    async def list_tools(self, scope: ToolScope) -> ScopedTools:
+        """列出 scope 身份可用的全部作用域工具；整体失败时可以直接抛异常，由解析器记为故障。"""
 
 
 class ToolCallReviewer(ABC):
@@ -332,6 +366,8 @@ class SubAgentLauncher(Protocol):
         workspace_id: int | None,
         parent_allowed_tool_names: frozenset[str] | None,
         allowed_skill_names: frozenset[str] | None,
+        scoped: ScopedGrant | None = None,
     ) -> str:
-        """按 spec 运行一次子代理并返回报告；子代理运行失败时原样上抛。"""
+        """按 spec 运行一次子代理并返回报告；scoped 是交给子代理的作用域工具，None 表示不给。
+        子代理运行失败时原样上抛。"""
         ...

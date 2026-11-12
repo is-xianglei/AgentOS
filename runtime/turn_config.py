@@ -19,9 +19,10 @@ from harness.app.ports import (
     SubAgentLauncher,
 )
 from harness.app.session_port import StoredSession
+from harness.app.tool_resolver import ResolvedScope
 from harness.app.tool_set import ToolSet
 from harness.domain.review import PLAN_MODE_ALLOWED_TOOLS
-from harness.domain.tool import ToolProfile
+from harness.domain.tool import ScopedGrant, ToolBinding, ToolProfile, select_scoped
 from model_service.policy import TURBO_ALLOWED_TOOLS
 from tools.gateway import ToolGateway
 
@@ -34,10 +35,11 @@ class TurnConfiguration:
     - agent_id、agent_prompt、agent_model_name、skill_ids：会话绑定的自建 Agent，默认 Agent 时为 None；
     - profile、principal_name：工具档位与执行身份；allowed_skill_names 为 None 表示不限 Skill；
     - delegate_catalog：可委派 Agent 目录，只有默认 Agent 才有；
-    - tools、gateway：本回合可见的工具集，以及冻结了身份与边界的执行网关；网关带着子代理启动器，
-      Agent 工具经它启动子代理；
-    - policies：本回合按名查策略的策略全集，取运行时注入的完整工具集，不按可见集裁剪：
+    - tools、gateway：本回合可见的工具集（平台工具在前，作用域工具按名字排序在后），以及冻结了
+      身份与边界的执行网关；网关带着子代理启动器与本回合的作用域工具，Agent 工具经它启动子代理；
+    - policies：本回合按名查策略的策略全集，即 scoped.policies，不按可见集裁剪：
       被裁掉的工具按可见集查会变成未知工具，从而跳过能力检查；
+    - scoped：本回合解析出的作用域工具与故障；请求路径和未解析时为 ResolvedScope.platform_only；
     - model：主模型，注入客户端时取客户端自带的默认参数，按会话配置之前为 None；
     - compact_model、compact_threshold：解析出的压缩模型与阈值，注入客户端时为 None，沿用压缩服务现值；
     - database_model：模型来自工作区模型配置，此时端点自带模型名，不再用 Agent 或会话上的模型名覆盖。
@@ -54,6 +56,7 @@ class TurnConfiguration:
     delegate_catalog: str | None
     tools: ToolSet
     policies: ToolSet
+    scoped: ResolvedScope
     gateway: ToolGateway
     model: ResolvedModel | None
     compact_model: ResolvedModel | None
@@ -67,6 +70,7 @@ class TurnConfiguration:
         *,
         tools: ToolSet,
         subagents: SubAgentLauncher | None,
+        resolved: ResolvedScope | None = None,
         mode_slug: str = "standard",
         delegate_catalog: str | None = None,
         model: ResolvedModel | None = None,
@@ -76,12 +80,13 @@ class TurnConfiguration:
     ) -> TurnConfiguration:
         """默认 Agent（会话未绑定自建 Agent）：完整工具集，可以委派。
 
-        tools 是组装根注入的完整工具集；subagents 是 Agent 工具用的子代理启动器，None 表示本回合
-        不能启动子代理（Agent 工具被调用时报错）。
+        tools 是组装根注入的平台工具集；subagents 是 Agent 工具用的子代理启动器，None 表示本回合
+        不能启动子代理（Agent 工具被调用时报错）；resolved 为 None 表示只用平台工具。
         """
         return cls._assemble(
             db,
             tools=tools,
+            resolved=resolved,
             subagents=subagents,
             mode_slug=mode_slug,
             agent=None,
@@ -100,6 +105,7 @@ class TurnConfiguration:
         *,
         tools: ToolSet,
         subagents: SubAgentLauncher | None,
+        resolved: ResolvedScope | None = None,
         mode_slug: str = "standard",
         model: ResolvedModel | None = None,
         compact_model: ResolvedModel | None = None,
@@ -110,6 +116,7 @@ class TurnConfiguration:
         return cls._assemble(
             db,
             tools=tools,
+            resolved=resolved,
             subagents=subagents,
             mode_slug=mode_slug,
             agent=agent,
@@ -126,6 +133,7 @@ class TurnConfiguration:
         db: AsyncSession,
         *,
         tools: ToolSet,
+        resolved: ResolvedScope | None,
         subagents: SubAgentLauncher | None,
         mode_slug: str,
         agent: AgentRuntimeConfig | None,
@@ -135,6 +143,8 @@ class TurnConfiguration:
         compact_threshold: int | None,
         database_model: bool,
     ) -> TurnConfiguration:
+        if resolved is None:
+            resolved = ResolvedScope.platform_only(tools)
         base_tools = tools
         if agent is None:
             agent_id = None
@@ -163,15 +173,26 @@ class TurnConfiguration:
         if mode_slug == "turbo":
             tools = tools.only(*TURBO_ALLOWED_TOOLS)
             allowed_skill_names = frozenset()
+        # 作用域工具接在平台工具裁剪结果之后；Plan、极速的逐轮裁剪仍由 tools_for_mode 负责。
+        visible_scoped = select_scoped(resolved.scoped, _scoped_binding(profile, mode_slug))
+        if visible_scoped:
+            tools = ToolSet((*tools.tools, *visible_scoped))
+        grant: ScopedGrant | None = None
+        if resolved.scoped:
+            grant = ScopedGrant(
+                tools=resolved.scoped,
+                visible=frozenset(tool.name for tool in visible_scoped),
+            )
         gateway = ToolGateway.from_registry(
             db,
             tools,
             profile,
             principal_name=principal_name,
-            policies=base_tools,
+            policies=resolved.policies,
             agent_id=agent_id,
             allowed_skill_names=allowed_skill_names,
             subagents=subagents,
+            scoped=grant,
         )
         return cls(
             mode_slug=mode_slug,
@@ -184,7 +205,8 @@ class TurnConfiguration:
             allowed_skill_names=allowed_skill_names,
             delegate_catalog=delegate_catalog,
             tools=tools,
-            policies=base_tools,
+            policies=resolved.policies,
+            scoped=resolved,
             gateway=gateway,
             model=model,
             compact_model=compact_model,
@@ -257,12 +279,14 @@ async def configure_turn(
     tools: ToolSet,
     subagents: SubAgentLauncher | None,
     injected: ModelClient | None = None,
+    resolved: ResolvedScope | None = None,
 ) -> TurnConfiguration:
     """按会话绑定解析本次运行的提示词、模型、Tool 与 Skill 边界。
 
-    models、tools、subagents 由运行时转交组装根注入的模型解析器、完整工具集与子代理启动器。
+    models、tools、subagents 由运行时转交组装根注入的模型解析器、平台工具集与子代理启动器。
     injected 是构造运行时注入的客户端：此时不解析模型，模型参数取客户端自带的默认值，
     也不改压缩模型与阈值，但 Agent 绑定、委派目录与工具边界照常计算。
+    resolved 是后台执行体本回合解析出的作用域工具；None 表示只用平台工具（请求路径不解析）。
     """
     mode_slug = getattr(session, "mode_slug", "standard")
     compact_model: ResolvedModel | None = None
@@ -279,6 +303,7 @@ async def configure_turn(
             compact_threshold = max(1, model.context_length * 3 // 4)
     model_fields: dict[str, Any] = {
         "tools": tools,
+        "resolved": resolved,
         "subagents": subagents,
         "mode_slug": mode_slug,
         "model": model,
@@ -295,6 +320,16 @@ async def configure_turn(
         raise AgentException.message("缺少可信工作区上下文")
     agent = await AgentDefinitionService(db).get_runtime_config(workspace_id, session_agent_id)
     return TurnConfiguration.for_agent(db, agent, **model_fields)
+
+
+def _scoped_binding(profile: ToolProfile, mode_slug: str) -> ToolBinding:
+    """主回合加载哪些作用域工具：默认 Agent 全部加载；极速模式与自建 Agent 不加载。
+
+    自建 Agent 按 server 绑定加载留到 Agent 的 MCP 绑定落地后再接入。
+    """
+    if mode_slug == "turbo" or profile != "lead":
+        return ToolBinding.none()
+    return ToolBinding.all()
 
 
 async def load_delegate_catalog(db: AsyncSession, workspace_id: int | None) -> str | None:

@@ -3,9 +3,10 @@
 ToolSet 取代原 ToolRegistry。工具顺序就是发给模型的工具顺序，提示缓存依赖它保持稳定：
 多个来源按传入顺序拼接，来源内部保持各自 ``list_tools()`` 的顺序，裁剪后保持原有相对顺序。
 
-另持有一份进程级工具集（register_platform_tools / platform_tools）：只有工具名、拿不到运行时工具集的
-调用方（权限规则、工具目录）经它按名查策略。应用层只持有 ToolSet，不认识具体的工具来源，
-由组装根 harness/bootstrap.py 在导入时登记。
+另持有一份进程级工具集（register_platform_tools / platform_tools）：只含进程级工具（内置工具），
+只给只有工具名、没有回合的管理场景（工具目录、绑定校验、权限规则配置）按名查策略。运行时按名查策略
+查本回合的策略全集 ResolvedScope.policies（平台工具加作用域工具，见 harness/app/tool_resolver.py）。
+应用层只持有 ToolSet，不认识具体的工具来源，由组装根 harness/bootstrap.py 在导入时登记。
 """
 
 from collections.abc import Iterable

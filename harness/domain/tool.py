@@ -3,9 +3,11 @@
 ``Tool`` 以 JSON Schema（``parameters``）描述参数，自带 ``ToolPolicy``，因此内置工具和
 外部来源（如 MCP server 下发的工具）都能被同一套 ToolSet 聚合、按策略裁剪与审核。
 内置工具继承 ``PydanticTool``，参数 schema 由 Pydantic 输入模型派生。
+随工作区和用户变化的作用域工具（如 MCP）另有身份、绑定与传递三个值类型，见文件末尾。
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -166,6 +168,8 @@ class ToolContext:
     shell_tmp_root: Path | None = None
     # 子代理启动器，由运行时经工具网关注入；只有 Agent 工具读取，缺失时 Agent 工具报错而不回落。
     subagents: SubAgentLauncher | None = None
+    # 本执行的作用域工具，由运行时经工具网关注入，留给 Agent 工具交给子执行；None 表示没有。
+    scoped: ScopedGrant | None = None
 
 
 class Tool(ABC):
@@ -179,6 +183,8 @@ class Tool(ABC):
     description: str
     parameters: dict[str, Any]
     policy: ToolPolicy
+    # 工具来源：None 表示内置工具；作用域工具（如 MCP）为 "mcp:{server_key}"。
+    source: str | None = None
 
     def to_spec(self) -> ToolSpec:
         """产出中立工具描述；编码成各家 SDK 形状由对应客户端内部完成。"""
@@ -231,3 +237,77 @@ class PydanticTool(Tool):
     @abstractmethod
     async def run(self, args: BaseModel, ctx: ToolContext) -> str:
         pass
+
+
+# ---------- 作用域工具：随工作区和用户变化的工具（如 MCP），每回合解析一次 ----------
+
+
+@dataclass(frozen=True)
+class ToolScope:
+    """解析作用域工具所需的身份，由运行时从可信的回合身份构造。"""
+
+    workspace_id: int
+    user_id: int
+
+
+@dataclass(frozen=True)
+class ToolBinding:
+    """本回合可见哪些作用域工具，只经 all()、servers()、none() 三个工厂方法构造。
+
+    grants 为 None 表示全部可见；否则每项是（工具来源 ``Tool.source``，可见工具名），
+    工具名为 None 表示该来源的全部工具。工具名是模型可见名：MCP 原名由构造方用
+    server_key 换算（server_key 创建后不可改，换算结果稳定），这里只做集合匹配。
+    """
+
+    grants: tuple[tuple[str, frozenset[str] | None], ...] | None
+
+    @classmethod
+    def all(cls) -> ToolBinding:
+        """全部作用域工具可见（默认 Agent）。"""
+        return cls(grants=None)
+
+    @classmethod
+    def servers(cls, grants: Mapping[str, Iterable[str] | None]) -> ToolBinding:
+        """只有列出的来源可见；值为 None 表示该来源全部工具，否则只留列出的工具名。"""
+        items: list[tuple[str, frozenset[str] | None]] = []
+        for source, names in sorted(grants.items(), key=lambda item: item[0]):
+            if names is None:
+                items.append((source, None))
+            else:
+                items.append((source, frozenset(names)))
+        return cls(grants=tuple(items))
+
+    @classmethod
+    def none(cls) -> ToolBinding:
+        """不加载作用域工具（极速模式、编排器等）。"""
+        return cls(grants=())
+
+
+@dataclass(frozen=True)
+class ScopedGrant:
+    """父执行交给子执行的作用域工具。
+
+    tools 是本身份的全部作用域工具，子执行据此查策略；visible 是子执行可见的工具名。
+    """
+
+    tools: tuple[Tool, ...]
+    visible: frozenset[str]
+
+    def visible_tools(self) -> tuple[Tool, ...]:
+        """可见的作用域工具，保持 tools 的顺序。"""
+        return tuple(tool for tool in self.tools if tool.name in self.visible)
+
+
+def select_scoped(tools: Iterable[Tool], binding: ToolBinding) -> tuple[Tool, ...]:
+    """按绑定从作用域工具里选出本回合可见的，保持输入顺序；来源不在绑定里的一律不选。"""
+    if binding.grants is None:
+        return tuple(tools)
+    grants = dict(binding.grants)
+    selected: list[Tool] = []
+    for tool in tools:
+        if tool.source is None or tool.source not in grants:
+            continue
+        names = grants[tool.source]
+        if names is None or tool.name in names:
+            selected.append(tool)
+    return tuple(selected)

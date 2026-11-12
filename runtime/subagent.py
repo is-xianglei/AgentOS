@@ -52,7 +52,7 @@ from harness.domain.messages import AssistantMessage, ToolCall, ToolResult
 from harness.domain.review import SOURCE_BUDGET, ReviewRequest
 from harness.domain.roles.subagent import SubAgent, SubAgentSpec
 from harness.domain.roles.teammate import Teammate, is_identity_block
-from harness.domain.tool import ToolProfile
+from harness.domain.tool import ScopedGrant, ToolProfile
 from runtime.step import AgentStep
 from runtime.stream_assembler import TurnEventAssembler
 from team.isolation import (
@@ -137,6 +137,7 @@ class SubAgentLoopRun:
     spec: SubAgentSpec
     tool_registry: ToolSet
     tool_gateway: ToolGateway
+    policies: ToolSet
     model_settings: ModelSettings
     budget: ToolCallBudget
     parent_turn_id: UUID | None
@@ -200,6 +201,7 @@ class _InMemoryLoopPolicy[R](LoopPolicy[R]):
             allowed_skill_names=run.allowed_skill_names,
             budget=run.budget,
             denied_calls=self._denied_calls,
+            policies=run.policies,
         )
         return None
 
@@ -304,7 +306,7 @@ class SubAgentRunner:
         """初始化子代理运行器依赖，具体实现全部由组装根（harness/bootstrap.py）注入。
 
         llm 是注入的模型客户端，注入后不再按会话解析模型；sessions 只用来读取所属会话冻结的模型选项；
-        tools 是完整工具集，既是裁剪的底集，也是网关与审核按名查策略的策略全集；
+        tools 是平台工具集，既是裁剪的底集，也是没有作用域工具时网关与审核按名查策略的策略全集；
         subagent_model 按 spec 给出 .env 端点上要覆盖的模型名。
         """
         self.db = db
@@ -320,9 +322,28 @@ class SubAgentRunner:
         self.sessions = sessions
         self.models = models
         self.tools = tools
-        # 按名查策略的策略全集：本阶段就是注入的完整工具集，裁剪只作用于可见集，不作用于它。
+        # 平台工具的策略全集，裁剪只作用于可见集，不作用于它；收到作用域工具时另见 _policies。
         self.policies = tools
         self._subagent_model = subagent_model
+
+    def _policies(self, scoped: ScopedGrant | None) -> ToolSet:
+        """本次执行的策略全集：平台工具加上父执行交来的全部作用域工具，不按可见名单裁剪。"""
+        if scoped is None:
+            return self.policies
+        return self.tools.with_tools(*scoped.tools)
+
+    @staticmethod
+    def _with_scoped(registry: ToolSet, scoped: ScopedGrant | None) -> ToolSet:
+        """在平台工具的裁剪结果后面接上父执行给出的可见作用域工具。
+
+        规格白名单只约束平台工具，作用域工具由父执行按绑定选好，这里不再裁剪。
+        """
+        if scoped is None:
+            return registry
+        visible = scoped.visible_tools()
+        if not visible:
+            return registry
+        return ToolSet((*registry.tools, *visible))
 
     def _resolve_tools(
         self,
@@ -393,11 +414,13 @@ class SubAgentRunner:
         workspace_id: int | None = None,
         parent_allowed_tool_names: frozenset[str] | None = None,
         allowed_skill_names: frozenset[str] | None = None,
+        scoped: ScopedGrant | None = None,
     ) -> str:
         """无状态执行一次子代理:按 spec 配置跑 ReAct 并返回报告。
 
         不依赖团队成员或收件箱,prompt 由调用方(Agent 工具)直接给出。
         member_name 复用为 spec 的运行标识(内置即 agent_type 值),兼容运行记录表与前端事件契约。
+        scoped 是父执行交来的作用域工具：全部工具进策略全集，visible 内的进可见集；None 表示没有。
         """
         member_name = spec.runtime_name
         started_at = time.perf_counter()
@@ -419,13 +442,15 @@ class SubAgentRunner:
             profile = "subagent"
         # 保持旧的二参数调用形态，便于上层替换/测试 _resolve_tools；数据库 Agent
         # 在默认子代理边界基础上再按自身档位做一次能力解析。
+        policies = self._policies(scoped)
         tool_registry = self._resolve_tools(spec, parent_allowed_tool_names)
         if profile != "subagent" and hasattr(tool_registry, "names"):
-            profile_names = self.policies.callable_names(
+            profile_names = policies.callable_names(
                 tool_registry.names,
                 profile,
             )
             tool_registry = tool_registry.only(*profile_names)
+        tool_registry = self._with_scoped(tool_registry, scoped)
         # 被委派的自建 Agent 没有审批通道:被拒的工具调用由运行时记下,结束时汇总给默认 Agent,
         # 由它在主会话里按正常审批重做。其余档位不收集,输出保持原样。
         denied_calls: list[DeniedToolCall] | None = None
@@ -460,11 +485,12 @@ class SubAgentRunner:
                 tool_registry,
                 profile,
                 principal_name=actor.name,
-                policies=self.policies,
+                policies=policies,
                 agent_id=spec.agent_id,
                 allowed_skill_names=allowed_skill_names,
                 shell_access=spec.shell_access,
                 shell_tmp_root=spec.shell_tmp_root(Path(tempfile.gettempdir())),
+                scoped=scoped,
             )
             assembler = TurnEventAssembler(actor, session_id, turn_id=parent_turn_id)
             await self._emit_event(StreamEvent.turn_start(actor, session_id))
@@ -486,6 +512,7 @@ class SubAgentRunner:
                         workspace_id,
                         allowed_skill_names=allowed_skill_names,
                         denied_calls=denied_calls,
+                        policies=policies,
                     )
                 if denied_calls:
                     report = f"{report}\n\n{_render_denied_summary(denied_calls)}"
@@ -597,6 +624,7 @@ class SubAgentRunner:
         allowed_skill_names: frozenset[str] | None = None,
         budget: ToolCallBudget | None = None,
         denied_calls: list[DeniedToolCall] | None = None,
+        policies: ToolSet | None = None,
     ) -> None:
         """裁决并执行一轮 tool_use,把结果追加回 messages。
 
@@ -604,8 +632,11 @@ class SubAgentRunner:
         因此 ask 在此坍缩为拒绝,并把原因作为 tool_result 回给模型,让它自行改道;
         不能沿用"未裁决直接执行"的旧行为,否则子代理成为绕过审批的提权路径。
         denied_calls 非空时,每次被权限裁决拒绝的调用都会追加进去,供调用方生成被拒摘要。
+        policies 是构造本次网关时传入的策略全集；None 表示本次执行没有作用域工具，按平台工具查。
         """
         agent_type = spec.runtime_name
+        if policies is None:
+            policies = self.policies
         if budget is None:
             budget = ToolCallBudget(
                 total_limit=max(1, spec.max_rounds * 4),
@@ -622,7 +653,7 @@ class SubAgentRunner:
                     workspace_id=workspace_id,
                     allowed_skill_names=tool_gateway.context.allowed_skill_names,
                     # 与构造本次网关时传入的是同一份策略全集。
-                    policies=self.policies,
+                    policies=policies,
                 ),
             )
             # 审核员改写过入参时（默认规则链不改写），执行与落库都用审核后的入参。
@@ -702,10 +733,12 @@ class SubAgentRunner:
         *,
         allowed_skill_names: frozenset[str] | None = None,
         denied_calls: list[DeniedToolCall] | None = None,
+        policies: ToolSet,
     ) -> tuple[str, int]:
         """执行子代理 ReAct 循环,返回报告与实际执行轮数。系统提示由角色组装,轮次上限取自 spec。
 
-        denied_calls 原样透传给 _execute_tool_calls,用于收集被拒的工具调用。
+        denied_calls 原样透传给 _execute_tool_calls,用于收集被拒的工具调用;
+        policies 是本次执行的策略全集。
         """
         model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
         run = SubAgentLoopRun(
@@ -714,6 +747,7 @@ class SubAgentRunner:
             spec=spec,
             tool_registry=tool_registry,
             tool_gateway=tool_gateway,
+            policies=policies,
             model_settings=model_settings,
             budget=ToolCallBudget(
                 total_limit=max(1, spec.max_rounds * 4),
@@ -747,12 +781,14 @@ class SubAgentRunner:
         workspace_id: int | None = None,
         parent_allowed_tool_names: frozenset[str] | None = None,
         allowed_skill_names: frozenset[str] | None = None,
+        scoped: ScopedGrant | None = None,
     ) -> str:
         """恢复并单次推进一个 teammate:读历史→注入身份→排空收件箱→认领→ReAct→写回。
 
         与 run() 的一次性子代理不同,teammate 状态全落库(member.history),
         本方法是一个「恢复 + 单次推进」运行单元:跑完即结束,不起常驻线程。
         任何实例都能据 DB 接着唤醒,多实例正确性由 DB 保证。
+        scoped 的含义同 run()。
         """
         logger.info(
             "唤醒 teammate,开始单次推进",
@@ -783,17 +819,22 @@ class SubAgentRunner:
             memory_prefix=rendered_memories,
         )
         # 先继承父 Agent 的硬白名单，再叠加 teammate 规格；通信工具同样不得越过父边界。
-        tool_registry = self._resolve_tools(spec, parent_allowed_tool_names, "teammate")
+        policies = self._policies(scoped)
+        tool_registry = self._with_scoped(
+            self._resolve_tools(spec, parent_allowed_tool_names, "teammate"),
+            scoped,
+        )
         tool_gateway = ToolGateway.from_registry(
             self.db,
             tool_registry,
             "teammate",
             principal_name=name,
-            policies=self.policies,
+            policies=policies,
             agent_id=spec.agent_id,
             allowed_skill_names=allowed_skill_names,
             shell_access=spec.shell_access,
             shell_tmp_root=spec.shell_tmp_root(Path(tempfile.gettempdir())),
+            scoped=scoped,
         )
 
         # 为本次推进设置独立隔离 id(收件箱消费按该 id 隔离;任务认领不隔离)。
@@ -838,6 +879,7 @@ class SubAgentRunner:
                 user_id,
                 workspace_id,
                 allowed_skill_names=allowed_skill_names,
+                policies=policies,
             )
 
             # 5) 写回历史 + 据剩余待办决定 idle / working。
@@ -926,6 +968,7 @@ class SubAgentRunner:
         workspace_id: int | None,
         *,
         allowed_skill_names: frozenset[str] | None = None,
+        policies: ToolSet,
     ) -> str:
         """teammate 版 ReAct:每轮开始尝试认领本会话 task,再走模型+工具循环;messages 原地追加。"""
         model_settings = await self._configure_model(session_id, spec, workspace_id, user_id)
@@ -935,6 +978,7 @@ class SubAgentRunner:
             spec=spec,
             tool_registry=tool_registry,
             tool_gateway=tool_gateway,
+            policies=policies,
             model_settings=model_settings,
             budget=ToolCallBudget(
                 total_limit=max(1, TEAMMATE_MAX_ROUNDS * 4),

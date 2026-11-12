@@ -16,7 +16,7 @@ from core.event_bus import StreamBus
 from core.events import Actor
 from harness.app.ports import SubAgentLauncher
 from harness.app.tool_set import ToolSet
-from harness.domain.tool import ShellAccess, ToolOutput, ToolProfile
+from harness.domain.tool import ScopedGrant, ShellAccess, ToolOutput, ToolProfile
 from tools.context import ToolExecutionContext
 from tools.models import ToolCallRecord
 from tools.service import ToolService
@@ -29,7 +29,8 @@ class ToolGateway:
     ``registry`` 是已经按 profile 和父级白名单裁剪后的集合；``run`` 仍然把
     profile 再传给 ``ToolService``，因此即使调用方持有旧的工具名，也会在执行层
     再次经过策略检查。``policies`` 是本回合按名查策略的策略全集（不按可见集裁剪），
-    构造期裁剪与执行层兜底都查它。``subagents`` 是运行时注入的子代理启动器，随每次执行放进工具上下文。
+    构造期裁剪与执行层兜底都查它。``subagents`` 是运行时注入的子代理启动器，``scoped`` 是本执行的
+    作用域工具，两者都随每次执行放进工具上下文，供 Agent 工具交给子执行。
     """
 
     db: AsyncSession
@@ -42,6 +43,7 @@ class ToolGateway:
     shell_access: ShellAccess = ShellAccess.FULL
     shell_tmp_root: Path | None = None
     subagents: SubAgentLauncher | None = None
+    scoped: ScopedGrant | None = None
     context: ToolExecutionContext = field(init=False)
     service: ToolService = field(init=False)
 
@@ -104,6 +106,7 @@ class ToolGateway:
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
         subagents: SubAgentLauncher | None = None,
+        scoped: ScopedGrant | None = None,
     ) -> ToolGateway:
         """创建网关并在构造期裁剪工具集合。
 
@@ -138,6 +141,7 @@ class ToolGateway:
             shell_access=shell_access,
             shell_tmp_root=shell_tmp_root,
             subagents=subagents,
+            scoped=scoped,
         )
 
     @classmethod
@@ -155,6 +159,7 @@ class ToolGateway:
         shell_access: ShellAccess = ShellAccess.FULL,
         shell_tmp_root: Path | None = None,
         subagents: SubAgentLauncher | None = None,
+        scoped: ScopedGrant | None = None,
     ) -> ToolGateway:
         """从已有注册表构造网关，并严格校验其能力边界。
 
@@ -184,6 +189,7 @@ class ToolGateway:
             shell_access=shell_access,
             shell_tmp_root=shell_tmp_root,
             subagents=subagents,
+            scoped=scoped,
         )
 
     @property
@@ -271,4 +277,5 @@ class ToolGateway:
             execution_context=self.context,
             round_tool_names=round_tool_names,
             subagents=self.subagents,
+            scoped=self.scoped,
         )

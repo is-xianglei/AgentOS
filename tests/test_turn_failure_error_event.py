@@ -139,6 +139,7 @@ def _runtime(
     runtime.configuration = TurnConfiguration.for_lead(
         runtime.db, tools=platform_tools(), subagents=None
     )
+    monkeypatch.setattr(runtime, "_resolve_scope", _noop)
     monkeypatch.setattr(runtime, "_configure_agent", _noop)
     monkeypatch.setattr(runtime, "_apply_user_prompt_hooks", _noop)
     monkeypatch.setattr(runtime, "_run_llm_loop", loop)

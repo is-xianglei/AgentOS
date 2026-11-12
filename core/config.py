@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     # 每会话并发 SubAgent 上限,防止无限 spawn 导致连接与 token 失控。
     subagent_max_concurrency: int = 3
 
+    # --- MCP -----------------------------------------------------------------
+    # 每回合解析全部作用域工具（MCP）的总超时;超时的来源记为故障,回合照常进行。
+    mcp_resolve_timeout_seconds: float = Field(default=20.0, gt=0)
+
     # --- 数据库 --------------------------------------------------------------
     database_url: str | None = None
 
