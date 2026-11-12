@@ -368,7 +368,7 @@ class McpServerRegistry(Protocol):
 `McpProbeResult`（server 信息、工具清单摘要、错误）都是领域值类型，放在 `harness/domain/mcp.py`。
 
 M1a 落地（`harness/app/mcp_port.py`）：
-- `McpServerConnector` 只有 `probe` 和 `invalidate` 两个抽象方法，OAuth 的两个半程留到 M3；`McpServerRegistry` 留到 M1b。
+- `McpServerConnector` 只有 `probe` 和 `invalidate` 两个抽象方法，OAuth 的两个半程留到 M3；`McpServerRegistry` 在 M1b 加入（见本节末尾）。
   `probe` 失败不抛异常，结果里带中文错误；只有地址不合法（SSRF 校验不通过）抛中文 AgentException，属于调用方输入错误。
 - 新增窄接口 `McpServerSource`，是 `McpToolProvider` 唯一的数据来源，**M1b 由 mcp_server 域按它实现**：
 
@@ -386,6 +386,47 @@ class McpServerSource(Protocol):
   放在应用层而不是适配层：mcp_server 域不能导入 `harness.adapters`（12.1 节），而它要满足这个协议、构造 `McpServerEntry`。
   这和 `SessionService` 结构化满足 `SessionStore` 是同一种做法。第 2 节说的「经 `session_factory` 开短会话」由实现方负责，
   适配器只认这个协议。
+
+M1b 落地（`harness/app/mcp_port.py`、`harness/domain/mcp_config.py`）：
+- **`McpServerSource` 的生产实现**是 `mcp_server/source.py` 的 `McpServerCatalog(session_factory)`：每次 `list_servers(scope)`
+  开一个短会话，调 `McpServerService.list_usable(workspace_id, user_id)` 读配置与凭证，读完即关。放在 mcp_server 包而不是组装根旁边：
+  它只依赖本域 Service 和应用层端口，不碰适配器；组装根只负责注入 `AsyncSessionLocal`。
+- **`McpServerRegistry`** 是 `Protocol`，`McpServerService(db)` 结构化满足它。工作区和当前用户按参数传入，
+  与仓库里其他 Service 的写法一致；看不到的 server（别人的私有 server、别的工作区、已删除、普通成员眼里停用的共享 server）一律 404：
+
+```python
+class McpServerRegistry(Protocol):
+    async def list_servers(self, workspace_id: int, actor_user_id: int) -> list[McpServerView]: ...
+    async def get_server(self, workspace_id: int, actor_user_id: int, server_id: int) -> McpServerView: ...
+    async def prepare_create(self, workspace_id: int, actor_user_id: int, draft: McpServerDraft) -> None: ...
+    async def create_server(self, workspace_id: int, actor_user_id: int, draft: McpServerDraft,
+                            probe: McpProbeResult) -> McpServerView: ...
+    async def load_for_write(self, workspace_id: int, actor_user_id: int, server_id: int) -> McpWritableServer: ...
+    async def apply_update(self, workspace_id: int, actor_user_id: int, server_id: int,
+                           update: McpServerUpdate, probe: McpProbeResult | None) -> McpServerView: ...
+    async def delete_server(self, workspace_id: int, actor_user_id: int, server_id: int) -> None: ...
+    async def record_probe(self, workspace_id: int, actor_user_id: int, server_id: int,
+                           probe: McpProbeResult) -> McpServerView: ...
+```
+
+- 端口用到的值类型放在领域层新模块 `harness/domain/mcp_config.py`，应用层因此不认识 ORM，业务域也不认识 HTTP Schema。
+  都是纯函数和不可变值类型：
+  - `McpServerDraft.create(...)`：新建输入。构造时完成规范化与校验，包括 `validate_server_key`、`canonical_server_url`、请求头、过滤名单、超时；
+    凭证不进 repr。`probe_config(...)` 给出创建前探测用的配置。
+  - `McpServerChanges`：更新时只含显式提交字段的 TypedDict。
+  - `plan_update(current, changes) -> McpServerUpdate`：算出更新后的配置。规则如下：
+    - server_key 不可改，不能在共享和私有之间切换；
+    - 请求头的值为 `********` 时沿用原值；
+    - 地址、认证（含请求头）、过滤、超时、启用状态任一变化，`config_rev` 加一；
+    - 只有地址或认证变化才要重新探测（`needs_probe`）。
+  - `McpServerView`：展示视图，不含凭证；`writable` 表示当前用户能否修改，`header_names` 只在读过凭证表的写操作里填。
+  - `McpWritableServer(view, secret)`：写操作读到的配置与凭证。
+  - `diff_tools(before, after) -> McpToolDiff(added, removed, schema_changed)`：按原名比较，schema 变化按 `input_schema_sha256` 判断。
+  - `list_server_tools(config, tools)`：管理界面的工具展示，与回合用同一套命名、过滤和审批推导。
+  - `canonical_server_url`、`merge_secret_headers`、`masked_headers`、`redact_url_query`。
+- `harness/domain/mcp.py` 补了 `server_key_of(tool_name)`，从模型名取出 server_key，不是 MCP 工具名时返回 None，权限规则校验用；
+  另补了 `McpToolSummary.from_dict`、`McpToolAnnotations.from_dict`，用来还原 `tools_snapshot`。
+  `validate_server_key`、`validate_static_headers` 的错误改为 400：它们校验的是调用方输入，原来的默认值 500 不对。
 
 ### 4.2 编排：`TurnToolResolver`
 
@@ -467,8 +508,43 @@ class TurnToolResolver:
   最长挂这么久。管理操作频率低，可以接受这个代价，不为此破例分步提交。
 - 和 HugAgentOS 一样，探测成功之后才写库，失败的探测不会留下半条配置。
 - 「先查重名 → 探测 → 写库」之间存在并发竞态：两个请求可能都通过了重名检查。
-  最后由部分唯一索引兜底，Service 捕获 `IntegrityError` 后转成 `AgentException.message("server_key 已存在", status_code=409)`，
+  最后由部分唯一索引兜底，Service 捕获 `IntegrityError` 后转成 `AgentException.message("server_key 已被占用", status_code=409)`，
   不让它变成 500。
+
+M1b 落地（`harness/app/mcp_admin.py`）：
+
+```python
+class McpAdminService:
+    def __init__(self, *, registry: McpServerRegistry, connector: McpServerConnector,
+                 workspace_id: int, user_id: int) -> None: ...
+    async def list_servers(self) -> list[McpServerView]: ...
+    async def get_server(self, server_id: int) -> McpServerView: ...
+    async def list_tools(self, server_id: int) -> list[McpToolListing]: ...        # 读快照，不连 server
+    async def create_server(self, draft: McpServerDraft) -> McpServerView: ...
+    async def update_server(self, server_id: int, changes: McpServerChanges) -> McpServerView: ...
+    async def delete_server(self, server_id: int) -> None: ...
+    async def refresh_tools(self, server_id: int) -> McpRefreshResult: ...          # (server, diff, error)
+```
+
+- 角色、可见性、上限和重名都放在数据所属域的 `McpServerService`，`McpAdminService` 只编排，不重复校验（CLAUDE.md 第 9、11 条）。
+  各操作的编排顺序：
+  - `create_server`：`prepare_create` → `connector.probe(draft.probe_config(...), draft.secret)` → 探测失败抛 400「MCP server 探测失败」，
+    `details.error` 是连接器给的中文错误 → `create_server`。新建不调 `invalidate`：此前没有连接。
+  - `update_server`：`load_for_write` → `plan_update` → 地址或认证有变化时探测，失败抛 400 → `apply_update` → `config_rev` 变化时 `invalidate`。
+    改名、改描述、改审批模式都不探测，也不让连接失效。
+  - `delete_server`：软删 server 与凭证 → `invalidate`。软删时级联解除 Agent 绑定，要等 M2 建了绑定表才有。
+  - `refresh_tools`：`load_for_write` → 探测 → `record_probe`。探测成功时替换快照，返回与旧快照的差异；
+    失败时只记 `last_probe_at` / `last_probe_error`、保留快照，返回 `error`，不抛异常。
+- 与上表不同的两处：
+  - `refresh_tools` 只换快照、不改 `config_rev`，也**不调用 `invalidate`**。快照只用于管理界面和权限规则校验，回合不读它（第 7 节）；
+    `McpRuntime.invalidate` 清不掉 SDK 响应缓存里的条目（键是 `target_id = {server_id}#rev={config_rev}`），调了也不会让下一回合立刻看到新清单。
+    回合里的清单仍按 `mcp_tools_cache_seconds` 过期后再刷新。要做到「管理员手动刷新后立即生效」，需要在 M1c 给运行时补一个清 SDK 缓存条目的入口。
+  - 停用状态下改地址也会探测，不留「重新启用时从没验证过新地址」的口子。
+- 写操作都先给 server 行加锁（`SELECT ... FOR UPDATE`），锁一直持有到请求事务结束：`load_for_write` 和 `apply_update` 各加一次，同一个请求里重入不会阻塞。
+  同一个 server 的两个写请求因此串行执行，审批模式这类不改 `config_rev` 的字段也不会丢失更新。
+  `apply_update` 另外核对 `config_rev` 与计划所依据的版本是否一致，不一致报 409「MCP server 配置已被修改，请刷新后重试」。
+- 私有 server 的上限查两次：`prepare_create` 先查一次，写库时在按用户的事务级咨询锁 `pg_advisory_xact_lock(0x4D435053 /* "MCPS" */, user_id)` 里再查一次，
+  防止同一用户的并发请求越过上限。共享 server 的角色在写库时也重新查一次，因为探测可能持续数十秒。
 
 ## 5. 适配层（harness/adapters/mcp）
 
@@ -1010,6 +1086,37 @@ MCP 工具**不进** `tools` 表。这张表是全局的，`tool_key` 和 `runti
   由 agent 域软删相关绑定。这条在函数体内局部导入，用来打破导入环，仓库里已有先例 `harness/adapters/tools/builtin/agent.py:140-141`。
   `tests/test_import_isolation.py` 只检查模块级导入环。
 
+M1b 落地（`mcp_server/`，迁移 `alembic/versions/0031_mcp_servers.py`，revision `0031_mcp_servers`）：
+- 只建 `mcp_servers`（ORM `McpServerRecord`）和 `mcp_server_secrets`（`McpServerSecretRecord`）两张表，已在 `database/registry.py` 登记。
+  OAuth 的两张表留到 M3，`agent_mcp_servers` 留到 M2。
+- 列按上表实现，另外：
+  - 两个 CHECK 约束 `ck_mcp_servers_auth_type`、`ck_mcp_servers_approval_mode`；
+  - 部分唯一索引 `uq_mcp_servers_active_workspace_key (workspace_id, server_key) WHERE is_deleted = false`，共享和私有 server 一起算；
+  - `uq_mcp_server_secrets_active_server (server_id) WHERE is_deleted = false`；
+  - 普通索引：`workspace_id`、`owner_user_id`、`created_by`、`server_id`、`is_deleted`。
+- 凭证变更时软删旧行再插新行，有效行始终只有一行。
+- 迁移在开发库上执行过 `upgrade head` → `downgrade -1` → `upgrade head`。用 alembic autogenerate 比较两张新表，库表结构与 ORM 无差异。
+- 包结构：`models.py`、`schemas.py`、`repository.py`、`service.py`、`source.py`（`McpServerSource` 的实现，见 4.1 节）、`api.py`。
+- `McpServerService(db)` 的公开方法。前八个就是 `McpServerRegistry`，签名见 4.1 节；后两个给回合和 permission 域用：
+
+| 方法 | 规则 |
+|---|---|
+| `list_servers(workspace_id, actor_user_id)` | 活跃成员可调。owner / admin 看全部共享 server，成员只看已启用的；另加本人的私有 server，共享在前。不读凭证表 |
+| `get_server(workspace_id, actor_user_id, server_id)` | 可见规则同上，看不到一律 404。不读凭证表 |
+| `prepare_create(workspace_id, actor_user_id, draft)` | 共享 server 要 owner / admin（403）；私有 server 要活跃成员，且没超过 `mcp_max_private_servers_per_user`（409，`details={"limit": n}`）；server_key 被占用报 409「server_key 已被占用」，`details` 只有 `server_key` |
+| `create_server(workspace_id, actor_user_id, draft, probe)` | 重新核对角色；私有 server 在咨询锁里重新核对上限。写入配置、快照、探测时间、`config_rev=1`，有请求头时写凭证行；`IntegrityError` 转 409「server_key 已被占用」 |
+| `load_for_write(workspace_id, actor_user_id, server_id)` | 加行锁。看不到报 404，看得到但不能改报 403（成员对共享 server）；读出凭证 |
+| `apply_update(workspace_id, actor_user_id, server_id, update, probe)` | 加行锁，核对 `config_rev`（409）；写入计划，带探测结果时一并刷新快照；凭证有变化时替换 |
+| `delete_server(workspace_id, actor_user_id, server_id)` | 加行锁，软删 server 与凭证 |
+| `record_probe(workspace_id, actor_user_id, server_id, probe)` | 加行锁，写探测时间；成功时清空错误、替换快照，失败时记错误、保留快照；不改 `config_rev` |
+| `list_usable(workspace_id, user_id) -> list[McpServerEntry]` | `McpServerSource` 的数据：已启用的共享 server 加本人已启用的私有 server，带凭证。身份来自可信的回合，不再校验成员 |
+| `is_known_shared_tool(workspace_id, tool_name) -> bool` | 9.1 节的工具名校验：用 `server_key_of` 取出 key，只查共享 server（停用的也算）；有快照时按快照原名算出模型名精确匹配，快照为空的 OAuth server 按前缀匹配；私有 server 不参与 |
+
+- 地址存规范化后的形式（`canonical_server_url`）：协议和主机名转小写，去掉默认端口和路径末尾的斜杠，空白与控制字符直接拒绝。
+  https、userinfo、片段和内网地址的安全校验仍由适配层探测时做（5.6 节）。
+- 本阶段 `auth_type` 只开放 `none` 和 `static_headers`。Schema 层拒绝 `oauth`，返回 422；领域层 `McpServerDraft` 也拒绝它，返回 400「OAuth 认证尚未开放」。
+  原因是 OAuth server 的授权流程与探测方式要到 M3 才有。
+
 ### 7.1 凭证存储
 
 MCP 凭证明文存储，与 `model_providers.api_key` 的做法一致（2026-11-12 拍板）。涉及三样东西：
@@ -1193,6 +1300,9 @@ M3 开始时先做一次 spike，确认具体能复用哪些函数，结论回�
 - 工作区 global 规则配置接口的工具名校验：`permission/api.py` 对 `mcp__` 开头的名字不走「工具未注册」校验，
   改为检查它是否属于本工作区某个共享 server 的 `tools_snapshot`；快照为空的 OAuth server，按 `mcp__{server_key}__` 前缀校验。
   私有 server 不参与这项校验，管理员看不到它们，校验结果也不能泄露它们的存在。
+  M1b 落地：`permission/api.py` 的 `_validate_tool_name(db, tool_name, workspace_id)` 改为异步。`mcp__` 开头的名字改调
+  `McpServerService.is_known_shared_tool(...)`（7 节），其余名字照旧查 `platform_tools()`。
+  两条路径查不到时都报 400「工具未注册，不能配置权限规则」，私有 server 的工具与不存在的工具报同一句话。停用的共享 server 也算已知，规则可以先配好。
 - 子代理没有审批通道，`NoApprovalChannelRule` 会把 ask 合并为拒绝，和内置工具的处理方式一样。
 
 ### 9.2 Elicitation 与 MRTR
@@ -1239,6 +1349,29 @@ MCP server 的工具描述、server 自报的 `instructions` 和工具结果都�
 - 路由只做鉴权和 Schema 转换，然后调用 `McpAdminService`（经组装根的 `mcp_admin_service(db, ...)` 取得），
   不在路由里直接 new 适配器。
 
+M1b 落地（`mcp_server/api.py`、`mcp_server/schemas.py`）：
+- 实现了上表中除 OAuth 三个接口、Agent 绑定接口以外的五个，另加一个 `GET /servers/{id}`（详情）。路由在 `api/router.py` 以 `/mcp` 前缀注册。
+  所有路由经 `api/deps.py` 新增的 `get_mcp_admin_service` 取得 `McpAdminService`；这个依赖内部调用 `default_harness().mcp_admin_service(...)`，
+  `AGENTOS_MCP_ENABLED=false` 时返回 403「MCP 功能未启用（AGENTOS_MCP_ENABLED=false）」。
+- 请求与响应 Schema 摘要（响应都包在 `ApiResponse[T]` 里）：
+
+| 接口 | 请求 | 响应 `data` |
+|---|---|---|
+| `GET /servers` | — | `list[McpServerResponse]` |
+| `POST /servers` | `McpServerCreateRequest`：`visibility`（`workspace` / `private`）、`server_key`、`name`、`description?`、`url`、`auth_type`（`none` / `static_headers`）、`headers`、`approval_mode`、`tool_allowlist`、`tool_denylist`、`call_timeout_seconds?`、`is_enabled`；`extra="forbid"` | `McpServerCreateResponse`：`server`（`McpServerResponse`）、`tools`（`list[McpToolSummaryResponse]`） |
+| `GET /servers/{id}` | — | `McpServerResponse` |
+| `PUT /servers/{id}` | `McpServerUpdateRequest`：字段同上，都可省略。`visibility`、`server_key` 只用于核对，与原值不同报 400；`description`、`call_timeout_seconds` 可以传 null 清空，其余字段传 null 报 422；`headers` 一旦提交就整体替换，值为 `********` 沿用原值 | `McpServerResponse` |
+| `DELETE /servers/{id}` | — | `{"deleted": true}` |
+| `POST /servers/{id}/probe` | — | `McpProbeResponse`：`ok`、`error?`、`server`、`diff`（`added`、`removed`、`schema_changed[{name, before_sha256, after_sha256}]`） |
+| `GET /servers/{id}/tools` | — | `list[McpToolResponse]`：`name`、`description`、`input_schema_sha256`、`read_only?`、`destructive?`、`model_name?`、`filtered_out`、`requires_approval` |
+
+- `McpServerResponse`：`id`、`server_key`、`visibility`、`name`、`description`、`url`、`auth_type`、`approval_mode`、`tool_allowlist`、`tool_denylist`、
+  `call_timeout_seconds`、`config_rev`、`is_enabled`、`writable`、`headers`、`tool_count`、`last_probe_at`、`last_probe_error`、`created_by`、
+  `created_at`、`updated_at`。其中：
+  - `headers` 只在写操作（新建、修改）的响应里给出，形如 `{名称: "********"}`；列表与详情不读凭证表，`headers` 为 null；
+  - 没有写权限的成员看到的 `url` 里，查询参数整段换成 `********`（查询参数可能带着凭证）。
+- 「附带自己的授权状态」属于 OAuth，留到 M3。
+
 ### 10.2 组装根
 
 ```python
@@ -1271,6 +1404,23 @@ class Harness:
   - 退出时，在 `shutdown_executions()` 之后、`close_run_event_store()` 之前调用 `await mcp_runtime().aclose()`；
   - 只有运行时已经创建过才去关闭，免得为了关闭反而先把它创建出来。
 - memory worker 不用 MCP，不导入这部分。
+
+M1b 落地（`harness/bootstrap.py`、`main.py`）：
+- `mcp_runtime()`（`@cache`）：用 Settings 组装 `McpHttpFactory(allow_insecure_http, allowed_private_hosts=parse_allowed_hosts(...),
+  connect_timeout, read_timeout=mcp_call_timeout_seconds, resolver=system_resolver)` 和 `McpRuntimeLimits`。
+  `read_timeout` 取单次调用的上限：每次调用的读超时另由 SDK 的 `read_timeout_seconds` 控制，httpx 的读超时只作兜底，不能比它短。
+- `close_mcp_runtime()`：`mcp_runtime.cache_info().currsize` 为 0 时什么也不做。`main.py` 的 lifespan 在 `shutdown_executions()` 之后、
+  `close_run_event_store()` 之前调用它。
+- `mcp_connector() -> McpServerConnector`：`McpConnector(runtime=mcp_runtime(), probe_timeout=..., max_schema_bytes=...)`。
+  `builtin_harness()` 的 `mcp_connector` 字段就是这个函数；`Harness.mcp_connector` 默认值为 None，排在 `scoped_tools` 之后。
+- `Harness.mcp_admin_service(db, *, user_id, workspace_id) -> McpAdminService`：`registry=McpServerService(db)`、`connector=self.mcp_connector()`；
+  `mcp_connector` 为 None 时抛「当前装配未提供 MCP 连接器，无法管理 MCP server」。
+- **`mcp_tool_provider(session_factory: SessionFactory) -> McpToolProvider`**：`McpToolProvider(runtime=mcp_runtime(),
+  servers=McpServerCatalog(session_factory), limits=McpProviderLimits(list_timeout, call_timeout, max_output_chars, max_schema_bytes))`。
+  **本阶段不接进 `scoped_tools`**，`builtin_harness()` 显式写着 `scoped_tools=()`。M1c 在 `mcp_enabled` 打开时改为
+  `scoped_tools=(mcp_tool_provider(AsyncSessionLocal),)`。
+- 导入组装根会连带导入 `harness.adapters.mcp`，也就会加载 mcp SDK，实测增加约 0.26 秒；但不会创建运行时，也不建连接。
+  memory worker 不导入组装根，不受影响。
 
 ### 10.3 落库与事件
 
@@ -1313,7 +1463,8 @@ class Harness:
 - M1a 已加入 `ENABLED`、`CONNECT`、`LIST`、`PROBE`、`CALL`、`IDLE`、`POOL_MAX_CONNECTIONS`、`TOOLS_CACHE`、`MAX_OUTPUT_CHARS`、
   `MAX_SCHEMA_BYTES`、`ALLOW_INSECURE_HTTP`、`ALLOWED_PRIVATE_HOSTS`（`RESOLVE` 在 M0b 已加入），类型与默认值同上表，
   超时校验是 `Settings._check_mcp_timeouts`（`model_validator`）。`PUBLIC_BASE_URL`、`OAUTH_REFRESH_SKEW_SECONDS` 留到 M3，
-  `MAX_PRIVATE_SERVERS_PER_USER` 留到 M1b。适配器不读 Settings，由组装根读好后经 `McpRuntimeLimits`、`McpProviderLimits`、
+  `MAX_PRIVATE_SERVERS_PER_USER` 已在 M1b 加入（`mcp_max_private_servers_per_user: int = Field(default=10, ge=0)`，0 表示不允许建私有 server，
+  `.env` 与 `.env.example` 同步）。适配器不读 Settings，由组装根读好后经 `McpRuntimeLimits`、`McpProviderLimits`、
   `McpHttpFactory` 和 `McpConnector` 的构造参数传入；`ALLOWED_PRIVATE_HOSTS` 经 `http.parse_allowed_hosts` 解析成小写集合。
 
 ## 12. 测试策略
@@ -1388,6 +1539,26 @@ class Harness:
   - 两个连接同时刷新同一个 token，确认只发出一次刷新请求；
   - 软删 server 时级联解除绑定；
   - 私有 server 的可见性：管理接口对别人返回 404，列表里看不到；`server_key` 与别人的私有 server 冲突时返回 409，信息里不带 owner。
+- **M1b 落地的测试文件**：
+  - `tests/test_mcp_config.py`：地址规范化与拒绝、查询参数掩码、请求头掩码合并、新建输入校验、更新计划的 `config_rev` 规则
+    （展示与审批不加、过滤、超时、启用加一但不探测，地址、认证、请求头加一并探测，规范化后相同不算变化）、不可变字段、工具差异、工具展示、`server_key_of`。
+  - `tests/test_mcp_admin.py`：内存 registry 加假 connector，测编排顺序：
+    - 校验 → 探测 → 写库；校验失败不探测；探测失败不写库；地址不合法时不写库；
+    - 改地址才重新探测并让 `config_rev` 加一、失效；只改过滤不探测；改名既不探测也不失效；
+    - 删除后失效；重新探测返回差异，失败时保留快照；工具列表不连 server。
+  - `tests/test_mcp_server_service.py`：内存仓储替身加 monkeypatch 的成员服务，测业务规则：
+    - 角色、私有 server 上限及写库时的复核、撞别人私有 server 的 key 时 409 不带 owner、`IntegrityError` 转 409；
+    - 别人的私有 server 在各方法上都是 404、成员对共享 server 403、列表与详情不读凭证表；
+    - 过期计划 409、软删后 key 可重建、探测记录、`list_usable`、`is_known_shared_tool`（快照精确匹配、OAuth 空快照按前缀、私有不参与）。
+  - `tests/test_mcp_server_api.py`：ASGI 契约测试，覆盖响应外壳、请求头掩码、校验错误不回显凭证、更新只传显式字段、成员视图的地址掩码、
+    `mcp_enabled=False` 时 403、组装根缺连接器的中文错误、`scoped_tools` 保持为空、工厂共用惰性运行时、
+    lifespan 只关闭已创建的运行时、permission 对 `mcp__` 名字的分流。
+  - `tests/test_mcp_server_pg.py`：真实 PostgreSQL，库可达时实际执行，覆盖：
+    - 部分唯一索引（共享与私有共用命名空间，软删后可以重建）、凭证行的软删替换与 JSONB 往返；
+    - 两个连接并发创建同一 key，一个成功一个 409（用 `pg_stat_activity` 确认后到者在等锁）；
+    - 私有 server 对别人 404 且不在别人的列表里、撞别人私有 server 的 key 时 409 不带 owner、每人上限（软删后释放名额）、成员不能写共享 server；
+    - `McpServerCatalog` 只返回已启用的共享 server 加本人的私有 server；
+    - 经 HTTP 调 `/api/permissions` 校验 `mcp__` 名字（快照名、有损清洗名、停用的共享 server、OAuth 空快照前缀都接受，私有 server 与未知名字报同一句话）。
 
 ### 12.3 黄金测试
 
@@ -1486,12 +1657,16 @@ M0 分两步提交：
 - M0b（已实现）：其余部分，即 `Tool.source`、`ToolScope`、`ToolBinding`、`ScopedGrant`、作用域工具的传递通道、`TurnToolResolver`、`Harness.scoped_tools`、`AGENTOS_MCP_RESOLVE_TIMEOUT_SECONDS`、第 15 节的文档修订。
 
 M1 分步实现：
-- M1a（已实现，未提交）：SDK 升级、`harness/domain/mcp.py`、`harness/app/mcp_port.py`（`McpServerConnector` 的 `probe` / `invalidate`
+- M1a（已实现，dd145ef）：SDK 升级、`harness/domain/mcp.py`、`harness/app/mcp_port.py`（`McpServerConnector` 的 `probe` / `invalidate`
   与 `McpServerSource`）、`harness/adapters/mcp/`（`http.py`、`pool.py`、`runtime.py`、`provider.py`、`tool.py`、`results.py`、
   `connector.py`）、第 11 节中 M1 用得到的配置项、12.1 节其余四条静态检查与测试。不建表、不接组装根和 lifespan，
   适配器只经端口和值类型对外，用进程内假 server 测通。
-- M1b：`mcp_server` 域（两张表、迁移、`McpServerService` 实现 `McpServerSource`、`McpServerRegistry`）、管理接口、组装根与 lifespan，
-  以及 M1 其余各项。
+- M1b（已实现）：`mcp_server` 域（两张表、迁移 `0031_mcp_servers`、`McpServerService` 结构化满足 `McpServerRegistry`、
+  `McpServerCatalog` 实现 `McpServerSource`）、`harness/domain/mcp_config.py`、`harness/app/mcp_admin.py` 的 `McpAdminService`、管理接口、
+  `permission/api.py` 对 `mcp__` 名字的校验、组装根（`mcp_runtime()`、`Harness.mcp_connector`、`mcp_admin_service`、`mcp_tool_provider`）与 lifespan 关闭、
+  `AGENTOS_MCP_MAX_PRIVATE_SERVERS_PER_USER`、第 15 节标 M1 的文档行（八份黄金测试除外）。主回合不加载 MCP 工具，`scoped_tools` 仍为 `()`。
+- M1c：运行时接线，即 `scoped_tools` 接上 `mcp_tool_provider(...)`、`tool_sources` 事件、`tool_calls.source`、`ToolInfo.source` 和审批载荷里的
+  `tool.source`、挂起快照核对、MCP 审批 `can_update_input=False` 与 422、`always_scope=global` 的管理员限制、第八份黄金测试。
 
 **M0b 对 Workflow 的调整**：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
 推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，
@@ -1523,16 +1698,16 @@ M1 分步实现：
 ## 15. 与上位文档的偏离
 
 以下几处现有文档和注释对 MCP 做了预设，本文的设计推翻了这些预设。M0 的第一个提交要同步修改这些地方，
-修改完成之前以本文为准。M0 的行已在 M0b 改完；标 M1 的部分（`McpServerConnector`、`mcp_connector`、导入禁令、八份黄金测试）留到 M1：
+修改完成之前以本文为准。M0 的行已在 M0b 改完；标 M1 的部分中，`McpServerConnector`、`McpServerRegistry`、`mcp_connector`、导入禁令已在 M1b 改完，八份黄金测试留到 M1c：
 
 | 位置 | 原来的预设 | 本文的设计 | 何时改 |
 |---|---|---|---|
-| CLAUDE.md、AGENTS.md「Agent 核心（harness）约定」第 3 条（已有端口，`:58-61`） | 端口清单里没有作用域来源 | 补上 `ScopedToolProvider`（ports.py）；M1 再补 `McpServerConnector`、`McpServerRegistry`（mcp_port.py） | M0 部分已改（M0b）/ M1 |
+| CLAUDE.md、AGENTS.md「Agent 核心（harness）约定」第 3 条（已有端口，`:58-61`） | 端口清单里没有作用域来源 | 补上 `ScopedToolProvider`（ports.py）；M1 再补 `McpServerConnector`、`McpServerRegistry`（mcp_port.py） | 已改（M0b / M1b） |
 | 同上第 4 条（扩展点） | 接 MCP 时实现 `ToolProvider`，并在 `platform_tool_set()` 里追加 | 实现 `ScopedToolProvider`，经 `Harness.scoped_tools` 注入；`platform_tool_set()` 只放内置工具 | 已改（M0b） |
-| 同上第 9 条（导入禁令，`:73-76`） | 只禁 anthropic / openai | 补上：`mcp` 只能在 `harness/adapters/mcp` 导入；runtime、app、domain 不得导入 `mcp_server` | M1 |
+| 同上第 9 条（导入禁令，`:73-76`） | 只禁 anthropic / openai | 补上：`mcp` 只能在 `harness/adapters/mcp` 导入；runtime、app、domain 不得导入 `mcp_server` | 已改（M1b，另补 `mcp_server` 不得导入 adapters 与 SDK） |
 | 同上第 10 条（`:77-79`） | 只有工具名的 feature 域经 `platform_tools()` 查策略 | 收窄为只用于管理场景；运行时与审核链一律查本回合的 `policies` | 已改（M0b） |
-| 同上第 11 条（`:80`）、README.md:122 | 七份黄金测试 | 八份（新增 `test_mcp_tool_golden.py`） | M1 |
-| `docs/agent-architecture.md:23`（组装根一段） | `Harness` 字段清单里没有作用域来源；「以后 MCP 连接管理器需要关闭钩子时再接入 lifespan」 | 补上 `scoped_tools`、`mcp_connector`；`mcp_runtime()` 惰性创建，由 lifespan 关闭 | M0 部分已改（M0b）/ M1 |
+| 同上第 11 条（`:80`）、README.md:122 | 七份黄金测试 | 八份（新增 `test_mcp_tool_golden.py`） | M1c |
+| `docs/agent-architecture.md:23`（组装根一段） | `Harness` 字段清单里没有作用域来源；「以后 MCP 连接管理器需要关闭钩子时再接入 lifespan」 | 补上 `scoped_tools`、`mcp_connector`；`mcp_runtime()` 惰性创建，由 lifespan 关闭 | 已改（M0b / M1b） |
 | `docs/agent-architecture.md:68`（ToolProvider 一行） | 接 MCP 时扩展为 `async list_tools(scope)` | ToolProvider 保持同步，另设 `ScopedToolProvider`（4.1 节） | 已改（M0b） |
 | `docs/agent-architecture.md:72`（SubAgentLauncher 一行） | 签名里没有作用域工具 | 增加 `scoped: ScopedGrant \| None` | 已改（M0b） |
 | `docs/agent-architecture.md:77`（ToolSet 一段） | 接 MCP 时只需在 `platform_tool_set()` 里追加 | 同上；运行时按名查策略改为查 `policies` | 已改（M0b） |

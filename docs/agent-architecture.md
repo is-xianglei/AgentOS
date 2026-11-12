@@ -20,7 +20,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
   其余 feature 域照 CLAUDE.md 继续「Service 调 Service」，不额外造端口。
 - 分层规则由 tests/test_import_isolation.py 做静态检查（目前覆盖领域层，按阶段扩展到 app、adapters）。
   阶段 7 已把 HTTP 异常处理器拆到 core/error_handlers.py，core/errors.py 加载期不再导入 fastapi，领域层不再间接加载 Web 框架。
-- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher、scoped_tools（作用域工具来源，默认 `()`，见 [mcp-design.md](mcp-design.md) 10.2 节）；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service 按数据库会话装配。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`），不走 lifespan：测试、Worker、alembic 都不经过 lifespan，而内置工具集是纯内存对象；MCP 运行时 `mcp_runtime()` 首次取用时惰性创建，由 lifespan 负责关闭（M1）。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
+- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher、scoped_tools（作用域工具来源，默认 `()`，见 [mcp-design.md](mcp-design.md) 10.2 节）、mcp_connector（MCP 管理入口用的连接器工厂，`None` 表示不提供 MCP 管理）；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service / mcp_admin_service 按数据库会话装配。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`、`mcp_runtime()`），不走 lifespan：测试、Worker、alembic 都不经过 lifespan，而内置工具集是纯内存对象；MCP 运行时 `mcp_runtime()` 首次取用时惰性创建，lifespan 退出时经 `close_mcp_runtime()` 关闭，只有创建过才关（M1b 落地）。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
 
 ## 2. 领域层（harness/domain/）
 
@@ -69,6 +69,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
 | ScopedToolProvider | `async list_tools(scope: ToolScope) -> ScopedTools(tools, faults)`，按工作区和用户列出作用域工具，每回合由 `TurnToolResolver`（app/tool_resolver.py）解析一次；见 [mcp-design.md](mcp-design.md) 4.1 节 | — | MCP |
 | MemoryProvider | 在 `app/memory_port.py`（与模型端口无关，单独成模块）。`recall(turn)`、`inherited(turn)`、`on_turn_completed(turn) -> MemoryWriteTicket | None`、`after_commit(ticket)`；调用方持有会话并负责提交，recall 和 on_turn_completed 在调用方事务里执行、从不提交，after_commit 在提交后自管事务 | BuiltinMemoryProvider | 外部记忆框架 |
 | ToolCallReviewer | `async review(call: ToolCall, request: ReviewRequest) -> Decision`；可扣减 request.budget | PolicyReviewer（规则链，阶段 3b 落地） | LLM 审核员（独立实现，或作为规则链里的一条规则） |
+| McpServerConnector、McpServerRegistry | 在 `app/mcp_port.py`（MCP 专属，单独成模块）。Connector：`probe(config, secret)`、`invalidate(server_id)`，OAuth 两个半程在 M3；Registry：server 配置的读写与业务规则（列表、详情、新建前校验、写库、写权限读取、按计划更新、软删、记探测结果），McpServerService 结构化满足；窄接口 McpServerSource `list_servers(scope)` 是 McpToolProvider 的数据来源；见 [mcp-design.md](mcp-design.md) 4.1、4.3 节 | McpConnector；McpServerService；McpServerCatalog（mcp_server/source.py） | — |
 | SubAgentLauncher | `async run(session_id, prompt, spec, *, bus, parent_turn_id, user_id, workspace_id, parent_allowed_tool_names, allowed_skill_names, scoped: ScopedGrant \| None = None) -> str`；经 `ToolContext.subagents` 注入给 Agent 工具，缺失时抛中文异常，消除了 Agent 工具对 runtime 的反向依赖 | IsolatedSubAgentLauncher（组装根，独立数据库会话 + 共享 bus） | — |
 
 编排：
@@ -98,7 +99,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 以 `ScopedToolProvider` 接入（不是 ToolProvider），经 `Harness.scoped_tools` 注入；每回合由 `TurnToolResolver` 解析一次并冻结进回合配置。
 - 命名用 `mcp__{server_key}__{tool}`，重名直接报错（3.2 节）。参数直接用 server 下发的 inputSchema。
 - 审批按 server 级三档模式（`always` / `trust_annotations` / `never`），默认全部需要审批（3.2 节）。
-- 连接运行时 `mcp_runtime()` 惰性创建，lifespan 只负责关闭（10.2 节）。
+- 连接运行时 `mcp_runtime()` 惰性创建，lifespan 只负责关闭（10.2 节）；管理入口 `McpAdminService`（app/mcp_admin.py）经组装根的 `mcp_admin_service(db, ...)` 取得（4.3 节）。
 - 结果中的非文本内容转成文本，`ToolResult.content` 仍是 str（5.5 节）；MCP 工具不进 tools 表，自建 Agent 按 server 绑定（6.2 节）。
 
 ### 外部记忆框架（后续实现）

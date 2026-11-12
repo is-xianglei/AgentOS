@@ -19,7 +19,7 @@ from core.logging import request_context_middleware, setup_logging
 from core.run_events import check_run_event_store, close_run_event_store
 from database.base import Base
 from database.engine import AsyncSessionLocal, engine
-from harness.bootstrap import platform_tool_set
+from harness.bootstrap import close_mcp_runtime, platform_tool_set
 from hooks.builtin import register_builtin_hooks
 from market.presets import sync_official_presets
 from runtime.execution import shutdown_executions
@@ -62,6 +62,8 @@ async def lifespan(app: FastAPI):
             await reaper
         # 取消本进程执行,让它们走取消路径收尾并清除租约,再关闭连接池。
         await shutdown_executions()
+        # 执行已全部收尾、不会再借 MCP 连接;运行时没创建过就不创建。
+        await close_mcp_runtime()
         await close_run_event_store()
 
 

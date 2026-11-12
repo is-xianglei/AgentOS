@@ -6,6 +6,7 @@ from department import api as department_api
 from group import api as group_api
 from interaction import api as interaction_api
 from market import api as market_api
+from mcp_server import api as mcp_server_api
 from memory import api as memory_api
 from model_service import api as model_service_api
 from permission import api as permission_api
@@ -31,6 +32,7 @@ api_router.include_router(
 api_router.include_router(group_api.router, tags=["groups"])
 api_router.include_router(interaction_api.router, prefix="/interactions", tags=["interactions"])
 api_router.include_router(market_api.router, prefix="/market", tags=["market"])
+api_router.include_router(mcp_server_api.router, prefix="/mcp", tags=["mcp"])
 api_router.include_router(memory_api.router, prefix="/memories", tags=["memories"])
 api_router.include_router(plan_api.router, prefix="/plans", tags=["plans"])
 api_router.include_router(session_api.router, prefix="/sessions", tags=["sessions"])

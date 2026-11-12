@@ -4,9 +4,9 @@
 换模型、换存储、换记忆、换审核员都只改这里：``Harness`` 的每个字段是一项可替换的实现，
 ``dataclasses.replace(default_harness(), memory=...)`` 即可只换一项。
 
-进程级单例用模块级缓存函数持有（目前是内置工具集），并在本模块导入时登记到应用层的
+进程级单例用模块级缓存函数持有（内置工具集、MCP 运行时），内置工具集在本模块导入时登记到应用层的
 ``platform_tools``，供只有工具名的 feature 域按名查策略。导入本模块不连接任何外部服务：
-数据库引擎惰性建连，模型客户端按调用现建。
+数据库引擎惰性建连，模型客户端按调用现建，MCP 运行时首次取用时才创建、也不预先建连。
 """
 
 from collections.abc import Callable
@@ -17,14 +17,21 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
+from core.errors import AgentException
 from core.event_bus import StreamBus
 from database.engine import AsyncSessionLocal
+from harness.adapters.mcp.connector import McpConnector
+from harness.adapters.mcp.http import McpHttpFactory, parse_allowed_hosts, system_resolver
+from harness.adapters.mcp.provider import McpProviderLimits, McpToolProvider
+from harness.adapters.mcp.runtime import McpRuntime, McpRuntimeLimits
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
 from harness.adapters.models.factory import create_model_client, resolve_subagent_model
 from harness.adapters.models.resolver import DatabaseModelResolver
 from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.agent_service import AgentService
+from harness.app.mcp_admin import McpAdminService
+from harness.app.mcp_port import McpServerConnector
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
@@ -39,6 +46,8 @@ from harness.app.tool_resolver import TurnToolResolver
 from harness.app.tool_set import ToolSet, register_platform_tools
 from harness.domain.roles.subagent import SubAgentSpec
 from harness.domain.tool import ScopedGrant
+from mcp_server.service import McpServerService
+from mcp_server.source import McpServerCatalog
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
 from runtime.execution import cancel_turn
@@ -51,6 +60,65 @@ from session.service import SessionService
 def platform_tool_set() -> ToolSet:
     """进程级工具集：只放进程级工具（目前是内置工具）；作用域来源见 Harness.scoped_tools。"""
     return builtin_tool_set()
+
+
+def _mcp_http() -> McpHttpFactory:
+    """出站 HTTP 工厂：SSRF 规则来自 Settings，DNS 走系统解析；读超时取单次调用上限。"""
+    return McpHttpFactory(
+        allow_insecure_http=settings.mcp_allow_insecure_http,
+        allowed_private_hosts=parse_allowed_hosts(settings.mcp_allowed_private_hosts),
+        connect_timeout=settings.mcp_connect_timeout_seconds,
+        read_timeout=settings.mcp_call_timeout_seconds,
+        resolver=system_resolver,
+    )
+
+
+@cache
+def mcp_runtime() -> McpRuntime:
+    """进程级 MCP 运行时：连接池与共享响应缓存。首次取用时惰性创建，不建任何连接。"""
+    return McpRuntime(
+        http=_mcp_http(),
+        limits=McpRuntimeLimits(
+            connect_timeout=settings.mcp_connect_timeout_seconds,
+            idle_seconds=settings.mcp_idle_seconds,
+            pool_max_connections=settings.mcp_pool_max_connections,
+            tools_cache_seconds=settings.mcp_tools_cache_seconds,
+        ),
+    )
+
+
+async def close_mcp_runtime() -> None:
+    """lifespan 退出时关闭 MCP 运行时；只有已经创建过才关，免得为了关闭反而先创建出来。"""
+    if mcp_runtime.cache_info().currsize:
+        await mcp_runtime().aclose()
+
+
+def mcp_connector() -> McpServerConnector:
+    """管理入口用的连接器：探测与缓存失效，共用进程级 MCP 运行时。"""
+    return McpConnector(
+        runtime=mcp_runtime(),
+        probe_timeout=settings.mcp_probe_timeout_seconds,
+        max_schema_bytes=settings.mcp_max_schema_bytes,
+    )
+
+
+def mcp_tool_provider(session_factory: SessionFactory) -> McpToolProvider:
+    """MCP 作用域工具来源：用进程级运行时，按 Settings 组装上限；每回合经 session_factory
+    开短会话读 server 配置与凭证（McpServerCatalog），不占用回合的事务。
+
+    本阶段（M1b）还没有接进 Harness.scoped_tools：挂起快照核对、422 / 403 等措施在 M1c 才有，
+    届时在 mcp_enabled 打开时以 (mcp_tool_provider(AsyncSessionLocal),) 接上。
+    """
+    return McpToolProvider(
+        runtime=mcp_runtime(),
+        servers=McpServerCatalog(session_factory),
+        limits=McpProviderLimits(
+            list_timeout=settings.mcp_list_timeout_seconds,
+            call_timeout=settings.mcp_call_timeout_seconds,
+            max_output_chars=settings.mcp_max_output_chars,
+            max_schema_bytes=settings.mcp_max_schema_bytes,
+        ),
+    )
 
 
 def _env_compact_model() -> ResolvedModel:
@@ -70,7 +138,8 @@ class Harness:
     - main_reviewer、subagent_reviewer：基于同一份权限服务构造主 Agent 与子代理的工具调用审核员；
     - compact_model：会话没有解析出压缩模型时现建的模型；
     - subagent_model：.env 端点上按子代理规格覆盖的模型名，None 表示沿用场景模型；
-    - subagent_launcher：按本装配构造 Agent 工具用的子代理启动器。
+    - subagent_launcher：按本装配构造 Agent 工具用的子代理启动器；
+    - mcp_connector：MCP 管理入口用的连接器工厂（探测、缓存失效），None 表示本装配不提供 MCP 管理。
     """
 
     tools: ToolSet
@@ -85,6 +154,7 @@ class Harness:
     subagent_model: Callable[[SubAgentSpec], str | None]
     subagent_launcher: Callable[[Harness], SubAgentLauncher]
     scoped_tools: tuple[ScopedToolProvider, ...] = ()
+    mcp_connector: Callable[[], McpServerConnector] | None = None
 
     def agent_runtime(
         self,
@@ -240,6 +310,23 @@ class Harness:
             cancel_turn=_cancel_turn,
         )
 
+    def mcp_admin_service(
+        self,
+        db: AsyncSession,
+        *,
+        user_id: int,
+        workspace_id: int,
+    ) -> McpAdminService:
+        """按请求装配 MCP 管理入口：server 配置读写经 McpServerService，网络动作经 mcp_connector。"""
+        if self.mcp_connector is None:
+            raise AgentException.message("当前装配未提供 MCP 连接器，无法管理 MCP server")
+        return McpAdminService(
+            registry=McpServerService(db),
+            connector=self.mcp_connector(),
+            workspace_id=workspace_id,
+            user_id=user_id,
+        )
+
 
 class IsolatedSubAgentLauncher:
     """SubAgentLauncher 的实现：开独立数据库会话，经组装根构造子代理运行器执行。
@@ -298,6 +385,9 @@ def builtin_harness() -> Harness:
         compact_model=_env_compact_model,
         subagent_model=resolve_subagent_model,
         subagent_launcher=IsolatedSubAgentLauncher,
+        # 作用域工具来源保持为空：MCP 工具在 M1c 才接进回合，见 mcp_tool_provider()。
+        scoped_tools=(),
+        mcp_connector=mcp_connector,
     )
 
 

@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     mcp_allow_insecure_http: bool = False  # 只用于开发,允许 http 地址;生产必须为 false
     # 逗号分隔的内网主机名白名单(精确匹配),只对共享 server 生效。
     mcp_allowed_private_hosts: str = ""
+    # 每人在一个工作区里的私有 server 数量上限;0 表示不允许建私有 server。
+    mcp_max_private_servers_per_user: int = Field(default=10, ge=0)
 
     # --- 数据库 --------------------------------------------------------------
     database_url: str | None = None

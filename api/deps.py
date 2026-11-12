@@ -10,6 +10,7 @@ from core.config import settings
 from core.errors import AgentException
 from database.engine import get_db
 from harness.app.agent_service import AgentService
+from harness.app.mcp_admin import McpAdminService
 from harness.bootstrap import default_harness
 from user.models import UserRecord
 from workspace.service import WorkspaceService
@@ -127,6 +128,21 @@ async def get_agent_service(
     )
 
 
+async def get_mcp_admin_service(
+    db: DatabaseSession,
+    current_user: Annotated[UserRecord, Depends(get_current_active_user)],
+    workspace_id: Annotated[int, Depends(get_current_workspace_id)],
+) -> McpAdminService:
+    """按请求经组装根装配 MCP 管理入口；MCP 总开关关闭时管理接口一律不可用。"""
+    if not settings.mcp_enabled:
+        raise AgentException.message("MCP 功能未启用（AGENTOS_MCP_ENABLED=false）", status_code=403)
+    return default_harness().mcp_admin_service(
+        db,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+    )
+
+
 __all__ = [
     "get_agent_service",
     "get_current_active_user",
@@ -135,4 +151,5 @@ __all__ = [
     "get_current_user",
     "get_current_workspace_id",
     "get_db",
+    "get_mcp_admin_service",
 ]

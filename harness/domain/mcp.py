@@ -59,6 +59,10 @@ class McpToolAnnotations:
     def to_dict(self) -> dict[str, bool | None]:
         return {"read_only": self.read_only, "destructive": self.destructive}
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> McpToolAnnotations:
+        return cls(read_only=data.get("read_only"), destructive=data.get("destructive"))
+
 
 @dataclass(frozen=True)
 class McpToolRef:
@@ -91,7 +95,21 @@ def validate_server_key(server_key: str) -> str:
             "server_key 不合法：须为 1～24 个字符，小写字母开头，只含小写字母、数字和单个下划线，"
             "且不以下划线结尾",
             {"server_key": server_key, "max_length": SERVER_KEY_MAX},
+            status_code=400,
         )
+    return server_key
+
+
+def server_key_of(tool_name: str) -> str | None:
+    """从 MCP 工具的模型名里取出 server_key；不是 MCP 工具名时返回 None。
+
+    server_key 不含连续下划线、不以下划线结尾，所以前缀后第一个 ``__`` 之前就是它，切分结果唯一。
+    """
+    if not tool_name.startswith(MCP_PREFIX):
+        return None
+    server_key, separator, remote = tool_name[len(MCP_PREFIX) :].partition("__")
+    if not separator or not remote or not _SERVER_KEY_RE.fullmatch(server_key):
+        return None
     return server_key
 
 
@@ -182,9 +200,14 @@ def validate_static_headers(headers: Mapping[str, str]) -> None:
             raise AgentException.message(
                 "MCP 请求头名称不合法或不允许配置",
                 {"header": name},
+                status_code=400,
             )
         if not isinstance(value, str) or "\r" in value or "\n" in value:
-            raise AgentException.message("MCP 请求头的值不能包含换行符", {"header": name})
+            raise AgentException.message(
+                "MCP 请求头的值不能包含换行符",
+                {"header": name},
+                status_code=400,
+            )
 
 
 @dataclass(frozen=True)
@@ -274,6 +297,16 @@ class McpToolSummary:
             "input_schema_sha256": self.input_schema_sha256,
             "annotations": self.annotations.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> McpToolSummary:
+        """从 tools_snapshot 的一项还原，形状即 to_dict() 的输出。"""
+        return cls(
+            name=data["name"],
+            description=data.get("description", ""),
+            input_schema_sha256=data["input_schema_sha256"],
+            annotations=McpToolAnnotations.from_dict(data.get("annotations") or {}),
+        )
 
 
 @dataclass(frozen=True)

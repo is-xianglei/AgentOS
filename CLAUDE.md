@@ -58,7 +58,8 @@ Agent 核心（harness）约定：
 3. 已有端口：ModelClient、ModelResolver、ToolProvider、ScopedToolProvider、ToolCallReviewer、
    SubAgentLauncher 在 harness/app/ports.py；MemoryProvider 在 harness/app/memory_port.py；
    SessionStore 及 TurnContextStore、TurnStateStore、TurnLeaseStore 等窄端口在
-   harness/app/session_port.py。
+   harness/app/session_port.py；McpServerConnector、McpServerRegistry（及窄接口 McpServerSource）
+   在 harness/app/mcp_port.py。
    端口只为多实现的外部能力和需要替身的 I/O 设立，其余 feature 域照旧 Service 调 Service。
 4. 扩展点：接 MCP 时实现 ScopedToolProvider，经 Harness.scoped_tools 注入，platform_tool_set()
    只放进程级工具；接外部记忆时实现 MemoryProvider，在 harness/bootstrap.py 里替换 Harness 的
@@ -74,7 +75,9 @@ Agent 核心（harness）约定：
 9. 分层与导入禁令由 tests/test_import_isolation.py 静态检查，新增或移动模块后先跑它。
    最常踩的几条连函数体和 TYPE_CHECKING 内的导入也算：runtime/、harness/app、harness/domain
    导入 harness.adapters；runtime/、harness/app 导入任何 *.repository；runtime/ 导入 memory 包；
-   在 harness/adapters/models 之外导入 anthropic / openai。
+   在 harness/adapters/models 之外导入 anthropic / openai；在 harness/adapters/mcp 之外导入 mcp
+   SDK（mcp、mcp_types）；runtime/、harness/app、harness/domain 导入 mcp_server 包；
+   mcp_server 包导入 harness.adapters 或 mcp SDK。
 10. 运行时与审核链按名查工具策略一律查本回合的策略全集（TurnConfiguration.policies：平台工具加
     本回合的作用域工具）；harness/app/tool_set.py 的 platform_tools() 只留给只有工具名、没有回合的
     管理场景（工具目录、绑定校验、权限规则配置），不要自建工具集。任何新的进程入口（脚本、Worker）

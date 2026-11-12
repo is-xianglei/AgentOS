@@ -7,6 +7,8 @@ from api.deps import get_current_active_user, get_current_workspace_id, get_db
 from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from harness.app.tool_set import platform_tools
+from harness.domain.mcp import MCP_PREFIX
+from mcp_server.service import McpServerService
 from permission.schemas import (
     PermissionRuleCreateRequest,
     PermissionRuleDeleteResult,
@@ -23,9 +25,17 @@ CurrentUser = Annotated[UserRecord, Depends(get_current_active_user)]
 CurrentWorkspaceId = Annotated[int, Depends(get_current_workspace_id)]
 
 
-def _validate_tool_name(tool_name: str) -> None:
-    """权限规则只能引用已声明能力策略的运行时工具。"""
-    if platform_tools().policy_for(tool_name).category == "unknown":
+async def _validate_tool_name(db: AsyncSession, tool_name: str, workspace_id: int) -> None:
+    """权限规则只能引用已声明能力策略的运行时工具。
+
+    mcp__ 开头的名字不是进程级工具，改查本工作区共享 MCP server 的工具快照（快照为空的 OAuth server
+    按 server 前缀匹配）；私有 server 不参与，查不到时与未注册的工具报同一句话，不泄露它们的存在。
+    """
+    if tool_name.startswith(MCP_PREFIX):
+        known = await McpServerService(db).is_known_shared_tool(workspace_id, tool_name)
+    else:
+        known = platform_tools().policy_for(tool_name).category != "unknown"
+    if not known:
         raise AgentException.message(
             "工具未注册，不能配置权限规则",
             {"tool_name": tool_name},
@@ -125,7 +135,7 @@ async def upsert_rule(
     current_user: CurrentUser,
     workspace_id: CurrentWorkspaceId,
 ):
-    _validate_tool_name(payload.tool_name)
+    await _validate_tool_name(db, payload.tool_name, workspace_id)
     await _authorize_scope(
         db,
         scope=payload.scope,
