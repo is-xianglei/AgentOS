@@ -92,8 +92,9 @@ Agent 核心（harness）约定：
     tests/fixtures/ 下对应的 *_golden.py（带 SHA-256 的一并更新），不允许手改字面量。
 13. 已登记的已知依赖：memory/jobs/*、memory/recall/service.py、model_service/service.py
     直接使用模型适配器（create_model_client、resolve_scenario_model、DatabaseModelResolver、
-    build_resolved_model）。memory job 由独立 Worker 运行，改成注入要动 Worker 的装配与生命周期，
-    收益不抵风险（见 docs/agent-architecture.md 第 7 节）；不要以此为先例在别处直接引用适配器。
+    build_resolved_model）。memory job 由随 lifespan 启动的 Memory Worker 运行，改成注入要动
+    Worker 的装配与生命周期，收益不抵风险（见 docs/agent-architecture.md 第 7 节）；
+    不要以此为先例在别处直接引用适配器。
 
 命名与类型：
 1. 文件、函数和变量使用 snake_case；类使用 PascalCase；常量使用 UPPER_SNAKE_CASE。

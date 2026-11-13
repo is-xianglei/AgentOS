@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, and_, func, or_, select, update
+from sqlalchemy import ColumnElement, and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -335,6 +335,33 @@ class MemoryJobRepository:
         for job in jobs:
             await self.db.refresh(job)
         return jobs
+
+    async def release_worker_leases(self, worker_id: str) -> int:
+        """把指定 Worker 认领中的 Job 交还队列，返回交还数量。
+
+        只在该 Worker 的执行任务已经停止后调用（进程正常关闭）。这次尝试被打断不是 Job 本身的问题，
+        所以退回认领时加的那次 attempts，状态回到 pending（从未失败过）或 retry，立即可被重新认领。
+        租约是否已过期不影响交还：只要 worker_id 仍是自己，就没有别的 Worker 接手过。
+        """
+        result = await self.db.execute(
+            update(MemoryJobRecord)
+            .where(
+                MemoryJobRecord.status == "running",
+                MemoryJobRecord.worker_id == worker_id,
+                MemoryJobRecord.is_deleted.is_(False),
+            )
+            .values(
+                status=case(
+                    (MemoryJobRecord.attempts <= 1, "pending"),
+                    else_="retry",
+                ),
+                attempts=MemoryJobRecord.attempts - 1,
+                available_at=func.now(),
+                worker_id=None,
+                lease_until=None,
+            )
+        )
+        return result.rowcount or 0
 
     async def get_owned_lease(
         self,

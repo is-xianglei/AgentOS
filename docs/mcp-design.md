@@ -1660,7 +1660,7 @@ class Harness:
   - 启动时不连接任何 MCP server，server 不可用不影响启动；
   - 退出时，在 `shutdown_executions()` 之后、`close_run_event_store()` 之前调用 `await mcp_runtime().aclose()`；
   - 只有运行时已经创建过才去关闭，免得为了关闭反而先把它创建出来。
-- memory worker 不用 MCP，不导入这部分。
+- Memory Worker 不用 MCP，不导入这部分。
 
 M1b 落地（`harness/bootstrap.py`、`main.py`）：
 - `mcp_runtime()`（`@cache`）：用 Settings 组装 `McpHttpFactory(allow_insecure_http, allowed_private_hosts=parse_allowed_hosts(...),
@@ -1679,7 +1679,7 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
   **M1c 已接**：`builtin_harness()` 用 `_scoped_tool_sources()`，`settings.mcp_enabled` 为真时返回上述元组，否则 `()`。
   `default_harness()` 有 `@cache`，开关在进程启动时读一次，与「配置重启生效」一致。
 - 导入组装根会连带导入 `harness.adapters.mcp`，也就会加载 mcp SDK，实测增加约 0.26 秒；但不会创建运行时，也不建连接。
-  memory worker 不导入组装根，不受影响。
+  Memory Worker 不导入组装根，不受影响。
 
 M3 落地（`harness/bootstrap.py`）：
 - `mcp_runtime()` 额外装配 `oauth=McpOAuth(http=同一个 McpHttpFactory, store=McpOAuthCatalog(AsyncSessionLocal), states=mcp_oauth_state_store,

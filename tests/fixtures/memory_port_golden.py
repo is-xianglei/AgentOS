@@ -3060,7 +3060,7 @@ EXPECTED: dict[str, dict[str, Any]] = {'main/recall_selected': {'requests': [{'m
                                   'message': '开始就地执行Memory提取任务',
                                   'extra': {'job_id': '00000000-0000-4000-8000-00000000e002'}},
                                  {'level': 'ERROR',
-                                  'message': '就地执行Memory提取任务失败，等待独立Worker接管',
+                                  'message': '就地执行Memory提取任务失败，等待Memory Worker接管',
                                   'extra': {'job_id': '00000000-0000-4000-8000-00000000e002'},
                                   'exc': 'RuntimeError: 提取任务认领失败'}]},
  'main/resume_reuses_frozen_recall': {'requests': [{'model': 'claude-golden',
@@ -4173,4 +4173,4 @@ EXPECTED: dict[str, dict[str, Any]] = {'main/recall_selected': {'requests': [{'m
                                                          'turn_id': '00000000-0000-4000-8000-00000000e001',
                                                          'ttft_ms': '<ms>'}}]}}
 
-EXPECTED_SHA256 = "d218ebffc68f9bb45ec85a881e0fa4deb3cee5e762d287b951b71004338effe9"
+EXPECTED_SHA256 = "ce13e19187dd06e2a6d1507a2b503ac5908e0c9a59592b26a4809592e8d264c6"

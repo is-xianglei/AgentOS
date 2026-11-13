@@ -129,21 +129,22 @@ class MemoryRetentionService:
 
 
 class MemoryRetentionRunner:
-    """为独立 Worker 提供一次一事务的保留策略执行入口。"""
+    """为 Memory Worker 提供一次一事务的保留策略执行入口。
+
+    扫描游标由调用方保存：多个进程轮流执行清理，游标要跨进程共享（见 maintenance_lock.py）。
+    """
 
     def __init__(self, *, session_factory: Any = AsyncSessionLocal) -> None:
         self.session_factory = session_factory
-        self._after_space_id = 0
 
-    async def run_once(self) -> MemoryRetentionResult:
+    async def run_once(self, *, after_space_id: int) -> MemoryRetentionResult:
+        """从 after_space_id 之后的 Space 清理一批并提交；返回值带下一批的起点。"""
         async with self.session_factory() as db:
             try:
                 result = await MemoryRetentionService(db).cleanup_batch(
-                    after_space_id=self._after_space_id,
+                    after_space_id=after_space_id,
                 )
                 await db.commit()
-                # 提交成功后才推进游标，提交失败时下次重扫同一批 Space。
-                self._after_space_id = result.next_space_id
                 return result
             except Exception:
                 await db.rollback()

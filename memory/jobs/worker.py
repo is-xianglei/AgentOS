@@ -1,76 +1,129 @@
+"""Memory 后台 Worker：随 API 进程的 lifespan 启动和关闭，每个进程各跑一份。
+
+- Job 消费：每个进程都认领，memory_jobs 的 SKIP LOCKED 与租约保证同一个 Job 只由一个进程执行；
+- 保留清理：每个进程到点都去抢周期锁，抢到的才执行，全集群每个周期只清理一次（maintenance_lock.py）；
+- 关闭：停止认领，限时等待在途 Job，超时就取消，再把本进程认领的 Job 交还队列，其他进程可立即接手。
+"""
+
 import asyncio
+import contextlib
 import logging
-import signal
 import time
 
 from core.config import settings
-from core.logging import setup_logging
 from database.engine import AsyncSessionLocal
+from memory.jobs.maintenance_lock import RetentionCoordinator, build_retention_coordinator
 from memory.jobs.retention import MemoryRetentionRunner
 from memory.jobs.service import MemoryJobRunner
 
 logger = logging.getLogger(__name__)
 
+# 关闭时等待在途 Job 的上限，与 runtime/execution.py 停止本进程执行的等待时长一致。
+STOP_GRACE_SECONDS = 5.0
+
 
 class MemoryWorker:
-    """持续认领并处理 PostgreSQL 中的 Memory Job。"""
+    """持续认领并处理 memory_jobs，按周期执行保留清理。"""
 
     def __init__(
         self,
-        runner: MemoryJobRunner | None = None,
-        retention_runner: MemoryRetentionRunner | None = None,
+        *,
+        runner: MemoryJobRunner,
+        retention_runner: MemoryRetentionRunner,
+        coordinator: RetentionCoordinator,
     ) -> None:
-        if runner is None:
-            runner = MemoryJobRunner(session_factory=AsyncSessionLocal)
         self.runner = runner
-        if retention_runner is None:
-            # 与 Job Runner 共用同一会话工厂；注入的替身 Runner 可能没有该属性。
-            retention_runner = MemoryRetentionRunner(
-                session_factory=getattr(runner, "session_factory", AsyncSessionLocal)
-            )
         self.retention_runner = retention_runner
+        self.coordinator = coordinator
         self._next_retention_at = 0.0
-        self.stop_event = asyncio.Event()
+        self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
 
-    async def run(self) -> None:
-        """收到终止信号后停止 Claim，并让当前 Job 尽力完成。"""
-        self._install_signal_handlers()
-        logger.info("Memory Worker已启动", extra={"worker_id": self.runner.worker_id})
-        while not self.stop_event.is_set():
+    def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("Memory Worker已经启动")
+        self._task = asyncio.create_task(self._run(), name="memory-worker")
+
+    def wake(self) -> None:
+        """有新 Job 入队时立即开始下一轮认领，不等轮询间隔。"""
+        self._wake_event.set()
+
+    async def stop(self, grace_seconds: float = STOP_GRACE_SECONDS) -> None:
+        """停止认领并限时等待在途 Job；超时就取消，再交还本 Worker 认领的 Job，最后关闭 Redis 连接。"""
+        try:
+            task = self._task
+            if task is None:
+                return
+            self._stop_event.set()
+            self._wake_event.set()
+            done, _ = await asyncio.wait({task}, timeout=grace_seconds)
+            if not done:
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            # 执行任务已经停止，交还之后本 Worker 不会再写这些 Job。
+            await self._release_leases()
+        finally:
+            await self.coordinator.aclose()
+
+    async def _release_leases(self) -> None:
+        worker_id = self.runner.worker_id
+        try:
+            released = await self.runner.release_leases()
+        except Exception:
+            logger.exception(
+                "Memory Worker交还在途任务失败，任务将等待Lease到期后重新认领",
+                extra={"worker_id": worker_id},
+            )
+            return
+        if released:
+            logger.info(
+                "Memory Worker已交还在途任务",
+                extra={"worker_id": worker_id, "released_count": released},
+            )
+
+    async def _run(self) -> None:
+        worker_id = self.runner.worker_id
+        logger.info("Memory Worker已启动", extra={"worker_id": worker_id})
+        while not self._stop_event.is_set():
             # 保留清理不受提取/Dream 开关影响，两者都关闭时仍按周期执行。
             await self._run_retention_if_due()
-            extraction_enabled = settings.memory_extraction_enabled
-            dream_enabled = settings.memory_dream_enabled
-            if not (extraction_enabled or dream_enabled):
+            if not (settings.memory_extraction_enabled or settings.memory_dream_enabled):
                 await self._wait_for_next_poll()
                 continue
             try:
                 claimed = await self.runner.run_once()
             except Exception:
-                logger.exception("Memory Worker认领任务失败")
+                logger.exception("Memory Worker认领任务失败", extra={"worker_id": worker_id})
                 await self._wait_for_next_poll()
                 continue
             # 本轮认领到任务时立即进入下一轮，队列空闲才等待。
             if claimed == 0:
                 await self._wait_for_next_poll()
-        logger.info("Memory Worker已停止", extra={"worker_id": self.runner.worker_id})
-
-    def request_stop(self) -> None:
-        self.stop_event.set()
+        logger.info("Memory Worker已停止", extra={"worker_id": worker_id})
 
     async def _run_retention_if_due(self) -> None:
-        """按单调时钟节流维护任务，失败不阻断 Job 消费。"""
+        """到点后抢周期锁，抢到才清理一批；失败只记日志，不阻断 Job 消费。"""
         if not settings.memory_retention_enabled:
             return
         now = time.monotonic()
         if now < self._next_retention_at:
             return
-        # 先推进下次执行时间，本次失败也要等满一个周期再重试。
-        self._next_retention_at = now + settings.memory_retention_interval_seconds
+        interval = settings.memory_retention_interval_seconds
+        # 先推进下次检查时间：没抢到锁或本次失败，都等满一个周期再试。
+        self._next_retention_at = now + interval
         try:
-            result = await self.retention_runner.run_once()
+            # 锁的过期时间等于清理间隔，执行完不释放，本周期内其他进程都抢不到。
+            if not await self.coordinator.try_acquire(interval):
+                logger.debug("本周期的Memory保留清理已由其他进程执行")
+                return
+            after_space_id = await self.coordinator.load_cursor()
+            result = await self.retention_runner.run_once(after_space_id=after_space_id)
+            # 清理批次提交成功后才推进游标，失败时下个周期重扫同一批 Space。
+            await self.coordinator.save_cursor(result.next_space_id)
         except Exception:
-            logger.exception("Memory保留策略清理失败")
+            logger.exception("Memory保留策略清理失败", extra={"worker_id": self.runner.worker_id})
             return
         counts = result.counts
         logger.info(
@@ -85,30 +138,41 @@ class MemoryWorker:
         )
 
     async def _wait_for_next_poll(self) -> None:
-        """等待一个轮询间隔；期间收到停止信号会立即返回。"""
-        try:
+        """等待一个轮询间隔；期间被唤醒或收到停止请求会立即返回。"""
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(
-                self.stop_event.wait(),
+                self._wake_event.wait(),
                 timeout=settings.memory_worker_poll_seconds,
             )
-        except TimeoutError:
-            pass
-
-    def _install_signal_handlers(self) -> None:
-        loop = asyncio.get_running_loop()
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(signum, self.request_stop)
-            except NotImplementedError:
-                # 部分平台（如 Windows）的事件循环不支持 add_signal_handler。
-                signal.signal(signum, lambda *_: self.request_stop())
+        self._wake_event.clear()
 
 
-async def main() -> None:
-    await MemoryWorker().run()
+_worker: MemoryWorker | None = None
 
 
-if __name__ == "__main__":
-    # 复用主进程的日志装配,保证 Worker 与 API 进程格式一致(KV Formatter + 级别配置)。
-    setup_logging()
-    asyncio.run(main())
+def start_memory_worker() -> None:
+    """lifespan 启动时调用：在本进程起一个 Memory Worker。"""
+    global _worker
+    if _worker is not None:
+        raise RuntimeError("本进程的Memory Worker已经启动")
+    worker = MemoryWorker(
+        runner=MemoryJobRunner(session_factory=AsyncSessionLocal),
+        retention_runner=MemoryRetentionRunner(session_factory=AsyncSessionLocal),
+        coordinator=build_retention_coordinator(),
+    )
+    worker.start()
+    _worker = worker
+
+
+async def stop_memory_worker() -> None:
+    """lifespan 退出时调用；本进程没有启动过 Worker 时什么也不做。"""
+    global _worker
+    worker, _worker = _worker, None
+    if worker is not None:
+        await worker.stop()
+
+
+def wake_memory_worker() -> None:
+    """唤醒本进程的 Memory Worker；没有运行中的 Worker 时什么也不做（如测试、脚本）。"""
+    if _worker is not None:
+        _worker.wake()

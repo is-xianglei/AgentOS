@@ -20,7 +20,7 @@ Agent 核心收进 `harness/` 包，内部按层分目录；其余业务域（se
   其余 feature 域照 CLAUDE.md 继续「Service 调 Service」，不额外造端口。
 - 分层规则由 tests/test_import_isolation.py 做静态检查（目前覆盖领域层，按阶段扩展到 app、adapters）。
   阶段 7 已把 HTTP 异常处理器拆到 core/error_handlers.py，core/errors.py 加载期不再导入 fastapi，领域层不再间接加载 Web 框架。
-- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher、scoped_tools（作用域工具来源，默认 `()`，见 [mcp-design.md](mcp-design.md) 10.2 节）、mcp_connector（MCP 管理入口用的连接器工厂，`None` 表示不提供 MCP 管理）；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service / mcp_admin_service 按数据库会话装配，tool_resolver() 给主 Agent 与 Workflow 运行时构造回合工具解析器（MCP M2）。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`、`mcp_runtime()`），不走 lifespan：测试、Worker、alembic 都不经过 lifespan，而内置工具集是纯内存对象；MCP 运行时 `mcp_runtime()` 首次取用时惰性创建，lifespan 退出时经 `close_mcp_runtime()` 关闭，只有创建过才关（M1b 落地）。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
+- 组装根 `harness/bootstrap.py` 是唯一实例化适配器的地方。`Harness`（frozen dataclass）的每个字段是一项可替换的实现：tools、session_factory、sessions、memory、models、permissions、main_reviewer、subagent_reviewer、compact_model、subagent_model、subagent_launcher、scoped_tools（作用域工具来源，默认 `()`，见 [mcp-design.md](mcp-design.md) 10.2 节）、mcp_connector（MCP 管理入口用的连接器工厂，`None` 表示不提供 MCP 管理）；工厂方法 agent_runtime / subagent_runner / workflow_runtime / agent_service / mcp_admin_service 按数据库会话装配，tool_resolver() 给主 Agent 与 Workflow 运行时构造回合工具解析器（MCP M2）。换一项只需 `dataclasses.replace(builtin_harness(), memory=...)`。进程级单例用模块级缓存函数持有（`platform_tool_set()`、`default_harness()`、`mcp_runtime()`），不走 lifespan：测试、脚本、alembic 都不经过 lifespan，而内置工具集是纯内存对象；MCP 运行时 `mcp_runtime()` 首次取用时惰性创建，lifespan 退出时经 `close_mcp_runtime()` 关闭，只有创建过才关（M1b 落地）。后台执行重建运行时经组装根生成的 `rebuild(db)` 闭包，只带入显式覆盖的 llm、memory、sessions。
 
 ## 2. 领域层（harness/domain/）
 
@@ -171,7 +171,7 @@ HTTP 路由仍放在各 feature 包的 api.py，起 WebApi 适配器的作用：
 - 阶段 5 起，L1 微压缩返回新列表而不是原地改写入参（主循环入参本就是副本，观测结果一致）；压缩日志的 logger 名从 runtime.compact 变为 harness.app.compaction，正文与 extra 不变。队友的系统提示不追加子代理规格的 critical_reminder，这是现状，已在黄金测试中固化。
 - 阶段 6b 起这些日志的 logger 名改变，正文与 extra 不变：「LLM调用开始/完成」「回合结束」→ runtime.lead_loop；工具权限策略相关 → runtime.tool_execution；人工交互挂起/取消 → runtime.interaction_flow。同时带 agent_id 和 workflow_id、会话不存在两种请求返回 500（AgentException 默认状态码），是现状，已在 HTTP 黄金测试中固化。
 - 静态类型缺口：pyright 不把 SQLAlchemy 的 `Mapped[T]` 视为只读属性，SessionService 无法被静态证明满足 StoredSession 等视图（原 SessionModelOptions 同样如此），由运行期签名比对测试兜底。SessionService 有一个名为 `list` 的方法，Python 3.14 惰性注解求值时会遮蔽类体里的 `list[...]`，对其部分方法调用 inspect.signature / get_type_hints 会抛 TypeError。
-- 已知依赖（有意保留）：memory/jobs/*、memory/recall/service.py、model_service/service.py 仍直接使用模型适配器（create_model_client、resolve_scenario_model、DatabaseModelResolver、build_resolved_model）。memory job 由独立 Worker 运行，改成注入需要改 Worker 的装配与生命周期，收益不足以抵消风险；这些 feature 包属于外层业务域，不违反 runtime / app / domain 的分层检查。
+- 已知依赖（有意保留）：memory/jobs/*、memory/recall/service.py、model_service/service.py 仍直接使用模型适配器（create_model_client、resolve_scenario_model、DatabaseModelResolver、build_resolved_model）。memory job 由 Memory Worker 运行（随 API 进程的 lifespan 启动，见 memory/jobs/worker.py），改成注入需要改 Worker 的装配与生命周期，收益不足以抵消风险；这些 feature 包属于外层业务域，不违反 runtime / app / domain 的分层检查。
 
 ## 8. 阶段
 

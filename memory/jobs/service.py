@@ -224,7 +224,7 @@ class MemoryJobRunner:
         # 保持 None 让各下游服务按自身 scenario 建客户端;注入非 None 时统一覆盖(测试用)。
         self.llm = llm
         self.worker_id = worker_id or self._default_worker_id()
-        # (workspace_id, user_id)：就地执行时限定只认领当前用户的 Job；独立 Worker 不限定。
+        # (workspace_id, user_id)：就地执行时限定只认领当前用户的 Job；Memory Worker 不限定。
         self.claim_scope = claim_scope
 
     async def run_once(self, *, job_id: UUID | None = None) -> int:
@@ -233,6 +233,17 @@ class MemoryJobRunner:
         for claimed_job_id, job_type in claimed_jobs:
             await self._execute_claimed(claimed_job_id, job_type)
         return len(claimed_jobs)
+
+    async def release_leases(self) -> int:
+        """把本 Runner 认领中的 Job 交还队列；只在执行任务已经停止后调用，返回交还数量。"""
+        async with self.session_factory() as db:
+            try:
+                released = await MemoryJobRepository(db).release_worker_leases(self.worker_id)
+                await db.commit()
+                return released
+            except Exception:
+                await db.rollback()
+                raise
 
     async def _claim(self, *, job_id: UUID | None) -> tuple[tuple[UUID, str], ...]:
         """优先认领提取任务；队列为空时每次只认领少量 Dream。"""

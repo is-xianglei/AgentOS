@@ -22,6 +22,7 @@ from database.engine import AsyncSessionLocal, engine
 from harness.bootstrap import close_mcp_runtime, platform_tool_set
 from hooks.builtin import register_builtin_hooks
 from market.presets import sync_official_presets
+from memory.jobs.worker import start_memory_worker, stop_memory_worker
 from runtime.execution import shutdown_executions
 from runtime.recovery import reap_orphan_turns, run_reaper_loop
 from tools.service import ToolCatalogService
@@ -54,6 +55,8 @@ async def lifespan(app: FastAPI):
     # 启动时回收一次:含已过期租约,以及迁移前遗留的 running 且无租约的轮次。
     await reap_orphan_turns(include_unleased_running=True)
     reaper = asyncio.create_task(run_reaper_loop())
+    # 每个进程各跑一个 Memory Worker:Job 靠 SKIP LOCKED 认领,保留清理靠 Redis 周期锁只跑一份。
+    start_memory_worker()
     try:
         yield
     finally:
@@ -62,6 +65,8 @@ async def lifespan(app: FastAPI):
             await reaper
         # 取消本进程执行,让它们走取消路径收尾并清除租约,再关闭连接池。
         await shutdown_executions()
+        # 回合已全部收尾,不会再唤醒 Worker;限时等在途 Job,未完成的交还队列。
+        await stop_memory_worker()
         # 执行已全部收尾、不会再借 MCP 连接;运行时没创建过就不创建。
         await close_mcp_runtime()
         await close_run_event_store()

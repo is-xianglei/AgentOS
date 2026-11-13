@@ -360,12 +360,16 @@ async def test_builtin_after_commit_runs_job_in_turn_scope(
         return 1
 
     monkeypatch.setattr(builtin_module.MemoryJobRunner, "run_once", _run_once)
+    wakes: list[None] = []
+    monkeypatch.setattr(builtin_module, "wake_memory_worker", lambda: wakes.append(None))
 
     await BuiltinMemoryProvider(_Db()).after_commit(  # type: ignore[arg-type]
         MemoryWriteTicket(turn=_TURN, ref=str(_JOB_ID))
     )
 
     assert runs == ([((2, 3), _JOB_ID)] if inline else [])
+    # 是否就地执行都唤醒本进程的 Worker：未就地执行的提取与顺带入队的 Dream 都靠它认领。
+    assert wakes == [None]
 
 
 async def test_builtin_after_commit_failure_only_logs(
@@ -382,5 +386,5 @@ async def test_builtin_after_commit_failure_only_logs(
         )
 
     (record,) = caplog.records
-    assert record.getMessage() == "就地执行Memory提取任务失败，等待独立Worker接管"
+    assert record.getMessage() == "就地执行Memory提取任务失败，等待Memory Worker接管"
     assert record.job_id == str(_JOB_ID)

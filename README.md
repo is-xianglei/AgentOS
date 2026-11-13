@@ -46,7 +46,9 @@ uv run uvicorn main:app --reload
 - `AGENTOS_TEAM_TASK_DEBUG_ISOLATION` 与 `AGENTOS_INSTANCE_ID`：多个实例连同一个库调试时开启，
   本实例派发的团队任务只被 `AGENTOS_INSTANCE_ID` 相同的实例消费。
 
-记忆的抽取、整理（dream）与保留清理由独立 Worker 执行：`uv run python -m memory.jobs.worker`。
+记忆的抽取、整理（dream）与保留清理由 Memory Worker 执行，它随 API 进程的 lifespan 启动，不需要单独起进程。
+多进程或多实例部署时每个进程各跑一个：Job 用 `SKIP LOCKED` 加租约认领，不会重复执行；
+保留清理执行前先抢 Redis 周期锁，每个周期全集群只跑一次。
 接口文档在 `/docs`。
 
 ## 发送消息

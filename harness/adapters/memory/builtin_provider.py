@@ -2,7 +2,8 @@
 
 召回包装 MemoryRecallService（按回合冻结召回结果，子代理只读继承），回合写入包装
 MemoryJobService（在回合终态的事务里登记提取任务）与 MemoryJobRunner（提交后就地执行）。
-memory 域内部的 Worker、Dream、保留清理与管理接口属于内置实现自己的功能，不经过这里。
+memory 域内部的 Worker、Dream、保留清理与管理接口属于内置实现自己的功能，不经过这里；
+提交后只负责唤醒本进程的 Memory Worker（随 lifespan 启动），不管理它的生命周期。
 """
 
 import asyncio
@@ -15,6 +16,7 @@ from core.config import settings
 from harness.app.memory_port import MemoryProvider
 from harness.domain.memory import MemoryRecall, MemoryWriteTicket, TurnRef
 from memory.jobs.service import MemoryJobRunner, MemoryJobService
+from memory.jobs.worker import wake_memory_worker
 from memory.recall.service import MemoryRecallService
 
 logger = logging.getLogger(__name__)
@@ -89,9 +91,18 @@ class BuiltinMemoryProvider(MemoryProvider):
         return MemoryWriteTicket(turn=turn, ref=str(job.id))
 
     async def after_commit(self, ticket: MemoryWriteTicket) -> None:
-        """回合终态提交后就地执行提取；失败时由持久 Job 和独立 Worker 接管。"""
-        if not settings.memory_extraction_inline:
-            return
+        """回合终态提交后就地执行提取；失败时由持久 Job 和 Memory Worker 接管。
+
+        无论是否就地执行都唤醒本进程的 Worker：未就地执行的提取、就地执行顺带入队的 Dream
+        都要靠它认领，唤醒后不必等轮询间隔。
+        """
+        try:
+            if settings.memory_extraction_inline:
+                await self._extract_inline(ticket)
+        finally:
+            wake_memory_worker()
+
+    async def _extract_inline(self, ticket: MemoryWriteTicket) -> None:
         job_id = UUID(ticket.ref)
         logger.info(
             "开始就地执行Memory提取任务",
@@ -107,6 +118,6 @@ class BuiltinMemoryProvider(MemoryProvider):
             raise
         except Exception:
             logger.exception(
-                "就地执行Memory提取任务失败，等待独立Worker接管",
+                "就地执行Memory提取任务失败，等待Memory Worker接管",
                 extra={"job_id": str(job_id)},
             )
