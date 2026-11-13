@@ -3,6 +3,8 @@
 每个 server 用 list_timeout 单独限时，一个慢 server 不拖垮其他 server；失败只记一条 fault。
 工具清单走 SDK 按授权分区隔离的响应缓存；缓存过期后重新拉取失败时，沿用进程内最近一次成功的清单，
 同时记一条 unavailable fault。命名、过滤、审批推导都在每回合现算，不进缓存。
+OAuth server：没有当前用户的有效 token 或刷新失败时本回合缺席，记一条 auth_required fault（不带授权地址）；
+离过期不到 refresh_skew 加 0～30 秒抖动就先刷新；列成功后把工具元数据回写到快照（独立短事务）。
 """
 
 import asyncio
@@ -18,16 +20,19 @@ from mcp_types import CallToolResult, ListToolsResult
 from mcp_types import Tool as SdkTool
 
 from core.errors import AgentException
+from harness.adapters.mcp.oauth import AuthOutcome, McpAuthRequired, McpTokenAuth, track_auth
 from harness.adapters.mcp.pool import McpConnectFailed, PoolKey, root_cause
 from harness.adapters.mcp.runtime import McpRuntime
-from harness.adapters.mcp.tool import McpTool
+from harness.adapters.mcp.tool import McpAuthRequiredError, McpTool
 from harness.app.mcp_port import McpServerSource
 from harness.app.ports import ScopedToolProvider, ScopedTools, ToolSourceFault
 from harness.domain.mcp import (
+    McpAuthType,
     McpServerConfig,
     McpServerEntry,
     McpToolAnnotations,
     McpToolRef,
+    McpToolSummary,
     auth_partition,
     mcp_tool_policy,
     model_tool_names,
@@ -129,6 +134,28 @@ def prepare_tool(tool: SdkTool, *, max_schema_bytes: int) -> PreparedTool | str:
     )
 
 
+def summarize_tools(tools: Sequence[SdkTool], *, max_schema_bytes: int) -> list[McpToolSummary]:
+    """工具清单 → 快照摘要（只有元数据），被预处理剔除的工具不计入；探测与 OAuth 快照回写共用。"""
+    summaries: list[McpToolSummary] = []
+    for tool in tools:
+        prepared = prepare_tool(tool, max_schema_bytes=max_schema_bytes)
+        if isinstance(prepared, str):
+            continue
+        summaries.append(
+            McpToolSummary(
+                name=prepared.remote_name,
+                description=prepared.description,
+                input_schema_sha256=schema_digest(prepared.parameters),
+                annotations=prepared.annotations,
+            ),
+        )
+    return sorted(summaries, key=lambda summary: summary.name)
+
+
+AUTH_REQUIRED_MESSAGE = "需要授权：请到 MCP 管理页为该 server 授权后再试"
+INSUFFICIENT_SCOPE_MESSAGE = "授权范围不足：请到 MCP 管理页为该 server 重新授权"
+
+
 def _fault(config: McpServerConfig, kind: FaultKind, message: str) -> ToolSourceFault:
     return ToolSourceFault(
         source=config.source,
@@ -191,6 +218,8 @@ class McpToolProvider(ScopedToolProvider):
             # 来源返回了不属于该身份或未落库的 server，属实现错误；只让这一个 server 缺席。
             logger.error("MCP server 配置与回合身份不符，已跳过：%s", exc.message, extra=context)
             return _ServerTools(tools=(), faults=(_fault(config, "invalid", exc.message),))
+        if config.auth_type is McpAuthType.OAUTH:
+            return await self._list_oauth_server(entry, scope, partition, key, context)
         fault: ToolSourceFault | None = None
         try:
             async with asyncio.timeout(self._limits.list_timeout):
@@ -217,6 +246,70 @@ class McpToolProvider(ScopedToolProvider):
         if fault is not None:
             return _ServerTools(tools=built.tools, faults=(*built.faults, fault))
         return built
+
+    async def _list_oauth_server(
+        self,
+        entry: McpServerEntry,
+        scope: ToolScope,
+        partition: str,
+        key: PoolKey,
+        context: dict[str, Any],
+    ) -> _ServerTools:
+        """OAuth server：没有有效 token 或刷新失败就缺席并记 auth_required；授权失败不沿用旧清单。
+
+        提前刷新的时间窗加 0～30 秒随机抖动（随机数在适配层读，领域层不读进程状态），
+        避免大量用户同时到期时集中刷新。列成功后回写快照，失败只记日志。
+        """
+        config = entry.config
+        try:
+            async with asyncio.timeout(self._limits.list_timeout):
+                oauth = self._runtime.oauth
+                cell = oauth.cell(config, scope.user_id)
+                if entry.oauth_token is None:
+                    # 库里没有有效 token（从未授权、已撤销或已失效）：以库为准，丢掉本进程的缓存，不发请求。
+                    cell.forget()
+                    raise McpAuthRequired("没有授权")
+                cell.seed(entry.oauth_token)
+                skew = oauth.settings.refresh_skew_seconds + oauth.settings.jitter()
+                await cell.refresh_if_expiring(skew)
+                with track_auth() as outcome:
+                    try:
+                        async with self._runtime.connection(
+                            config,
+                            None,
+                            partition=partition,
+                            auth=McpTokenAuth(cell),
+                        ) as lease:
+                            raw = tuple(await lease.run(list_all_tools(lease.client)))
+                    except Exception:
+                        if outcome.auth_required:
+                            raise _auth_error(outcome) from None
+                        raise
+                    if outcome.auth_required:
+                        raise _auth_error(outcome)
+            self._runtime.remember_tools(key, raw)
+        except (McpAuthRequired, McpAuthRequiredError) as exc:
+            logger.info(
+                "MCP OAuth server 需要授权，本回合缺席，server=%s",
+                config.server_key,
+                extra=context,
+            )
+            fault = _fault(config, "auth_required", _auth_text(exc))
+            return _ServerTools(tools=(), faults=(fault,))
+        except AgentException as exc:
+            logger.error("MCP OAuth server 无法使用：%s", exc.message, extra=context)
+            return _ServerTools(tools=(), faults=(_fault(config, "invalid", exc.message),))
+        except Exception as exc:  # noqa: BLE001  一个 server 失败只记 fault，回合照常
+            fault = self._list_fault(config, exc, context)
+            stale = self._runtime.last_good_tools(key)
+            if stale is None:
+                return _ServerTools(tools=(), faults=(fault,))
+            fault = _fault(config, "unavailable", "MCP server 暂时不可用，沿用上次获取的工具清单")
+            built = self._build_tools(entry, stale, context)
+            return _ServerTools(tools=built.tools, faults=(*built.faults, fault))
+        summaries = summarize_tools(raw, max_schema_bytes=self._limits.max_schema_bytes)
+        await self._runtime.oauth.record_snapshot(config, tuple(summaries))
+        return self._build_tools(entry, raw, context)
 
     def _list_fault(
         self,
@@ -324,11 +417,59 @@ class McpToolProvider(ScopedToolProvider):
             raise McpConnectFailed("缺少调用身份", retryable=False)
         config = entry.config
         partition = auth_partition(config, workspace_id=ctx.workspace_id, user_id=ctx.user_id)
+        if config.auth_type is McpAuthType.OAUTH:
+            return await self._call_oauth(entry, ref, arguments, ctx.user_id, partition, timeout)
         async with self._runtime.connection(config, entry.secret, partition=partition) as lease:
             # SDK 的读超时到期后按传输方式通知 server 取消（HTTP 关闭响应流）。
             return await lease.run(
                 lease.client.call_tool(ref.remote_name, arguments, read_timeout_seconds=timeout),
             )
+
+    async def _call_oauth(
+        self,
+        entry: McpServerEntry,
+        ref: McpToolRef,
+        arguments: dict[str, Any],
+        user_id: int,
+        partition: str,
+        timeout: float,
+    ) -> CallToolResult:
+        """OAuth server 的调用：认证插件处理过期与 401 刷新；刷新也失败时把 token 标记为失效，
+        抛 McpAuthRequiredError，由 McpTool 映射成「需要重新授权」。"""
+        config = entry.config
+        oauth = self._runtime.oauth
+        cell = oauth.cell(config, user_id)
+        with track_auth() as outcome:
+            try:
+                async with self._runtime.connection(
+                    config,
+                    None,
+                    partition=partition,
+                    auth=McpTokenAuth(cell),
+                ) as lease:
+                    result = await lease.run(
+                        lease.client.call_tool(
+                            ref.remote_name,
+                            arguments,
+                            read_timeout_seconds=timeout,
+                        ),
+                    )
+            except Exception:
+                if outcome.auth_required:
+                    await self._expire(entry, user_id, outcome)
+                    raise _auth_error(outcome) from None
+                raise
+            if outcome.auth_required:
+                await self._expire(entry, user_id, outcome)
+                raise _auth_error(outcome)
+            return result
+
+    async def _expire(self, entry: McpServerEntry, user_id: int, outcome: AuthOutcome) -> None:
+        """401 且刷新失败：把这份 token 标记为失效（库里已被别处换掉就不动）；scope 不足不标记。"""
+        if outcome.insufficient_scope or outcome.token is None:
+            return
+        await self._runtime.oauth.invalidate(entry.config, user_id, outcome.token)
+        self._runtime.oauth.forget_user(entry.config.require_id(), user_id)
 
     @staticmethod
     def _log_context(config: McpServerConfig, scope: ToolScope) -> dict[str, Any]:
@@ -338,3 +479,13 @@ class McpToolProvider(ScopedToolProvider):
             "mcp_server_id": config.server_id,
             "mcp_server_key": config.server_key,
         }
+
+
+def _auth_error(outcome: AuthOutcome) -> McpAuthRequiredError:
+    return McpAuthRequiredError(insufficient_scope=outcome.insufficient_scope)
+
+
+def _auth_text(exc: Exception) -> str:
+    if isinstance(exc, McpAuthRequiredError) and exc.insufficient_scope:
+        return INSUFFICIENT_SCOPE_MESSAGE
+    return AUTH_REQUIRED_MESSAGE

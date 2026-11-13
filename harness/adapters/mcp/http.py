@@ -3,6 +3,7 @@
 用户填写的地址由服务端去连接，所以每个 DNS 结果都要是公网地址；校验用的那份解析结果就是连接用的
 地址：PinnedTransport 把请求的主机换成校验过的 IP，原主机名留在 Host 头和 TLS SNI 里。
 内网白名单只对共享 server 生效。日志与错误只带主机名，不带完整 URL 和请求头值。
+OAuth 流程自己发出的请求经 oauth_client() 走同一套校验，不同主机各自解析、校验、固定。
 """
 
 import ipaddress
@@ -316,8 +317,10 @@ class McpHttpFactory:
         config: McpServerConfig,
         secret: McpSecret | None,
         pinned: PinnedOrigin,
+        *,
+        auth: httpx2.Auth | None = None,
     ) -> httpx2.AsyncClient:
-        """建客户端：请求头只来自 server 配置的静态请求头，不转发入站请求的任何头。"""
+        """建客户端：请求头只来自 server 配置的静态请求头，不转发入站请求的任何头；OAuth server 另挂 auth。"""
         headers = sanitize_headers(secret.as_dict() if secret is not None else {})
         origin = pinned.origin
         transport = PinnedTransport(
@@ -329,9 +332,28 @@ class McpHttpFactory:
         return httpx2.AsyncClient(
             transport=transport,
             headers=headers,
+            auth=auth,
             timeout=httpx2.Timeout(self.connect_timeout, read=self.read_timeout),
             follow_redirects=False,
             # 不读 .netrc 与环境代理：凭证只来自配置，连接只走固定 IP。
+            trust_env=False,
+        )
+
+    def oauth_client(self, config: McpServerConfig) -> httpx2.AsyncClient:
+        """OAuth 流程自己发请求（元数据、注册、换 token、刷新）用的客户端：不带任何默认请求头。
+
+        transport 不预置固定 IP：MCP server、元数据、授权服务器各自首次请求时解析、校验、固定，
+        地址规则与这个 server 相同（私有 server 不适用内网白名单）。不跟随重定向，3xx 由调用方当作失败。
+        """
+        transport = PinnedTransport(
+            self.inner_transport(),
+            policy=self.policy_for(config),
+            resolver=self.resolver,
+        )
+        return httpx2.AsyncClient(
+            transport=transport,
+            timeout=httpx2.Timeout(self.connect_timeout),
+            follow_redirects=False,
             trust_env=False,
         )
 

@@ -172,7 +172,7 @@ async def test_create_validation_errors_do_not_echo_secrets(client) -> None:
         "/api/mcp/servers",
         json={"visibility": "private", "server_key": "Bad", "name": "x", "url": "https://x.com"},
     )
-    oauth = await http.post(
+    oauth_with_headers = await http.post(
         "/api/mcp/servers",
         json={
             "visibility": "private",
@@ -180,6 +180,7 @@ async def test_create_validation_errors_do_not_echo_secrets(client) -> None:
             "name": "x",
             "url": "https://x.com",
             "auth_type": "oauth",
+            "headers": {"Authorization": _SECRET},
         },
     )
     extra = await http.post(
@@ -193,8 +194,9 @@ async def test_create_validation_errors_do_not_echo_secrets(client) -> None:
     assert bad_header.json()["error"]["message"] == "MCP 请求头名称不合法或不允许配置"
     assert bad_key.status_code == 400
     assert "server_key 不合法" in bad_key.json()["error"]["message"]
-    # 本阶段只开放 none 与 static_headers，oauth 在 Schema 层就被拒绝。
-    assert oauth.status_code == 422
+    # M3 放开 oauth 后，OAuth server 带静态请求头仍在领域层被拒绝，错误里同样不回显凭证。
+    assert oauth_with_headers.status_code == 400
+    assert _SECRET not in oauth_with_headers.text
     assert extra.status_code == 422
     assert fake.calls == []
 

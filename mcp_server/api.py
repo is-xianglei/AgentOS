@@ -2,17 +2,27 @@
 
 角色、可见性、上限与重名等业务规则在 McpServerService，「校验 → 探测 → 写库 → 失效」的编排在
 应用层 McpAdminService，经 api/deps.py 的 get_mcp_admin_service 取得，路由里不 new 适配器。
-别人的私有 server 一律按不存在处理（404）。OAuth 的三个接口在 M3、Agent 绑定接口在 M2 由 agent 域提供。
+别人的私有 server 一律按不存在处理（404）。Agent 绑定接口由 agent 域提供。
+
+OAuth：授权回跳到前端路由 {AGENTOS_PUBLIC_BASE_URL}/mcp/oauth/callback，前端带 Bearer 调完成接口；
+CIMD 文档接口不鉴权（授权服务器来取），内容只有公开的客户端元数据。
 """
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
 
 from api.deps import get_mcp_admin_service
+from core.config import settings
+from core.errors import AgentException
 from core.responses import ApiResponse, ok
 from harness.app.mcp_admin import McpAdminService
+from harness.domain.mcp_oauth import oauth_client_metadata_document
 from mcp_server.schemas import (
+    McpOAuthAuthorizeResponse,
+    McpOAuthCompleteRequest,
+    McpOAuthRevokeResponse,
     McpProbeResponse,
     McpServerCreateRequest,
     McpServerCreateResponse,
@@ -81,3 +91,45 @@ async def probe_server(server_id: int, request: Request, service: AdminService):
 async def list_tools(server_id: int, request: Request, service: AdminService):
     listings = await service.list_tools(server_id)
     return ok([McpToolResponse.from_listing(listing) for listing in listings], request)
+
+
+# ---------- OAuth ----------
+
+
+@router.post(
+    "/servers/{server_id}/oauth/authorize",
+    response_model=ApiResponse[McpOAuthAuthorizeResponse],
+)
+async def authorize_oauth(server_id: int, request: Request, service: AdminService):
+    """授权前半程：返回授权地址；私有 server 只有 owner 本人能授权，别人 404。"""
+    url = await service.begin_oauth(server_id)
+    return ok(McpOAuthAuthorizeResponse(authorization_url=url), request)
+
+
+@router.post("/oauth/complete", response_model=ApiResponse[McpServerResponse])
+async def complete_oauth(
+    payload: McpOAuthCompleteRequest,
+    request: Request,
+    service: AdminService,
+):
+    """授权后半程：state 只能用一次，且必须是当前登录用户发起的；成功返回带授权状态的 server。"""
+    server = await service.complete_oauth(payload.to_callback())
+    return ok(McpServerResponse.from_view(server), request)
+
+
+@router.delete("/servers/{server_id}/oauth", response_model=ApiResponse[McpOAuthRevokeResponse])
+async def revoke_oauth(server_id: int, request: Request, service: AdminService):
+    """撤销自己的授权（软删自己的 token），之后可以重新授权。"""
+    revoked = await service.revoke_oauth(server_id)
+    return ok(McpOAuthRevokeResponse(revoked=revoked), request)
+
+
+@router.get("/oauth/client-metadata.json", include_in_schema=False)
+async def oauth_client_metadata() -> JSONResponse:
+    """CIMD（OAuth Client ID Metadata Document）：授权服务器按 client_id 地址来取，不带 Bearer。
+
+    内容只有公开的客户端元数据（名称、回跳地址），不含任何凭证；未配置对外地址时 404。
+    """
+    if not settings.public_base_url:
+        raise AgentException.message("未配置 AGENTOS_PUBLIC_BASE_URL", status_code=404)
+    return JSONResponse(oauth_client_metadata_document(settings.public_base_url))

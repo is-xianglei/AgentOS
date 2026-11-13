@@ -264,9 +264,14 @@ class ConnectionPool[C]:
             connection.request_close()
         self._freed.set()
 
-    def invalidate(self, server_id: int) -> int:
-        """让某个 server 的全部连接失效：空闲的立即关闭，忙的摘下并在归还后关闭。返回摘下的条数。"""
-        removed = [key for key in self._connections if key.server_id == server_id]
+    def invalidate(self, server_id: int, *, partition: str | None = None) -> int:
+        """让某个 server 的连接失效（给了 partition 只作用于这个授权分区）：空闲的立即关闭，
+        忙的摘下并在归还后关闭。返回摘下的条数。"""
+        removed = [
+            key
+            for key in self._connections
+            if key.server_id == server_id and (partition is None or key.partition == partition)
+        ]
         for key in removed:
             self._retire(self._connections[key])
         return len(removed)

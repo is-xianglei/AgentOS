@@ -114,6 +114,13 @@ class Settings(BaseSettings):
     mcp_allowed_private_hosts: str = ""
     # 每人在一个工作区里的私有 server 数量上限;0 表示不允许建私有 server。
     mcp_max_private_servers_per_user: int = Field(default=10, ge=0)
+    # OAuth 提前刷新的时间窗(秒):回合开始时离过期不到这么久就先刷新,另加 0~30 秒随机抖动。
+    mcp_oauth_refresh_skew_seconds: int = Field(default=300, ge=0)
+
+    # --- 对外地址 ------------------------------------------------------------
+    # 前端的对外访问地址(如 https://agentos.example.com),用来拼 MCP OAuth 回跳地址
+    # {public_base_url}/mcp/oauth/callback 与 CIMD 的 client_id;用到 OAuth 时必填,缺失时抛中文错误。
+    public_base_url: str | None = None
 
     # --- 数据库 --------------------------------------------------------------
     database_url: str | None = None
@@ -196,6 +203,23 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("public_base_url", mode="before")
+    @classmethod
+    def _normalize_public_base_url(cls, value: object) -> object:
+        """留空归一成 None(用到时再报错);非空时去掉末尾斜杠,只接受 http(s) 绝对地址。"""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return None
+        if not cleaned.startswith(("https://", "http://")) or "?" in cleaned or "#" in cleaned:
+            raise ValueError(
+                "AGENTOS_PUBLIC_BASE_URL 须为 http(s) 绝对地址,且不含查询参数与片段"
+            )
+        return cleaned
 
     @model_validator(mode="after")
     def _check_mcp_timeouts(self) -> Settings:

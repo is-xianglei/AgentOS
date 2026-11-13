@@ -26,7 +26,12 @@ from memory.models import (  # noqa: F401
     MemorySpaceRecord,
     TurnMemoryContextRecord,
 )
-from mcp_server.models import McpServerRecord, McpServerSecretRecord  # noqa: F401
+from mcp_server.models import (  # noqa: F401
+    McpOAuthClientRecord,
+    McpOAuthTokenRecord,
+    McpServerRecord,
+    McpServerSecretRecord,
+)
 from model_service.models import ModelProviderRecord, ModelRoleRecord  # noqa: F401
 from permission.models import PermissionRuleRecord  # noqa: F401
 from plan.models import SessionPlanRecord  # noqa: F401

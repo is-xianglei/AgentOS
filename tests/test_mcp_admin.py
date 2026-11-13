@@ -77,6 +77,24 @@ class FakeConnector(McpServerConnector):
     async def drop_cached_tools(self, server_id: int) -> None:
         self.dropped.append(server_id)
 
+    # M3 新增的 OAuth 抽象方法：这里的用例不走 OAuth，调用即说明编排出错。
+    async def begin_oauth(self, config: McpServerConfig, *, workspace_id: int, user_id: int) -> str:
+        raise AssertionError("不应发起 OAuth")
+
+    async def complete_oauth(self, callback: Any, **kwargs: Any) -> Any:
+        raise AssertionError("不应完成 OAuth")
+
+    async def refresh_oauth_snapshot(
+        self,
+        config: McpServerConfig,
+        user_id: int,
+        token: Any,
+    ) -> bool:
+        raise AssertionError("不应回写 OAuth 快照")
+
+    async def forget_user(self, server_id: int, user_id: int) -> None:
+        raise AssertionError("不应撤销 OAuth 授权")
+
 
 class InMemoryRegistry:
     """McpServerRegistry 的内存实现：只保存一份配置，记下每一步调用，拒绝时抛预设的异常。"""

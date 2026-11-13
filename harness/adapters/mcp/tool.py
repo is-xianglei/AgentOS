@@ -34,8 +34,18 @@ CallFn = Callable[[McpToolRef, dict[str, Any], ToolContext, float], Awaitable[Ca
 
 由 McpToolProvider 提供。超时只从借到连接后开始计，建连另受建连超时限制。建连阶段失败抛
 McpConnectFailed，调用中连接断开抛 McpConnectionLost，调用超时抛 TimeoutError，
+OAuth server 401 且刷新失败（或 403 insufficient_scope）抛 McpAuthRequiredError，
 其余 SDK 异常原样上抛，由 McpTool.execute 统一映射。
 """
+
+
+class McpAuthRequiredError(Exception):
+    """OAuth server 需要用户重新授权：401 且刷新失败，或 403 insufficient_scope（需要更大的 scope）。"""
+
+    def __init__(self, *, insufficient_scope: bool = False) -> None:
+        super().__init__("需要重新授权")
+        self.insufficient_scope = insufficient_scope
+
 
 # 只有建连阶段失败（请求确实没发出去）才自动重试，且只重试 1 次。
 _CONNECT_RETRIES = 1
@@ -128,6 +138,9 @@ class McpTool(Tool):
     def _map_error(self, exc: Exception, ctx: ToolContext) -> ToolOutput:
         cause = root_cause(exc)
         key = self.ref.server_key
+        if isinstance(cause, McpAuthRequiredError):
+            self._log("MCP 工具调用需要重新授权", ctx, cause)
+            return self._failure(f"需要重新授权 MCP server {key}")
         if isinstance(cause, TimeoutError):
             self._log("MCP 工具调用超时，结果未知", ctx, cause)
             return self._failure(self._timeout_text())

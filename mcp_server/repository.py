@@ -1,12 +1,17 @@
-"""MCP server 域的数据访问：只操作 mcp_servers 与 mcp_server_secrets，事务由调用方边界提交。"""
+"""MCP server 域的数据访问：mcp_servers、mcp_server_secrets 与 OAuth 的两张表，事务由调用方边界提交。"""
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy import Select, func, or_, select, update
+from sqlalchemy import Select, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mcp_server.models import McpServerRecord, McpServerSecretRecord
+from mcp_server.models import (
+    McpOAuthClientRecord,
+    McpOAuthTokenRecord,
+    McpServerRecord,
+    McpServerSecretRecord,
+)
 
 # 私有 server 上限的咨询锁命名空间，即 pg_advisory_xact_lock(int4, int4) 的第一个键（ASCII "MCPS"），
 # 第二个键是用户 ID；与 "USER"、"DEPT" 命名空间互不阻塞。
@@ -109,7 +114,12 @@ class McpServerRepository:
         await self.db.refresh(record)
         return record
 
-    async def save(self, record: McpServerRecord | McpServerSecretRecord) -> None:
+    async def save(
+        self,
+        record: (
+            McpServerRecord | McpServerSecretRecord | McpOAuthClientRecord | McpOAuthTokenRecord
+        ),
+    ) -> None:
         self.db.add(record)
         await self.db.flush()
         await self.db.refresh(record)
@@ -156,3 +166,82 @@ class McpServerRepository:
         await self.db.execute(
             select(func.pg_advisory_xact_lock(PRIVATE_QUOTA_LOCK_NAMESPACE, owner_user_id)),
         )
+
+    # ---------- OAuth：客户端注册与用户 token，只有建连、刷新与授权流程才读 ----------
+
+    async def get_oauth_client(self, server_id: int) -> McpOAuthClientRecord | None:
+        stmt = select(McpOAuthClientRecord).where(McpOAuthClientRecord.server_id == server_id)
+        return await self.db.scalar(stmt)
+
+    async def soft_delete_oauth_clients(self, server_id: int) -> None:
+        await self.db.execute(
+            update(McpOAuthClientRecord)
+            .where(
+                McpOAuthClientRecord.server_id == server_id,
+                McpOAuthClientRecord.is_deleted.is_(False),
+            )
+            .values(is_deleted=True, deleted_at=datetime.now(UTC)),
+        )
+
+    async def get_oauth_token(
+        self,
+        server_id: int,
+        user_id: int,
+        *,
+        for_update: bool = False,
+    ) -> McpOAuthTokenRecord | None:
+        """读一个用户的有效 token；for_update 时加行锁，持锁到事务结束，同一 token 的刷新因此串行。"""
+        stmt = select(McpOAuthTokenRecord).where(
+            McpOAuthTokenRecord.server_id == server_id,
+            McpOAuthTokenRecord.user_id == user_id,
+        )
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        return await self.db.scalar(stmt)
+
+    async def list_oauth_tokens(
+        self,
+        server_ids: Sequence[int],
+        user_id: int,
+    ) -> dict[int, McpOAuthTokenRecord]:
+        if not server_ids:
+            return {}
+        stmt = select(McpOAuthTokenRecord).where(
+            McpOAuthTokenRecord.server_id.in_(list(server_ids)),
+            McpOAuthTokenRecord.user_id == user_id,
+        )
+        return {row.server_id: row for row in await self.db.scalars(stmt)}
+
+    async def soft_delete_oauth_tokens(self, server_id: int, user_id: int | None = None) -> int:
+        """软删有效 token：给了 user_id 只删这个用户的，否则删这个 server 的全部；返回软删的行数。"""
+        stmt = update(McpOAuthTokenRecord).where(
+            McpOAuthTokenRecord.server_id == server_id,
+            McpOAuthTokenRecord.is_deleted.is_(False),
+        )
+        if user_id is not None:
+            stmt = stmt.where(McpOAuthTokenRecord.user_id == user_id)
+        result = await self.db.execute(stmt.values(is_deleted=True, deleted_at=datetime.now(UTC)))
+        return int(result.rowcount or 0)
+
+    async def set_lock_timeout(self, seconds: int) -> None:
+        """只对当前事务生效的锁等待上限；等锁超时报 LockNotAvailable（SQLSTATE 55P03）。"""
+        # SET LOCAL 不接受绑定参数，这里只拼接整数秒，不拼接任何外部输入。
+        await self.db.execute(text(f"SET LOCAL lock_timeout = '{int(seconds)}s'"))
+
+    async def get_by_id_for_update(
+        self,
+        server_id: int,
+        *,
+        skip_locked: bool = False,
+    ) -> McpServerRecord | None:
+        """按 ID 加行锁读（不限定工作区）：OAuth 快照回写由适配器按 server_id 调用，身份来自可信回合。
+
+        skip_locked 时行已被别的事务锁住就返回 None，不等待。
+        """
+        stmt = (
+            select(McpServerRecord)
+            .where(McpServerRecord.id == server_id)
+            .with_for_update(skip_locked=skip_locked)
+            .execution_options(populate_existing=True)
+        )
+        return await self.db.scalar(stmt)

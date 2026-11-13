@@ -148,6 +148,20 @@ AgentOS 作为 MCP 客户端，按工作区接入远程 MCP server（只支持 S
   私有 server 不能绑定）；委派取被委派 Agent 的绑定与父回合可见工具的交集；general-purpose
   子代理和队友继承父回合可见的 MCP 工具，Explore、Plan、verification 不带；Workflow 成员各按
   自己的绑定加载。极速模式、Plan 模式下不可用。删除 server 时同时解除全部 Agent 绑定。
+- OAuth（`auth_type=oauth`）：按用户授权，凭证归个人。管理员新建时只校验 server 的受保护资源元数据与授权服务器元数据能被发现，
+  不需要 token；之后每个成员各自授权（私有 server 只有 owner 本人能授权）：
+  1. `POST /api/mcp/servers/{id}/oauth/authorize` 返回 `authorization_url`，前端把浏览器带过去；
+  2. 授权服务器回跳到前端路由 `{AGENTOS_PUBLIC_BASE_URL}/mcp/oauth/callback?state=…&code=…&iss=…`。**这个回跳页需要前端实现**：
+     取下 `state`、`code`、`iss`，带着当前登录用户的 Bearer 调 `POST /api/mcp/oauth/complete`（body 为 `{state, code, iss}`，没有 `iss` 就不传）；
+     state 10 分钟内有效、只能用一次，且必须是同一用户发起的；
+  3. 撤销自己的授权：`DELETE /api/mcp/servers/{id}/oauth`，之后可以重新授权。
+
+  `GET /api/mcp/servers` 的每个 OAuth server 带 `oauth.status`（`authorized` / `unauthorized` / `expired`）和 scope，不回显 token。
+  回合里没有有效授权的 server 不提供工具，并通过 `tool_sources` 事件推一条 `kind=auth_required` 的 fault（带 `server_id`），前端据此引导授权；
+  调用中授权失效时工具返回「需要重新授权 MCP server {key}」。token 在后台按需刷新（提前量见 `AGENTOS_MCP_OAUTH_REFRESH_SKEW_SECONDS`）。
+  配置：`AGENTOS_PUBLIC_BASE_URL` 是前端的对外地址，用到 OAuth 时必填；授权进行中的状态存在 Redis（`AGENTOS_DISABLE_REDIS_EVENTS=true`
+  时退回进程内，只适合单进程调试）。授权服务器支持客户端元数据文档（CIMD）时，`client_id` 是
+  `{AGENTOS_PUBLIC_BASE_URL}/api/mcp/oauth/client-metadata.json`，部署时前端域名需要把 `/api` 代理到后端；否则走动态注册。
 
 ## 扩展
 

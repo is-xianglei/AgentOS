@@ -1,7 +1,8 @@
 """MCP server 配置与凭证的持久化记录。
 
 共享 server 与私有 server 在同一张表里，owner_user_id 非空即为私有；凭证单独成表，
-列表与详情只读 mcp_servers，只有建连与探测才读 mcp_server_secrets。
+列表与详情只读 mcp_servers，只有建连与探测才读 mcp_server_secrets；OAuth 的客户端注册与用户 token
+各自成表（mcp_oauth_clients、mcp_oauth_tokens），只有建连、刷新与授权流程才读。
 """
 
 from datetime import datetime
@@ -149,4 +150,87 @@ class McpServerSecretRecord(Base):
         MutableDict.as_mutable(json_type()),
         default=dict,
         comment="静态请求头 {名称: 值}，明文，接口只回显名称",
+    )
+
+
+class McpOAuthClientRecord(Base):
+    """server 的 OAuth 客户端注册信息（CIMD 或 DCR 的结果，可能含 client_secret，明文），一个 server 一行。
+
+    issuer 是注册时针对的授权服务器，只用于排查与展示；授权服务器一换就重新注册，旧行软删。
+    """
+
+    __tablename__ = "mcp_oauth_clients"
+    __table_args__ = (
+        Index(
+            "uq_mcp_oauth_clients_active_server",
+            "server_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        {"comment": "MCP server 的 OAuth 客户端注册信息（明文）"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="客户端注册记录ID")
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"),
+        index=True,
+        comment="所属 MCP server ID",
+    )
+    issuer: Mapped[str | None] = mapped_column(
+        String(2048),
+        nullable=True,
+        comment="注册时针对的授权服务器 issuer，用于排查与展示",
+    )
+    client_info: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(json_type()),
+        default=dict,
+        comment="SDK 的 OAuthClientInformationFull，可能含 client_secret，明文，不回显",
+    )
+
+
+class McpOAuthTokenRecord(Base):
+    """一个用户在一个 OAuth server 上的 token（明文）；撤销授权即软删，之后可以重新授权。"""
+
+    __tablename__ = "mcp_oauth_tokens"
+    __table_args__ = (
+        Index(
+            "uq_mcp_oauth_tokens_active_server_user",
+            "server_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        {"comment": "MCP server 的用户 OAuth token（明文）"},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, comment="token 记录ID")
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"),
+        index=True,
+        comment="所属 MCP server ID",
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        comment="授权用户ID",
+    )
+    issuer: Mapped[str | None] = mapped_column(
+        String(2048),
+        nullable=True,
+        comment="签发 token 的授权服务器 issuer",
+    )
+    token: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(json_type()),
+        default=dict,
+        comment="SDK 的 OAuthToken（含 access_token、refresh_token），明文，不回显",
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="access_token 过期时间，空表示授权服务器未给出，用于提前刷新",
+    )
+    scope: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="授权的 scope，用于展示与排查",
     )

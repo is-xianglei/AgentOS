@@ -4,6 +4,7 @@
 CacheConfig(partition=授权分区, target_id=f"{server_id}#rev={config_rev}") 隔离；server 给的
 ttlMs 超过 tools_cache_seconds 时由 _CappedTtlStore 截断。target_id 不放 URL，凭证不会混进缓存键。
 管理员手动刷新后经 drop_cached_tools() 按 server 清掉缓存条目，下一回合就重新拉取。
+OAuth server 的连接挂 McpTokenAuth，token 缓存与刷新归 McpOAuth（oauth.py），由组装根注入。
 """
 
 import hashlib
@@ -13,15 +14,18 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 
+import httpx2
 from mcp import Client
 from mcp.client import CacheConfig, CacheEntry, CacheKey, InMemoryResponseCacheStore
 from mcp.client.streamable_http import streamable_http_client
 from mcp_types import Implementation
 from mcp_types import Tool as SdkTool
 
+from core.errors import AgentException
 from harness.adapters.mcp.http import McpAddressError, McpHttpFactory
+from harness.adapters.mcp.oauth import McpOAuth
 from harness.adapters.mcp.pool import ConnectionPool, Lease, McpConnectFailed, PoolKey
-from harness.domain.mcp import McpSecret, McpServerConfig
+from harness.domain.mcp import McpSecret, McpServerConfig, user_partition
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +97,7 @@ class McpRuntime:
 
     connection() 按 (server_id, config_rev, 授权分区) 借一条连接；invalidate() 让某个 server
     在本进程的连接失效；aclose() 在 lifespan 退出时关闭全部连接。首次使用前不建任何连接。
+    oauth 为 None 表示本装配不支持 OAuth server，遇到时抛中文异常，不回落成无认证连接。
     """
 
     def __init__(
@@ -100,10 +105,12 @@ class McpRuntime:
         *,
         http: McpHttpFactory,
         limits: McpRuntimeLimits,
+        oauth: McpOAuth | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._http = http
         self._limits = limits
+        self._oauth = oauth
         self._clock = clock
         self._cache_store = _CappedTtlStore(
             max_ttl_seconds=limits.tools_cache_seconds,
@@ -131,6 +138,13 @@ class McpRuntime:
     def connect_timeout(self) -> float:
         return self._limits.connect_timeout
 
+    @property
+    def oauth(self) -> McpOAuth:
+        """OAuth 服务；本装配没有提供时抛中文异常（调用方把它记成该 server 的故障）。"""
+        if self._oauth is None:
+            raise AgentException.message("当前装配未提供 MCP OAuth 支持，无法连接 OAuth server")
+        return self._oauth
+
     def cache_config(self, target_id: str, partition: str) -> CacheConfig:
         """共享 store 下的缓存配置；server 没给 ttlMs 时用工具清单缓存时长。"""
         return CacheConfig(
@@ -148,8 +162,9 @@ class McpRuntime:
         secret: McpSecret | None,
         *,
         cache: CacheConfig | None,
+        auth: httpx2.Auth | None = None,
     ) -> Client:
-        """建连：SSRF 校验 → 建 httpx2 客户端 → Streamable HTTP → SDK Client，全部压进 stack。
+        """建连：SSRF 校验 → 建 httpx2 客户端（OAuth server 挂 auth）→ Streamable HTTP → SDK Client，全部压进 stack。
 
         地址校验不通过属于不可重试的建连失败；其余错误由连接池按建连失败归类。
         """
@@ -157,7 +172,9 @@ class McpRuntime:
             pinned = await self._http.check(config)
         except McpAddressError as exc:
             raise McpConnectFailed(exc.message, retryable=False) from exc
-        http_client = await stack.enter_async_context(self._http.create(config, secret, pinned))
+        http_client = await stack.enter_async_context(
+            self._http.create(config, secret, pinned, auth=auth),
+        )
         transport = streamable_http_client(config.url, http_client=http_client)
         client = Client(
             transport,
@@ -174,8 +191,12 @@ class McpRuntime:
         secret: McpSecret | None,
         *,
         partition: str,
+        auth: httpx2.Auth | None = None,
     ) -> AsyncIterator[Lease[Client]]:
-        """借用 (server_id, config_rev, partition) 的连接，用完归还；建连失败抛 McpConnectFailed。"""
+        """借用 (server_id, config_rev, partition) 的连接，用完归还；建连失败抛 McpConnectFailed。
+
+        auth 只在新建连接时挂上；OAuth 的分区按用户划分，复用到的连接挂的就是同一个用户的认证插件。
+        """
         server_id = config.require_id()
         key = PoolKey(server_id=server_id, config_rev=config.config_rev, partition=partition)
         target_id = f"{server_id}#rev={config.config_rev}"
@@ -183,7 +204,9 @@ class McpRuntime:
         cache = self.cache_config(target_id, partition)
 
         async def opener(stack: AsyncExitStack) -> Client:
-            return await self.open_client(stack, config, secret, cache=cache)
+            if auth is None:
+                return await self.open_client(stack, config, secret, cache=cache)
+            return await self.open_client(stack, config, secret, cache=cache, auth=auth)
 
         lease = await self._pool.acquire(key, opener)
         try:
@@ -219,10 +242,22 @@ class McpRuntime:
         )
         return removed
 
+    def forget_oauth_user(self, server_id: int, user_id: int) -> None:
+        """撤销授权后：这个用户在这个 server 上的 token 缓存、连接与最近成功清单作废，别的用户不受影响。"""
+        if self._oauth is not None:
+            self._oauth.forget_user(server_id, user_id)
+        partition = user_partition(user_id)
+        stale = [k for k in self._last_good if (k.server_id, k.partition) == (server_id, partition)]
+        for key in stale:
+            del self._last_good[key]
+        self._pool.invalidate(server_id, partition=partition)
+
     def invalidate(self, server_id: int) -> None:
         """本进程内这个 server 的连接与旧清单全部失效；SDK 缓存条目随 config_rev 变化不再被读到。"""
         for key in [k for k in self._last_good if k.server_id == server_id]:
             del self._last_good[key]
+        if self._oauth is not None:
+            self._oauth.forget_server(server_id)
         removed = self._pool.invalidate(server_id)
         logger.info(
             "MCP server 连接已失效，server_id=%s，条数=%s",

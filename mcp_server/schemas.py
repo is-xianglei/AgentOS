@@ -19,10 +19,10 @@ from harness.domain.mcp_config import (
     masked_headers,
     redact_url_query,
 )
+from harness.domain.mcp_oauth import McpOAuthAuthorization, OAuthCallback
 
 Visibility = Literal["workspace", "private"]
-# 本阶段可选的认证方式；oauth 在 M3 开放。
-AuthType = Literal["none", "static_headers"]
+AuthType = Literal["none", "static_headers", "oauth"]
 
 
 class McpServerCreateRequest(BaseModel):
@@ -129,6 +129,22 @@ class McpToolSummaryResponse(BaseModel):
         )
 
 
+class McpOAuthStatusResponse(BaseModel):
+    """当前用户在 OAuth server 上的授权状态：只有状态、scope 与过期时间，不含 token。"""
+
+    status: Literal["authorized", "unauthorized", "expired"]
+    scope: str | None = None
+    expires_at: datetime | None = None
+
+    @classmethod
+    def from_authorization(cls, authorization: McpOAuthAuthorization) -> McpOAuthStatusResponse:
+        return cls(
+            status=authorization.status.value,
+            scope=authorization.scope,
+            expires_at=authorization.expires_at,
+        )
+
+
 class McpServerResponse(BaseModel):
     """server 的对外视图：不含凭证；没有写权限的成员看不到地址里的查询参数和请求头名称。"""
 
@@ -156,6 +172,10 @@ class McpServerResponse(BaseModel):
     created_by: int | None = None
     created_at: datetime
     updated_at: datetime
+    oauth: McpOAuthStatusResponse | None = Field(
+        default=None,
+        description="当前用户的授权状态，只有 OAuth server 才有；不含 token",
+    )
 
     @classmethod
     def from_view(cls, view: McpServerView) -> McpServerResponse:
@@ -183,6 +203,11 @@ class McpServerResponse(BaseModel):
             created_by=view.created_by,
             created_at=view.created_at,
             updated_at=view.updated_at,
+            oauth=(
+                McpOAuthStatusResponse.from_authorization(view.oauth)
+                if view.oauth is not None
+                else None
+            ),
         )
 
 
@@ -245,3 +270,30 @@ class McpProbeResponse(BaseModel):
     error: str | None = None
     server: McpServerResponse
     diff: McpToolDiffResponse
+
+
+class McpOAuthAuthorizeResponse(BaseModel):
+    """授权前半程的结果：前端把浏览器带到这个地址，授权服务器回跳到前端的 /mcp/oauth/callback。"""
+
+    authorization_url: str
+
+
+class McpOAuthCompleteRequest(BaseModel):
+    """授权后半程：前端从回跳地址上取下的 state、code、iss 原样提交。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: str = Field(min_length=1, max_length=512, description="授权前半程生成的 state")
+    code: str = Field(min_length=1, max_length=4096, description="授权服务器回跳带回的授权码")
+    iss: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="授权服务器回跳带回的 iss（RFC 9207），没有就不传",
+    )
+
+    def to_callback(self) -> OAuthCallback:
+        return OAuthCallback(state=self.state, code=self.code, iss=self.iss)
+
+
+class McpOAuthRevokeResponse(BaseModel):
+    revoked: bool = Field(description="是否确有自己的授权被撤销")

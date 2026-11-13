@@ -4,14 +4,16 @@
 本类结构化满足应用层的 McpServerRegistry 端口；回合读取配置与凭证另见 source.py。
 - 共享 server 只有工作区 owner / admin 能写；私有 server 只有 owner 本人能写，普通成员可以建私有 server；
 - 别人的私有 server 一律按不存在处理（404），列表里也看不到；
-- 凭证表只在需要凭证的方法里读，列表与详情不读它。
+- 凭证表只在需要凭证的方法里读，列表与详情不读它；
+- OAuth：客户端注册按 server 一行，token 按 (server, 用户) 一行，都只经本类读写；列表与详情只附带
+  当前用户的授权状态（不含 token）。持锁刷新用组装根注入的会话工厂自开短事务，见 refresh_token_locked。
 """
 
 import logging
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
@@ -33,7 +35,20 @@ from harness.domain.mcp_config import (
     McpServerView,
     McpWritableServer,
 )
-from mcp_server.models import McpServerRecord, McpServerSecretRecord
+from harness.domain.mcp_oauth import (
+    McpOAuthAuthorization,
+    McpOAuthClient,
+    McpOAuthGrant,
+    McpOAuthToken,
+    McpTokenRefresh,
+    oauth_authorization,
+)
+from mcp_server.models import (
+    McpOAuthClientRecord,
+    McpOAuthTokenRecord,
+    McpServerRecord,
+    McpServerSecretRecord,
+)
 from mcp_server.repository import McpServerRepository
 from workspace.service import WorkspaceService
 
@@ -84,11 +99,41 @@ def record_secret(record: McpServerSecretRecord | None) -> McpSecret | None:
     return McpSecret.from_headers(record.headers)
 
 
+# 持锁刷新等锁的上限：到期即判为需要重新授权，不无限等待（8.2 节）。
+REFRESH_LOCK_TIMEOUT_SECONDS = 5
+
+
+class McpTokenLockTimeout(AgentException):
+    """持锁刷新时等行锁超时：另一个实例正在刷新同一个 token，本次判为需要重新授权。"""
+
+    status_code = 409
+
+
+def record_token(record: McpOAuthTokenRecord | None) -> McpOAuthToken | None:
+    """token 行 → 领域值；payload 损坏（缺 access_token）按没有 token 处理。"""
+    if record is None or not record.token.get("access_token"):
+        return None
+    return McpOAuthToken.from_payload(
+        record.token,
+        issuer=record.issuer,
+        expires_at=record.expires_at,
+        scope=record.scope,
+    )
+
+
+def _apply_token(record: McpOAuthTokenRecord, token: McpOAuthToken) -> None:
+    record.token = token.payload()
+    record.issuer = token.issuer
+    record.expires_at = token.expires_at
+    record.scope = token.scope
+
+
 def _view(
     record: McpServerRecord,
     *,
     writable: bool,
     header_names: Iterable[str] | None = None,
+    oauth: McpOAuthAuthorization | None = None,
 ) -> McpServerView:
     return McpServerView(
         config=record_config(record),
@@ -102,6 +147,7 @@ def _view(
         created_at=record.created_at,
         updated_at=record.updated_at,
         header_names=tuple(sorted(header_names)) if header_names is not None else None,
+        oauth=oauth,
     )
 
 
@@ -177,8 +223,13 @@ class McpServerService:
             actor_user_id,
             include_disabled_shared=is_admin,
         )
+        authorizations = await self._oauth_authorizations(records, actor_user_id)
         return [
-            _view(record, writable=self._writable(record, actor_user_id, is_admin=is_admin))
+            _view(
+                record,
+                writable=self._writable(record, actor_user_id, is_admin=is_admin),
+                oauth=authorizations.get(record.id),
+            )
             for record in records
         ]
 
@@ -189,7 +240,28 @@ class McpServerService:
         server_id: int,
     ) -> McpServerView:
         record, is_admin = await self._require_visible(workspace_id, actor_user_id, server_id)
-        return _view(record, writable=self._writable(record, actor_user_id, is_admin=is_admin))
+        authorizations = await self._oauth_authorizations([record], actor_user_id)
+        return _view(
+            record,
+            writable=self._writable(record, actor_user_id, is_admin=is_admin),
+            oauth=authorizations.get(record.id),
+        )
+
+    async def _oauth_authorizations(
+        self,
+        records: Sequence[McpServerRecord],
+        user_id: int,
+    ) -> dict[int, McpOAuthAuthorization]:
+        """当前用户在这些 OAuth server 上的授权状态；只读 token 表的状态字段，不回显 token。"""
+        oauth_ids = [r.id for r in records if r.auth_type == McpAuthType.OAUTH.value]
+        if not oauth_ids:
+            return {}
+        tokens = await self.repo.list_oauth_tokens(oauth_ids, user_id)
+        now = datetime.now(UTC)
+        return {
+            server_id: oauth_authorization(record_token(tokens.get(server_id)), now)
+            for server_id in oauth_ids
+        }
 
     # ---------- 新建 ----------
 
@@ -317,6 +389,8 @@ class McpServerService:
                 status_code=409,
             )
         config = update.config
+        # 地址或认证方式变了，旧 token 的受众（resource）已不是这个 server，全部作废，用户重新授权。
+        drop_tokens = record.url != config.url or record.auth_type != config.auth_type.value
         record.name = update.name
         record.description = update.description
         record.url = config.url
@@ -332,6 +406,8 @@ class McpServerService:
         if probe is not None:
             self._apply_probe(record, probe)
         await self.repo.save(record)
+        if drop_tokens:
+            await self.repo.soft_delete_oauth_tokens(record.id)
         headers = await self._replace_secret(record.id, update)
         logger.info(
             "MCP server 已修改，server_key=%s，config_rev=%s",
@@ -352,12 +428,14 @@ class McpServerService:
         return list(headers)
 
     async def delete_server(self, workspace_id: int, actor_user_id: int, server_id: int) -> None:
-        """软删 server 与它的凭证，并经 agent 域解除全部 Agent 对它的绑定，三者同一事务。"""
+        """软删 server 与它的凭证（含 OAuth 注册与全部用户的 token），并经 agent 域解除全部 Agent 绑定，同一事务。"""
         # 局部导入打破导入环：agent.service 在模块级导入本模块（绑定时校验 server）。
         from agent.service import AgentDefinitionService
 
         record = await self._require_writable(workspace_id, actor_user_id, server_id)
         await self.repo.soft_delete_secrets(record.id)
+        await self.repo.soft_delete_oauth_tokens(record.id)
+        await self.repo.soft_delete_oauth_clients(record.id)
         await self.repo.soft_delete(record)
         await AgentDefinitionService(self.db).unbind_mcp_server(record.id)
         logger.info(
@@ -384,7 +462,9 @@ class McpServerService:
         record.last_probe_at = datetime.now(UTC)
         if probe.ok:
             record.last_probe_error = None
-            record.tools_snapshot = [tool.to_dict() for tool in probe.tools]
+            # OAuth server 的探测不带 token、不拉清单，快照留给授权成功与回合解析回写。
+            if probe.tools_listed:
+                record.tools_snapshot = [tool.to_dict() for tool in probe.tools]
         else:
             record.last_probe_error = probe.error
 
@@ -402,13 +482,17 @@ class McpServerService:
         """回合可用的 server 配置与凭证：已启用的共享 server，加上 user_id 本人已启用的私有 server。
 
         McpServerSource 的数据来源；身份由运行时从可信回合身份给出，这里不再校验成员资格。
+        OAuth server 附带 user_id 本人的 token（没有授权时为 None）。
         """
         records = await self.repo.list_enabled_usable(workspace_id, user_id)
         secrets = await self.repo.list_secrets([record.id for record in records])
+        oauth_ids = [r.id for r in records if r.auth_type == McpAuthType.OAUTH.value]
+        tokens = await self.repo.list_oauth_tokens(oauth_ids, user_id)
         return [
             McpServerEntry(
                 config=record_config(record),
                 secret=record_secret(secrets.get(record.id)),
+                oauth_token=record_token(tokens.get(record.id)),
             )
             for record in records
         ]
@@ -496,3 +580,230 @@ class McpServerService:
             return record.auth_type == McpAuthType.OAUTH.value
         naming = model_tool_names(record.server_key, [tool.name for tool in tools])
         return tool_name in naming.names.values()
+
+    # ---------- OAuth：管理入口（请求事务）----------
+
+    async def require_oauth_server(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        server_id: int,
+    ) -> McpServerConfig:
+        """当前用户能对它发起授权的 OAuth server。
+
+        看不到（别人的私有 server、别的工作区、已删除、成员眼里停用的共享 server）一律 404，
+        私有 server 因此只有 owner 本人能授权；管理员眼里停用的共享 server 409；不是 OAuth server 400。
+        """
+        record = await self._require_oauth_record(workspace_id, actor_user_id, server_id)
+        return record_config(record)
+
+    async def save_oauth_token(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        grant: McpOAuthGrant,
+    ) -> McpServerView:
+        """授权完成后写入或替换当前用户的 token（软删旧行再插新行），返回带授权状态的视图。
+
+        授权期间 server 被删、停用或改了地址与认证（config_rev 变化）时拒绝写入：新 token 的受众可能已不是它。
+        不给 server 行加锁：随后的快照回写在独立短事务里要锁这一行，请求事务持锁会让它跳过；同一用户并发写 token
+        由部分唯一索引兜底，转成 409。
+        """
+        record = await self._require_oauth_record(workspace_id, actor_user_id, grant.server_id)
+        if record.config_rev != grant.config_rev:
+            raise AgentException.message(
+                "授权期间 MCP server 配置已被修改，请重新发起授权",
+                status_code=409,
+            )
+        await self.repo.soft_delete_oauth_tokens(record.id, actor_user_id)
+        row = McpOAuthTokenRecord(server_id=record.id, user_id=actor_user_id)
+        _apply_token(row, grant.token)
+        try:
+            await self.repo.save(row)
+        except IntegrityError as exc:
+            raise AgentException.message(
+                "授权正在由另一个请求保存，请刷新后查看",
+                status_code=409,
+            ) from exc
+        logger.info(
+            "MCP OAuth 授权已保存，server_key=%s，user_id=%s",
+            record.server_key,
+            actor_user_id,
+            extra={**self._log_context(record), "user_id": actor_user_id},
+        )
+        authorization = oauth_authorization(grant.token, datetime.now(UTC))
+        is_admin = await self._is_admin(workspace_id, actor_user_id)
+        return _view(
+            record,
+            writable=self._writable(record, actor_user_id, is_admin=is_admin),
+            oauth=authorization,
+        )
+
+    async def _require_oauth_record(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        server_id: int,
+    ) -> McpServerRecord:
+        record, _ = await self._require_visible(workspace_id, actor_user_id, server_id)
+        if record.auth_type != McpAuthType.OAUTH.value:
+            raise AgentException.message("该 MCP server 不使用 OAuth 认证", status_code=400)
+        if not record.is_enabled:
+            raise AgentException.message("MCP server 已停用，不能授权", status_code=409)
+        return record
+
+    async def revoke_oauth_token(
+        self,
+        workspace_id: int,
+        actor_user_id: int,
+        server_id: int,
+    ) -> bool:
+        """撤销自己的授权：软删自己的 token，之后可以重新授权。看不到的 server 404；停用的也能撤销。"""
+        record, _ = await self._require_visible(workspace_id, actor_user_id, server_id)
+        if record.auth_type != McpAuthType.OAUTH.value:
+            raise AgentException.message("该 MCP server 不使用 OAuth 认证", status_code=400)
+        revoked = await self.repo.soft_delete_oauth_tokens(record.id, actor_user_id) > 0
+        logger.info(
+            "MCP OAuth 授权已撤销，server_key=%s，user_id=%s，有效 token=%s",
+            record.server_key,
+            actor_user_id,
+            revoked,
+            extra={**self._log_context(record), "user_id": actor_user_id},
+        )
+        return revoked
+
+    # ---------- OAuth：给适配器用（经 McpOAuthCatalog 的短事务调用，身份来自可信回合）----------
+
+    async def get_oauth_client(self, server_id: int) -> McpOAuthClient | None:
+        row = await self.repo.get_oauth_client(server_id)
+        if row is None or not row.client_info.get("client_id"):
+            return None
+        return McpOAuthClient(
+            client_id=str(row.client_info["client_id"]),
+            issuer=row.issuer,
+            info=dict(row.client_info),
+        )
+
+    async def save_oauth_client(self, server_id: int, client: McpOAuthClient) -> None:
+        """写入或替换客户端注册：软删旧行再插新行，有效行始终只有一行。"""
+        await self.repo.soft_delete_oauth_clients(server_id)
+        await self.repo.save(
+            McpOAuthClientRecord(
+                server_id=server_id,
+                issuer=client.issuer,
+                client_info=dict(client.info),
+            ),
+        )
+        logger.info(
+            "MCP OAuth 客户端注册已保存，server_id=%s，issuer=%s",
+            server_id,
+            client.issuer,
+            extra={"mcp_server_id": server_id},
+        )
+
+    async def get_oauth_token(self, server_id: int, user_id: int) -> McpOAuthToken | None:
+        return record_token(await self.repo.get_oauth_token(server_id, user_id))
+
+    async def refresh_token_locked(
+        self,
+        server_id: int,
+        user_id: int,
+        refresh: McpTokenRefresh,
+    ) -> McpOAuthToken | None:
+        """持行锁刷新 token，必须在专用短事务里调用并由调用方提交（见 source.py 的 McpOAuthCatalog）。
+
+        依次：SET LOCAL lock_timeout → SELECT ... FOR UPDATE 锁住这一行 → 把锁内读到的 token 交给回调，
+        回调据此判断是否已被别的实例刷新过（是就原样返回）→ 否则回调换新 token，在同一事务里写回。
+        回调返回 None 表示授权服务器明确拒绝，在锁内软删这一行（标记失效）。
+        没有有效 token 返回 None；等锁超时抛 McpTokenLockTimeout，不无限等待。
+        """
+        await self.repo.set_lock_timeout(REFRESH_LOCK_TIMEOUT_SECONDS)
+        try:
+            row = await self.repo.get_oauth_token(server_id, user_id, for_update=True)
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) == "55P03":
+                raise McpTokenLockTimeout.message(
+                    "刷新 MCP 授权时等锁超时",
+                    {"server_id": server_id},
+                ) from exc
+            raise
+        current = record_token(row)
+        if row is None or current is None:
+            return None
+        refreshed = await refresh(current)
+        if refreshed is None:
+            row.is_deleted = True
+            row.deleted_at = datetime.now(UTC)
+            await self.repo.save(row)
+            logger.info(
+                "MCP OAuth 刷新被授权服务器拒绝，token 已标记失效，server_id=%s，user_id=%s",
+                server_id,
+                user_id,
+                extra={"mcp_server_id": server_id, "user_id": user_id},
+            )
+            return None
+        if refreshed is current:
+            return current
+        _apply_token(row, refreshed)
+        await self.repo.save(row)
+        return refreshed
+
+    async def invalidate_oauth_token(
+        self,
+        server_id: int,
+        user_id: int,
+        access_token: str,
+    ) -> bool:
+        """把 token 标记为失效（软删），返回是否软删了。
+
+        只有库里仍是这个 access_token 时才软删：别的实例刚刷新出的新 token 不受影响。
+        加行锁并设等锁上限，与持锁刷新串行；等锁超时按未软删处理。
+        """
+        await self.repo.set_lock_timeout(REFRESH_LOCK_TIMEOUT_SECONDS)
+        try:
+            row = await self.repo.get_oauth_token(server_id, user_id, for_update=True)
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) == "55P03":
+                return False
+            raise
+        if row is None or row.token.get("access_token") != access_token:
+            return False
+        row.is_deleted = True
+        row.deleted_at = datetime.now(UTC)
+        await self.repo.save(row)
+        logger.info(
+            "MCP OAuth token 已标记失效，server_id=%s，user_id=%s",
+            server_id,
+            user_id,
+            extra={"mcp_server_id": server_id, "user_id": user_id},
+        )
+        return True
+
+    async def record_tools_snapshot(
+        self,
+        server_id: int,
+        config_rev: int,
+        tools: Sequence[McpToolSummary],
+    ) -> bool:
+        """OAuth server 的快照回写（第 7 节）：只有工具元数据，不含用户数据。
+
+        配置版本已变（清单可能来自旧地址）或清单与快照一致时不写；返回是否写入。
+        """
+        # 管理员正在改这个 server（持有行锁）时跳过，不排队：快照下次解析成功时还会回写。
+        record = await self.repo.get_by_id_for_update(server_id, skip_locked=True)
+        if record is None or record.auth_type != McpAuthType.OAUTH.value:
+            return False
+        if record.config_rev != config_rev:
+            return False
+        snapshot = [tool.to_dict() for tool in sorted(tools, key=lambda tool: tool.name)]
+        if record.tools_snapshot == snapshot:
+            return False
+        record.tools_snapshot = snapshot
+        await self.repo.save(record)
+        logger.info(
+            "MCP OAuth server 工具快照已回写，server_key=%s，工具数=%s",
+            record.server_key,
+            len(snapshot),
+            extra=self._log_context(record),
+        )
+        return True

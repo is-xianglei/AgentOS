@@ -1,6 +1,6 @@
 # AgentOS MCP 接入设计
 
-> 状态：设计稿（2026-11-11），M0、M1、M2 已实现（M1、M2 于 2026-11-13 完成），M3、M4 待实现，阶段见第 13 节。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
+> 状态：设计稿（2026-11-11），M0～M3 已实现（M1、M2、M3 于 2026-11-13 完成），M4 待实现，阶段见第 13 节。拍板过的决策记在第 14 节，并已写入正文。实现阶段细化出的签名回写到本文。
 > 上位文档：[agent-architecture.md](agent-architecture.md)（分层规则、端口约定、组装根）。本文只写 MCP 的增量。
 > 本文推翻了上位文档和 CLAUDE.md 里关于 MCP 的几条预设，具体列在第 15 节；M0 开始时同步修改那几处，
 > 修改之前以本文为准。其余分层规则仍以上位文档为准。
@@ -268,7 +268,7 @@ class McpProbeResult:                     # success(...) / failure(error) 两个
 
 - 授权分区（5.2 节）：`workspace_partition(id) -> "ws:{id}"`、`user_partition(id) -> "user:{id}"`，以及
   `auth_partition(config, *, workspace_id, user_id) -> str`：私有 server 取 `user:{owner_user_id}`，共享 server 的 OAuth 取
-  `user:{user_id}`（留给 M3），共享 server 的静态请求头和无认证取 `ws:{workspace_id}`。身份与配置不符（跨工作区、别人的私有 server）
+  `user:{user_id}`（M3 已接入），共享 server 的静态请求头和无认证取 `ws:{workspace_id}`。身份与配置不符（跨工作区、别人的私有 server）
   抛中文 AgentException，不回落。
 
 **命名算法 `model_tool_names`**（参考 codex `codex-mcp/src/tools.rs` 与 openai-agents `mcp/util.py`）：
@@ -368,7 +368,7 @@ class McpServerRegistry(Protocol):
 `McpProbeResult`（server 信息、工具清单摘要、错误）都是领域值类型，放在 `harness/domain/mcp.py`。
 
 M1a 落地（`harness/app/mcp_port.py`）：
-- `McpServerConnector` 只有 `probe` 和 `invalidate` 两个抽象方法，OAuth 的两个半程留到 M3；`McpServerRegistry` 在 M1b 加入（见本节末尾）。
+- `McpServerConnector` 只有 `probe` 和 `invalidate` 两个抽象方法，OAuth 的两个半程留到 M3（已加，见本节末尾 M3 落地）；`McpServerRegistry` 在 M1b 加入（见本节末尾）。
   `probe` 失败不抛异常，结果里带中文错误；只有地址不合法（SSRF 校验不通过）抛中文 AgentException，属于调用方输入错误。
 - 新增窄接口 `McpServerSource`，是 `McpToolProvider` 唯一的数据来源，**M1b 由 mcp_server 域按它实现**：
 
@@ -386,6 +386,23 @@ class McpServerSource(Protocol):
   放在应用层而不是适配层：mcp_server 域不能导入 `harness.adapters`（12.1 节），而它要满足这个协议、构造 `McpServerEntry`。
   这和 `SessionService` 结构化满足 `SessionStore` 是同一种做法。第 2 节说的「经 `session_factory` 开短会话」由实现方负责，
   适配器只认这个协议。
+
+M3 落地（`harness/app/mcp_port.py`、`harness/domain/mcp_oauth.py`）：
+- `McpServerConnector` 新增五个抽象方法：`begin_oauth(config, *, workspace_id, user_id) -> str`；
+  `complete_oauth(callback, *, workspace_id, user_id, config_for) -> McpOAuthGrant`，比上文多了 `config_for(server_id)`：
+  state 里只有 server_id，换 token 的请求要按该 server 的地址规则走 SSRF 防护，配置由 `McpAdminService` 经 registry 取（看不到即 404）；
+  返回值不是上文的 `int` 而是 `McpOAuthGrant(server_id, config_rev, token)`：连接器只做网络动作，token 由 registry 写进请求事务；
+  `refresh_oauth_snapshot(config, user_id, token) -> bool`（授权成功后拉清单回写快照）；`forget_user(server_id, user_id)`（撤销后本进程缓存作废）。
+- 新增两个端口：
+  - `McpOAuthStore`（`Protocol`）：`get_client` / `save_client` / `get_token` / `refresh_token_locked` / `invalidate_token(server_id, user_id, access_token) -> bool` /
+    `record_tools_snapshot(server_id, config_rev, tools) -> bool`。实现是 `mcp_server/source.py` 的 `McpOAuthCatalog(session_factory)`，
+    每次调用自开短事务并提交；适配器只认这个协议。
+  - `OAuthStateStore`（ABC）：`put(state, pending, *, ttl_seconds)`、`take(state)`（一次性读删）、`aclose()`。实现见 8.2 节末尾。
+- `McpServerRegistry` 新增 `require_oauth_server` / `save_oauth_token` / `revoke_oauth_token`（签名见第 7 节 M3 落地）。
+- 领域值类型放在新模块 `harness/domain/mcp_oauth.py`：`McpOAuthToken`（凭证字段不进 repr，`payload()` 即落库形状）、`McpOAuthClient`、
+  `McpOAuthPending`（state 记录）、`OAuthCallback(state, code, iss)`（code 不进 repr）、`McpOAuthGrant`、`McpOAuthStatus` / `McpOAuthAuthorization`
+  （接口回显的授权状态）、`McpTokenRefresh` 回调类型、`oauth_authorization(token, now)`，以及回跳地址与 CIMD 文档的纯函数。当前时间由调用方传入。
+  `McpServerEntry` 新增 `oauth_token`（repr 不输出），`McpProbeResult` 新增 `tools_listed` 与工厂 `metadata_only()`，`McpServerView` 新增 `oauth`。
 
 M1b 落地（`harness/app/mcp_port.py`、`harness/domain/mcp_config.py`）：
 - **`McpServerSource` 的生产实现**是 `mcp_server/source.py` 的 `McpServerCatalog(session_factory)`：每次 `list_servers(scope)`
@@ -732,7 +749,11 @@ M1a 落地（`tool.py`），按 SDK 2.3.0 的实际行为细化了上表：
 - 连接断开：调用中后台断开得到 `McpConnectionLost`，或 SDK 的 `MCPError(CONNECTION_CLOSED)`，或 httpx2 的 `TransportError`，
   一律是「连接失败」、不重试；只有建连阶段的 `McpConnectFailed(retryable=True)` 自动重试 1 次。地址不合法（SSRF）属于不可重试的建连失败。
 - 401：静态请求头和无认证的 server 收到 401 / 403 / 5xx 时，SDK 把它们合成为 `MCPError(INTERNAL_ERROR, "Server returned an error response")`
-  （`client/streamable_http.py:400-432`），按「JSON-RPC 协议错误」返回。「401 且 OAuth 刷新失败」一行留到 M3。
+  （`client/streamable_http.py:400-432`），按「JSON-RPC 协议错误」返回。
+- **M3 落地「401 且 OAuth 刷新失败」**：OAuth server 的调用经 `McpToolProvider._call_oauth`，连接挂 `McpTokenAuth`；认证插件把结论写进
+  contextvar `AuthOutcome`（插件不能抛异常，见 8.2 节 spike），SDK 照常合成上面那个错误，调用方看到 `auth_required` 就把它换成
+  `McpAuthRequiredError`，`McpTool` 映射成「需要重新授权 MCP server {key}」，同时经 `McpOAuthStore.invalidate_token` 把被拒的那份 token
+  标记为失效（库里已被别处换成新 token 时不动）。403 `insufficient_scope` 同样返回这句话，但不标记失效（token 本身有效，只是 scope 不够）。
 - outputSchema：SDK 校验失败抛 `RuntimeError("Invalid structured content ...")`（`client/session.py:1118-1154`），映射成上表文本。
 - `input_required`：`Client(input_required_max_rounds=0)`，SDK 一轮都不自动应答，直接抛 `InputRequiredRoundsExceededError`，
   映射成「该工具需要交互输入，暂不支持」（9.2 节）。SDK 默认会把 elicitation 交给回调，这里不声明该能力。
@@ -1183,7 +1204,7 @@ M2 落地（`agent/`，迁移 `alembic/versions/0033_agent_mcp_servers.py`，rev
 
 M1b 落地（`mcp_server/`，迁移 `alembic/versions/0031_mcp_servers.py`，revision `0031_mcp_servers`）：
 - 只建 `mcp_servers`（ORM `McpServerRecord`）和 `mcp_server_secrets`（`McpServerSecretRecord`）两张表，已在 `database/registry.py` 登记。
-  OAuth 的两张表留到 M3，`agent_mcp_servers` 留到 M2（已建，见本节末尾 M2 落地）。
+  OAuth 的两张表留到 M3（已建，见本节 M3 落地），`agent_mcp_servers` 留到 M2（已建，见本节末尾 M2 落地）。
 - 列按上表实现，另外：
   - 两个 CHECK 约束 `ck_mcp_servers_auth_type`、`ck_mcp_servers_approval_mode`；
   - 部分唯一索引 `uq_mcp_servers_active_workspace_key (workspace_id, server_key) WHERE is_deleted = false`，共享和私有 server 一起算；
@@ -1210,7 +1231,35 @@ M1b 落地（`mcp_server/`，迁移 `alembic/versions/0031_mcp_servers.py`，rev
 - 地址存规范化后的形式（`canonical_server_url`）：协议和主机名转小写，去掉默认端口和路径末尾的斜杠，空白与控制字符直接拒绝。
   https、userinfo、片段和内网地址的安全校验仍由适配层探测时做（5.6 节）。
 - 本阶段 `auth_type` 只开放 `none` 和 `static_headers`。Schema 层拒绝 `oauth`，返回 422；领域层 `McpServerDraft` 也拒绝它，返回 400「OAuth 认证尚未开放」。
-  原因是 OAuth server 的授权流程与探测方式要到 M3 才有。
+  原因是 OAuth server 的授权流程与探测方式要到 M3 才有。**M3 已放开**：Schema 的 `auth_type` 接受 `oauth`，删除领域层的 `_reject_oauth`；
+  OAuth server 与 `none` 一样不能带静态请求头（400「只有 static_headers 认证方式可以配置请求头」）。
+
+M3 落地（`mcp_server/`，迁移 `alembic/versions/0034_mcp_oauth.py`，revision `0034_mcp_oauth`）：
+- ORM `McpOAuthClientRecord`（`mcp_oauth_clients`）、`McpOAuthTokenRecord`（`mcp_oauth_tokens`），已在 `database/registry.py` 登记。列按上表实现：
+  - `issuer` 为 `String(2048)`、可空；`client_info`、`token` 为 JSONB（`MutableDict`，`default=dict`）；`expires_at` 带时区、可空；`scope` 为 Text、可空；
+  - 部分唯一索引 `uq_mcp_oauth_clients_active_server (server_id)`、`uq_mcp_oauth_tokens_active_server_user (server_id, user_id)`，都是 `WHERE is_deleted = false`；
+  - 普通索引 `server_id`、`user_id`、`is_deleted`；外键 `server_id → mcp_servers` CASCADE、`user_id → users` CASCADE。
+- 迁移在开发库上执行过 `upgrade head` → `downgrade -1` → `upgrade head`；用 alembic 的 `compare_metadata` 比较，库表结构与 ORM 无差异。
+- 写法：客户端注册与 token 变更都是软删旧行再插新行，有效行始终只有一行（同 `mcp_server_secrets`）。
+- `McpServerService` 新增的方法（前三个是 `McpServerRegistry`，走请求事务；其余由 `McpOAuthCatalog` 在自开的短事务里调用）：
+
+| 方法 | 规则 |
+|---|---|
+| `require_oauth_server(workspace_id, actor_user_id, server_id) -> McpServerConfig` | 可见规则同 `get_server`，看不到一律 404（别人的私有 server 因此只有 owner 本人能授权）；不是 OAuth 400；停用 409 |
+| `save_oauth_token(workspace_id, actor_user_id, grant) -> McpServerView` | 同上的校验，再核对 `config_rev` 与授权发起时一致（409）；软删本人旧 token 再插新行；撞部分唯一索引转 409。不给 server 行加锁，原因见 10.1 节 M3 落地 |
+| `revoke_oauth_token(workspace_id, actor_user_id, server_id) -> bool` | 看不到 404、不是 OAuth 400；停用的也能撤销；软删本人的有效 token，返回是否确有 token |
+| `get_oauth_client(server_id)` / `save_oauth_client(server_id, client)` | 读写客户端注册；写入是软删旧行再插新行 |
+| `get_oauth_token(server_id, user_id) -> McpOAuthToken \| None` | 读有效 token；payload 缺 `access_token` 按没有处理 |
+| `refresh_token_locked(server_id, user_id, refresh) -> McpOAuthToken \| None` | 8.2 节第 2 条：`SET LOCAL lock_timeout = '5s'` → `SELECT … FOR UPDATE`（`populate_existing`）→ 把锁内读到的 token 交给回调 → 回调原样返回（已被别处刷新）就不写，返回新 token 就写回，返回 None（授权服务器明确拒绝）就在锁内软删；等锁超时（SQLSTATE 55P03）抛 `McpTokenLockTimeout`（409）。不提交，由 `McpOAuthCatalog` 提交 |
+| `invalidate_oauth_token(server_id, user_id, access_token) -> bool` | 调用中 401 且刷新失败时用。同样加行锁与等锁上限；只有库里仍是这份 `access_token` 才软删，别的实例刚刷新出的新 token 不受影响 |
+| `record_tools_snapshot(server_id, config_rev, tools) -> bool` | 第 7 节的快照回写：server 行 `FOR UPDATE SKIP LOCKED`（管理员正在改就跳过，下次再写）；不是 OAuth、`config_rev` 已变或清单与快照一致都不写 |
+
+- 既有方法的变化：
+  - `list_servers` / `get_server` 给 OAuth server 附带当前用户的授权状态（`McpServerView.oauth`），只读 token 表，不回显 token；
+  - `list_usable` 给 OAuth server 附带调用用户本人的 token（`McpServerEntry.oauth_token`）；
+  - `apply_update` 在地址或认证方式变化时软删这个 server 的全部 token：旧 token 的受众（resource）已不是它；
+  - `delete_server` 同时软删客户端注册与全部 token；
+  - `_apply_probe` 遇到 `tools_listed=False`（OAuth server 的探测）不覆盖快照。
 
 ### 7.1 凭证存储
 
@@ -1293,6 +1342,47 @@ MCP 凭证明文存储，与 `model_providers.api_key` 的做法一致（2026-11
 `create_client_registration_request`、`should_use_client_metadata_url`，以及 `auth/oauth2.py:115` 的 `PKCEParameters`），不自己重写协议。
 M3 开始时先做一次 spike，确认具体能复用哪些函数，结论回写到本文。
 
+**M3 spike 结论**（2026-11-13，已安装的 mcp 2.3.0；`client/auth/oauth2.py`、`client/auth/utils.py`、`shared/auth.py`、
+`shared/auth_utils.py`、`shared/_httpx_utils.py` 与克隆逐字节相同）：
+
+- 直接复用的函数（均为公开名，只有 `check_registration_usable` 在 `oauth2.py` 里没进 `__all__`，但同样是模块级公开函数）：
+
+| 用途 | SDK 函数与签名 |
+|---|---|
+| PRM 发现 URL | `utils.build_protected_resource_metadata_discovery_urls(www_auth_url: str \| None, server_url: str) -> list[str]` |
+| AS 元数据发现 URL | `utils.build_oauth_authorization_server_metadata_discovery_urls(auth_server_url: str \| None, server_url: str) -> list[str]` |
+| 元数据请求 | `utils.create_oauth_metadata_request(url: str) -> httpx2.Request`（带 `MCP-Protocol-Version`） |
+| 解析 PRM / AS 元数据 | `async utils.handle_protected_resource_response(resp) -> ProtectedResourceMetadata \| None`；`async utils.handle_auth_metadata_response(resp) -> tuple[bool, OAuthMetadata \| None]`（3xx～4xx 换下一个 URL，5xx 停止） |
+| 401 挑战 | `utils.extract_resource_metadata_from_www_auth(resp)`、`utils.extract_scope_from_www_auth(resp)`、`utils.extract_field_from_www_auth(resp, name)` |
+| issuer 校验 | `utils.validate_metadata_issuer(oauth_metadata: OAuthMetadata, expected_issuer: str) -> None`；`utils.issuers_match(a, b) -> bool` |
+| RFC 9207 | `utils.validate_authorization_response_iss(iss: str \| None, oauth_metadata: OAuthMetadata \| None) -> None` |
+| resource（RFC 8707） | `shared.auth_utils.resource_url_from_server_url(url) -> str`、`check_resource_allowed(requested_resource, configured_resource) -> bool` |
+| scope 选择 | `utils.get_client_metadata_scopes(www_authenticate_scope, protected_resource_metadata, authorization_server_metadata=None, client_grant_types=None) -> str \| None` |
+| CIMD | `utils.should_use_client_metadata_url(oauth_metadata, client_metadata_url) -> bool`、`utils.is_valid_client_metadata_url(url) -> bool`、`utils.create_client_info_from_metadata_url(client_metadata_url, redirect_uris=None) -> OAuthClientInformationFull` |
+| DCR | `utils.create_client_registration_request(auth_server_metadata, client_metadata: OAuthClientMetadata, auth_base_url: str) -> httpx2.Request`、`async utils.handle_registration_response(resp) -> OAuthClientInformationFull`（丢弃线上的 issuer）、`oauth2.check_registration_usable(client_info) -> None` |
+| 客户端与 issuer 绑定 | `utils.credentials_match_issuer(client_info, issuer: str, client_metadata_url: str \| None) -> bool` |
+| PKCE | `oauth2.PKCEParameters.generate() -> PKCEParameters`（`code_verifier` 128 字符，S256） |
+| token 响应 | `async utils.handle_token_response_scopes(resp) -> OAuthToken` |
+
+- 不复用的：`OAuthClientProvider` 与 `TokenStorage`（理由见上）；`OAuthContext.prepare_token_auth` 是 `OAuthContext` 的方法，
+  构造它要给 `storage`、`client_metadata` 等整套上下文，所以照它的三个分支（`client_secret_basic` 用 URL 编码后的 Basic 头并从表单去掉 secret、
+  `client_secret_post` 放表单、`none` 不带）在适配器里写了十几行；未知方法在注册时已被 `check_registration_usable` 拒绝。
+  `calculate_token_expiry` 读 `time.time()`，改用注入的时钟算 `expires_at`。
+- SDK 没做、AgentOS 补上的：规范要求 AS 元数据的 `code_challenge_methods_supported` 含 `S256`，否则拒绝继续（MUST），SDK 不查；
+  `authorization_endpoint` 只交给浏览器，不经 `PinnedTransport`，单独按 https 规则校验。
+- **换 token 与刷新的请求怎样组装最省事**：表单字段照抄 SDK 的 `_exchange_token_authorization_code` / `_refresh_token`
+  （`grant_type`、`code` / `refresh_token`、`redirect_uri`、`client_id`、`code_verifier`），`resource` 一律带（规范要求「不论 AS 是否支持都要带」，
+  SDK 只在有 PRM 时带，AgentOS 必有 PRM，结果相同）；客户端认证按上面三个分支；响应交给 `handle_token_response_scopes`；
+  刷新响应缺 `refresh_token` / `scope` 时沿用旧值，同 SDK 的 `_handle_refresh_response`。
+- **自己发出的请求怎么走 SSRF 防护**：`McpHttpFactory.oauth_client(config)` 另建一个不带任何默认请求头的 httpx2 客户端，
+  transport 是不预置固定 IP 的 `PinnedTransport`：MCP server、PRM、AS 元数据、注册与 token 端点各自首次请求时解析、校验、固定，
+  地址规则与该 server 相同（私有 server 不适用内网白名单）。`follow_redirects=False`、`trust_env=False`；元数据请求遇 3xx 当作「此处没有」
+  换下一个候选 URL，注册与 token 请求遇 3xx 当作失败。响应体读取有上限（1 MiB）。
+- **实测**（`httpx2.ASGITransport` 挂假 server）：
+  - 在 `httpx2.Auth.async_auth_flow` 里抛异常，会让 SDK Streamable HTTP 的 `post_writer` 任务组整体退出，调用方只拿到 `CancelledError`，
+    连接随之报废。所以 `McpTokenAuth` 绝不抛异常：失败时不带 token 照常发出（server 回 401），失败原因经 contextvar 交给调用方。
+  - contextvar 能到达认证插件：SDK 的 `ContextSendStream` 在 `send` 时拷贝发送方上下文，`post_writer` 用 `sender_ctx.run(...)` 起处理任务。
+
 1. **`McpTokenAuth(httpx2.Auth)`**：调用路径上的认证插件，按 `(server, user)` 构造，挂在这个用户的 MCP 连接上。
    - 首次请求时从 `McpServerService` 读出 token 缓存在内存里，后续请求直接用缓存；发现 `expires_at` 已过期就先刷新。
      收到 401 时，先**重新读库**：如果别的实例已经刷新过，直接换用新 token 重发；否则自己刷新一次再重发。
@@ -1337,6 +1427,40 @@ M3 开始时先做一次 spike，确认具体能复用哪些函数，结论回�
 4. **不实现 SDK 的 `TokenStorage`**：调用路径用的是 `McpTokenAuth`，授权的两个半程复用的是 `auth/utils.py` 里的工具函数，
    这些函数都不读写存储，所以两条路径都用不到 `TokenStorage` 协议。
 
+**M3 落地**（`harness/adapters/mcp/oauth.py`、`oauth_state.py`）：
+- 进程级 `McpOAuth(*, http, store, states, settings, clock=time.time)`，挂在 `McpRuntime(oauth=...)` 上，探测、回合解析、调用与管理入口共用：
+  - `begin(config, *, workspace_id, user_id) -> str`：401 挑战（不带 token 发一个 `server/discover`，取 `WWW-Authenticate` 的 `resource_metadata`）→
+    PRM 发现 → resource 校验 → AS 元数据发现与 issuer 校验 → 要求 `code_challenge_methods_supported` 含 S256 → 注册客户端 → PKCE 与 state →
+    `states().put(state, McpOAuthPending, ttl_seconds=600)` → 返回授权地址（带 `resource`、`code_challenge`、`state`，scope 按 SDK 的 `get_client_metadata_scopes`）。
+    PRM 找不到直接报错，不走 2025-03-26 的旧路径（规范要求 server 必须提供 PRM）；授权服务器取 PRM 列出的第一个。
+  - `complete(callback, *, workspace_id, user_id, config_for) -> McpOAuthGrant`：`states().take(state)`（GETDEL）→ 不存在或过期 400 →
+    `pending.require_owner(...)`，发起人不是当前用户 403（state 已被取出，作废）→ `validate_authorization_response_iss(iss, 记下的 AS 元数据)` →
+    `config_for(server_id)`，`config_rev` 与发起时不同 409 → 带 `code_verifier`、`redirect_uri`、`resource` 换 token。
+  - `refresh(config, user_id, stale) -> McpOAuthToken`：先取客户端注册与发现结果（按 `(server_id, config_rev)` 缓存 5 分钟），再进 `store.refresh_token_locked`，
+    锁里只有一次 token 请求的往返。授权服务器回 4xx 视为明确拒绝（回调返回 None，锁内标记失效），5xx 或网络错误抛异常、事务回滚、不写库；
+    issuer 与 token 记录的不同（授权服务器已更换）不把旧 refresh_token 发给新服务器，同样视为拒绝。失败一律抛 `McpAuthRequired`。
+  - `invalidate(config, user_id, token)`、`forget_user` / `forget_server`（本进程缓存作废）、`check_metadata(config)`（探测用）、
+    `record_snapshot(config, tools)`（本进程对同一份清单只写一次）。
+- **客户端注册**：`ensure_client(...)` 已有注册且属于同一授权服务器（SDK 的 `credentials_match_issuer`）、回跳地址也没变就复用；否则
+  CIMD（`client_id` = `{AGENTOS_PUBLIC_BASE_URL}/api/mcp/oauth/client-metadata.json`，要求该地址是 https 且授权服务器声明支持）优先，其次 DCR
+  （`application_type="web"`、`token_endpoint_auth_method="none"`；授权服务器另行签发 secret 时按它返回的方法认证）。注册信息写入 `mcp_oauth_clients`。
+  CIMD 文档由后端 `GET /api/mcp/oauth/client-metadata.json` 发布（不鉴权，只有公开的客户端元数据），经前端同域的 `/api` 代理对外。
+- **`McpTokenAuth(httpx2.Auth)`**：按 `TokenCell` 构造；`TokenCell` 是本进程里一个 `(server, config_rev, 用户)` 的 token 缓存，同一身份的连接共用，
+  内部 `asyncio.Lock` 让本进程内的刷新只做一次。认证插件**不抛异常**（spike 实测，见上），没有 token 时不带 `Authorization` 照常发出，
+  401 与 403 `insufficient_scope` 的结论写进 contextvar `AuthOutcome`（`track_auth()` 上下文），调用方据此映射。
+- **回合解析**（`McpToolProvider._list_oauth_server`）：`McpServerEntry.oauth_token` 为 None（从未授权、已撤销或已失效）就丢掉本进程缓存、不发请求，
+  记 `auth_required` fault；否则用它预置 `TokenCell`，离过期不到 `refresh_skew_seconds + jitter()` 就先刷新，`jitter` 是
+  `OAuthClientSettings` 的字段，默认 `secrets.randbelow(30_001) / 1000`（0～30 秒，适配层读随机数）。列表失败且 `AuthOutcome.auth_required`
+  记 `auth_required`；授权类故障不沿用旧清单（与连接故障不同）。成功后 `summarize_tools` → `record_snapshot` 回写快照。
+  `McpRuntime` 没有注入 OAuth（测试装配）时该 server 记 `invalid`，不回落成无认证连接。
+- **state 存储的落位**：端口 `OAuthStateStore` 在 `harness/app/mcp_port.py`；实现 `RedisOAuthStateStore(clients: RedisClients, *, key_prefix)`、
+  `LocalOAuthStateStore(*, clock)` 在 `harness/adapters/mcp/oauth_state.py`。Redis key 为 `agentos:mcp:oauth:state:{sha256(state)}`
+  （不放 state 原文），`SET EX 600` 写入、`GETDEL` 取出。组装根的 `mcp_oauth_state_store()`（`@cache`，首次用到时才连 Redis）：
+  `disable_redis_events=true` 时用进程内实现；否则用 `build_redis_clients(...)` 建 Redis 客户端，未配置 `AGENTOS_REDIS_URL` 抛中文异常；
+  `close_mcp_runtime()` 一并关闭它。
+- **凭证不外泄**：token、code、code_verifier、client_secret 不进日志与错误；授权服务器的错误只记 HTTP 状态和 RFC 6749 的 `error` 码（只放行小写字母与下划线），
+  不回显响应体；`McpOAuthToken`、`OAuthCallback`、`McpOAuthPending`、`McpOAuthClient` 的凭证字段都不进 repr。
+
 ### 8.3 缺少授权时的体验
 
 - 回合开始解析工具时，如果某个 OAuth server 没有当前用户的有效 token，或者刷新失败，这个 server 本回合不提供工具，
@@ -1349,12 +1473,17 @@ M3 开始时先做一次 spike，确认具体能复用哪些函数，结论回�
   2026-11-11 拍板：只提示用户去授权，不挂起回合。
 - 调用过程中收到 401 并且刷新失败：返回 `ToolOutput.error("需要重新授权…")`，同时把这个用户在这个 server 上的
   token 标记为失效。
+- M3 落地：fault 文本为「需要授权：请到 MCP 管理页为该 server 授权后再试」，scope 不足时为「授权范围不足：请到 MCP 管理页为该 server 重新授权」，
+  都不带授权地址。调用时的文本为「需要重新授权 MCP server {key}」（5.4 节 M3 落地）。
 
 ### 8.4 健康状态区分身份
 
 - 「server 挂了」和「这个用户没有凭证」是两回事，401 / 403 不能当作网络不可达。mcp-context-forge #4495
   就因为用管理员身份探测按用户授权的 server，把这类 server 全部误标成了离线。
 - 管理员探测 OAuth server 时，只验证 PRM 和 AS 元数据能否发现，不需要 token；`last_probe_error` 只记录与身份无关的错误。
+- M3 落地：`McpConnector.probe` 对 OAuth server 走 `McpOAuth.check_metadata`（同 `begin` 的发现与校验，但不注册、不换 token），
+  成功返回 `McpProbeResult.metadata_only()`（`ok=True`、`tools_listed=False`），失败返回中文错误；探测结果不覆盖已有快照。
+  新建 OAuth server 时快照为空，权限规则按 `mcp__{server_key}__` 前缀校验（9.1 节，M1b 已实现，M3 未改动）。
 
 ## 9. 审核与审批
 
@@ -1468,7 +1597,28 @@ M1b 落地（`mcp_server/api.py`、`mcp_server/schemas.py`）：
   `created_at`、`updated_at`。其中：
   - `headers` 只在写操作（新建、修改）的响应里给出，形如 `{名称: "********"}`；列表与详情不读凭证表，`headers` 为 null；
   - 没有写权限的成员看到的 `url` 里，查询参数整段换成 `********`（查询参数可能带着凭证）。
-- 「附带自己的授权状态」属于 OAuth，留到 M3。
+- 「附带自己的授权状态」属于 OAuth，留到 M3（已实现，见下）。
+
+M3 落地（`mcp_server/api.py`、`mcp_server/schemas.py`）：
+
+| 接口 | 请求 | 响应 `data` |
+|---|---|---|
+| `POST /servers/{id}/oauth/authorize` | — | `McpOAuthAuthorizeResponse`：`authorization_url` |
+| `POST /oauth/complete` | `McpOAuthCompleteRequest`：`state`、`code`、`iss?`；`extra="forbid"` | `McpServerResponse`（带授权状态） |
+| `DELETE /servers/{id}/oauth` | — | `McpOAuthRevokeResponse`：`revoked` |
+| `GET /oauth/client-metadata.json` | 不鉴权 | CIMD 文档（不是 `ApiResponse` 外壳，授权服务器按 RFC 要求直接解析 JSON）；未配置 `AGENTOS_PUBLIC_BASE_URL` 时 404 |
+
+- `McpServerResponse` 新增 `oauth: {status: authorized / unauthorized / expired, scope, expires_at} | null`，只有 OAuth server 才有；列表、详情、写接口都带。
+  `expired` 表示已过期且没有 refresh_token；有 refresh_token 的过期 token 仍算 `authorized`（下一回合会自动刷新）。
+- `McpAdminService` 新增 `begin_oauth(server_id) -> str`、`complete_oauth(callback) -> McpServerView`、`revoke_oauth(server_id) -> bool`。编排：
+  - 发起：`registry.require_oauth_server` → `connector.begin_oauth`；
+  - 完成：`connector.complete_oauth(config_for=registry.require_oauth_server)` → `registry.save_oauth_token`（请求事务）→ `connector.forget_user` →
+    `connector.refresh_oauth_snapshot`（独立短事务）；
+  - 撤销：`registry.revoke_oauth_token` → `connector.forget_user`。
+- `save_oauth_token` 不给 server 行加锁：随后的快照回写在独立短事务里要 `FOR UPDATE SKIP LOCKED` 这一行，请求事务持锁会让它一直跳过。
+  授权期间 server 被改的竞态由 `config_rev` 核对兜底。
+- 别人的私有 server：三个接口都经 `require_oauth_server` / `revoke_oauth_token` 的可见性规则，一律 404「MCP server 不存在」；
+  完成接口的 state 若属于别人，先在 `require_owner` 处 403，state 同时作废。
 
 M2 落地（`agent/api.py`、`agent/schemas.py`）：
 - `PUT /api/agents/{id}/mcp-servers`，请求体 `AgentMcpBindingsRequest`：`servers: list[AgentMcpBindingItem]`，每项 `server_id`（正整数）、
@@ -1531,6 +1681,11 @@ M1b 落地（`harness/bootstrap.py`、`main.py`）：
 - 导入组装根会连带导入 `harness.adapters.mcp`，也就会加载 mcp SDK，实测增加约 0.26 秒；但不会创建运行时，也不建连接。
   memory worker 不导入组装根，不受影响。
 
+M3 落地（`harness/bootstrap.py`）：
+- `mcp_runtime()` 额外装配 `oauth=McpOAuth(http=同一个 McpHttpFactory, store=McpOAuthCatalog(AsyncSessionLocal), states=mcp_oauth_state_store,
+  settings=OAuthClientSettings(public_base_url, refresh_skew_seconds))`。`states` 传的是工厂函数：只有发起或完成授权时才连 Redis。
+- `mcp_oauth_state_store()`（`@cache`）与 `close_mcp_runtime()` 见 8.2 节 M3 落地。`main.py` 的 lifespan 不用改。
+
 ### 10.3 落库与事件
 
 - 调用入参原样写入 `tool_calls`，不做脱敏（2026-11-11 拍板）。
@@ -1585,10 +1740,14 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
 - 超时之间必须满足 `CONNECT < LIST < RESOLVE`，Settings 校验时检查，不满足就启动失败。
 - M1a 已加入 `ENABLED`、`CONNECT`、`LIST`、`PROBE`、`CALL`、`IDLE`、`POOL_MAX_CONNECTIONS`、`TOOLS_CACHE`、`MAX_OUTPUT_CHARS`、
   `MAX_SCHEMA_BYTES`、`ALLOW_INSECURE_HTTP`、`ALLOWED_PRIVATE_HOSTS`（`RESOLVE` 在 M0b 已加入），类型与默认值同上表，
-  超时校验是 `Settings._check_mcp_timeouts`（`model_validator`）。`PUBLIC_BASE_URL`、`OAUTH_REFRESH_SKEW_SECONDS` 留到 M3，
+  超时校验是 `Settings._check_mcp_timeouts`（`model_validator`）。`PUBLIC_BASE_URL`、`OAUTH_REFRESH_SKEW_SECONDS` 留到 M3（已加，见本节末尾），
   `MAX_PRIVATE_SERVERS_PER_USER` 已在 M1b 加入（`mcp_max_private_servers_per_user: int = Field(default=10, ge=0)`，0 表示不允许建私有 server，
   `.env` 与 `.env.example` 同步）。适配器不读 Settings，由组装根读好后经 `McpRuntimeLimits`、`McpProviderLimits`、
   `McpHttpFactory` 和 `McpConnector` 的构造参数传入；`ALLOWED_PRIVATE_HOSTS` 经 `http.parse_allowed_hosts` 解析成小写集合。
+- M3 已加入 `PUBLIC_BASE_URL`（`public_base_url: str | None = None`，留空归一成 None；非空时去掉末尾斜杠，只接受不带查询参数和片段的 http(s) 绝对地址，
+  否则启动失败）和 `MCP_OAUTH_REFRESH_SKEW_SECONDS`（`mcp_oauth_refresh_skew_seconds: int = Field(default=300, ge=0)`），`.env` 与 `.env.example` 同步。
+  `.env` 里没有可参考的前端地址（前端工程 console 的 Vite 开发服务器没有固定对外地址），所以 `.env` 的 `AGENTOS_PUBLIC_BASE_URL` 留空：
+  发起授权时抛 500「未配置 AGENTOS_PUBLIC_BASE_URL（前端对外地址），无法发起 MCP OAuth 授权」，CIMD 文档接口 404。
 
 ## 12. 测试策略
 
@@ -1712,6 +1871,29 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
     绑定本人私有 / 别人私有 / 停用 / 跨工作区 server 报错且不写库；接口 `PUT /api/agents/{id}/mcp-servers` 的 200 与详情回显、空白名单 400、
     成员 403、Agent 不存在与跨工作区 404、server 不存在 404。
 
+- **M3 落地的测试文件**：
+  - `tests/fixtures/mcp_oauth_fake.py`：假授权服务器（元数据、DCR、token 端点；校验 PKCE S256、resource、redirect_uri、client_id，
+    回跳带 iss，刷新轮换 refresh_token、旧的一经使用即作废，可选签发 client_secret 并要求 Basic 认证）、`ProtectedMcp`（PRM 与 Bearer 校验，
+    401 带 `resource_metadata`，可切 403 `insufficient_scope`）、按 Host 分派的 ASGI 路由（MCP server 与授权服务器在不同主机上，各自经
+    `PinnedTransport` 解析、校验、固定）、内存版 `McpOAuthStore`、`oauth_harness(...)` 装配。
+  - `tests/test_mcp_oauth.py`（不联网、不监听端口）：授权码 + PKCE + resource + iss；CIMD 优先、DCR 与注册复用；state 只能用一次、
+    10 分钟过期、别的用户或工作区来完成被拒且 state 作废；iss 不符、缺 iss（声明支持时）被拒，未声明时放行；不支持 PKCE、issuer 不符、
+    既无 CIMD 也无 DCR、没有 PRM、缺 `AGENTOS_PUBLIC_BASE_URL`、授权期间 `config_rev` 变化、授权服务器解析到内网；回合解析时无 token 缺席并记
+    `auth_required`（不带授权地址、不发请求）、有 token 列出工具并回写快照、别的用户缺席、离过期不到 skew + 抖动时提前刷新（窗口外不刷新）、
+    刷新被拒映射 `auth_required` 并在锁内标记失效、无 refresh_token 过期；调用中 401 先读库换用别处刷新的 token（自己不刷新）、
+    否则刷新一次后重发、刷新失败返回「需要重新授权 MCP server fake」并标记失效、下一回合缺席；403 `insufficient_scope` 不标记失效；
+    同进程并发只刷新一次；撤销后重新授权；探测 OAuth server 不需要 token；授权后回写快照；装配没有 OAuth 时记 invalid；
+    token、refresh_token、code、code_verifier、client_secret 不出现在日志（含 `extra`）、错误与 repr 里；DCR 签发的 secret 走 Basic 认证。
+  - `tests/test_mcp_oauth_state.py`：真实 Redis（`redis_test_clients`，不可达时跳过；本次实际执行）的 GETDEL 一次性、TTL、key 不含 state 原文、
+    经 Redis 跑完整授权且同一 state 第二次被拒；进程内实现同样的语义；组装根按 `disable_redis_events` 选后端、缺 `AGENTOS_REDIS_URL` 报中文错误。
+  - `tests/test_mcp_oauth_admin.py`：内存 registry 加假连接器，新建 OAuth server 只探测元数据、快照为空；发起先查 registry 再连网、看不到 404 不连网；
+    完成的顺序为「换 token → 写库 → 缓存作废 → 回写快照」；授权期间配置变化 409 且不写库；撤销后缓存作废。
+  - `tests/test_mcp_oauth_pg.py`：真实 PostgreSQL（库可达且已升到 0034 时执行；本次实际执行）。两个连接同时刷新只发出一次请求
+    （用 `pg_stat_activity` 按 backend pid 确认后到者在等锁，`finally` 里放行先到者，失败时不会卡住夹具清理）；`lock_timeout` 生效（1 秒内放弃、
+    回调不被调用）且只在事务内有效；刷新被拒在锁内软删；标记失效只动被拒的那份；部分唯一索引与撤销后重新授权、客户端注册替换；
+    `config_rev` 变化拒写、改地址作废全部 token；快照只在变化且版本未变时写；经真实 HTTP 接口：私有 server 的三个 OAuth 接口对别人（含管理员）404、
+    完成与撤销后列表与详情的授权状态、响应里没有 token；CIMD 文档接口不鉴权、未配置对外地址 404。
+
 ### 12.3 黄金测试
 
 **期望字面量不变**：M0 不改变对外行为，七份黄金测试的期望字面量（`tests/fixtures/*_golden.py`，包括 SHA-256）**一个字都不改**。
@@ -1823,6 +2005,17 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
   - `_wake_team_members` 读 `configuration.gateway.scoped`：`tests/test_logging_chain.py` 的配置替身补 `gateway=SimpleNamespace(scoped=None)`；
   - `delete_server` 跨域调用 agent 域：`tests/test_mcp_server_service.py` 的夹具（`db=None` 加内存仓储）补一行 `monkeypatch` 记录解除绑定。
 
+**M3 实际改动的核对结果**：
+- 八份黄金测试的文件和 `tests/fixtures/*_golden.py` 零改动。新增的一律带默认值或只在 OAuth server 上生效：`McpServerEntry.oauth_token`、
+  `McpProbeResult.tools_listed`、`McpServerView.oauth`、`McpRuntime(oauth=None)`、`McpHttpFactory.create(..., auth=None)`；
+  `McpRuntime.connection(..., auth=None)` 没有 auth 时按原来的形状调用 `open_client`。
+- 非黄金测试只改替身与构造，断言语义不变：
+  - `tests/test_mcp_admin.py` 的 `FakeConnector` 补端口新增的四个抽象方法（被调用即报错）；
+  - `tests/test_mcp_server_service.py` 的 `FakeRepository` 补 `list_oauth_tokens`、`soft_delete_oauth_tokens`、`soft_delete_oauth_clients`（没有 OAuth 行）。
+- 例外两处，随 M3「放开 OAuth」而改：`tests/test_mcp_config.py` 删掉「OAuth 认证尚未开放」两条参数（新建一条改为「OAuth 不能带请求头」，
+  更新一条直接删除）；`tests/test_mcp_server_api.py::test_create_validation_errors_do_not_echo_secrets` 原断言 `auth_type=oauth` 422，
+  改为 OAuth 带请求头 400 且错误里不回显凭证。
+
 ## 13. 阶段
 
 | 阶段 | 内容 | 完成判据 |
@@ -1830,7 +2023,7 @@ M1c 落地（迁移 `alembic/versions/0032_tool_calls_source.py`，revision `003
 | M0 | 前置重构，即 6.1 节的第 1～5 步：按名查策略改为查本回合的 `policies`；`ToolOutput` 贯穿执行层；作用域工具的传递通道；`ToolScope`、`ToolBinding`、`ScopedGrant`、`ScopedToolProvider`、`ResolvedScope`、`TurnToolResolver`；删除审核员的 None 回落和 `dangerous_tools()`；12.3 节列出的一次性替身破例；修改第 15 节列出的上位文档 | 七份黄金测试字面量不变；用内存假来源跑通「解析 → 审核 → 执行 → 挂起 → 恢复」，以及子代理继承；完整测试通过 |
 | M1 | SDK 升级到 v2；`harness/domain/mcp.py`；`harness/adapters/mcp/`（连接池、McpTool、结果转换、SSRF 防护）；`mcp_server` 域的 `mcp_servers`、`mcp_server_secrets` 两张表、迁移和静态请求头认证；共享与私有 server（7.2 节）；管理接口与 `permission/api.py` 对 `mcp__` 名字的校验；组装根与 lifespan；`tool_sources` 事件；`tool_calls.source`、`ToolInfo.source` 和审批载荷里的 `tool.source`；挂起快照核对；MCP 审批 `can_update_input=False` 与 422；`always_scope=global` 的管理员限制；第八份黄金测试 `test_mcp_tool_golden.py`。本阶段只有 `lead` 加载 MCP 工具，其余档位一律 `ToolBinding.none()` | 进程内假 server 端到端、SSRF、新增静态检查、第八份黄金测试全部通过 |
 | M2（已实现） | 自建 Agent 绑定 server（`agent_mcp_servers`、agent 域接口）；委派、Workflow 成员、子代理、队友按 6.2 节加载 | 绑定、裁剪、各档位继承的运行时测试通过 |
-| M3 | OAuth：先做 spike（8.2 节），确认复用 SDK 的哪些工具函数；再建 `mcp_oauth_clients`、`mcp_oauth_tokens` 两张表和迁移；实现 `McpTokenAuth`、行锁刷新、授权的两个半程、`auth_required` fault，以及 OAuth server 的快照回填 | 用 ASGI 假授权服务器跑通授权码 + PKCE、刷新、并发刷新，以及撤销后重新授权 |
+| M3（已实现） | OAuth：先做 spike（8.2 节），确认复用 SDK 的哪些工具函数；再建 `mcp_oauth_clients`、`mcp_oauth_tokens` 两张表和迁移；实现 `McpTokenAuth`、行锁刷新、授权的两个半程、`auth_required` fault，以及 OAuth server 的快照回填 | 用 ASGI 假授权服务器跑通授权码 + PKCE、刷新、并发刷新，以及撤销后重新授权 |
 | M4（后续） | MRTR / elicitation 接入 ask 挂起；订阅 list_changed；图片进模型；resources / prompts；审批时允许修改 MCP 工具的参数 | 单独立项 |
 
 每个阶段单独提交。实现中细化出的签名回写到本文。
@@ -1853,7 +2046,7 @@ M1 分步实现：
   手动刷新清缓存入口、第八份黄金测试。签名回写在 4.3、5.3、6.3、10.2、10.3、12.3 节。
 
 **M1 全部完成**（M1a dd145ef、M1b 8abea39、M1c 74815b9）。M1 只有 `lead` 加载 MCP 工具；子代理、队友、委派、Workflow 成员的加载与 Agent 绑定在 M2，
-OAuth 在 M3。
+OAuth 在 M3（均已实现）。
 
 **M2 已实现**（2026-11-13）：`agent_mcp_servers` 表与迁移 `0033_agent_mcp_servers`、`McpServerService.require_usable` / `enabled_shared_keys`、
 `AgentDefinitionService.replace_mcp_bindings` / `unbind_mcp_server`、`PUT /api/agents/{id}/mcp-servers` 与详情里的 `mcp_servers`、
@@ -1862,6 +2055,13 @@ OAuth 在 M3。
 市场快照与官方预置不导出 MCP 绑定：`build_snapshot` 只读工具与 Skill 绑定，预置格式里没有 MCP 字段，均无需改动。
 留给 M3 及以后：OAuth 全部内容；OAuth server 绑定到 Agent 后，成员用这个 Agent 时各自授权的体验（`auth_required` fault 已有通道）；
 Agent 绑定接口按 `tools_snapshot` 校验白名单原名（本期不校验，不存在的原名只是匹配不到）；Agent 导出导入一并设计 MCP 绑定（14 节已搁置）。
+
+**M3 已实现**（2026-11-13）：spike 结论回写在 8.2 节；`mcp_oauth_clients`、`mcp_oauth_tokens` 两张表与迁移 `0034_mcp_oauth`；
+`McpServerService` 的 OAuth 方法与 `McpOAuthCatalog`（`McpOAuthStore` 的实现，自开短事务）；`harness/domain/mcp_oauth.py`；
+`harness/adapters/mcp/oauth.py`（两个半程、`McpTokenAuth`、`TokenCell`、持锁刷新的回调）与 `oauth_state.py`（Redis / 进程内 state 存储）；
+回合解析的 `auth_required` fault、提前刷新与快照回写；调用中 401 映射「需要重新授权」并标记失效；OAuth server 的探测只查元数据；
+三个 OAuth 接口、CIMD 文档接口与列表里的授权状态；`AGENTOS_PUBLIC_BASE_URL`、`AGENTOS_MCP_OAUTH_REFRESH_SKEW_SECONDS`。
+签名回写在 4.1、5.4、第 7 节、8.2～8.4、10.1、10.2、第 11 节、12.2、12.3。与设计不一致之处见第 14 节待定事项 2～5。
 
 **M0b 对 Workflow 的调整**（M2 已按此接入）：`BaseOrchestrator` 的 `resolved` 参数和 WorkflowRuntime 的解析（6.1 节第 4、5 步，6.3 节，10.2 节）
 推迟到 M2。Workflow 成员要按自身绑定选作用域工具（6.2 节），绑定表 M2 才有，M0b 接进来也只能传 `none()`，
@@ -1889,6 +2089,15 @@ Agent 绑定接口按 `tools_snapshot` 校验白名单原名（本期不校验�
    `mcp__github__create_issue`。工具名总长不能超过 64 个字符（OpenAI 的上限），前缀 `mcp__{key}__` 占得越多，
    留给原始工具名的就越少。24 个字符时前缀最多 31 个字符，原始工具名还能用 33 个字符，超出的部分截短再加哈希后缀。
    放宽到 32，原始工具名只剩 25 个字符，截短会更常见。没有另行决定就按 24 实现。
+2. **OAuth server 绑定到自建 Agent 时成员各自授权的体验**（M2 遗留，M3 未改）：Agent 绑定只校验 server 可用，不看谁授权过；
+   成员用这个 Agent 时，没授权的成员照常收到 `auth_required` fault。是否要在绑定界面或 Agent 详情里提示「需要各自授权」，待前端设计时定。
+3. **CIMD 文档经前端代理对外**（M3 实现选择）：`client_id` 取 `{AGENTOS_PUBLIC_BASE_URL}/api/mcp/oauth/client-metadata.json`，
+   要求部署时前端域名把 `/api` 反向代理到后端（开发环境 console 的 Vite 已这样配置）。另一种做法是新增后端对外地址配置项，本期没有加。
+   `AGENTOS_PUBLIC_BASE_URL` 不是 https 时（本地开发）CIMD 不可用，自动改走 DCR。
+4. **刷新失败的判定**（M3 实现选择）：授权服务器对刷新请求回 4xx 一律视为「明确拒绝」并在锁内把 token 标记失效；5xx 和网络错误不写库，
+   本回合记 `auth_required`、下一回合再试。若以后遇到用 4xx 表示暂时故障的授权服务器，需要细分 `error` 码。
+5. **SDK 未覆盖、自己写的部分**（M3 实现选择，见 8.2 节 spike 结论）：token 请求的客户端认证三分支（照抄 `OAuthContext.prepare_token_auth`）、
+   `expires_at` 用注入的时钟计算、S256 支持校验、授权端点只做格式校验。SDK 升级时要复核这几处是否已有可直接调用的公开函数。
 
 ## 15. 与上位文档的偏离
 

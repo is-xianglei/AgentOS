@@ -19,9 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import settings
 from core.errors import AgentException
 from core.event_bus import StreamBus
+from core.redis_client import build_redis_clients
 from database.engine import AsyncSessionLocal
 from harness.adapters.mcp.connector import McpConnector
 from harness.adapters.mcp.http import McpHttpFactory, parse_allowed_hosts, system_resolver
+from harness.adapters.mcp.oauth import McpOAuth, OAuthClientSettings
+from harness.adapters.mcp.oauth_state import LocalOAuthStateStore, RedisOAuthStateStore
 from harness.adapters.mcp.provider import McpProviderLimits, McpToolProvider
 from harness.adapters.mcp.runtime import McpRuntime, McpRuntimeLimits
 from harness.adapters.memory.builtin_provider import BuiltinMemoryProvider
@@ -31,7 +34,7 @@ from harness.adapters.reviewers.policy_reviewer import PolicyReviewer
 from harness.adapters.tools.builtin_provider import builtin_tool_set
 from harness.app.agent_service import AgentService
 from harness.app.mcp_admin import McpAdminService
-from harness.app.mcp_port import McpServerConnector
+from harness.app.mcp_port import McpServerConnector, OAuthStateStore
 from harness.app.memory_port import MemoryProvider
 from harness.app.ports import (
     ModelClient,
@@ -47,7 +50,7 @@ from harness.app.tool_set import ToolSet, register_platform_tools
 from harness.domain.roles.subagent import SubAgentSpec
 from harness.domain.tool import ScopedGrant
 from mcp_server.service import McpServerService
-from mcp_server.source import McpServerCatalog
+from mcp_server.source import McpOAuthCatalog, McpServerCatalog
 from permission.service import PermissionService
 from runtime.agent import AgentRuntime
 from runtime.execution import cancel_turn
@@ -73,24 +76,62 @@ def _mcp_http() -> McpHttpFactory:
     )
 
 
+# 普通命令的阻塞读时长：OAuth state 只用 SET / GETDEL，不做阻塞读，取最小值即可。
+_OAUTH_STATE_BLOCK_MS = 0
+
+
+@cache
+def mcp_oauth_state_store() -> OAuthStateStore:
+    """进程级 OAuth state 存储，首次发起或完成授权时惰性创建。
+
+    与 run 事件流同一取舍（core/run_events.py）：disable_redis_events=true 时退回进程内存储，只适合单进程调试；
+    否则用 Redis（复用 core/redis_client.py 的构造方式），未配置 AGENTOS_REDIS_URL 时抛中文异常，不静默降级。
+    """
+    if settings.disable_redis_events:
+        return LocalOAuthStateStore()
+    if not settings.redis_url:
+        raise AgentException.message(
+            "未配置 AGENTOS_REDIS_URL，无法保存 MCP OAuth 授权状态；单进程本地调试可设置 "
+            "AGENTOS_DISABLE_REDIS_EVENTS=true",
+        )
+    return RedisOAuthStateStore(build_redis_clients(block_ms=_OAUTH_STATE_BLOCK_MS))
+
+
 @cache
 def mcp_runtime() -> McpRuntime:
-    """进程级 MCP 运行时：连接池与共享响应缓存。首次取用时惰性创建，不建任何连接。"""
+    """进程级 MCP 运行时：连接池、共享响应缓存与 OAuth（token 缓存与刷新）。首次取用时惰性创建，不建任何连接。
+
+    OAuth 的持久化经 McpOAuthCatalog 自开短事务（会话来自 AsyncSessionLocal），state 存储惰性创建。
+    """
+    http = _mcp_http()
     return McpRuntime(
-        http=_mcp_http(),
+        http=http,
         limits=McpRuntimeLimits(
             connect_timeout=settings.mcp_connect_timeout_seconds,
             idle_seconds=settings.mcp_idle_seconds,
             pool_max_connections=settings.mcp_pool_max_connections,
             tools_cache_seconds=settings.mcp_tools_cache_seconds,
         ),
+        oauth=McpOAuth(
+            http=http,
+            store=McpOAuthCatalog(AsyncSessionLocal),
+            states=mcp_oauth_state_store,
+            settings=OAuthClientSettings(
+                public_base_url=settings.public_base_url,
+                refresh_skew_seconds=settings.mcp_oauth_refresh_skew_seconds,
+            ),
+        ),
     )
 
 
 async def close_mcp_runtime() -> None:
-    """lifespan 退出时关闭 MCP 运行时；只有已经创建过才关，免得为了关闭反而先创建出来。"""
+    """lifespan 退出时关闭 MCP 运行时与 OAuth state 存储；只有已经创建过才关，免得为了关闭反而先创建出来。"""
     if mcp_runtime.cache_info().currsize:
         await mcp_runtime().aclose()
+    if mcp_oauth_state_store.cache_info().currsize:
+        store = mcp_oauth_state_store()
+        mcp_oauth_state_store.cache_clear()
+        await store.aclose()
 
 
 def mcp_connector() -> McpServerConnector:

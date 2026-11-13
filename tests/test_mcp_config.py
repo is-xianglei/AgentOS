@@ -164,7 +164,8 @@ def test_draft_normalizes_and_validates() -> None:
         ({"server_key": "Bad_Key"}, "server_key 不合法"),
         ({"auth_type": McpAuthType.STATIC_HEADERS}, "至少要配置一个请求头"),
         ({"headers": {"X-A": "1"}}, "只有 static_headers"),
-        ({"auth_type": McpAuthType.OAUTH}, "OAuth 认证尚未开放"),
+        # M3 放开 OAuth 后，OAuth server 同样不能带静态请求头。
+        ({"auth_type": McpAuthType.OAUTH, "headers": {"X-A": "1"}}, "只有 static_headers"),
         ({"name": "   "}, "名称"),
         ({"tool_denylist": ["ok", " "]}, "空的工具名"),
         ({"call_timeout_seconds": 0}, "调用超时"),
@@ -277,7 +278,6 @@ def test_switching_to_none_rejects_submitted_headers() -> None:
     [
         ({"server_key": "gitlab"}, "server_key 创建后不能修改"),
         ({"private": True}, "共享和私有之间切换"),
-        ({"auth_type": McpAuthType.OAUTH}, "OAuth 认证尚未开放"),
     ],
 )
 def test_update_rejects_immutable_changes(changes: dict[str, object], message: str) -> None:

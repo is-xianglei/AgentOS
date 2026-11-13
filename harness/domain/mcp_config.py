@@ -21,6 +21,7 @@ from harness.domain.mcp import (
     requires_approval,
     validate_server_key,
 )
+from harness.domain.mcp_oauth import McpOAuthAuthorization
 
 SECRET_MASK = "********"  # 接口回显凭证时的掩码；更新时提交掩码表示沿用原值
 _DEFAULT_PORTS = {"https": 443, "http": 80}
@@ -150,15 +151,6 @@ def _build_secret(auth_type: McpAuthType, headers: Mapping[str, str] | None) -> 
     return None
 
 
-def _reject_oauth(auth_type: McpAuthType) -> None:
-    # OAuth 的授权流程、token 存储与探测方式在 M3 才有，现在建出来也连不上。
-    if auth_type is McpAuthType.OAUTH:
-        raise AgentException.message(
-            "OAuth 认证尚未开放，请使用 none 或 static_headers",
-            status_code=400,
-        )
-
-
 class McpServerChanges(TypedDict, total=False):
     """更新时提交的字段，只含客户端显式给出的项；server_key 与 private 只用于核对，不能改。"""
 
@@ -210,7 +202,6 @@ class McpServerDraft:
         call_timeout_seconds: int | None = None,
         is_enabled: bool = True,
     ) -> McpServerDraft:
-        _reject_oauth(auth_type)
         return cls(
             server_key=validate_server_key(server_key),
             name=_clean_name(name),
@@ -248,7 +239,8 @@ class McpServerView:
     """一个 server 的展示视图（mcp_servers 的一行），不含凭证。
 
     writable 表示当前用户能否修改它；header_names 只在读过凭证表的写操作里填入，
-    列表与详情不读凭证表，为 None。
+    列表与详情不读凭证表，为 None。oauth 是当前用户在 OAuth server 上的授权状态（不含 token），
+    非 OAuth server 为 None。
     """
 
     config: McpServerConfig
@@ -262,6 +254,7 @@ class McpServerView:
     created_at: datetime
     updated_at: datetime
     header_names: tuple[str, ...] | None = None
+    oauth: McpOAuthAuthorization | None = None
 
     @property
     def server_id(self) -> int:
@@ -323,8 +316,6 @@ def plan_update(current: McpWritableServer, changes: McpServerChanges) -> McpSer
         raise AgentException.message("server 不能在共享和私有之间切换", status_code=400)
     url = _clean_url(changes["url"]) if "url" in changes else config.url
     auth_type = changes.get("auth_type", config.auth_type)
-    if auth_type is not config.auth_type:
-        _reject_oauth(auth_type)
     existing = current.secret.as_dict() if current.secret is not None else {}
     secret = _updated_secret(auth_type, existing, changes)
     secret_changed = (secret.as_dict() if secret is not None else {}) != existing

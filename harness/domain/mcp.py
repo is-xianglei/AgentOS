@@ -13,6 +13,7 @@ from enum import StrEnum
 from typing import Any
 
 from core.errors import AgentException
+from harness.domain.mcp_oauth import McpOAuthToken
 from harness.domain.tool import ALL_PROFILES_AND_DELEGATE, ToolPolicy
 
 SERVER_KEY_PATTERN = r"^[a-z](?:_?[a-z0-9])*$"  # 小写字母开头，不允许连续或结尾下划线
@@ -298,10 +299,14 @@ class McpSecret:
 
 @dataclass(frozen=True)
 class McpServerEntry:
-    """某个身份可用的一个 server：配置加上凭证（静态请求头），没有凭证时为 None。"""
+    """某个身份可用的一个 server：配置加上凭证（静态请求头），没有凭证时为 None。
+
+    OAuth server 另带这个身份当前的 token（没有授权时为 None），回合解析据此决定是否缺席、是否提前刷新。
+    """
 
     config: McpServerConfig
     secret: McpSecret | None = None
+    oauth_token: McpOAuthToken | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -334,7 +339,11 @@ class McpToolSummary:
 
 @dataclass(frozen=True)
 class McpProbeResult:
-    """一次探测的结果：成功时带 server 信息与工具摘要，失败时只带可展示的中文错误。"""
+    """一次探测的结果：成功时带 server 信息与工具摘要，失败时只带可展示的中文错误。
+
+    tools_listed 为 False 表示这次探测没有拉工具清单（OAuth server 的管理员探测只验证元数据能被发现，
+    不带 token，8.4 节），写库时不能拿空清单覆盖已有快照。
+    """
 
     ok: bool
     error: str | None = None
@@ -342,6 +351,7 @@ class McpProbeResult:
     server_version: str | None = None
     protocol_version: str | None = None
     tools: tuple[McpToolSummary, ...] = ()
+    tools_listed: bool = True
 
     @classmethod
     def success(
@@ -364,6 +374,11 @@ class McpProbeResult:
     def failure(cls, error: str) -> McpProbeResult:
         return cls(ok=False, error=error)
 
+    @classmethod
+    def metadata_only(cls) -> McpProbeResult:
+        """OAuth server 的探测：PRM 与授权服务器元数据都能发现，但没有 token，拿不到工具清单。"""
+        return cls(ok=True, tools_listed=False)
+
 
 # ---------- 授权分区：凭证归谁，连接池与 SDK 响应缓存都按它隔离 ----------
 
@@ -380,7 +395,7 @@ def auth_partition(config: McpServerConfig, *, workspace_id: int, user_id: int) 
     """按可信的回合身份算授权分区。
 
     - 私有 server：归 owner 本人，只有 owner 的身份能用；
-    - 共享 server 的 OAuth：归调用的用户（M3 用）；
+    - 共享 server 的 OAuth：归调用的用户；
     - 共享 server 的静态请求头或无认证：归工作区。
     身份与配置不符（跨工作区、别人的私有 server）属越权，抛中文异常而不回落。
     """

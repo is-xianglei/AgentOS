@@ -160,6 +160,16 @@ class FakeRepository:
     async def soft_delete_secrets(self, server_id: int) -> None:
         self.secrets.pop(server_id, None)
 
+    # OAuth 的两张表：M3 新增的仓储方法，这里只做最小的内存实现（没有 OAuth 行）。
+    async def list_oauth_tokens(self, server_ids: list[int], user_id: int) -> dict[int, Any]:
+        return {}
+
+    async def soft_delete_oauth_tokens(self, server_id: int, user_id: int | None = None) -> int:
+        return 0
+
+    async def soft_delete_oauth_clients(self, server_id: int) -> None:
+        return None
+
 
 @pytest.fixture
 def service(monkeypatch: pytest.MonkeyPatch) -> McpServerService:
